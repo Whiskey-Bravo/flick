@@ -523,6 +523,19 @@ mod tests {
         let notepad = PathBuf::from(root).join(r"System32\notepad.exe");
         let png = ShellIcons.png(&IconKey::File(notepad), 32).expect("an icon");
         assert!(png.starts_with(b"\x89PNG"));
+        // The alpha path on a real Shell icon: 32x32, with see-through pixels
+        // and opaque pixels that are not black.
+        let mut reader = png::Decoder::new(std::io::Cursor::new(&png)).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (32, 32));
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        let pixels: Vec<&[u8]> = buf[..info.buffer_size()].chunks_exact(4).collect();
+        assert!(pixels.iter().any(|p| p[3] == 0), "some transparent pixels");
+        assert!(
+            pixels.iter().any(|p| p[3] == 255 && p[..3].iter().map(|&c| c as u32).sum::<u32>() > 0),
+            "some opaque, non-black pixels"
+        );
         // Extension and folder keys touch no file.
         assert!(ShellIcons.png(&IconKey::Ext(".txt".into()), 48).unwrap().starts_with(b"\x89PNG"));
         assert!(ShellIcons.png(&IconKey::Folder, 16).unwrap().starts_with(b"\x89PNG"));
