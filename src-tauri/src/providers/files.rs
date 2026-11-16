@@ -454,14 +454,14 @@ impl FilesProvider {
     }
 }
 
-/// The icon key of a file: `ext:.pdf`, or a bare `ext:` (generic file icon) when it has none.
+/// The icon key of a file: `ext:.pdf`, or `builtin:file` when it has none.
 fn file_icon(name: &str, is_dir: bool) -> String {
     if is_dir {
         return "folder".into();
     }
     match Path::new(name).extension().and_then(|e| e.to_str()) {
         Some(ext) if !ext.is_empty() => format!("ext:.{}", ext.to_lowercase()),
-        _ => "ext:".into(),
+        _ => "builtin:file".into(),
     }
 }
 
@@ -893,6 +893,8 @@ mod tests {
         assert_eq!((f.icon.as_str(), f.title.as_str(), f.score), ("ext:.pdf", "Report.PDF", 0));
         assert!(f.pinnable && f.revealable && !f.elevatable);
         assert_eq!(p.item(r"C:\x\docs").unwrap().icon, "folder");
+        let (p2, _) = provider(vec![entry(r"C:\x\Makefile", false)]);
+        assert_eq!(p2.item(r"C:\x\Makefile").unwrap().icon, "builtin:file");
         assert!(p.item(r"C:\x\other.txt").is_none());
         assert!(p.ready());
 

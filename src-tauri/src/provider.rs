@@ -18,11 +18,12 @@ pub enum Modifier {
 /// Where a row came from in the bar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Pin and Recent are produced by the pins and history tasks
 pub enum Origin {
     #[default]
     Search,
+    #[allow(dead_code)] // produced by the pins task
     Pin,
+    #[allow(dead_code)] // produced by the history task
     Recent,
 }
 
@@ -81,7 +82,6 @@ pub enum Outcome {
     Fill { text: String },
 }
 
-#[allow(dead_code)] // item, ready and reveal are called by the pins and menu tasks
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     /// Scopes this provider answers when `Query.scope` is Some. Default: none.
@@ -116,14 +116,17 @@ pub trait Provider: Send + Sync {
         vec![]
     }
     /// The row `query` would return for `id` (score 0), if it can be rebuilt.
+    #[allow(dead_code)] // called by the pins and menu tasks
     fn item(&self, _id: &str) -> Option<ResultItem> {
         None
     }
     /// False until the provider's first scan has been swapped in.
+    #[allow(dead_code)] // called by the pins and menu tasks
     fn ready(&self) -> bool {
         true
     }
     /// Show the item's location in the file manager.
+    #[allow(dead_code)] // called by the pins and menu tasks
     fn reveal(&self, _id: &str) -> Result<(), String> {
         Err("can't show this item's location".to_string())
     }

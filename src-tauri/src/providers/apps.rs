@@ -373,12 +373,14 @@ impl AppsProvider {
             self.publish(&start, &fresh);
             *self.store.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
+        // Ready only after the Store attempt, so a pinned Store app is not
+        // reported missing while the first Store scan is still running.
+        self.scanned.store(true, Ordering::SeqCst);
     }
 
     fn publish(&self, start: &[AppEntry], store: &[AppEntry]) {
         let fresh = dedupe(start.iter().chain(store).cloned().collect());
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = fresh;
-        self.scanned.store(true, Ordering::SeqCst);
     }
 }
 
@@ -550,6 +552,22 @@ mod tests {
         assert_eq!(rec.calls(), [r"reveal C:\b.lnk".to_string()]);
         assert!(p.ready());
         assert!(!AppsProvider::new(rec).ready());
+    }
+
+    #[test]
+    fn ready_only_after_the_store_scan_attempt() {
+        let rec = Arc::new(crate::launch::testing::RecordingLauncher::default());
+        for store_result in [Some(vec![store("Calc", "x!a")]), None] {
+            let p = AppsProvider::new(rec.clone());
+            let p2 = p.clone();
+            p.refresh_from(vec![shortcut("Blender", r"C:\b.lnk")], move || {
+                // Start menu published (twice), Store scan still running.
+                assert_eq!(p2.query(&q("blender")).len(), 1);
+                assert!(!p2.ready());
+                store_result
+            });
+            assert!(p.ready());
+        }
     }
 
     #[test]
