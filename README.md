@@ -26,6 +26,16 @@ Results you pick often move up, a file you pick often even above apps. Only whic
 
 If you press Enter while results for what you just typed are still on their way, Flick waits for them and opens the new top result.
 
+## Install
+
+Download `Flick_<version>_x64-setup.exe` from the Releases page of this repository and run it. It installs for the current user and needs no admin rights.
+
+The installer is not signed, so Windows may say "Windows protected your PC". Click More info, then Run anyway.
+
+Flick starts when the installer finishes, opens the bar once with a welcome, and starts at login from then on. The tray menu item Start at login turns that off.
+
+To uninstall, use Settings, Apps. This also removes start at login.
+
 ## Keys
 
 | Key | Action |
@@ -196,7 +206,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-The build makes an NSIS installer.
+The build makes an NSIS installer at `src-tauri/target/release/bundle/nsis/Flick_<version>_x64-setup.exe`.
 
 Tests:
 
