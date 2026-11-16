@@ -6,7 +6,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -16,7 +16,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[cfg(test)]
 use super::files_scan::skip_by_attributes;
-use super::files_scan::{char_bit, is_junk_dir, scan_index, Index};
+use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Slot};
 use crate::fuzzy;
 use crate::launch::Launcher;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
@@ -224,6 +224,8 @@ pub struct FilesProvider {
     home: Option<PathBuf>,
     /// Alive while watching; replaced by each `watch`.
     watcher: Mutex<Option<RecommendedWatcher>>,
+    /// Set once the first scan has been swapped in.
+    scanned: AtomicBool,
 }
 
 #[derive(Default)]
@@ -251,15 +253,15 @@ impl Drop for ClearOnPanic<'_> {
 
 impl FilesProvider {
     pub fn new(launcher: Arc<dyn Launcher>) -> Arc<Self> {
-        Self::with_index(launcher, Index::default())
+        Self::with_index(launcher, Index::default(), false)
     }
 
     #[cfg(test)]
     pub fn with_entries(launcher: Arc<dyn Launcher>, e: Vec<FileEntry>) -> Arc<Self> {
-        Self::with_index(launcher, Index::from_entries(e))
+        Self::with_index(launcher, Index::from_entries(e), true)
     }
 
-    fn with_index(launcher: Arc<dyn Launcher>, index: Index) -> Arc<Self> {
+    fn with_index(launcher: Arc<dyn Launcher>, index: Index, scanned: bool) -> Arc<Self> {
         Arc::new(Self {
             launcher,
             index: RwLock::new(index),
@@ -270,6 +272,7 @@ impl FilesProvider {
             idle: Condvar::new(),
             home: std::env::var_os("USERPROFILE").map(PathBuf::from),
             watcher: Mutex::new(None),
+            scanned: AtomicBool::new(scanned),
         })
     }
 
@@ -364,6 +367,7 @@ impl FilesProvider {
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
+                self.scanned.store(true, Ordering::SeqCst);
                 drop(index);
                 drop(old); // freed outside the lock
                 return;
@@ -450,6 +454,33 @@ impl FilesProvider {
     }
 }
 
+/// The icon key of a file: `ext:.pdf`, or a bare `ext:` (generic file icon) when it has none.
+fn file_icon(name: &str, is_dir: bool) -> String {
+    if is_dir {
+        return "folder".into();
+    }
+    match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some(ext) if !ext.is_empty() => format!("ext:.{}", ext.to_lowercase()),
+        _ => "ext:".into(),
+    }
+}
+
+impl FilesProvider {
+    fn row(&self, index: &Index, s: &Slot, score: u32) -> ResultItem {
+        ResultItem {
+            id: index.path(s).to_string_lossy().into_owned(),
+            provider: "files",
+            title: index.name(s).to_string(),
+            subtitle: shorten_home(index.dir(s), self.home.as_deref()),
+            score,
+            icon: file_icon(index.name(s), s.is_dir),
+            pinnable: true,
+            revealable: true,
+            ..Default::default()
+        }
+    }
+}
+
 impl Provider for FilesProvider {
     fn name(&self) -> &'static str {
         "files"
@@ -510,17 +541,27 @@ impl Provider for FilesProvider {
         picked
             .into_iter()
             .map(|(score, i)| {
-                let s = &index.slots[i];
-                ResultItem {
-                    id: index.path(s).to_string_lossy().into_owned(),
-                    provider: "files",
-                    title: index.name(s).to_string(),
-                    subtitle: shorten_home(index.dir(s), self.home.as_deref()),
-                    score,
-                    confirm: false,
-                }
+                self.row(&index, &index.slots[i], score)
             })
             .collect()
+    }
+
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        let s = index.find(Path::new(id))?;
+        Some(self.row(&index, s, 0))
+    }
+
+    fn ready(&self) -> bool {
+        self.scanned.load(Ordering::SeqCst)
+    }
+
+    fn reveal(&self, id: &str) -> Result<(), String> {
+        let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(id)).is_some();
+        if !known {
+            return Err(NOT_FOUND.into());
+        }
+        self.launcher.reveal(id)
     }
 
     fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
@@ -843,6 +884,33 @@ mod tests {
 
         let (p, _) = provider(vec![entry(r"D:\Stuff\taxes.txt", false)]);
         assert_eq!(p.query(&q("taxes"))[0].subtitle, r"D:\Stuff");
+    }
+
+    #[test]
+    fn item_only_for_indexed_paths() {
+        let (p, _) = provider(vec![entry(r"C:\x\Report.PDF", false), entry(r"C:\x\docs", true)]);
+        let f = p.item(r"C:\x\Report.PDF").unwrap();
+        assert_eq!((f.icon.as_str(), f.title.as_str(), f.score), ("ext:.pdf", "Report.PDF", 0));
+        assert!(f.pinnable && f.revealable && !f.elevatable);
+        assert_eq!(p.item(r"C:\x\docs").unwrap().icon, "folder");
+        assert!(p.item(r"C:\x\other.txt").is_none());
+        assert!(p.ready());
+
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("a.txt"));
+        let p = FilesProvider::new(Arc::new(RecordingLauncher::default()));
+        assert!(!p.ready());
+        p.set_roots(vec![dir.path().to_path_buf()]);
+        p.refresh_blocking();
+        assert!(p.ready());
+    }
+
+    #[test]
+    fn reveal_uses_the_launcher() {
+        let (p, rec) = provider(vec![entry(r"C:\x\a.txt", false)]);
+        assert_eq!(p.reveal(r"C:\x\a.txt"), Ok(()));
+        assert_eq!(rec.calls(), [r"reveal C:\x\a.txt".to_string()]);
+        assert!(p.reveal(r"C:\x\nope.txt").is_err());
     }
 
     #[test]

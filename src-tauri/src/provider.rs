@@ -15,7 +15,18 @@ pub enum Modifier {
     CtrlShift,
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+/// Where a row came from in the bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Pin and Recent are produced by the pins and history tasks
+pub enum Origin {
+    #[default]
+    Search,
+    Pin,
+    Recent,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ResultItem {
     /// Unique within its provider, stable across queries.
     pub id: String,
@@ -27,6 +38,14 @@ pub struct ResultItem {
     pub score: u32,
     /// UI must ask for a second Enter.
     pub confirm: bool,
+    /// Icon key: `file:<path>`, `ext:<.lower>`, `folder`, or `builtin:<name>`.
+    pub icon: String,
+    pub origin: Origin,
+    /// Set by the engine.
+    pub pinned: bool,
+    pub pinnable: bool,
+    pub revealable: bool,
+    pub elevatable: bool,
 }
 
 /// A provider that owns a typed prefix: when the text matches, only it is queried.
@@ -62,6 +81,7 @@ pub enum Outcome {
     Fill { text: String },
 }
 
+#[allow(dead_code)] // item, ready and reveal are called by the pins and menu tasks
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     /// Scopes this provider answers when `Query.scope` is Some. Default: none.
@@ -95,6 +115,18 @@ pub trait Provider: Send + Sync {
     fn empty_query(&self) -> Vec<ResultItem> {
         vec![]
     }
+    /// The row `query` would return for `id` (score 0), if it can be rebuilt.
+    fn item(&self, _id: &str) -> Option<ResultItem> {
+        None
+    }
+    /// False until the provider's first scan has been swapped in.
+    fn ready(&self) -> bool {
+        true
+    }
+    /// Show the item's location in the file manager.
+    fn reveal(&self, _id: &str) -> Result<(), String> {
+        Err("can't show this item's location".to_string())
+    }
 }
 
 /// Lets a provider that is also used elsewhere (e.g. apps, refreshed by a
@@ -126,5 +158,14 @@ impl<P: Provider + ?Sized> Provider for Arc<P> {
     }
     fn empty_query(&self) -> Vec<ResultItem> {
         (**self).empty_query()
+    }
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        (**self).item(id)
+    }
+    fn ready(&self) -> bool {
+        (**self).ready()
+    }
+    fn reveal(&self, id: &str) -> Result<(), String> {
+        (**self).reveal(id)
     }
 }

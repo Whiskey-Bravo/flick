@@ -332,8 +332,43 @@ fn describe(def: &ShortcutDef) -> String {
     }
 }
 
-fn item(id: String, title: String, subtitle: String, score: u32) -> ResultItem {
-    ResultItem { id, provider: "shortcuts", title, subtitle, score, confirm: false }
+fn icon(def: &ShortcutDef) -> &'static str {
+    if def.open.is_some() {
+        "builtin:web"
+    } else if def.wsl.is_some() {
+        "builtin:wsl"
+    } else {
+        "builtin:shortcut"
+    }
+}
+
+/// Only rows that carry no typed text or picked value can be pinned.
+fn item(def: &ShortcutDef, id: String, title: String, subtitle: String, score: u32) -> ResultItem {
+    let pinnable = matches!(id.split_once(':'), Some(("run" | "need" | "step", _)));
+    ResultItem {
+        id,
+        provider: "shortcuts",
+        title,
+        subtitle,
+        score,
+        icon: icon(def).into(),
+        pinnable,
+        ..Default::default()
+    }
+}
+
+/// Id and subtitle of the row a shortcut shows for its own name.
+fn head(def: &ShortcutDef, distro: &str) -> (String, String) {
+    let n = &def.name;
+    let no_wsl = def.wsl.is_some() && distro.is_empty();
+    let about = || if no_wsl { NO_WSL.to_string() } else { describe(def) };
+    match kind(def) {
+        Kind::Plain => (format!("run:{n}"), about()),
+        Kind::Arg if no_wsl => (format!("need:{n}"), about()),
+        Kind::Arg => (format!("need:{n}"), format!("type: {n} <argument>")),
+        Kind::Pick if no_wsl => (format!("step:{n}"), about()),
+        Kind::Pick => (format!("step:{n}"), "choose…".to_string()),
+    }
 }
 
 /// Entries matching `text`, best first, at most `MAX_ENTRIES`, with their
@@ -371,7 +406,7 @@ impl Provider for ShortcutsProvider {
             let entry = |e: &Entry, score: u32| {
                 let id = format!("pick:{}:{}", def.name, e.name);
                 // Every entry sits directly in the pick folder: no subtitle.
-                item(id, e.name.clone(), String::new(), score)
+                item(def, id, e.name.clone(), String::new(), score)
             };
             if text.is_empty() {
                 // Descending scores keep the alphabetical order through the engine's sort.
@@ -404,14 +439,8 @@ impl Provider for ShortcutsProvider {
             let about = || if no_wsl { NO_WSL.to_string() } else { describe(def) };
 
             if let Some(score) = words().filter_map(|w| fuzzy::score(text, w)).max() {
-                let (id, subtitle) = match k {
-                    Kind::Plain => (format!("run:{n}"), about()),
-                    Kind::Arg if no_wsl => (format!("need:{n}"), about()),
-                    Kind::Arg => (format!("need:{n}"), format!("type: {n} <argument>")),
-                    Kind::Pick if no_wsl => (format!("step:{n}"), about()),
-                    Kind::Pick => (format!("step:{n}"), "choose…".to_string()),
-                };
-                push(item(id, n.clone(), subtitle, score + BONUS));
+                let (id, subtitle) = head(def, &st.distro);
+                push(item(def, id, n.clone(), subtitle, score + BONUS));
             }
 
             if rest.is_empty() || !words().any(|w| w.to_lowercase() == first) {
@@ -419,11 +448,12 @@ impl Provider for ShortcutsProvider {
             }
             match k {
                 Kind::Plain => {}
-                Kind::Arg => push(item(format!("arg:{n}:{rest}"), format!("{n} {rest}"), about(), 1000 + BONUS)),
+                Kind::Arg => push(item(def, format!("arg:{n}:{rest}"), format!("{n} {rest}"), about(), 1000 + BONUS)),
                 Kind::Pick => {
                     if let Some(Ok(entries)) = st.entries.get(n) {
                         for (e, score) in matching(entries, rest) {
                             push(item(
+                                def,
                                 format!("pick:{n}:{}", e.name),
                                 format!("{n} › {}", e.name),
                                 about(),
@@ -435,6 +465,21 @@ impl Provider for ShortcutsProvider {
             }
         }
         out
+    }
+
+    /// Only the shortcut's own rows; never one that carries typed or picked text.
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        let (prefix, name) = id.split_once(':')?;
+        let want = match prefix {
+            "run" => Kind::Plain,
+            "need" => Kind::Arg,
+            "step" => Kind::Pick,
+            _ => return None,
+        };
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
+        let def = find(&st.defs, name, want)?;
+        let (id, subtitle) = head(def, &st.distro);
+        Some(item(def, id, def.name.clone(), subtitle, 0))
     }
 
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
@@ -618,6 +663,27 @@ mod tests {
 
     fn sub_name(v: &str) -> Substitution {
         Substitution { name: Some(v.into()), ..Default::default() }
+    }
+
+    #[test]
+    fn item_never_rebuilds_typed_text() {
+        let dir = projects();
+        let (p, _) = setup(vec![
+            run("hello", "notepad"),
+            ShortcutDef { run: Some("x {arg}".into()), ..base("search") },
+            picker(run("proj", "code"), dir.path()),
+            open("web", "https://example.com"),
+        ]);
+        let r = p.item("run:hello").unwrap();
+        assert_eq!((r.title.as_str(), r.icon.as_str(), r.pinnable, r.score), ("hello", "builtin:shortcut", true, 0));
+        assert_eq!(p.item("run:web").unwrap().icon, "builtin:web");
+        assert_eq!(p.item("need:search").unwrap().subtitle, "type: search <argument>");
+        assert!(p.item("step:proj").is_some());
+        assert!(p.item("arg:search:secret").is_none());
+        assert!(p.item("pick:proj:x").is_none());
+        assert!(p.item("run:search").is_none());
+        // Rows with typed or picked text are not pinnable.
+        assert!(!p.query(&q("search secret")).iter().find(|r| r.id.starts_with("arg:")).unwrap().pinnable);
     }
 
     // ---- plain ---------------------------------------------------------------

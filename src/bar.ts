@@ -1,5 +1,17 @@
 // Pure bar state machine: no DOM, no Tauri. All decisions live in `reduce`.
-export type Item = { id: string; provider: string; title: string; subtitle: string; confirm: boolean };
+export type Item = {
+  id: string;
+  provider: string;
+  title: string;
+  subtitle: string;
+  confirm: boolean;
+  icon: string; // file:<path>, ext:<.ext>, folder or builtin:<name>
+  origin: "search" | "pin" | "recent";
+  pinned: boolean;
+  pinnable: boolean;
+  revealable: boolean;
+  elevatable: boolean;
+};
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
 export type State = {
   text: string;

@@ -21,6 +21,19 @@ impl FlickProvider {
     }
 }
 
+fn row(score: u32) -> ResultItem {
+    ResultItem {
+        id: ID.into(),
+        provider: "flick",
+        title: TITLE.into(),
+        subtitle: "open the config file".into(),
+        score,
+        icon: "builtin:flick".into(),
+        pinnable: true,
+        ..Default::default()
+    }
+}
+
 impl Provider for FlickProvider {
     fn name(&self) -> &'static str {
         "flick"
@@ -34,14 +47,11 @@ impl Provider for FlickProvider {
         let Some(score) = KEYWORDS.iter().filter_map(|k| fuzzy::score(text, k)).max() else {
             return Vec::new();
         };
-        vec![ResultItem {
-            id: ID.into(),
-            provider: "flick",
-            title: TITLE.into(),
-            subtitle: "open the config file".into(),
-            score,
-            confirm: false,
-        }]
+        vec![row(score)]
+    }
+
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        (id == ID).then(|| row(0))
     }
 
     /// Opening can block while the shell works; activation runs off the main thread.

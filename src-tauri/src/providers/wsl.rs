@@ -41,7 +41,8 @@ impl Provider for WslProvider {
             title: format!("> {}", q.text),
             subtitle: format!("run in {}", self.distro()),
             score: 1000,
-            confirm: false,
+            icon: "builtin:wsl".into(),
+            ..Default::default()
         }]
     }
 

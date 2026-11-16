@@ -214,7 +214,7 @@ fn setup(app: &AppHandle) {
 
     // One launcher for every provider that starts something.
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
-    let providers = Providers::new(AppsProvider::new(), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
+    let providers = Providers::new(AppsProvider::new(launcher.clone()), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));

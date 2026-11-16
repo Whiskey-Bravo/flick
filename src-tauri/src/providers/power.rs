@@ -92,6 +92,20 @@ fn id_of(title: &str) -> String {
     title.to_lowercase()
 }
 
+fn row(title: &str, confirm: bool, score: u32) -> ResultItem {
+    ResultItem {
+        id: id_of(title),
+        provider: "power",
+        title: title.to_string(),
+        subtitle: "Power".to_string(),
+        score,
+        confirm,
+        icon: "builtin:power".into(),
+        pinnable: true,
+        ..Default::default()
+    }
+}
+
 impl Provider for PowerProvider {
     fn name(&self) -> &'static str {
         "power"
@@ -105,18 +119,15 @@ impl Provider for PowerProvider {
         let mut hits: Vec<ResultItem> = ACTIONS
             .iter()
             .filter_map(|&(_, title, confirm)| {
-                fuzzy::score(text, title).map(|s| ResultItem {
-                    id: id_of(title),
-                    provider: "power",
-                    title: title.to_string(),
-                    subtitle: "Power".to_string(),
-                    score: s.saturating_sub(POWER_PENALTY).max(1),
-                    confirm,
-                })
+                fuzzy::score(text, title).map(|s| row(title, confirm, s.saturating_sub(POWER_PENALTY).max(1)))
             })
             .collect();
         hits.sort_by(|a, b| b.score.cmp(&a.score));
         hits
+    }
+
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        ACTIONS.iter().find(|(_, title, _)| id_of(title) == id).map(|&(_, title, confirm)| row(title, confirm, 0))
     }
 
     /// Power actions never learn: a boost would let them outrank apps for the
@@ -160,6 +171,16 @@ mod tests {
     fn provider() -> (PowerProvider, Arc<Mutex<Vec<PowerAction>>>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         (PowerProvider::new(Box::new(RecordingRunner(log.clone()))), log)
+    }
+
+    #[test]
+    fn power_rows_are_pinnable_but_not_learned() {
+        let (p, _) = provider();
+        let r = p.item("restart").unwrap();
+        assert!(r.confirm && r.pinnable && !r.revealable && !r.elevatable);
+        assert_eq!((r.title.as_str(), r.score, r.icon.as_str()), ("Restart", 0, "builtin:power"));
+        assert_eq!(p.rank_key("restart"), None);
+        assert!(p.item("nope").is_none());
     }
 
     fn q(text: &str) -> Query {

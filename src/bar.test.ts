@@ -3,6 +3,7 @@ import { failureText, initial, reduce, visibleItems, type Effect, type Event, ty
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
+  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, revealable: false, elevatable: false,
 });
 const run = (s: State, ...events: Event[]) => {
   let state = s;

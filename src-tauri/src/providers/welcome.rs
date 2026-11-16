@@ -43,7 +43,8 @@ fn row(id: &str, title: String) -> ResultItem {
         title,
         subtitle: String::new(),
         score: 0,
-        confirm: false,
+        icon: "builtin:flick".into(),
+        ..Default::default()
     }
 }
 

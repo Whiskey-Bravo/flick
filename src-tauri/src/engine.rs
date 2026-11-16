@@ -144,9 +144,32 @@ impl Engine {
                 title: l.example,
                 subtitle: l.about,
                 score: 1000 - i as u32,
-                confirm: false,
+                icon: "builtin:help".into(),
+                ..Default::default()
             })
             .collect()
+    }
+
+    fn provider(&self, name: &str) -> Option<&dyn Provider> {
+        self.providers.iter().find(|p| p.name() == name).map(|p| p.as_ref())
+    }
+
+    /// The row `provider` would return for `id`, if it can be rebuilt.
+    #[allow(dead_code)] // called by the pins and menu tasks
+    pub fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
+        self.provider(provider)?.item(id)
+    }
+
+    /// False while the provider has not finished its first scan. An unknown
+    /// provider has nothing to wait for.
+    #[allow(dead_code)] // called by the pins and menu tasks
+    pub fn ready(&self, provider: &str) -> bool {
+        self.provider(provider).is_none_or(|p| p.ready())
+    }
+
+    #[allow(dead_code)] // called by the pins and menu tasks
+    pub fn reveal(&self, provider: &str, id: &str) -> Result<(), String> {
+        self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.reveal(id)
     }
 
     pub fn activate(&self, provider: &str, id: &str, m: Modifier) -> Result<Outcome, String> {
@@ -223,6 +246,14 @@ mod tests {
         fn plain_share(&self) -> usize {
             self.share
         }
+        fn item(&self, id: &str) -> Option<ResultItem> {
+            self.items.iter().find(|(i, _, _)| *i == id).map(|(id, title, _)| ResultItem {
+                id: id.to_string(),
+                provider: self.name,
+                title: title.to_string(),
+                ..Default::default()
+            })
+        }
         fn query(&self, q: &Query) -> Vec<ResultItem> {
             self.seen.lock().unwrap().push(q.text.clone());
             self.items
@@ -233,7 +264,7 @@ mod tests {
                     title: title.to_string(),
                     subtitle: String::new(),
                     score: *score,
-                    confirm: false,
+                    ..Default::default()
                 })
                 .collect()
         }
@@ -269,6 +300,18 @@ mod tests {
     }
 
     #[test]
+    fn engine_item_and_reveal_route_to_the_provider() {
+        let (e, _, _dir) = engine_boxed(vec![Box::new(FakeProvider::new("a", vec![("x", "Ex", 500)]))]);
+        let row = e.item("a", "x").unwrap();
+        assert_eq!((row.id.as_str(), row.title.as_str(), row.provider, row.score), ("x", "Ex", "a", 0));
+        assert!(e.item("a", "nope").is_none());
+        assert!(e.item("nope", "x").is_none());
+        assert!(e.ready("a"));
+        assert!(e.reveal("nope", "x").is_err());
+        assert!(e.reveal("a", "x").is_err());
+    }
+
+    #[test]
     fn empty_and_whitespace_return_nothing() {
         let (e, _, _dir) = engine(vec![FakeProvider::new("a", vec![("1", "x", 500)])]);
         assert!(e.query("", None).is_empty());
@@ -295,7 +338,7 @@ mod tests {
                     title: "hello".into(),
                     subtitle: String::new(),
                     score: 0,
-                    confirm: false,
+                    ..Default::default()
                 }]
             }
         }

@@ -119,6 +119,19 @@ fn open_page(p: &SettingsPage) -> Result<(), String> {
 
 pub struct SettingsProvider;
 
+fn row(p: &SettingsPage, score: u32) -> ResultItem {
+    ResultItem {
+        id: p.id(),
+        provider: "settings",
+        title: p.title.to_string(),
+        subtitle: "Settings".to_string(),
+        score,
+        icon: "builtin:settings".into(),
+        pinnable: true,
+        ..Default::default()
+    }
+}
+
 impl Provider for SettingsProvider {
     fn name(&self) -> &'static str {
         "settings"
@@ -132,18 +145,15 @@ impl Provider for SettingsProvider {
         let mut hits: Vec<ResultItem> = PAGES
             .iter()
             .filter_map(|p| {
-                page_score(text, p).map(|score| ResultItem {
-                    id: p.id(),
-                    provider: "settings",
-                    title: p.title.to_string(),
-                    subtitle: "Settings".to_string(),
-                    score,
-                    confirm: false,
-                })
+                page_score(text, p).map(|score| row(p, score))
             })
             .collect();
         hits.sort_by(|a, b| b.score.cmp(&a.score));
         hits
+    }
+
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        PAGES.iter().find(|p| p.id() == id).map(|p| row(p, 0))
     }
 
     fn help(&self) -> Vec<HelpLine> {

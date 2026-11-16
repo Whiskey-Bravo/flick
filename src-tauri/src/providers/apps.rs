@@ -2,11 +2,12 @@
 
 use std::collections::hash_map::{Entry, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use crate::fuzzy;
-use crate::launch;
+use crate::launch::{self, Launcher};
 use crate::process;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
@@ -283,15 +284,36 @@ pub struct AppsProvider {
     store: Mutex<Vec<AppEntry>>,
     /// Held for a whole refresh, so overlapping refreshes queue.
     refreshing: Mutex<()>,
+    #[allow(dead_code)] // used by `reveal`, which the menu task calls
+    launcher: Arc<dyn Launcher>,
+    /// Set once the first scan has been swapped in.
+    scanned: AtomicBool,
 }
 
 impl AppsProvider {
-    pub fn new() -> Arc<Self> {
-        Self::with_entries(Vec::new())
+    pub fn new(launcher: Arc<dyn Launcher>) -> Arc<Self> {
+        Self::build(launcher, Vec::new(), false)
     }
 
+    /// An index that counts as scanned already (tests).
+    #[cfg(test)]
     pub fn with_entries(e: Vec<AppEntry>) -> Arc<Self> {
-        Arc::new(Self { index: RwLock::new(e), store: Mutex::new(Vec::new()), refreshing: Mutex::new(()) })
+        Self::with_launcher(Arc::new(crate::launch::testing::RecordingLauncher::default()), e)
+    }
+
+    #[cfg(test)]
+    pub fn with_launcher(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>) -> Arc<Self> {
+        Self::build(launcher, e, true)
+    }
+
+    fn build(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>, scanned: bool) -> Arc<Self> {
+        Arc::new(Self {
+            index: RwLock::new(e),
+            store: Mutex::new(Vec::new()),
+            refreshing: Mutex::new(()),
+            launcher,
+            scanned: AtomicBool::new(scanned),
+        })
     }
 
     /// Scan the Start menu (fast) and publish it at once, then read the
@@ -356,6 +378,7 @@ impl AppsProvider {
     fn publish(&self, start: &[AppEntry], store: &[AppEntry]) {
         let fresh = dedupe(start.iter().chain(store).cloned().collect());
         *self.index.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+        self.scanned.store(true, Ordering::SeqCst);
     }
 }
 
@@ -384,6 +407,23 @@ fn store_elevation_error(err: String) -> String {
     }
 }
 
+/// The row for an app; `score` 0 when rebuilt from an id.
+fn row(e: &AppEntry, score: u32) -> ResultItem {
+    let shortcut = e.kind == AppKind::Shortcut;
+    ResultItem {
+        id: e.target.clone(),
+        provider: "apps",
+        title: e.name.clone(),
+        subtitle: "App".into(),
+        score,
+        icon: if shortcut { format!("file:{}", e.target) } else { "builtin:app".into() },
+        pinnable: true,
+        revealable: shortcut,
+        elevatable: true,
+        ..Default::default()
+    }
+}
+
 impl Provider for AppsProvider {
     fn name(&self) -> &'static str {
         "apps"
@@ -407,18 +447,31 @@ impl Provider for AppsProvider {
                     .max()
                     .map(|s| s.saturating_sub(ALIAS_PENALTY));
                 let score = fuzzy::score(text, &e.name).max(by_alias)?;
-                Some(ResultItem {
-                    id: e.target.clone(),
-                    provider: "apps",
-                    title: e.name.clone(),
-                    subtitle: "App".into(),
-                    score,
-                    confirm: false,
-                })
+                Some(row(e, score))
             })
             .collect();
         out.sort_by(|a, b| b.score.cmp(&a.score));
         out
+    }
+
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        index.iter().find(|e| e.target == id).map(|e| row(e, 0))
+    }
+
+    fn ready(&self) -> bool {
+        self.scanned.load(Ordering::SeqCst)
+    }
+
+    fn reveal(&self, id: &str) -> Result<(), String> {
+        let shortcut = {
+            let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+            index.iter().any(|e| e.target == id && e.kind == AppKind::Shortcut)
+        };
+        if !shortcut {
+            return Err("can't show this item's location".into());
+        }
+        self.launcher.reveal(id)
     }
 
     fn help(&self) -> Vec<HelpLine> {
@@ -476,6 +529,27 @@ mod tests {
             kind: AppKind::Store,
             aliases: store_aliases(name, app_id),
         }
+    }
+
+    #[test]
+    fn item_rebuilds_a_known_app() {
+        let rec = Arc::new(crate::launch::testing::RecordingLauncher::default());
+        let p = AppsProvider::with_launcher(
+            rec.clone(),
+            vec![shortcut("Blender", r"C:\b.lnk"), store("Calc", "Microsoft.WindowsCalculator_x!App")],
+        );
+        let r = p.item(r"C:\b.lnk").unwrap();
+        assert_eq!((r.title.as_str(), r.icon.as_str(), r.score), ("Blender", r"file:C:\b.lnk", 0));
+        assert!(r.pinnable && r.revealable && r.elevatable);
+        assert!(p.item("nope").is_none());
+        let s = p.item(r"shell:AppsFolder\Microsoft.WindowsCalculator_x!App").unwrap();
+        assert_eq!(s.icon, "builtin:app");
+        assert!(s.pinnable && !s.revealable && s.elevatable);
+        assert_eq!(p.reveal(r"C:\b.lnk"), Ok(()));
+        assert!(p.reveal(&s.id).is_err());
+        assert_eq!(rec.calls(), [r"reveal C:\b.lnk".to_string()]);
+        assert!(p.ready());
+        assert!(!AppsProvider::new(rec).ready());
     }
 
     #[test]
@@ -682,7 +756,7 @@ mod tests {
 
     #[test]
     fn has_help_line() {
-        let help = AppsProvider::new().help();
+        let help = AppsProvider::with_entries(vec![]).help();
         assert_eq!(help.len(), 1);
         assert_eq!(help[0].example, "blender");
         assert_eq!(help[0].about, "open an app by name; Ctrl+Shift+Enter runs it as administrator");
