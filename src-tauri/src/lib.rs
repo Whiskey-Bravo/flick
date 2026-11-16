@@ -4,6 +4,7 @@ mod engine;
 mod fuzzy;
 mod history;
 mod hotkey;
+mod icon;
 mod launch;
 mod pins;
 mod provider;
@@ -213,18 +214,27 @@ pub fn run() {
     if let Some(home) = std::env::var_os("USERPROFILE") {
         let _ = std::env::set_current_dir(home);
     }
+    let icons = icon::IconServer::new(Arc::new(icon::ShellIcons));
     tauri::Builder::default()
         // Must be first: a second launch shows the running instance and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![commands::query,
+        .invoke_handler(tauri::generate_handler![
+            commands::query,
             commands::activate,
             commands::hide,
             commands::toggle_pin,
             commands::past_searches,
             commands::reveal
         ])
+        // Result-row icons. Answered on the icon workers, never on this thread.
+        .register_asynchronous_uri_scheme_protocol(icon::SCHEME, move |_ctx, request, responder| {
+            let uri = request.uri();
+            icons.request(uri.path(), uri.query(), move |status, body| {
+                responder.respond(icon::response(status, body));
+            });
+        })
         .setup(|app| {
             setup(app.handle());
             Ok(())

@@ -1026,6 +1026,7 @@ name = "flick"
 version = "0.1.0"
 dependencies = [
  "notify",
+ "png",
  "serde",
  "serde_json",
  "tauri",
