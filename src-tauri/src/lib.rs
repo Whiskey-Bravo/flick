@@ -113,15 +113,32 @@ fn record_detection(state: &AppState, detection: wsl_detect::Detection) {
     }
 }
 
+/// Puts `config`'s shortcuts and the effective distro into the providers.
+/// `detected` is used only when the config leaves `wsl_distro` empty.
+/// `shortcuts.set` reads the pick folders: never call on the main thread.
+fn push_distro(p: &Providers, config: &Config, detected: Option<&str>) {
+    let distro = effective_distro(&config.wsl_distro, detected);
+    p.shortcuts.set(config.shortcuts.clone(), &distro);
+    p.wsl.set_distro(&distro);
+}
+
+/// Stores a detection and pushes the resulting distro with the last good
+/// config, whether or not the config file currently parses. Takes the config
+/// lock (then `detected`); call with no lock held, after `wsl.exe` has run.
+fn apply_detection(state: &AppState, detection: wsl_detect::Detection) {
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    record_detection(state, detection);
+    let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    push_distro(&state.providers, &config, detected.as_deref());
+}
+
 /// Push a newly loaded `new` config (replacing `old`) into the providers;
-/// `detected` is the distro WSL's default resolved to.
+/// `detected` is used only when `new` leaves `wsl_distro` empty.
 /// `shortcuts.set` reads the pick folders: never call on the main thread.
 /// Returns true when the file roots changed; the caller then rescans the
 /// files in the background (the watcher has already moved to the new roots).
 fn push_config(p: &Providers, old: &Config, new: &Config, detected: Option<&str>) -> bool {
-    let distro = effective_distro(&new.wsl_distro, detected);
-    p.shortcuts.set(new.shortcuts.clone(), &distro);
-    p.wsl.set_distro(&distro);
+    push_distro(p, new, detected);
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
     let changed = old.file_roots != new.file_roots;
@@ -197,9 +214,10 @@ fn setup(app: &AppHandle) {
         // Off the main thread: all of these can block. Config first, so a
         // slow PowerShell or file scan never delays it.
         std::thread::spawn(move || {
-            // Before the reload, which pushes the result; no lock held while
-            // `wsl.exe` runs.
-            record_detection(&app.state::<AppState>(), wsl_detect::detect());
+            // No lock held while `wsl.exe` runs. Pushed even when the config
+            // has an error, which makes the reload skip its own push.
+            let detection = wsl_detect::detect();
+            apply_detection(&app.state::<AppState>(), detection);
             reload_config(&app);
             let state = app.state::<AppState>();
             let p = &state.providers;
@@ -231,21 +249,18 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
 
     let handle = app.clone();
     let shortcuts = p.shortcuts;
-    let wsl = p.wsl;
     std::thread::spawn(move || {
-        // `wsl.exe` can take seconds: run it with no lock held.
-        let detection = wsl_detect::detect();
+        let state = handle.state::<AppState>();
         {
-            // Under the config lock, so this never replaces the definitions
-            // or distro of a reload that ran first with older ones.
-            let state = handle.state::<AppState>();
+            // Right away, with no detection yet. Under the config lock, so
+            // this never replaces the definitions of a reload that ran first
+            // with older ones.
             let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-            record_detection(&state, detection);
             let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let distro = effective_distro(&config.wsl_distro, detected.as_deref());
-            wsl.set_distro(&distro);
-            shortcuts.set(config.shortcuts.clone(), &distro);
+            push_distro(&state.providers, &config, detected.as_deref());
         }
+        // `wsl.exe` can take seconds: run it with no lock held.
+        apply_detection(&state, wsl_detect::detect());
         loop {
             std::thread::sleep(SHORTCUTS_REFRESH_INTERVAL);
             shortcuts.refresh();
@@ -590,6 +605,17 @@ mod tests {
         let set = Config { wsl_distro: "Debian".into(), ..Config::default() };
         push_config(&r.providers, &old, &set, Some("Ubuntu"));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Debian");
+    }
+
+    #[test]
+    fn push_distro_applies_the_effective_distro_to_wsl_and_shortcuts() {
+        let r = rig(vec![], vec![]);
+        let config = Config { shortcuts: vec![shortcut("hello", "notepad")], ..Config::default() };
+        push_distro(&r.providers, &config, Some("Ubuntu"));
+        assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
+        assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
+        push_distro(&r.providers, &config, None);
+        assert!(r.engine.query("> ls", None).is_empty());
     }
 
     #[test]

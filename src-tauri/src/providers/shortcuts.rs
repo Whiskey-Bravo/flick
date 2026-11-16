@@ -320,10 +320,10 @@ fn find<'a>(defs: &'a [ShortcutDef], name: &str, want: Kind) -> Option<&'a Short
     defs.iter().find(|d| d.name == name && kind(d) == want)
 }
 
-/// `about`, or the command when there is none.
 /// Shown for a `wsl` shortcut when there is no WSL to run it in.
 const NO_WSL: &str = "WSL is not installed";
 
+/// `about`, or the command when there is none.
 fn describe(def: &ShortcutDef) -> String {
     if def.about.is_empty() {
         template(def).to_string()
