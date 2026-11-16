@@ -6,14 +6,14 @@ use std::time::Duration;
 use crate::launch::valid_distro;
 use crate::process::{run_hidden, RunError};
 
-const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outcome of [`detect`].
 #[derive(Debug, PartialEq)]
 pub enum Detection {
     /// WSL answered (or is not installed): the distro to use, if any.
     Found(Option<String>),
-    /// `wsl.exe` timed out; the caller keeps its previous value.
+    /// `wsl.exe` timed out; the caller keeps its previous state and retries later.
     Failed,
 }
 

@@ -68,10 +68,9 @@ pub(crate) struct AppState {
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
     config: Mutex<Config>,
-    /// Distro found by the last successful detection; `None` before the first
-    /// one finishes or when there is no usable WSL. Lock order: `config`, then
-    /// this.
-    detected: Mutex<Option<String>>,
+    /// Result of the last successful WSL detection; `Unknown` until one
+    /// succeeds. Lock order: `config`, then this.
+    detected: Mutex<WslState>,
     /// Configured accelerator last applied successfully; `None` when the last
     /// `hotkey::apply` failed (the previous hotkey may then still be active).
     hotkey: Mutex<Option<String>>,
@@ -105,23 +104,50 @@ fn build_engine(p: &Providers, power: Box<dyn PowerRunner>, open_config: Opener,
     Engine::new(providers, ranking)
 }
 
-/// The distro to run WSL commands in: the configured one, else the detected
-/// one, else `""`, which means there is no WSL.
-fn effective_distro(configured: &str, detected: Option<&str>) -> String {
-    if configured.is_empty() { detected.unwrap_or("").to_string() } else { configured.to_string() }
+/// What detection has said about WSL so far.
+#[derive(Clone, Debug, PartialEq)]
+enum WslState {
+    /// No detection has succeeded yet (not run, or it timed out).
+    Unknown,
+    /// Detection found no usable WSL.
+    NoWsl,
+    /// Detection found this default distro.
+    Distro(String),
 }
 
-/// Keeps the previous detection when `wsl.exe` did not answer in time.
+impl WslState {
+    /// `None` for a failed detection: the caller keeps its previous state.
+    fn from_detection(detection: wsl_detect::Detection) -> Option<WslState> {
+        match detection {
+            wsl_detect::Detection::Found(Some(d)) => Some(WslState::Distro(d)),
+            wsl_detect::Detection::Found(None) => Some(WslState::NoWsl),
+            wsl_detect::Detection::Failed => None,
+        }
+    }
+}
+
+/// The distro to run WSL commands in: `""` when detection positively found no
+/// WSL; else the configured one; else the detected one, else `""`.
+fn effective_distro(configured: &str, detected: &WslState) -> String {
+    match detected {
+        WslState::NoWsl => String::new(),
+        _ if !configured.is_empty() => configured.to_string(),
+        WslState::Distro(d) => d.clone(),
+        WslState::Unknown => String::new(),
+    }
+}
+
+/// Keeps the previous state when `wsl.exe` did not answer in time.
 fn record_detection(state: &AppState, detection: wsl_detect::Detection) {
-    if let wsl_detect::Detection::Found(distro) = detection {
-        *state.detected.lock().unwrap_or_else(|e| e.into_inner()) = distro;
+    if let Some(new) = WslState::from_detection(detection) {
+        *state.detected.lock().unwrap_or_else(|e| e.into_inner()) = new;
     }
 }
 
 /// Puts `config`'s shortcuts and the effective distro into the providers.
-/// `detected` is used only when the config leaves `wsl_distro` empty.
+/// `detected` decides whether the configured or detected distro is used.
 /// `shortcuts.set` reads the pick folders: never call on the main thread.
-fn push_distro(p: &Providers, config: &Config, detected: Option<&str>) {
+fn push_distro(p: &Providers, config: &Config, detected: &WslState) {
     let distro = effective_distro(&config.wsl_distro, detected);
     p.shortcuts.set(config.shortcuts.clone(), &distro);
     p.wsl.set_distro(&distro);
@@ -134,15 +160,15 @@ fn apply_detection(state: &AppState, detection: wsl_detect::Detection) {
     let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     record_detection(state, detection);
     let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    push_distro(&state.providers, &config, detected.as_deref());
+    push_distro(&state.providers, &config, &detected);
 }
 
 /// Push a newly loaded `new` config (replacing `old`) into the providers;
-/// `detected` is used only when `new` leaves `wsl_distro` empty.
+/// `detected` decides whether the configured or detected distro is used.
 /// `shortcuts.set` reads the pick folders: never call on the main thread.
 /// Returns true when the file roots changed; the caller then rescans the
 /// files in the background (the watcher has already moved to the new roots).
-fn push_config(p: &Providers, old: &Config, new: &Config, detected: Option<&str>) -> bool {
+fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -> bool {
     push_distro(p, new, detected);
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
@@ -188,7 +214,7 @@ fn setup(app: &AppHandle) {
 
     // One launcher for every provider that starts something.
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
-    let providers = Providers::new(AppsProvider::new(), launcher, &effective_distro(&loaded.config.wsl_distro, None));
+    let providers = Providers::new(AppsProvider::new(), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));
@@ -197,7 +223,7 @@ fn setup(app: &AppHandle) {
         engine: Arc::new(engine),
         providers: providers.clone(),
         config: Mutex::new(loaded.config.clone()),
-        detected: Mutex::new(None),
+        detected: Mutex::new(WslState::Unknown),
         hotkey: Mutex::new(None),
         watcher: Mutex::new(None),
         config_error: Mutex::new(None),
@@ -268,12 +294,18 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
             // with older ones.
             let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
             let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            push_distro(&state.providers, &config, detected.as_deref());
+            push_distro(&state.providers, &config, &detected);
         }
         // `wsl.exe` can take seconds: run it with no lock held.
         apply_detection(&state, wsl_detect::detect());
         loop {
             std::thread::sleep(SHORTCUTS_REFRESH_INTERVAL);
+            // A timed-out (or never successful) detection is retried here,
+            // again with no lock held.
+            let unknown = *state.detected.lock().unwrap_or_else(|e| e.into_inner()) == WslState::Unknown;
+            if unknown {
+                apply_detection(&state, wsl_detect::detect());
+            }
             shortcuts.refresh();
         }
     });
@@ -326,7 +358,7 @@ fn reload_config(app: &AppHandle) {
     let loaded = config::load(&config::config_path(), Some(&config));
     // On error `loaded.config` is the last good one, already pushed.
     let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if loaded.error.is_none() && push_config(&state.providers, &config, &loaded.config, detected.as_deref()) {
+    if loaded.error.is_none() && push_config(&state.providers, &config, &loaded.config, &detected) {
         let files = state.providers.files.clone();
         std::thread::spawn(move || files.refresh());
     }
@@ -591,31 +623,47 @@ mod tests {
             shortcuts: vec![shortcut("hello", "notepad")],
             ..Config::default()
         };
-        assert!(!push_config(&r.providers, &old, &new, None), "same roots: no rescan");
+        assert!(!push_config(&r.providers, &old, &new, &WslState::Unknown), "same roots: no rescan");
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         let moved = Config { file_roots: vec![PathBuf::from(r"C:\definitely\missing")], ..new.clone() };
-        assert!(push_config(&r.providers, &new, &moved, None), "roots changed: rescan");
+        assert!(push_config(&r.providers, &new, &moved, &WslState::Unknown), "roots changed: rescan");
         assert!(r.launcher.calls().is_empty());
     }
 
     #[test]
     fn config_distro_wins_over_detected() {
-        assert_eq!(effective_distro("Debian", Some("Ubuntu")), "Debian");
-        assert_eq!(effective_distro("", Some("Ubuntu")), "Ubuntu");
-        assert_eq!(effective_distro("", None), "");
+        let ubuntu = WslState::Distro("Ubuntu".into());
+        assert_eq!(effective_distro("Debian", &ubuntu), "Debian");
+        assert_eq!(effective_distro("", &ubuntu), "Ubuntu");
+        assert_eq!(effective_distro("", &WslState::Unknown), "");
+    }
+
+    #[test]
+    fn no_wsl_beats_a_configured_distro_and_unknown_does_not() {
+        assert_eq!(effective_distro("Debian", &WslState::NoWsl), "");
+        assert_eq!(effective_distro("", &WslState::NoWsl), "");
+        assert_eq!(effective_distro("Debian", &WslState::Unknown), "Debian");
+    }
+
+    #[test]
+    fn detection_maps_to_state_and_failure_keeps_the_old_one() {
+        use wsl_detect::Detection::{Failed, Found};
+        assert_eq!(WslState::from_detection(Found(Some("Ubuntu".into()))), Some(WslState::Distro("Ubuntu".into())));
+        assert_eq!(WslState::from_detection(Found(None)), Some(WslState::NoWsl));
+        assert_eq!(WslState::from_detection(Failed), None);
     }
 
     #[test]
     fn push_config_uses_the_detected_distro_when_none_is_configured() {
         let r = rig(vec![], vec![]);
         let old = Config::default();
-        assert!(!push_config(&r.providers, &old, &old, None));
+        assert!(!push_config(&r.providers, &old, &old, &WslState::Unknown));
         assert!(r.engine.query("> ls", None).is_empty(), "no WSL: nothing offered");
-        assert!(!push_config(&r.providers, &old, &old, Some("Ubuntu")));
+        assert!(!push_config(&r.providers, &old, &old, &WslState::Distro("Ubuntu".into())));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         let set = Config { wsl_distro: "Debian".into(), ..Config::default() };
-        push_config(&r.providers, &old, &set, Some("Ubuntu"));
+        push_config(&r.providers, &old, &set, &WslState::Distro("Ubuntu".into()));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Debian");
     }
 
@@ -623,10 +671,10 @@ mod tests {
     fn push_distro_applies_the_effective_distro_to_wsl_and_shortcuts() {
         let r = rig(vec![], vec![]);
         let config = Config { shortcuts: vec![shortcut("hello", "notepad")], ..Config::default() };
-        push_distro(&r.providers, &config, Some("Ubuntu"));
+        push_distro(&r.providers, &config, &WslState::Distro("Ubuntu".into()));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
-        push_distro(&r.providers, &config, None);
+        push_distro(&r.providers, &config, &WslState::NoWsl);
         assert!(r.engine.query("> ls", None).is_empty());
     }
 
