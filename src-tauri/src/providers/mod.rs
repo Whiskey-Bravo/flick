@@ -6,4 +6,5 @@ pub mod flick;
 pub mod power;
 pub mod settings;
 pub mod shortcuts;
+pub mod welcome;
 pub mod wsl;

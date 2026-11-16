@@ -23,6 +23,11 @@ describe("bar", () => {
     expect(state.error).toBe("bad toml");
   });
 
+  it("queries the empty text when shown", () => {
+    const { effects } = reduce(initial, { type: "shown" });
+    expect(effects).toEqual([{ type: "query", text: "", scope: null }]);
+  });
+
   it("input emits scoped query", () => {
     expect(run(initial, { type: "input", text: "bl" }).effects).toEqual([{ type: "query", text: "bl", scope: null }]);
     const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } }).state;
