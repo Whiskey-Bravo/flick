@@ -1,15 +1,13 @@
 //! Apps provider: Start-menu shortcuts and Store apps, fuzzy-searched in memory.
 
 use std::collections::hash_map::{Entry, HashMap};
-use std::io::Read;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::fuzzy;
 use crate::launch;
+use crate::process;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 /// Shortcuts whose name has one of these as a whole word (case-insensitive,
@@ -24,8 +22,6 @@ const SKIP_WORDS: [&str; 8] = [
     "hilfe",
     "dokumentation",
 ];
-
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// `Get-StartApps | ConvertTo-Json`, with stdout forced to UTF-8 so non-ASCII
 /// app names survive the pipe (the console code page would mangle them).
@@ -55,9 +51,6 @@ pub const ALIAS_PENALTY: u32 = 200;
 
 /// `scan_store_apps` gives up (and kills PowerShell) after this long.
 pub const STORE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How often `scan_store_apps` checks whether PowerShell has finished.
-const STORE_SCAN_POLL: Duration = Duration::from_millis(50);
 
 /// Shortcut targets that host many unrelated apps: their stem is no alias,
 /// or every script, installer and Electron app would match it.
@@ -241,48 +234,12 @@ fn powershell_exe() -> PathBuf {
 /// keep its last good list. Also `None` (PowerShell killed) when it has not
 /// finished within `STORE_SCAN_TIMEOUT`.
 pub fn scan_store_apps() -> Option<Vec<AppEntry>> {
-    let mut child = Command::new(powershell_exe())
-        .args(["-NoProfile", "-NonInteractive", "-Command", START_APPS_SCRIPT])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + STORE_SCAN_TIMEOUT;
-    let stop = |child: &mut std::process::Child| {
-        let _ = child.kill();
-        let _ = child.wait();
-    };
-    // Drain stdout on a helper thread so a full pipe never stalls PowerShell
-    // while this thread waits on it with a deadline.
-    let Some(mut stdout) = child.stdout.take() else {
-        stop(&mut child);
-        return None;
-    };
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let read = stdout.read_to_end(&mut buf);
-        let _ = tx.send(read.ok().map(|_| buf));
-    });
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(STORE_SCAN_POLL),
-            _ => {
-                stop(&mut child);
-                return None;
-            }
-        }
-    };
-    if !status.success() {
-        return None;
-    }
-    // The pipe closes when PowerShell exits; the grace only covers a
-    // descendant still holding it open.
-    let wait = deadline.saturating_duration_since(Instant::now()).max(STORE_SCAN_POLL);
-    let stdout = rx.recv_timeout(wait).ok().flatten()?;
+    let stdout = process::run_hidden(
+        &powershell_exe(),
+        &["-NoProfile", "-NonInteractive", "-Command", START_APPS_SCRIPT],
+        STORE_SCAN_TIMEOUT,
+    )
+    .ok()?;
     let apps = parse_start_apps(&String::from_utf8_lossy(&stdout));
     (!apps.is_empty()).then_some(apps)
 }

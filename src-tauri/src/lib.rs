@@ -5,11 +5,13 @@ mod fuzzy;
 mod hotkey;
 mod launch;
 mod provider;
+mod process;
 mod providers;
 mod quote;
 mod ranking;
 mod tray;
 mod window;
+mod wsl_detect;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
