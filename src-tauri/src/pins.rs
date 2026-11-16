@@ -18,14 +18,12 @@ struct PinsFile {
     pins: Vec<Pin>,
 }
 
-#[allow(dead_code)]
 pub struct Pins {
     pins: Mutex<Vec<Pin>>,
     save_lock: Mutex<()>,
     path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl Pins {
     /// Missing or corrupt file -> empty.
     pub fn load(path: PathBuf) -> Self {

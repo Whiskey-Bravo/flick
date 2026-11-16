@@ -21,9 +21,7 @@ pub enum Modifier {
 pub enum Origin {
     #[default]
     Search,
-    #[allow(dead_code)] // produced by the pins task
     Pin,
-    #[allow(dead_code)] // produced by the history task
     Recent,
 }
 
@@ -116,17 +114,14 @@ pub trait Provider: Send + Sync {
         vec![]
     }
     /// The row `query` would return for `id` (score 0), if it can be rebuilt.
-    #[allow(dead_code)] // called by the pins and menu tasks
     fn item(&self, _id: &str) -> Option<ResultItem> {
         None
     }
     /// False until the provider's first scan has been swapped in.
-    #[allow(dead_code)] // called by the pins and menu tasks
     fn ready(&self) -> bool {
         true
     }
     /// Show the item's location in the file manager.
-    #[allow(dead_code)] // called by the pins and menu tasks
     fn reveal(&self, _id: &str) -> Result<(), String> {
         Err("can't show this item's location".to_string())
     }

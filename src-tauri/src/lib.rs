@@ -29,11 +29,14 @@ use provider::Provider;
 use providers::apps::AppsProvider;
 use providers::files::FilesProvider;
 use providers::flick::{FlickProvider, Opener};
+use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
 use providers::settings::SettingsProvider;
 use providers::shortcuts::ShortcutsProvider;
 use providers::welcome::WelcomeProvider;
 use providers::wsl::WslProvider;
+use history::History;
+use pins::Pins;
 use ranking::Ranking;
 
 const APPS_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -66,6 +69,8 @@ impl Providers {
 
 pub(crate) struct AppState {
     pub(crate) engine: Arc<Engine>,
+    /// Shared with the engine; the config's `history` switch is applied to it.
+    history: Arc<History>,
     providers: Providers,
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
@@ -91,7 +96,14 @@ impl AppState {
 
 /// The one place providers are put together: used by `run()` and by the tests.
 /// Registration order is the order of the help list.
-fn build_engine(p: &Providers, power: Box<dyn PowerRunner>, open_config: Opener, ranking: Arc<Ranking>) -> Engine {
+fn build_engine(
+    p: &Providers,
+    power: Box<dyn PowerRunner>,
+    open_config: Opener,
+    ranking: Arc<Ranking>,
+    history: Arc<History>,
+    pins: Arc<Pins>,
+) -> Engine {
     let providers: Vec<Box<dyn Provider>> = vec![
         Box::new(p.apps.clone()),
         Box::new(p.files.clone()),
@@ -100,10 +112,11 @@ fn build_engine(p: &Providers, power: Box<dyn PowerRunner>, open_config: Opener,
         Box::new(SettingsProvider),
         Box::new(PowerProvider::new(power)),
         Box::new(FlickProvider::new(open_config)),
+        Box::new(HistoryProvider::new(history.clone())),
         // Last: it has no help line, so the help list is unchanged.
         Box::new(p.welcome.clone()),
     ];
-    Engine::new(providers, ranking)
+    Engine::new(providers, ranking, history, pins)
 }
 
 /// What detection has said about WSL so far.
@@ -185,6 +198,14 @@ fn picks_path() -> PathBuf {
     config::config_path().with_file_name("picks.json")
 }
 
+fn history_path() -> PathBuf {
+    config::config_path().with_file_name("history.json")
+}
+
+fn pins_path() -> PathBuf {
+    config::config_path().with_file_name("pins.json")
+}
+
 pub fn run() {
     // Everything Flick starts inherits this directory unless told otherwise:
     // the user profile, not wherever Flick happened to be started from (and
@@ -197,7 +218,13 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![commands::query, commands::activate, commands::hide])
+        .invoke_handler(tauri::generate_handler![commands::query,
+            commands::activate,
+            commands::hide,
+            commands::toggle_pin,
+            commands::past_searches,
+            commands::reveal
+        ])
         .setup(|app| {
             setup(app.handle());
             Ok(())
@@ -220,9 +247,19 @@ fn setup(app: &AppHandle) {
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));
-    let engine = build_engine(&providers, Box::new(SystemPower), Box::new(launch::open_config), ranking);
+    let history = Arc::new(History::load(history_path(), loaded.config.history));
+    let pins = Arc::new(Pins::load(pins_path()));
+    let engine = build_engine(
+        &providers,
+        Box::new(SystemPower),
+        Box::new(launch::open_config),
+        ranking,
+        history.clone(),
+        pins,
+    );
     app.manage(AppState {
         engine: Arc::new(engine),
+        history,
         providers: providers.clone(),
         config: Mutex::new(loaded.config.clone()),
         detected: Mutex::new(WslState::Unknown),
@@ -364,6 +401,11 @@ fn reload_config(app: &AppHandle) {
         let files = state.providers.files.clone();
         std::thread::spawn(move || files.refresh());
     }
+    // Under the config lock, so concurrent reloads apply the switch in order.
+    // At most one `remove_file`, and only when the switch changed.
+    if loaded.config.history != config.history {
+        state.history.set_enabled(loaded.config.history);
+    }
     *config = loaded.config;
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let hotkey_error = if hotkey_needs_apply(applied.as_deref(), &config.hotkey) {
@@ -450,6 +492,8 @@ mod tests {
                 Ok(())
             }),
             ranking,
+            Arc::new(History::load(dir.path().join("history.json"), true)),
+            Arc::new(Pins::load(dir.path().join("pins.json"))),
         );
         Rig { engine, providers, launcher, power, opened, dir }
     }
@@ -548,7 +592,7 @@ mod tests {
         assert!(!plain.is_empty());
         assert!(plain.iter().all(|i| i.provider != "wsl"));
         // Typed commands are never learned.
-        assert_eq!(r.engine.activate("wsl", "htop -d 10", provider::Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(r.engine.activate("wsl", "htop -d 10", provider::Modifier::None, "", None), Ok(Outcome::Hide));
         assert_eq!(
             r.launcher.calls(),
             ["run_command Wsl(Debian) env=[] keep=true elevated=false cwd=-: htop -d 10"]
@@ -611,7 +655,7 @@ mod tests {
             assert_eq!((res[0].provider, res[0].title.as_str()), ("flick", "Flick: edit config"), "{text}");
         }
         let id = r.engine.query("flick config", None)[0].id.clone();
-        assert_eq!(r.engine.activate("flick", &id, provider::Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(r.engine.activate("flick", &id, provider::Modifier::None, "", None), Ok(Outcome::Hide));
         assert_eq!(r.opened.load(Ordering::SeqCst), 1);
         assert!(r.launcher.calls().is_empty());
     }
@@ -693,7 +737,7 @@ mod tests {
     fn picked_power_action_stays_below_equal_tier_app() {
         let r = rig(vec![app("Sleep Timer")], vec![]);
         for _ in 0..20 {
-            r.engine.activate("power", "sleep", provider::Modifier::None).unwrap();
+            r.engine.activate("power", "sleep", provider::Modifier::None, "", None).unwrap();
         }
         assert_eq!(r.power.lock().unwrap().len(), 20);
         let titles = titles(&r.engine.query("sleep", None));

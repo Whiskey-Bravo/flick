@@ -20,6 +20,9 @@ const DEFAULT_FILE: &str = "\
 ## file_roots: folders searched for files. Leave unset to search your whole user folder.
 # file_roots = [\"C:/Users/you/Desktop\", \"C:/Users/you/Documents\", \"C:/Users/you/Downloads\"]
 ##
+## history: remember recent searches and launches (false: forget and stop). 
+# history = true
+##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
@@ -61,6 +64,8 @@ pub struct Config {
     pub wsl_distro: String,
     /// Folders to index for file search; empty means the defaults.
     pub file_roots: Vec<PathBuf>,
+    /// Remember recent searches and launches; false forgets them and stops.
+    pub history: bool,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -72,6 +77,7 @@ impl Default for Config {
             hotkey: "Alt+Space".to_string(),
             wsl_distro: String::new(),
             file_roots: Vec::new(),
+            history: true,
             shortcuts: Vec::new(),
         }
     }
@@ -297,6 +303,13 @@ mod tests {
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn config_history_defaults_on_and_parses_false() {
+        assert!(Config::default().history);
+        assert!(parse("").unwrap().history);
+        assert!(!parse("history = false").unwrap().history);
+    }
+
     #[test] fn empty_file_is_defaults() { assert_eq!(parse("").unwrap(), Config::default()); }
     #[test] fn unknown_key_is_error() { assert!(parse("hotkye = \"x\"").is_err()); }
 

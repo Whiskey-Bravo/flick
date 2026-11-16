@@ -3,7 +3,9 @@
 use std::sync::Arc;
 
 use crate::fuzzy;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route};
+use crate::history::History;
+use crate::pins::Pins;
+use crate::provider::{HelpLine, Modifier, Origin, Outcome, Provider, Query, ResultItem, Route};
 use crate::ranking::Ranking;
 
 pub const MAX_RESULTS: usize = 8;
@@ -34,11 +36,28 @@ fn strip_route<'a>(text: &'a str, route: &Route) -> Option<&'a str> {
 pub struct Engine {
     providers: Vec<Box<dyn Provider>>,
     ranking: Arc<Ranking>,
+    history: Arc<History>,
+    pins: Arc<Pins>,
 }
 
 impl Engine {
-    pub fn new(providers: Vec<Box<dyn Provider>>, ranking: Arc<Ranking>) -> Self {
-        Self { providers, ranking }
+    pub fn new(
+        providers: Vec<Box<dyn Provider>>,
+        ranking: Arc<Ranking>,
+        history: Arc<History>,
+        pins: Arc<Pins>,
+    ) -> Self {
+        Self { providers, ranking, history, pins }
+    }
+
+    /// Pins or unpins an item; returns the new pinned state.
+    pub fn toggle_pin(&self, provider: &str, id: &str) -> bool {
+        self.pins.toggle(provider, id)
+    }
+
+    /// Past searches, newest first.
+    pub fn past_searches(&self) -> Vec<String> {
+        self.history.searches()
     }
 
     /// In-memory only; sorted by score + boost. Plain queries return at most
@@ -49,6 +68,14 @@ impl Engine {
     /// (or the built-in `help` route) goes to that provider alone, with the
     /// prefix removed; providers that own a route never see plain text.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
+        let mut rows = self.query_rows(text, scope);
+        for row in &mut rows {
+            row.pinned = self.pins.is_pinned(row.provider, &row.id);
+        }
+        rows
+    }
+
+    fn query_rows(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
         let untrimmed_empty = text.is_empty();
         let text = text.trim();
         if let Some(scope) = scope {
@@ -57,10 +84,9 @@ impl Engine {
             return self.rank(owners, &q, ROUTED_MAX_RESULTS, false);
         }
         if text.is_empty() {
-            // Only the unscoped, truly empty bar (not whitespace) asks the providers
-            // for their rows, in registration order.
+            // Only the unscoped, truly empty bar (not whitespace) shows rows.
             if untrimmed_empty {
-                return self.providers.iter().flat_map(|p| p.empty_query()).collect();
+                return self.empty_bar();
             }
             return vec![];
         }
@@ -75,6 +101,47 @@ impl Engine {
         }
         let q = Query { text: text.to_string(), scope: None };
         self.rank(self.providers.iter().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true)
+    }
+
+    /// The truly empty bar: the providers' own rows (welcome) in registration
+    /// order, then pins, then recent launches that are not pinned, cut to
+    /// `MAX_RESULTS`. Pins that do not resolve are skipped, never removed. A
+    /// recent that does not resolve is forgotten, but only once its (known)
+    /// provider has finished its first scan; before that it may just be missing
+    /// from an index that is not built yet.
+    fn empty_bar(&self) -> Vec<ResultItem> {
+        let mut rows: Vec<ResultItem> = self.providers.iter().flat_map(|p| p.empty_query()).collect();
+        let pins = self.pins.list();
+        for (provider, id) in &pins {
+            if let Some(item) = self.item(provider, id) {
+                rows.push(ResultItem { origin: Origin::Pin, ..item });
+            }
+        }
+        for (provider, id) in self.history.recents() {
+            if pins.iter().any(|(p, i)| *p == provider && *i == id) {
+                continue;
+            }
+            match self.item(&provider, &id) {
+                Some(item) => rows.push(ResultItem { origin: Origin::Recent, ..item }),
+                None => {
+                    if self.provider(&provider).is_some() && self.ready(&provider) {
+                        self.history.forget_launch(&provider, &id);
+                    }
+                }
+            }
+        }
+        rows.truncate(MAX_RESULTS);
+        rows
+    }
+
+    /// Whether `text` typed in `scope` is worth remembering as a past search:
+    /// not empty, not inside a scope, and not a route (`help`, `>`, ...).
+    fn searchable(&self, text: &str, scope: Option<&str>) -> bool {
+        let text = text.trim();
+        scope.is_none()
+            && !text.is_empty()
+            && strip_route(text, &HELP_ROUTE).is_none()
+            && !self.providers.iter().any(|p| p.route().is_some_and(|r| strip_route(text, &r).is_some()))
     }
 
     /// Sorted by score + boost, cut to `max`. With `shares`, each provider
@@ -155,24 +222,32 @@ impl Engine {
     }
 
     /// The row `provider` would return for `id`, if it can be rebuilt.
-    #[allow(dead_code)] // called by the pins and menu tasks
     pub fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
         self.provider(provider)?.item(id)
     }
 
     /// False while the provider has not finished its first scan. An unknown
     /// provider has nothing to wait for.
-    #[allow(dead_code)] // called by the pins and menu tasks
     pub fn ready(&self, provider: &str) -> bool {
         self.provider(provider).is_none_or(|p| p.ready())
     }
 
-    #[allow(dead_code)] // called by the pins and menu tasks
     pub fn reveal(&self, provider: &str, id: &str) -> Result<(), String> {
         self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.reveal(id)
     }
 
-    pub fn activate(&self, provider: &str, id: &str, m: Modifier) -> Result<Outcome, String> {
+    /// `text` and `scope` are what the bar held when the row was picked. A launch
+    /// that is learned (`rank_key`) is recorded as a recent launch, and the text
+    /// as a past search when it is searchable. A failed launch records nothing;
+    /// when it no longer resolves, it is also dropped from the recents.
+    pub fn activate(
+        &self,
+        provider: &str,
+        id: &str,
+        m: Modifier,
+        text: &str,
+        scope: Option<&str>,
+    ) -> Result<Outcome, String> {
         // Help lines are not a provider: picking one only fills the bar, and is never learned.
         if provider == HELP {
             return Ok(Outcome::Fill { text: id.to_string() });
@@ -182,9 +257,21 @@ impl Engine {
             .iter()
             .find(|p| p.name() == provider)
             .ok_or_else(|| format!("unknown provider: {provider}"))?;
-        let outcome = p.activate(id, m)?;
+        let outcome = match p.activate(id, m) {
+            Ok(o) => o,
+            Err(e) => {
+                if p.ready() && p.item(id).is_none() {
+                    self.history.forget_launch(provider, id);
+                }
+                return Err(e);
+            }
+        };
         if let Some(key) = p.rank_key(id) {
             self.ranking.record(provider, &key);
+            self.history.record_launch(provider, id);
+            if self.searchable(text, scope) {
+                self.history.record_search(text);
+            }
         }
         Ok(outcome)
     }
@@ -209,6 +296,8 @@ mod tests {
         help: Vec<HelpLine>,
         /// Rows this provider may take in a plain query while others have results.
         share: usize,
+        /// `ready()` result.
+        ready: bool,
         /// `Query.text` of every query this provider received.
         seen: std::sync::Mutex<Vec<String>>,
     }
@@ -225,6 +314,7 @@ mod tests {
                 route: None,
                 help: vec![],
                 share: usize::MAX,
+                ready: true,
                 seen: Default::default(),
             }
         }
@@ -245,6 +335,9 @@ mod tests {
         }
         fn plain_share(&self) -> usize {
             self.share
+        }
+        fn ready(&self) -> bool {
+            self.ready
         }
         fn item(&self, id: &str) -> Option<ResultItem> {
             self.items.iter().find(|(i, _, _)| *i == id).map(|(id, title, _)| ResultItem {
@@ -294,9 +387,195 @@ mod tests {
     }
 
     fn engine_boxed(providers: Vec<Box<dyn Provider>>) -> (Engine, Arc<Ranking>, tempfile::TempDir) {
+        let (e, ranking, _, _, dir) = engine_stores(providers);
+        (e, ranking, dir)
+    }
+
+    type Stores = (Engine, Arc<Ranking>, Arc<History>, Arc<Pins>, tempfile::TempDir);
+
+    fn engine_stores(providers: Vec<Box<dyn Provider>>) -> Stores {
         let dir = tempfile::tempdir().unwrap();
         let ranking = Arc::new(Ranking::load(dir.path().join("picks.json")));
-        (Engine::new(providers, ranking.clone()), ranking, dir)
+        let history = Arc::new(History::load(dir.path().join("history.json"), true));
+        let pins = Arc::new(Pins::load(dir.path().join("pins.json")));
+        let e = Engine::new(providers, ranking.clone(), history.clone(), pins.clone());
+        (e, ranking, history, pins, dir)
+    }
+
+    /// A welcome-like provider `w` (one empty-bar row), then `a`.
+    fn empty_bar_engine(a: FakeProvider) -> Stores {
+        struct Welcome;
+        impl Provider for Welcome {
+            fn name(&self) -> &'static str {
+                "w"
+            }
+            fn query(&self, _q: &Query) -> Vec<ResultItem> {
+                vec![]
+            }
+            fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+                Ok(Outcome::Hide)
+            }
+            fn empty_query(&self) -> Vec<ResultItem> {
+                vec![ResultItem { id: "w1".into(), provider: "w", title: "welcome".into(), ..Default::default() }]
+            }
+        }
+        engine_stores(vec![Box::new(Welcome), Box::new(a)])
+    }
+
+    fn bar(e: &Engine) -> Vec<(String, Origin, bool)> {
+        e.query("", None).into_iter().map(|r| (r.title, r.origin, r.pinned)).collect()
+    }
+
+    fn letters() -> FakeProvider {
+        FakeProvider::new("a", vec![("b", "b", 1), ("c", "c", 1), ("d", "d", 1), ("x", "x", 1)])
+    }
+
+    fn pair(p: &str, i: &str) -> (String, String) {
+        (p.to_string(), i.to_string())
+    }
+
+    #[test]
+    fn empty_bar_lists_welcome_then_pins_then_recents() {
+        let (e, _, h, p, _dir) = empty_bar_engine(letters());
+        p.toggle("a", "b");
+        h.record_launch("a", "c");
+        h.record_launch("a", "d");
+        assert_eq!(
+            bar(&e),
+            [
+                ("welcome".to_string(), Origin::Search, false),
+                ("b".to_string(), Origin::Pin, true),
+                ("d".to_string(), Origin::Recent, false),
+                ("c".to_string(), Origin::Recent, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_bar_never_shows_more_than_8_rows() {
+        let items: Vec<Item> = vec![
+            ("0", "t0", 1), ("1", "t1", 1), ("2", "t2", 1), ("3", "t3", 1), ("4", "t4", 1),
+            ("5", "t5", 1), ("6", "t6", 1), ("7", "t7", 1), ("8", "t8", 1), ("9", "t9", 1),
+        ];
+        let (e, _, h, p, _dir) = empty_bar_engine(FakeProvider::new("a", items));
+        for i in 0..7 {
+            p.toggle("a", &i.to_string());
+        }
+        for i in 7..10 {
+            h.record_launch("a", &i.to_string());
+        }
+        let rows = e.query("", None);
+        assert_eq!(rows.len(), MAX_RESULTS);
+        assert_eq!(rows.iter().filter(|r| r.origin == Origin::Recent).count(), 0);
+    }
+
+    #[test]
+    fn a_pinned_recent_is_listed_once() {
+        let (e, _, h, p, _dir) = empty_bar_engine(letters());
+        h.record_launch("a", "c");
+        p.toggle("a", "c");
+        let rows = bar(&e);
+        assert_eq!(rows.iter().filter(|r| r.0 == "c").count(), 1);
+        assert_eq!(rows[1], ("c".to_string(), Origin::Pin, true));
+    }
+
+    #[test]
+    fn unresolved_pins_are_skipped_but_kept() {
+        let (e, _, _, p, _dir) = empty_bar_engine(letters());
+        p.toggle("a", "gone");
+        p.toggle("nowhere", "x");
+        assert_eq!(bar(&e).len(), 1);
+        assert_eq!(p.list().len(), 2);
+    }
+
+    #[test]
+    fn unresolved_recents_are_kept_while_the_provider_is_not_ready() {
+        let mut a = letters();
+        a.ready = false;
+        let (e, _, h, _, _dir) = empty_bar_engine(a);
+        h.record_launch("a", "gone");
+        h.record_launch("nowhere", "x");
+        assert_eq!(bar(&e).len(), 1);
+        assert_eq!(h.recents().len(), 2);
+
+        let (e, _, h, _, _dir) = empty_bar_engine(letters());
+        h.record_launch("a", "gone");
+        h.record_launch("nowhere", "x");
+        assert_eq!(bar(&e).len(), 1);
+        // The ready provider's missing item is forgotten; the unknown provider's is not.
+        assert_eq!(h.recents(), [pair("nowhere", "x")]);
+    }
+
+    #[test]
+    fn launch_records_search_and_recent() {
+        let (e, _, h, _, _dir) = engine_stores(vec![Box::new(FakeProvider::new("a", vec![("x", "X", 1)]))]);
+        e.activate("a", "x", Modifier::None, "blen", None).unwrap();
+        assert_eq!(h.searches(), ["blen"]);
+        assert_eq!(h.recents(), [pair("a", "x")]);
+    }
+
+    #[test]
+    fn routed_scoped_and_unlearned_launches_record_no_search() {
+        let mut routed = FakeProvider::new("sh", vec![("x", "X", 1)]);
+        routed.route = Some(Route { prefix: ">", needs_space: false });
+        let mut unlearned = FakeProvider::new("u", vec![("y", "Y", 1)]);
+        unlearned.learn = false;
+        let (e, _, h, _, _dir) = engine_stores(vec![
+            Box::new(routed),
+            Box::new(unlearned),
+            Box::new(FakeProvider::new("a", vec![("x", "X", 1)])),
+        ]);
+        e.activate("sh", "x", Modifier::None, "> htop", None).unwrap();
+        e.activate("a", "x", Modifier::None, "help", None).unwrap();
+        e.activate("a", "x", Modifier::None, "Help me", None).unwrap();
+        e.activate("a", "x", Modifier::None, "  ", None).unwrap();
+        e.activate("a", "x", Modifier::None, "pick", Some("proj")).unwrap();
+        assert!(h.searches().is_empty());
+        h.clear();
+        e.activate("u", "y", Modifier::None, "typed", None).unwrap();
+        assert!(h.searches().is_empty());
+        assert!(h.recents().is_empty());
+    }
+
+    #[test]
+    fn failed_launch_records_nothing() {
+        let mut a = FakeProvider::new("a", vec![("x", "X", 1)]);
+        a.fail = Some("boom");
+        let (e, _, h, _, _dir) = engine_stores(vec![Box::new(a)]);
+        assert!(e.activate("a", "x", Modifier::None, "blen", None).is_err());
+        assert!(h.searches().is_empty() && h.recents().is_empty());
+    }
+
+    #[test]
+    fn failed_launch_of_a_vanished_item_forgets_it() {
+        let mut a = FakeProvider::new("a", vec![("x", "X", 1)]);
+        a.fail = Some("boom");
+        let (e, _, h, _, _dir) = engine_stores(vec![Box::new(a)]);
+        h.record_launch("a", "gone");
+        h.record_launch("a", "x");
+        assert!(e.activate("a", "gone", Modifier::None, "", None).is_err());
+        assert!(e.activate("a", "x", Modifier::None, "", None).is_err());
+        assert_eq!(h.recents(), [pair("a", "x")]);
+    }
+
+    #[test]
+    fn history_off_shows_no_recents() {
+        let (e, _, h, p, _dir) = empty_bar_engine(letters());
+        p.toggle("a", "b");
+        h.record_launch("a", "c");
+        h.set_enabled(false);
+        e.activate("a", "d", Modifier::None, "dd", None).unwrap();
+        assert_eq!(bar(&e).iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["welcome", "b"]);
+        assert!(h.searches().is_empty());
+    }
+
+    #[test]
+    fn query_rows_carry_the_pinned_flag() {
+        let (e, _, _, p, _dir) = engine_stores(vec![Box::new(letters())]);
+        p.toggle("a", "b");
+        let rows = e.query("x", None);
+        assert!(rows.iter().find(|r| r.id == "b").unwrap().pinned);
+        assert!(!rows.iter().find(|r| r.id == "c").unwrap().pinned);
     }
 
     #[test]
@@ -401,14 +680,14 @@ mod tests {
     #[test]
     fn activate_unknown_provider_is_err() {
         let (e, _, _dir) = engine(vec![]);
-        assert!(e.activate("nope", "1", Modifier::None).is_err());
+        assert!(e.activate("nope", "1", Modifier::None, "", None).is_err());
     }
 
     #[test]
     fn activate_records_pick() {
         let (e, ranking, _dir) = engine(vec![FakeProvider::new("a", vec![("1", "t", 1)])]);
         assert_eq!(ranking.boost("a", "1"), 0);
-        assert_eq!(e.activate("a", "1", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(e.activate("a", "1", Modifier::None, "", None), Ok(Outcome::Hide));
         assert_eq!(ranking.boost("a", "1"), 15);
         assert_eq!(ranking.boost("a", "2"), 0);
     }
@@ -418,7 +697,7 @@ mod tests {
         // Same score, "aa" would win the alphabetical tie-break; a pick on "zz" must beat it.
         let (e, _, _dir) = engine(vec![FakeProvider::new("a", vec![("1", "aa", 500), ("2", "zz", 500)])]);
         assert_eq!(e.query("x", None)[0].id, "1");
-        e.activate("a", "2", Modifier::None).unwrap();
+        e.activate("a", "2", Modifier::None, "", None).unwrap();
         assert_eq!(e.query("x", None)[0].id, "2");
     }
 
@@ -428,7 +707,7 @@ mod tests {
         p.step = true;
         let (e, _, _dir) = engine(vec![p]);
         assert_eq!(
-            e.activate("a", "1", Modifier::None),
+            e.activate("a", "1", Modifier::None, "", None),
             Ok(Outcome::Step { prompt: "p".into(), scope: "proj".into() })
         );
     }
@@ -450,7 +729,7 @@ mod tests {
         let mut p = FakeProvider::new("power", vec![("sleep", "Sleep", 700)]);
         p.learn = false;
         let (e, ranking, dir) = engine(vec![p]);
-        assert_eq!(e.activate("power", "sleep", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(e.activate("power", "sleep", Modifier::None, "", None), Ok(Outcome::Hide));
         assert_eq!(ranking.boost("power", "sleep"), 0);
         assert!(!dir.path().join("picks.json").exists());
     }
@@ -460,7 +739,7 @@ mod tests {
         let mut p = FakeProvider::new("power", vec![("sleep", "Sleep", 700)]);
         p.learn = false;
         let (e, ranking, dir) = engine_boxed(vec![Box::new(Arc::new(p))]);
-        e.activate("power", "sleep", Modifier::None).unwrap();
+        e.activate("power", "sleep", Modifier::None, "", None).unwrap();
         assert_eq!(ranking.boost("power", "sleep"), 0);
         assert!(!dir.path().join("picks.json").exists());
     }
@@ -484,7 +763,7 @@ mod tests {
             let mut p = FakeProvider::new("a", vec![("1", "t", 1)]);
             p.fail = Some(e);
             let (eng, ranking, dir) = engine(vec![p]);
-            assert_eq!(eng.activate("a", "1", Modifier::CtrlShift), Err(e.to_string()));
+            assert_eq!(eng.activate("a", "1", Modifier::CtrlShift, "", None), Err(e.to_string()));
             assert_eq!(ranking.boost("a", "1"), 0);
             assert!(!dir.path().join("picks.json").exists());
         }
@@ -669,7 +948,7 @@ mod tests {
     #[test]
     fn activating_a_help_line_fills_and_records_nothing() {
         let (e, ranking, dir) = engine(vec![FakeProvider::new("a", vec![])]);
-        assert_eq!(e.activate(HELP, "> ", Modifier::None), Ok(Outcome::Fill { text: "> ".into() }));
+        assert_eq!(e.activate(HELP, "> ", Modifier::None, "", None), Ok(Outcome::Fill { text: "> ".into() }));
         assert_eq!(ranking.boost(HELP, "> "), 0);
         assert!(!dir.path().join("picks.json").exists());
     }

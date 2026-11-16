@@ -56,12 +56,14 @@ pub async fn activate(
     provider: String,
     id: String,
     modifier: Modifier,
+    text: String,
+    scope: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<Outcome, String> {
     let engine = state.engine.clone();
     let started = window::shows();
-    let result = tauri::async_runtime::spawn_blocking(move || engine.activate(&provider, &id, modifier))
+    let result = tauri::async_runtime::spawn_blocking(move || engine.activate(&provider, &id, modifier, &text, scope.as_deref()))
         .await
         .map_err(|e| format!("activation failed: {e}"))
         .and_then(|r| r);
@@ -72,6 +74,31 @@ pub async fn activate(
         After::Leave => {}
     }
     result
+}
+
+/// Pins or unpins an item; returns whether it is now pinned.
+#[tauri::command(async)]
+pub fn toggle_pin(provider: String, id: String, state: State<AppState>) -> bool {
+    state.engine.toggle_pin(&provider, &id)
+}
+
+/// Past searches, newest first (for Up/Down in the bar).
+#[tauri::command(async)]
+pub fn past_searches(state: State<AppState>) -> Vec<String> {
+    state.engine.past_searches()
+}
+
+/// Shows the item's location in the file manager, then hides the bar.
+/// Opening a window can block, so it runs on a blocking-pool thread.
+#[tauri::command]
+pub async fn reveal(provider: String, id: String, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.reveal(&provider, &id))
+        .await
+        .map_err(|e| format!("reveal failed: {e}"))
+        .and_then(|r| r)?;
+    window::hide(&app);
+    Ok(())
 }
 
 #[tauri::command]

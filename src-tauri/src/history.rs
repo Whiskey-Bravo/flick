@@ -31,14 +31,12 @@ struct State {
     data: HistoryFile,
 }
 
-#[allow(dead_code)]
 pub struct History {
     state: Mutex<State>,
     save_lock: Mutex<()>,
     path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl History {
     /// Missing or corrupt file -> empty. Disabled: starts empty and deletes the file.
     pub fn load(path: PathBuf, enabled: bool) -> Self {
@@ -97,6 +95,10 @@ impl History {
             data.searches.clear();
             data.recents.clear();
         });
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.lock_state().enabled
     }
 
     /// Off: empties the lists and deletes the file; records become no-ops.
