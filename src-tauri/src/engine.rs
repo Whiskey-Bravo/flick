@@ -117,6 +117,7 @@ impl Engine {
                 rows.push(ResultItem { origin: Origin::Pin, ..item });
             }
         }
+        let mut stale = Vec::new();
         for (provider, id) in self.history.recents() {
             if pins.iter().any(|(p, i)| *p == provider && *i == id) {
                 continue;
@@ -125,10 +126,14 @@ impl Engine {
                 Some(item) => rows.push(ResultItem { origin: Origin::Recent, ..item }),
                 None => {
                     if self.provider(&provider).is_some() && self.ready(&provider) {
-                        self.history.forget_launch(&provider, &id);
+                        stale.push((provider, id));
                     }
                 }
             }
+        }
+        // Memory now, disk on another thread: the query path never writes.
+        if !stale.is_empty() {
+            self.history.forget_launches(&stale);
         }
         rows.truncate(MAX_RESULTS);
         rows

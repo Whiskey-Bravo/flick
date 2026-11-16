@@ -3,7 +3,7 @@
 
 use std::{
     path::PathBuf,
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -88,6 +88,40 @@ impl History {
         self.change(|data| {
             data.recents.retain(|r| !(r.provider == provider && r.id == id));
         });
+    }
+
+    /// Drops the pairs from memory now and saves on a spawned thread, for the
+    /// query path, which must not touch the disk. The thread saves the state as
+    /// it is when it gets the save lock, so an older snapshot never overwrites
+    /// a newer one.
+    pub fn forget_launches(self: &Arc<Self>, pairs: &[(String, String)]) {
+        let changed = {
+            let mut state = self.lock_state();
+            if !state.enabled {
+                return;
+            }
+            let before = state.data.recents.len();
+            state.data.recents.retain(|r| !pairs.iter().any(|(p, i)| r.provider == *p && r.id == *i));
+            state.data.recents.len() != before
+        };
+        if changed {
+            let this = Arc::clone(self);
+            std::thread::spawn(move || this.save_current());
+        }
+    }
+
+    /// Saves the current state (no-op while disabled), serialised with writers.
+    fn save_current(&self) {
+        let _saving = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut state = self.lock_state();
+            if !state.enabled {
+                return;
+            }
+            state.data.version = 1;
+            state.data.clone()
+        };
+        let _ = save_json(&self.path, &snapshot);
     }
 
     pub fn clear(&self) {
@@ -181,6 +215,26 @@ mod tests {
         assert_eq!(recent_ids(&h), vec!["id6", "id5", "id4", "id3", "id2"]);
         h.record_launch("apps", "id2");
         assert_eq!(recent_ids(&h), vec!["id2", "id6", "id5", "id4", "id3"]);
+    }
+
+    #[test]
+    fn forget_launches_drops_from_memory_and_saves_off_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Arc::new(history_in(&dir));
+        h.record_launch("apps", "a");
+        h.record_launch("apps", "b");
+        h.forget_launches(&[pair("apps", "a"), pair("nowhere", "z")]);
+        assert_eq!(recent_ids(&h), vec!["b"]);
+        let path = dir.path().join("history.json");
+        let saved = |p: &std::path::Path| std::fs::read_to_string(p).map_or(false, |t| !t.contains("\"a\""));
+        for _ in 0..200 {
+            if saved(&path) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(saved(&path));
+        assert!(History::load(path, true).recents().iter().all(|(_, i)| i == "b"));
     }
 
     #[test]
