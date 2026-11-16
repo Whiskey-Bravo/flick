@@ -69,21 +69,36 @@ pub fn choose(list: &[(String, bool)]) -> Option<String> {
         .map(|(n, _)| n.clone())
 }
 
-/// Ask `wsl.exe` for its distros. A missing `wsl.exe` or a failing one means
-/// no WSL; only a timeout is `Failed`.
+/// Ask `wsl.exe` for its distros.
 pub fn detect() -> Detection {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     let exe = PathBuf::from(root).join(r"System32\wsl.exe");
-    match run_hidden(&exe, &["-l", "-v"], LIST_TIMEOUT) {
+    from_run(run_hidden(&exe, &["-l", "-v"], LIST_TIMEOUT), exe.exists())
+}
+
+/// No WSL only when `wsl.exe` is missing, or ran and failed (how it reports
+/// "not installed" and "no distros"). A timeout, or a `wsl.exe` that exists
+/// but could not be started, is `Failed` and gets retried.
+fn from_run(res: Result<Vec<u8>, RunError>, exe_exists: bool) -> Detection {
+    match res {
         Ok(out) => Detection::Found(choose(&parse_list(&out))),
-        Err(RunError::Timeout) => Detection::Failed,
-        Err(_) => Detection::Found(None),
+        Err(RunError::Exit) => Detection::Found(None),
+        Err(RunError::Spawn) if !exe_exists => Detection::Found(None),
+        Err(RunError::Spawn | RunError::Timeout) => Detection::Failed,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_or_failing_wsl_means_no_wsl() {
+        assert!(matches!(from_run(Err(RunError::Exit), true), Detection::Found(None)));
+        assert!(matches!(from_run(Err(RunError::Spawn), false), Detection::Found(None)));
+        assert!(matches!(from_run(Err(RunError::Spawn), true), Detection::Failed));
+        assert!(matches!(from_run(Err(RunError::Timeout), true), Detection::Failed));
+    }
 
     const LIST: &str = "  NAME              STATE           VERSION\r\n* Ubuntu            Stopped         2\r\n  docker-desktop    Stopped         2\r\n  Debian            Running         2\r\n";
 
