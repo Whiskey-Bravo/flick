@@ -1,0 +1,122 @@
+//! Provider interface: what every result source implements.
+
+use std::sync::Arc;
+
+pub struct Query {
+    pub text: String,
+    pub scope: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Modifier {
+    None,
+    Ctrl,
+    CtrlShift,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ResultItem {
+    /// Unique within its provider, stable across queries.
+    pub id: String,
+    pub provider: &'static str,
+    pub title: String,
+    pub subtitle: String,
+    /// From the provider, before ranking boost: normally 0..=1000; shortcuts
+    /// add 50 so a user's own command wins a tie.
+    pub score: u32,
+    /// UI must ask for a second Enter.
+    pub confirm: bool,
+}
+
+/// A provider that owns a typed prefix: when the text matches, only it is queried.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Route {
+    pub prefix: &'static str,
+    /// true for word prefixes ("help"): the prefix must be followed by a space or the end.
+    pub needs_space: bool,
+}
+
+/// One line of the built-in help list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HelpLine {
+    /// What to type, shown as the title, e.g. "> htop -d 10".
+    pub example: String,
+    /// One short sentence, shown as the subtitle.
+    pub about: String,
+    /// Text put in the bar when the line is picked ("" = just clear).
+    pub fill: String,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Outcome {
+    /// Done, hide the bar.
+    Hide,
+    /// Done, bar stays.
+    #[allow(dead_code)] // part of the front-end contract (bar.ts handles it); no provider produces it yet
+    Keep,
+    /// Show `prompt`; next queries carry `scope`.
+    Step { prompt: String, scope: String },
+    /// Put `text` in the bar and keep it open (picked help lines).
+    Fill { text: String },
+}
+
+pub trait Provider: Send + Sync {
+    fn name(&self) -> &'static str;
+    /// Scopes this provider answers when `Query.scope` is Some. Default: none.
+    fn owns_scope(&self, _scope: &str) -> bool {
+        false
+    }
+    fn query(&self, q: &Query) -> Vec<ResultItem>;
+    fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String>;
+    /// Key under which picks of `id` are counted and boosted. `None` opts the
+    /// item out of learning: nothing is boosted and nothing is written to disk.
+    /// Providers whose ids carry typed text must return `None` or a key without it.
+    fn rank_key(&self, id: &str) -> Option<String> {
+        Some(id.to_string())
+    }
+    /// Typed prefix this provider owns. Default: none (queried for plain text).
+    fn route(&self) -> Option<Route> {
+        None
+    }
+    /// Lines for the built-in `help` list, in display order.
+    fn help(&self) -> Vec<HelpLine> {
+        vec![]
+    }
+    /// Rows this provider may take in a plain (unrouted, unscoped) query
+    /// while other providers have results; rows left over after every other
+    /// result still go to it. Default: no limit.
+    fn plain_share(&self) -> usize {
+        usize::MAX
+    }
+}
+
+/// Lets a provider that is also used elsewhere (e.g. apps, refreshed by a
+/// background thread) be handed to the engine as a shared `Arc`.
+impl<P: Provider + ?Sized> Provider for Arc<P> {
+    fn name(&self) -> &'static str {
+        (**self).name()
+    }
+    fn owns_scope(&self, scope: &str) -> bool {
+        (**self).owns_scope(scope)
+    }
+    fn query(&self, q: &Query) -> Vec<ResultItem> {
+        (**self).query(q)
+    }
+    fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
+        (**self).activate(id, modifier)
+    }
+    fn rank_key(&self, id: &str) -> Option<String> {
+        (**self).rank_key(id)
+    }
+    fn route(&self) -> Option<Route> {
+        (**self).route()
+    }
+    fn help(&self) -> Vec<HelpLine> {
+        (**self).help()
+    }
+    fn plain_share(&self) -> usize {
+        (**self).plain_share()
+    }
+}

@@ -1,0 +1,1060 @@
+//! Files provider: file and folder names under a few root folders, searched
+//! in memory. The index is built off the query path (a background scan, kept
+//! fresh by a folder watcher and the periodic refresh) and swapped in whole.
+
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use notify::event::ModifyKind;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
+#[cfg(test)]
+use super::files_scan::skip_by_attributes;
+use super::files_scan::{char_bit, is_junk_dir, scan_index, Index};
+use crate::fuzzy;
+use crate::launch::Launcher;
+use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+
+pub const MAX_ENTRIES: usize = 300_000;
+pub const MAX_DEPTH: usize = 8;
+
+/// The provider caps its own output.
+const MAX_RESULTS: usize = 20;
+/// Rows of a plain query's list files may take while other results exist.
+const PLAIN_SHARE: usize = 5;
+/// Shorter text matches far too much to be useful.
+const MIN_QUERY_CHARS: usize = 2;
+/// One directory listing adds at most this many entries.
+pub const MAX_PER_FOLDER: usize = 20_000;
+/// A watcher-triggered rescan starts this long after the last relevant change...
+const QUIET: Duration = Duration::from_secs(2);
+/// ...but no later than this long after the first change of a burst.
+const MAX_WAIT: Duration = Duration::from_secs(10);
+const NOT_FOUND: &str = "file not found";
+
+/// One indexed file or folder in list form, for tests (the provider keeps the
+/// compact `Index`).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub name: String,
+    pub name_norm: String,
+    pub is_dir: bool,
+    /// Levels below its root: 1 for an entry directly in a root.
+    pub depth: u8,
+}
+
+#[cfg(test)]
+impl FileEntry {
+    /// An entry directly in a root (depth 1).
+    pub fn new(path: PathBuf, is_dir: bool) -> Self {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+        let name_norm = fuzzy::normalize(&name);
+        Self { path, name, name_norm, is_dir, depth: 1 }
+    }
+
+    pub fn at_depth(self, depth: u8) -> Self {
+        Self { depth, ..self }
+    }
+}
+
+/// Desktop, Documents and Downloads under `%USERPROFILE%`; empty without it.
+pub fn default_roots() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("USERPROFILE") else { return Vec::new() };
+    let home = PathBuf::from(home);
+    ["Desktop", "Documents", "Downloads"].iter().map(|d| home.join(d)).collect()
+}
+
+/// Every file and folder under `roots`, breadth-first: skips hidden and
+/// system entries, dot-names and build/tool folders, does not follow links,
+/// stops at `MAX_DEPTH` levels, at an equal share of `MAX_ENTRIES` per root
+/// and at `MAX_PER_FOLDER` entries per folder. Never panics on missing or
+/// unreadable folders.
+/// The provider keeps the compact index; this list form is for tests.
+#[cfg(test)]
+pub fn scan(roots: &[PathBuf]) -> Vec<FileEntry> {
+    scan_with_limits(roots, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER)
+}
+
+#[cfg(test)]
+fn scan_with_limits(roots: &[PathBuf], max_entries: usize, max_depth: usize, max_per_folder: usize) -> Vec<FileEntry> {
+    scan_index(roots, max_entries, max_depth, max_per_folder).entries()
+}
+
+/// `dir` with a leading `home` shown as `~`.
+fn shorten_home(dir: &Path, home: Option<&Path>) -> String {
+    match home.and_then(|h| dir.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+        Some(rest) => format!(r"~\{}", rest.display()),
+        None => dir.display().to_string(),
+    }
+}
+
+/// Folder scores per tier; a file scores 10 less. All stay below 650, the
+/// lowest name match of an app, shortcut or Settings page.
+const EXACT: u32 = 640;
+const PREFIX: u32 = 600;
+const SQUASHED_PREFIX: u32 = 580;
+const WORD_PREFIX: u32 = 560;
+const SUBSTRING: u32 = 520;
+const FILE_BELOW_FOLDER: u32 = 10;
+/// Points lost per level below the first, for at most `MAX_DEPTH_STEPS` levels.
+const DEPTH_STEP: u32 = 15;
+const MAX_DEPTH_STEPS: u32 = 4;
+
+/// Points an entry loses for sitting `depth` levels below its root (1 = directly in it).
+fn depth_penalty(depth: u8) -> u32 {
+    u32::from(depth.saturating_sub(1)).min(MAX_DEPTH_STEPS) * DEPTH_STEP
+}
+
+/// Score of a file or folder name `hay` for `needle` (both normalised;
+/// `len` = needle chars), strict tiers only: exact name, or exact stem for a
+/// file (2+ chars); prefix, squashed prefix, word prefix or every typed word a
+/// word prefix (3+ chars); substring (4+ chars). Never acronyms, initials or
+/// typos. Minus [`depth_penalty`].
+fn file_score(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
+    let f = fuzzy::score_prenormalized(needle, hay);
+    let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
+    let tier = if f == Some(1000) || stem_exact {
+        EXACT
+    } else if len < 3 {
+        return None;
+    } else {
+        match f? {
+            900 => PREFIX,
+            850 => SQUASHED_PREFIX,
+            800 => WORD_PREFIX,
+            _ if len >= 4 && hay.contains(needle) => SUBSTRING,
+            _ => return None,
+        }
+    };
+    let file = if is_dir { 0 } else { FILE_BELOW_FOLDER };
+    Some(tier - file - depth_penalty(depth))
+}
+
+/// Whether a change at one of `paths` can alter the index: not inside a
+/// dot-named or build/tool folder below a root. Unknown places count.
+fn change_is_relevant(paths: &[PathBuf], roots: &[PathBuf]) -> bool {
+    paths.is_empty() || paths.iter().any(|p| path_is_relevant(p, roots))
+}
+
+/// Whether a watcher event can change the index. The index holds only names
+/// and folder-ness, so only creations, removals and renames count, plus
+/// `Other` and events whose backend lost track (`need_rescan`). Content
+/// writes (`Modify(Any)` on Windows), metadata and access are ignored: a file
+/// written continuously must not rescan the roots over and over. Hidden or
+/// system attribute changes are left to the periodic refresh.
+fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
+    need_rescan
+        || matches!(
+            kind,
+            EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) | EventKind::Other
+        )
+}
+
+/// When a burst of changes that began at `first` and last saw a change at
+/// `last` should be rescanned: `QUIET` after the last change, capped at
+/// `MAX_WAIT` after the first.
+fn rescan_deadline(first: Instant, last: Instant) -> Instant {
+    (last + QUIET).min(first + MAX_WAIT)
+}
+
+fn path_is_relevant(path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(rel) = roots.iter().find_map(|r| path.strip_prefix(r).ok()) else { return true };
+    let mut parts = rel.components().peekable();
+    while let Some(part) = parts.next() {
+        let Some(name) = part.as_os_str().to_str() else { continue };
+        let is_last = parts.peek().is_none();
+        if name.starts_with('.') || (!is_last && is_junk_dir(name)) {
+            return false;
+        }
+    }
+    true
+}
+
+pub struct FilesProvider {
+    launcher: Arc<dyn Launcher>,
+    index: RwLock<Index>,
+    roots: Mutex<Vec<PathBuf>>,
+    /// Bumped by `set_roots`; a scan started before the bump is thrown away.
+    generation: AtomicU64,
+    /// Whether a scan runs, and whether another was asked for meanwhile.
+    refresh_state: Mutex<RefreshState>,
+    /// Signalled when a refresh run (with its follow-ups) ends.
+    idle: Condvar,
+    /// `%USERPROFILE%`, shown as `~` in subtitles.
+    home: Option<PathBuf>,
+    /// Alive while watching; replaced by each `watch`.
+    watcher: Mutex<Option<RecommendedWatcher>>,
+}
+
+#[derive(Default)]
+struct RefreshState {
+    running: bool,
+    again: bool,
+}
+
+/// Clears the refresh state if a scan panics, so later refreshes still run.
+struct ClearOnPanic<'a>(&'a FilesProvider);
+
+impl Drop for ClearOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            *self.0.refresh_state.lock().unwrap_or_else(|e| e.into_inner()) = RefreshState::default();
+            self.0.idle.notify_all();
+        }
+    }
+}
+
+impl FilesProvider {
+    pub fn new(launcher: Arc<dyn Launcher>) -> Arc<Self> {
+        Self::with_index(launcher, Index::default())
+    }
+
+    #[cfg(test)]
+    pub fn with_entries(launcher: Arc<dyn Launcher>, e: Vec<FileEntry>) -> Arc<Self> {
+        Self::with_index(launcher, Index::from_entries(e))
+    }
+
+    fn with_index(launcher: Arc<dyn Launcher>, index: Index) -> Arc<Self> {
+        Arc::new(Self {
+            launcher,
+            index: RwLock::new(index),
+            roots: Mutex::new(default_roots()),
+            generation: AtomicU64::new(0),
+            refresh_state: Mutex::new(RefreshState::default()),
+            idle: Condvar::new(),
+            home: std::env::var_os("USERPROFILE").map(PathBuf::from),
+            watcher: Mutex::new(None),
+        })
+    }
+
+    /// Empty = [`default_roots`]. The current index keeps answering until the
+    /// next `refresh`; a scan already running for the old roots is discarded.
+    /// A running watcher moves to the new roots.
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        let roots = if roots.is_empty() { default_roots() } else { roots };
+        let old = std::mem::replace(&mut *self.roots.lock().unwrap_or_else(|e| e.into_inner()), roots.clone());
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(w) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            for r in &old {
+                let _ = w.unwatch(r);
+            }
+            // A root that cannot be watched (e.g. missing) only misses
+            // events; the periodic refresh covers them.
+            for r in &roots {
+                let _ = w.watch(r, RecursiveMode::Recursive);
+            }
+        }
+    }
+
+    fn roots(&self) -> Vec<PathBuf> {
+        self.roots.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Full rescan of the roots (seconds; no lock held while walking), then
+    /// swap. If a refresh is already running, this only asks it for one
+    /// follow-up scan and returns at once, before that scan has run: any
+    /// number of requests during a scan collapse into one follow-up, and
+    /// scans never overlap.
+    pub fn refresh(&self) {
+        self.refresh_using(|roots| scan_index(roots, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER));
+    }
+
+    /// `refresh` with the scan passed in (tests).
+    #[cfg(test)]
+    fn refresh_with(&self, mut scan: impl FnMut(&[PathBuf]) -> Vec<FileEntry>) {
+        self.refresh_using(|roots| Index::from_entries(scan(roots)));
+    }
+
+    /// `refresh`, then wait until no refresh or follow-up is running (tests).
+    #[cfg(test)]
+    fn refresh_blocking(&self) {
+        self.refresh();
+        self.wait_idle();
+    }
+
+    /// Wait until no refresh or follow-up is running (tests).
+    #[cfg(test)]
+    fn wait_idle(&self) {
+        let mut st = self.refresh_state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.running {
+            st = self.idle.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// The caller that finds no scan running runs it, then one follow-up if
+    /// any was asked for meanwhile (again while more are asked for).
+    fn refresh_using(&self, mut scan: impl FnMut(&[PathBuf]) -> Index) {
+        {
+            let mut st = self.refresh_state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.running {
+                st.again = true;
+                return;
+            }
+            st.running = true;
+        }
+        let _clear = ClearOnPanic(self);
+        loop {
+            self.scan_and_swap(&mut scan);
+            let mut st = self.refresh_state.lock().unwrap_or_else(|e| e.into_inner());
+            if !st.again {
+                st.running = false;
+                self.idle.notify_all();
+                return;
+            }
+            st.again = false;
+        }
+    }
+
+    /// Scans until a scan finishes with the roots it started with, and swaps
+    /// that one in: a stale result never replaces a newer one.
+    fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf]) -> Index) {
+        loop {
+            let generation = self.generation.load(Ordering::SeqCst);
+            let fresh = scan(&self.roots());
+            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+            if self.generation.load(Ordering::SeqCst) == generation {
+                let old = std::mem::replace(&mut *index, fresh);
+                drop(index);
+                drop(old); // freed outside the lock
+                return;
+            }
+        }
+    }
+
+    /// Watch the roots recursively. Creations, removals and renames trigger
+    /// `refresh` once changes have been quiet for 2 s (at most 10 s after the
+    /// first change of a burst). If the watcher cannot be created the error
+    /// is returned and the caller relies on its periodic refresh.
+    pub fn watch(self: &Arc<Self>) -> notify::Result<()> {
+        let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            // A watcher error means missed events; the periodic refresh covers them.
+            if let Ok(event) = res {
+                if event_triggers_rescan(&event.kind, event.need_rescan()) {
+                    let _ = tx.send(event.paths);
+                }
+            }
+        })?;
+        for root in self.roots() {
+            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+                // A missing root is skipped by the scan too.
+                if root.exists() {
+                    return Err(e);
+                }
+            }
+        }
+        let weak = Arc::downgrade(self);
+        std::thread::spawn(move || {
+            // Ends when the watcher (and with it `tx`) or the provider is dropped.
+            while let Ok(paths) = rx.recv() {
+                let Some(p) = weak.upgrade() else { return };
+                let roots = p.roots();
+                drop(p);
+                if !change_is_relevant(&paths, &roots) {
+                    continue;
+                }
+                let first = Instant::now();
+                let mut deadline = rescan_deadline(first, first);
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(paths) if change_is_relevant(&paths, &roots) => {
+                            deadline = rescan_deadline(first, Instant::now());
+                        }
+                        Ok(_) => {}
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                let Some(p) = weak.upgrade() else { return };
+                p.refresh();
+            }
+        });
+        *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
+        Ok(())
+    }
+}
+
+impl Provider for FilesProvider {
+    fn name(&self) -> &'static str {
+        "files"
+    }
+
+    /// Read lock only, no disk: every entry is checked against cheap char
+    /// masks first, [`file_score`] runs only on candidates that can still
+    /// make the best 20, and result strings are built for those 20 alone.
+    fn query(&self, q: &Query) -> Vec<ResultItem> {
+        let text = q.text.trim();
+        if text.chars().count() < MIN_QUERY_CHARS {
+            return Vec::new();
+        }
+        let needle = fuzzy::normalize(text);
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let len = needle.chars().count();
+        // Every tier needs each non-break char of the needle somewhere in the name.
+        let need = needle.chars().filter(|&c| !fuzzy::is_word_break(c)).fold(0, |m, c| m | char_bit(c));
+        // Every tier but substring needs a word of the name to start with the
+        // needle's first char (when that char is not itself a word break).
+        let first = needle.chars().next().filter(|&c| !fuzzy::is_word_break(c)).map(char_bit);
+
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        // Min-heap of (score, Reverse(position)): the top is the entry to drop
+        // next (lowest score, then latest), so equal scores keep index order.
+        let mut best: BinaryHeap<Reverse<(u32, Reverse<usize>)>> = BinaryHeap::with_capacity(MAX_RESULTS + 1);
+        for (i, s) in index.slots.iter().enumerate() {
+            if s.chars & need != need {
+                continue;
+            }
+            let substring_only = first.is_some_and(|b| s.initials & b == 0);
+            if substring_only && len < 4 {
+                continue;
+            }
+            let depth = index.depth(s);
+            if best.len() == MAX_RESULTS {
+                let tier = if substring_only { SUBSTRING } else { EXACT };
+                let file = if s.is_dir { 0 } else { FILE_BELOW_FOLDER };
+                let Some(Reverse((worst, _))) = best.peek() else { continue };
+                if tier - file - depth_penalty(depth) <= *worst {
+                    continue;
+                }
+            }
+            let hay = index.norm(s);
+            if substring_only && !hay.contains(needle.as_str()) {
+                continue;
+            }
+            let Some(score) = file_score(&needle, len, hay, s.is_dir, depth) else { continue };
+            best.push(Reverse((score, Reverse(i))));
+            if best.len() > MAX_RESULTS {
+                best.pop();
+            }
+        }
+        let mut picked: Vec<(u32, usize)> = best.into_iter().map(|Reverse((score, Reverse(i)))| (score, i)).collect();
+        picked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        picked
+            .into_iter()
+            .map(|(score, i)| {
+                let s = &index.slots[i];
+                ResultItem {
+                    id: index.path(s).to_string_lossy().into_owned(),
+                    provider: "files",
+                    title: index.name(s).to_string(),
+                    subtitle: shorten_home(index.dir(s), self.home.as_deref()),
+                    score,
+                    confirm: false,
+                }
+            })
+            .collect()
+    }
+
+    fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
+        let path = Path::new(id);
+        let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(path).is_some();
+        // Checking the disk is fine here: activate is not the query path.
+        if !known || !path.exists() {
+            return Err(NOT_FOUND.into());
+        }
+        match modifier {
+            Modifier::None | Modifier::CtrlShift => self.launcher.open(id)?,
+            Modifier::Ctrl => self.launcher.reveal(id)?,
+        }
+        Ok(Outcome::Hide)
+    }
+
+    fn rank_key(&self, id: &str) -> Option<String> {
+        Some(id.to_string())
+    }
+
+    /// File names are many and noisy: they never crowd apps, shortcuts and
+    /// Settings pages out of the list.
+    fn plain_share(&self) -> usize {
+        PLAIN_SHARE
+    }
+
+    fn help(&self) -> Vec<HelpLine> {
+        vec![HelpLine {
+            example: "report.pdf".into(),
+            about: "find a file or folder by name; Ctrl+Enter shows it in Explorer".into(),
+            fill: String::new(),
+        }]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fuzzy;
+    use crate::launch::testing::RecordingLauncher;
+    use std::fs;
+    use std::path::Path;
+
+    fn q(text: &str) -> Query {
+        Query { text: text.into(), scope: None }
+    }
+
+    fn entry(path: &str, is_dir: bool) -> FileEntry {
+        FileEntry::new(PathBuf::from(path), is_dir)
+    }
+
+    fn provider(entries: Vec<FileEntry>) -> (Arc<FilesProvider>, Arc<RecordingLauncher>) {
+        let rec = Arc::new(RecordingLauncher::default());
+        (FilesProvider::with_entries(rec.clone(), entries), rec)
+    }
+
+    fn names(entries: &[FileEntry]) -> Vec<String> {
+        let mut out: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+        out.sort();
+        out
+    }
+
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"").unwrap();
+    }
+
+    fn set_attributes(path: &Path, attrs: u32) {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES};
+        unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_FLAGS_AND_ATTRIBUTES(attrs)) }.unwrap();
+    }
+
+    #[test]
+    fn scan_finds_files_and_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("report.pdf"));
+        touch(&dir.path().join("Projects").join("flick").join("notes.txt"));
+        let out = scan(&[dir.path().to_path_buf()]);
+        assert_eq!(names(&out), ["Projects", "flick", "notes.txt", "report.pdf"]);
+        let notes = out.iter().find(|e| e.name == "notes.txt").unwrap();
+        assert_eq!(notes.path, dir.path().join("Projects").join("flick").join("notes.txt"));
+        assert!(!notes.is_dir);
+        let projects = out.iter().find(|e| e.name == "Projects").unwrap();
+        assert!(projects.is_dir);
+        assert_eq!(projects.name_norm, "projects");
+        // Depth counts levels below the root: Projects 1, flick 2, notes.txt 3.
+        assert_eq!((projects.depth, notes.depth), (1, 3));
+    }
+
+    #[test]
+    fn scan_skips_hidden_dot_and_junk_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("keep.txt"));
+        touch(&root.join(".gitconfig"));
+        touch(&root.join(".git").join("HEAD"));
+        for junk in [
+            "node_modules",
+            "target",
+            "dist",
+            "build",
+            "__pycache__",
+            "venv",
+            ".venv",
+            "AppData",
+            "$RECYCLE.BIN",
+            "vendor",
+            "site-packages",
+            "Pods",
+            "bower_components",
+            "obj",
+        ] {
+            touch(&root.join(junk).join("inside.txt"));
+        }
+        // Junk names only skip folders; a file called "build" stays.
+        touch(&root.join("src").join("build"));
+        touch(&root.join("hidden.txt"));
+        set_attributes(&root.join("hidden.txt"), 0x2);
+        touch(&root.join("system.txt"));
+        set_attributes(&root.join("system.txt"), 0x4);
+        touch(&root.join("Secret").join("inside.txt"));
+        set_attributes(&root.join("Secret"), 0x2);
+
+        let out = scan(&[root.to_path_buf()]);
+        assert_eq!(names(&out), ["build", "keep.txt", "src"]);
+    }
+
+    #[test]
+    fn hidden_and_system_attribute_bits_are_skipped() {
+        assert!(skip_by_attributes(0x2));
+        assert!(skip_by_attributes(0x4));
+        assert!(skip_by_attributes(0x2 | 0x10));
+        assert!(!skip_by_attributes(0x10));
+        assert!(!skip_by_attributes(0x20));
+        assert!(!skip_by_attributes(0));
+    }
+
+    #[test]
+    fn scan_stops_at_max_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("a").join("b").join("c").join("deep.txt"));
+        touch(&dir.path().join("a").join("shallow.txt"));
+        let out = scan_with_limits(&[dir.path().to_path_buf()], MAX_ENTRIES, 2, MAX_PER_FOLDER);
+        assert_eq!(names(&out), ["a", "b", "shallow.txt"]);
+    }
+
+    #[test]
+    fn scan_survives_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("found.txt"));
+        let out = scan(&[PathBuf::from(r"C:\definitely\missing\root"), dir.path().to_path_buf()]);
+        assert_eq!(names(&out), ["found.txt"]);
+    }
+
+    #[test]
+    fn scan_caps_total_entries_shallow_first() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two roots, each with one shallow file and one deep folder.
+        let (a, b) = (dir.path().join("rootA"), dir.path().join("rootB"));
+        touch(&a.join("a1.txt"));
+        touch(&a.join("adeep").join("a2.txt"));
+        touch(&b.join("b1.txt"));
+        touch(&b.join("bdeep").join("b2.txt"));
+        let out = scan_with_limits(&[a, b], 4, MAX_DEPTH, MAX_PER_FOLDER);
+        assert_eq!(out.len(), 4);
+        // Each root gets half the cap, filled breadth-first: depth 1 before depth 2.
+        assert_eq!(names(&out), ["a1.txt", "adeep", "b1.txt", "bdeep"]);
+    }
+
+    #[test]
+    fn accented_file_found_by_ascii_query() {
+        let (p, _) = provider(vec![entry(r"C:\Users\x\Documents\Café.pdf", false)]);
+        let out = p.query(&q("cafe"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "Café.pdf");
+        assert_eq!(out[0].id, r"C:\Users\x\Documents\Café.pdf");
+        assert_eq!(out[0].provider, "files");
+    }
+
+    #[test]
+    fn short_query_returns_nothing() {
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\ab.txt", false)]);
+        assert!(p.query(&q("")).is_empty());
+        assert!(p.query(&q("a")).is_empty());
+        assert!(p.query(&q("  a  ")).is_empty());
+        assert_eq!(p.query(&q("ab")).len(), 1);
+    }
+
+    /// `file_score` for raw text, as the query path calls it.
+    fn fs(needle: &str, name: &str, is_dir: bool, depth: u8) -> Option<u32> {
+        let needle = fuzzy::normalize(needle);
+        file_score(&needle, needle.chars().count(), &fuzzy::normalize(name), is_dir, depth)
+    }
+
+    #[test]
+    fn file_scores_use_strict_tiers_and_depth() {
+        assert_eq!(fs("calc", "Calculator", true, 5), Some(540));
+        assert_eq!(fs("calc", "calculator.py", false, 1), Some(590));
+        // No acronym, initials or typo tiers for files.
+        assert_eq!(fs("tpr", "Third Party Report.pdf", false, 1), None);
+        assert_eq!(fs("tdo", "to-do output.txt", false, 1), None);
+        assert_eq!(fs("blnder", "Blender.blend", false, 1), None);
+        // Two chars: an exact name only.
+        assert_eq!(fs("bl", "Blender", true, 1), None);
+        assert_eq!(fs("db", "db", true, 1), Some(640));
+        assert_eq!(fs("db", "db.sqlite", false, 1), Some(630));
+        // Exact, exact stem, prefix, word prefix, substring.
+        assert_eq!(fs("report", "report.pdf", false, 1), Some(630));
+        assert_eq!(fs("report", "Reports", true, 1), Some(600));
+        assert_eq!(fs("report", "Annual Report.docx", false, 1), Some(550));
+        assert_eq!(fs("report", "preport.txt", false, 1), Some(510));
+        assert_eq!(fs("wifi", "Wi-Fi notes.txt", false, 1), Some(570));
+        // Substring needs four chars.
+        assert_eq!(fs("rep", "myrepo", true, 1), None);
+        // Every typed word a word prefix; typed in name order it is a plain prefix.
+        assert_eq!(fs("rep annual", "Annual Report.docx", false, 1), Some(550));
+        assert_eq!(fs("annual rep", "Annual Report.docx", false, 1), Some(590));
+        // A leading dot is not a stem: `env` is a squashed prefix of `.env`, not its exact name.
+        assert_eq!(fs("env", ".env", false, 1), Some(570));
+        // Depth: 0, 15, 30, 45, then 60 for anything deeper.
+        let by_depth: Vec<_> = (1..=7).map(|d| fs("db", "db", true, d)).collect();
+        assert_eq!(by_depth, [640, 625, 610, 595, 580, 580, 580].map(Some));
+    }
+
+    #[test]
+    fn no_file_ever_reaches_the_app_name_band() {
+        let names = ["calc", "calc.exe", "Calculator", "calc tools", "x-calc", "c.a.l.c", "CALC (1).txt"];
+        for needle in ["calc", "ca", "calc tools", "c a l c", "calc.exe"] {
+            for name in names {
+                for is_dir in [false, true] {
+                    if let Some(score) = fs(needle, name, is_dir, 1) {
+                        assert!(score < 650, "{needle:?} vs {name:?}: {score}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shallow_entry_ranks_above_the_same_name_deeper() {
+        let (p, _) = provider(vec![
+            entry(r"C:\r\a\b\c\notes.txt", false).at_depth(4),
+            entry(r"C:\r\notes.txt", false),
+        ]);
+        let out = p.query(&q("notes"));
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].id.as_str(), out[0].score), (r"C:\r\notes.txt", 630));
+        assert_eq!((out[1].id.as_str(), out[1].score), (r"C:\r\a\b\c\notes.txt", 585));
+    }
+
+    #[test]
+    fn folders_rank_above_files() {
+        let (p, _) = provider(vec![entry(r"C:\d\taxes.txt", false), entry(r"C:\e\taxes", true)]);
+        let out = p.query(&q("taxes"));
+        assert_eq!(out.len(), 2);
+        assert_eq!((out[0].id.as_str(), out[0].score), (r"C:\e\taxes", 640));
+        assert_eq!(out[1].score, 630);
+    }
+
+    #[test]
+    fn returns_at_most_20() {
+        let entries = (0..50).map(|i| entry(&format!(r"C:\d\report {i}.pdf"), false)).collect();
+        let (p, _) = provider(entries);
+        let out = p.query(&q("report"));
+        assert_eq!(out.len(), 20);
+        // Equal scores keep index order (shallow first after a scan).
+        assert_eq!(out[0].title, "report 0.pdf");
+        assert_eq!(out[19].title, "report 19.pdf");
+    }
+
+    #[test]
+    fn best_matches_survive_the_cap() {
+        let mut entries: Vec<FileEntry> =
+            (0..40).map(|i| entry(&format!(r"C:\d\old report {i}.pdf"), false)).collect();
+        entries.push(entry(r"C:\d\report.pdf", false));
+        let (p, _) = provider(entries);
+        let out = p.query(&q("report"));
+        assert_eq!(out.len(), 20);
+        assert_eq!(out[0].title, "report.pdf");
+        assert!(out.windows(2).all(|w| w[0].score >= w[1].score));
+    }
+
+    #[test]
+    fn substring_inside_a_word_still_matches_when_the_list_is_full() {
+        // "epor" starts no word of "report", so only the substring tier can match it.
+        let mut entries: Vec<FileEntry> = (0..30).map(|i| entry(&format!(r"C:\d\epor {i}.txt"), false)).collect();
+        entries.push(entry(r"C:\d\report.pdf", true));
+        let (p, _) = provider(entries);
+        let out = p.query(&q("epor"));
+        assert_eq!(out.len(), 20);
+        // File prefix 590; the folder's substring 520 loses.
+        assert!(out.iter().all(|r| r.score == 590));
+        let (p, _) = provider(vec![entry(r"C:\d\report.pdf", true)]);
+        assert_eq!(p.query(&q("epor"))[0].score, 520);
+    }
+
+    #[test]
+    fn watcher_rescans_after_a_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![dir.path().to_path_buf()]);
+        p.watch().unwrap();
+        touch(&dir.path().join("watched report.pdf"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while p.query(&q("watched")).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "watcher did not rescan");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(p.query(&q("watched"))[0].title, "watched report.pdf");
+    }
+
+    #[test]
+    fn subtitle_is_parent_folder_with_home_shortened() {
+        let home = Path::new(r"C:\Users\x");
+        assert_eq!(shorten_home(Path::new(r"C:\Users\x\Documents\Tax"), Some(home)), r"~\Documents\Tax");
+        assert_eq!(shorten_home(Path::new(r"C:\Users\x"), Some(home)), "~");
+        assert_eq!(shorten_home(Path::new(r"D:\Stuff"), Some(home)), r"D:\Stuff");
+        assert_eq!(shorten_home(Path::new(r"D:\Stuff"), None), r"D:\Stuff");
+
+        let (p, _) = provider(vec![entry(r"D:\Stuff\taxes.txt", false)]);
+        assert_eq!(p.query(&q("taxes"))[0].subtitle, r"D:\Stuff");
+    }
+
+    #[test]
+    fn enter_opens_ctrl_enter_reveals() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.pdf");
+        touch(&file);
+        let id = file.to_str().unwrap().to_string();
+        let (p, rec) = provider(vec![FileEntry::new(file.clone(), false)]);
+        assert_eq!(p.activate(&id, Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(p.activate(&id, Modifier::CtrlShift), Ok(Outcome::Hide));
+        assert_eq!(p.activate(&id, Modifier::Ctrl), Ok(Outcome::Hide));
+        assert_eq!(rec.calls(), [format!("open {id}"), format!("open {id}"), format!("reveal {id}")]);
+        assert_eq!(p.rank_key(&id), Some(id.clone()));
+    }
+
+    #[test]
+    fn missing_file_is_an_error() {
+        let (p, rec) = provider(vec![entry(r"C:\definitely\missing\gone.pdf", false)]);
+        assert_eq!(p.activate(r"C:\definitely\missing\gone.pdf", Modifier::None), Err("file not found".into()));
+        // Not in the index at all: same answer, nothing started.
+        assert_eq!(p.activate(r"C:\Windows\notepad.exe", Modifier::None), Err("file not found".into()));
+        assert!(rec.calls().is_empty());
+    }
+
+    #[test]
+    fn set_roots_empty_uses_defaults() {
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![PathBuf::from(r"C:\x")]);
+        assert_eq!(p.roots(), [PathBuf::from(r"C:\x")]);
+        p.set_roots(vec![]);
+        assert_eq!(p.roots(), default_roots());
+    }
+
+    #[test]
+    fn default_roots_are_desktop_documents_downloads() {
+        let roots = default_roots();
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            let home = PathBuf::from(home);
+            assert_eq!(roots, [home.join("Desktop"), home.join("Documents"), home.join("Downloads")]);
+        } else {
+            assert!(roots.is_empty());
+        }
+    }
+
+    #[test]
+    fn refresh_swaps_in_a_new_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("fresh report.pdf"));
+        let (p, _) = provider(vec![entry(r"C:\d\old report.pdf", false)]);
+        p.set_roots(vec![dir.path().to_path_buf()]);
+        // Stale until refreshed: the old index keeps answering.
+        assert_eq!(p.query(&q("report"))[0].title, "old report.pdf");
+        p.refresh_blocking();
+        let out = p.query(&q("report"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "fresh report.pdf");
+    }
+
+    #[test]
+    fn stale_scan_does_not_overwrite_newer_roots() {
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![PathBuf::from(r"C:\old")]);
+        let p2 = p.clone();
+        let mut scanned: Vec<Vec<PathBuf>> = Vec::new();
+        p.refresh_with(|roots| {
+            scanned.push(roots.to_vec());
+            if scanned.len() == 1 {
+                // Roots change while the first scan runs.
+                p2.set_roots(vec![PathBuf::from(r"C:\new")]);
+            }
+            let name = if roots[0] == Path::new(r"C:\old") { "old hit.txt" } else { "new hit.txt" };
+            vec![FileEntry::new(roots[0].join(name), false)]
+        });
+        assert_eq!(scanned, [vec![PathBuf::from(r"C:\old")], vec![PathBuf::from(r"C:\new")]]);
+        let out = p.query(&q("hit"));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title, "new hit.txt");
+    }
+
+    #[test]
+    fn each_root_gets_an_equal_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("big"), dir.path().join("small"));
+        for i in 0..10 {
+            touch(&a.join(format!("a{i:02}.txt")));
+        }
+        for i in 0..3 {
+            touch(&b.join(format!("b{i}.txt")));
+        }
+        // Share 8 / 2 = 4 each; "small" uses 3 and does not donate the rest.
+        let out = scan_with_limits(&[a.clone(), b], 8, MAX_DEPTH, MAX_PER_FOLDER);
+        assert_eq!(out.iter().filter(|e| e.path.starts_with(&a)).count(), 4);
+        assert_eq!(out.iter().filter(|e| e.name.starts_with('b')).count(), 3);
+        assert_eq!(out.len(), 7);
+    }
+
+    #[test]
+    fn one_folder_contributes_at_most_the_per_folder_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..30 {
+            touch(&dir.path().join("huge").join(format!("f{i:02}.txt")));
+        }
+        let out = scan_with_limits(&[dir.path().to_path_buf()], MAX_ENTRIES, MAX_DEPTH, 10);
+        assert_eq!(out.iter().filter(|e| e.name.starts_with('f')).count(), 10);
+        assert_eq!(out.len(), 11); // plus "huge" itself
+
+        // Entries past the cap are skipped, but a folder read before it is still walked.
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("a").join("x.txt"));
+        touch(&dir.path().join("b.txt"));
+        touch(&dir.path().join("c.txt"));
+        let out = scan_with_limits(&[dir.path().to_path_buf()], MAX_ENTRIES, MAX_DEPTH, 2);
+        assert_eq!(names(&out), ["a", "b.txt", "x.txt"]);
+    }
+
+    #[test]
+    fn only_name_changes_trigger_a_rescan() {
+        use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+        assert!(event_triggers_rescan(&EventKind::Create(CreateKind::Any), false));
+        assert!(event_triggers_rescan(&EventKind::Create(CreateKind::Folder), false));
+        assert!(event_triggers_rescan(&EventKind::Remove(RemoveKind::Any), false));
+        assert!(event_triggers_rescan(&EventKind::Modify(ModifyKind::Name(RenameMode::From)), false));
+        assert!(event_triggers_rescan(&EventKind::Modify(ModifyKind::Name(RenameMode::To)), false));
+        assert!(event_triggers_rescan(&EventKind::Other, false));
+        // Content writes (Windows reports them as Modify(Any)), metadata and access do not.
+        assert!(!event_triggers_rescan(&EventKind::Modify(ModifyKind::Any), false));
+        assert!(!event_triggers_rescan(&EventKind::Modify(ModifyKind::Data(DataChange::Content)), false));
+        assert!(!event_triggers_rescan(&EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)), false));
+        assert!(!event_triggers_rescan(&EventKind::Access(AccessKind::Any), false));
+        // The backend lost events: rescan whatever the kind.
+        assert!(event_triggers_rescan(&EventKind::Modify(ModifyKind::Any), true));
+        assert!(event_triggers_rescan(&EventKind::Any, true));
+    }
+
+    #[test]
+    fn rescan_waits_for_quiet_but_not_forever() {
+        use std::time::{Duration, Instant};
+        let first = Instant::now();
+        let s = Duration::from_secs;
+        // 2 s after the last event...
+        assert_eq!(rescan_deadline(first, first), first + s(2));
+        assert_eq!(rescan_deadline(first, first + s(5)), first + s(7));
+        // ...but never later than 10 s after the first one of the burst.
+        assert_eq!(rescan_deadline(first, first + s(9)), first + s(10));
+        assert_eq!(rescan_deadline(first, first + s(30)), first + s(10));
+    }
+
+    #[test]
+    fn refresh_requests_during_a_scan_collapse_into_one_follow_up() {
+        use std::sync::atomic::AtomicUsize;
+        let (p, _) = provider(vec![]);
+        let scans = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let worker = {
+            let (p, scans) = (p.clone(), scans.clone());
+            std::thread::spawn(move || {
+                p.refresh_with(move |_| {
+                    if scans.fetch_add(1, Ordering::SeqCst) == 0 {
+                        started_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                    }
+                    vec![]
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        // A scan is running: these return at once and do not scan themselves.
+        for _ in 0..3 {
+            p.refresh_with(|_| panic!("a second scan must not run alongside the first"));
+        }
+        go_tx.send(()).unwrap();
+        worker.join().unwrap();
+        p.wait_idle();
+        assert_eq!(scans.load(Ordering::SeqCst), 2, "one scan plus exactly one follow-up");
+    }
+
+    #[test]
+    fn watcher_ignores_changes_in_skipped_folders() {
+        let roots = [PathBuf::from(r"C:\Users\x\Documents")];
+        let rel = |p: &str| change_is_relevant(&[PathBuf::from(p)], &roots);
+        assert!(rel(r"C:\Users\x\Documents\report.pdf"));
+        assert!(rel(r"C:\Users\x\Documents\Tax\node_modules"));
+        assert!(!rel(r"C:\Users\x\Documents\app\node_modules\x\index.js"));
+        assert!(!rel(r"C:\Users\x\Documents\.git\index"));
+        assert!(!rel(r"C:\Users\x\Documents\notes\.swp"));
+        // Unknown places and pathless events are rescanned to be safe.
+        assert!(rel(r"D:\elsewhere\file.txt"));
+        assert!(change_is_relevant(&[], &roots));
+    }
+
+    /// Step 5 speed check. Run in release:
+    /// `cargo test --release --manifest-path src-tauri/Cargo.toml -- --ignored query_speed_300k --nocapture`
+    #[test]
+    #[ignore]
+    fn query_speed_300k() {
+        use std::time::Instant;
+        const WORDS: [&str; 48] = [
+            "report", "invoice", "facture", "lettre", "Café", "notes", "meeting", "draft", "final", "backup",
+            "project", "flick", "launcher", "budget", "summary", "photo", "Screenshot", "IMG", "DSC", "scan",
+            "contract", "agreement", "resume", "letter", "presentation", "slides", "data", "export", "config", "setup",
+            "README", "license", "changelog", "test", "results", "analysis", "thesis", "chapter", "lecture", "homework",
+            "tax", "payslip", "statement", "travel", "ticket", "booking", "copy", "old",
+        ];
+        const EXTS: [&str; 12] = ["pdf", "docx", "xlsx", "jpg", "png", "txt", "md", "zip", "mp4", "pptx", "rs", "py"];
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let dirs: Vec<PathBuf> = (0..3000)
+            .map(|i| {
+                let mut d = PathBuf::from(r"C:\Users\someone").join(["Desktop", "Documents", "Downloads"][i % 3]);
+                for _ in 0..1 + rnd(4) {
+                    d.push(WORDS[rnd(WORDS.len())]);
+                }
+                d.push(format!("{i}"));
+                d
+            })
+            .collect();
+        let entries: Vec<FileEntry> = (0..MAX_ENTRIES)
+            .map(|i| {
+                let name = match rnd(6) {
+                    0 => format!("IMG_2023{:02}{:02}_{:06}.jpg", 1 + rnd(12), 1 + rnd(28), rnd(999_999)),
+                    1 => format!("{} {}.{}", WORDS[rnd(48)], 2000 + rnd(26), EXTS[rnd(12)]),
+                    2 => format!("{}_{}_v{}.{}", WORDS[rnd(48)], WORDS[rnd(48)], rnd(9), EXTS[rnd(12)]),
+                    3 => format!("{} {} ({}).{}", WORDS[rnd(48)], WORDS[rnd(48)], rnd(5), EXTS[rnd(12)]),
+                    4 => format!("{}-{}-{}", WORDS[rnd(48)], WORDS[rnd(48)], rnd(100)),
+                    _ => format!("{}{}.{}", WORDS[rnd(48)].to_lowercase(), rnd(1000), EXTS[rnd(12)]),
+                };
+                FileEntry::new(dirs[rnd(dirs.len())].join(name), i % 10 == 0)
+            })
+            .collect();
+        let (p, _) = provider(entries);
+        let queries = [
+            "re", "in", "pd", "ca", "img", "rep", "doc", "2023", "notes", "tax", "invoice", "resum", "final pd",
+            "meeting", "xq", "zzz", "fact 20", "screensh", "flick la", "statem",
+        ];
+        let mut worst = (0.0f64, "");
+        let mut all = Vec::new();
+        for text in queries {
+            let mut times = Vec::new();
+            for _ in 0..5 {
+                let t = Instant::now();
+                let out = p.query(&q(text));
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                assert!(out.len() <= 20);
+            }
+            times.sort_by(|a, b| a.total_cmp(b));
+            let (median, max) = (times[2], times[4]);
+            println!("{text:>10}: median {median:6.2} ms, worst {max:6.2} ms");
+            all.push(median);
+            if max > worst.0 {
+                worst = (max, text);
+            }
+        }
+        all.sort_by(|a, b| a.total_cmp(b));
+        println!("entries {MAX_ENTRIES}: typical (median of medians) {:.2} ms, worst {:.2} ms ({:?})", all[all.len() / 2], worst.0, worst.1);
+        if !cfg!(debug_assertions) {
+            assert!(worst.0 <= 20.0, "worst query took {:.2} ms", worst.0);
+        }
+    }
+
+    #[test]
+    fn has_help_line() {
+        let (p, _) = provider(vec![]);
+        let help = p.help();
+        assert_eq!(help.len(), 1);
+        assert_eq!(help[0].example, "report.pdf");
+        assert_eq!(help[0].about, "find a file or folder by name; Ctrl+Enter shows it in Explorer");
+        assert_eq!(help[0].fill, "");
+    }
+
+    #[test]
+    fn files_take_at_most_five_rows_of_a_plain_list() {
+        let (p, _) = provider(vec![]);
+        assert_eq!(p.plain_share(), 5);
+    }
+}
