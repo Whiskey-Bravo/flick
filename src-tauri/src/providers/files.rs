@@ -165,9 +165,6 @@ fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
         )
 }
 
-/// When a burst of changes that began at `first` and last saw a change at
-/// `last` should be rescanned: `QUIET` after the last change, capped at
-/// `MAX_WAIT` after the first.
 /// When a watcher-triggered rescan wanted at `ready` may start, given when the
 /// last full scan started and how long it took (`None`: none yet): not before
 /// `max(30 s, 3 x duration)` after that scan started.
@@ -178,6 +175,16 @@ fn next_rescan_at(last: Option<(Instant, Duration)>, ready: Instant) -> Instant 
     }
 }
 
+/// The last scan as `next_rescan_at` takes it: a scan still running (no
+/// duration yet) counts as having taken as long as it has run so far, so a
+/// rescan never starts right behind it.
+fn last_scan_so_far(last: Option<(Instant, Option<Duration>)>, now: Instant) -> Option<(Instant, Duration)> {
+    last.map(|(start, took)| (start, took.unwrap_or_else(|| now.saturating_duration_since(start))))
+}
+
+/// When a burst of changes that began at `first` and last saw a change at
+/// `last` should be rescanned: `QUIET` after the last change, capped at
+/// `MAX_WAIT` after the first.
 fn rescan_deadline(first: Instant, last: Instant) -> Instant {
     (last + QUIET).min(first + MAX_WAIT)
 }
@@ -209,8 +216,8 @@ pub struct FilesProvider {
     generation: AtomicU64,
     /// Whether a scan runs, and whether another was asked for meanwhile.
     refresh_state: Mutex<RefreshState>,
-    /// Start and duration of the last full scan.
-    last_scan: Mutex<Option<(Instant, Duration)>>,
+    /// Start and duration of the last full scan; no duration while it runs.
+    last_scan: Mutex<Option<(Instant, Option<Duration>)>>,
     /// Signalled when a refresh run (with its follow-ups) ends.
     idle: Condvar,
     /// `%USERPROFILE%`, shown as `~` in subtitles.
@@ -231,6 +238,11 @@ struct ClearOnPanic<'a>(&'a FilesProvider);
 impl Drop for ClearOnPanic<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            let mut last = self.0.last_scan.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((start, None)) = *last {
+                *last = Some((start, Some(start.elapsed())));
+            }
+            drop(last);
             *self.0.refresh_state.lock().unwrap_or_else(|e| e.into_inner()) = RefreshState::default();
             self.0.idle.notify_all();
         }
@@ -346,8 +358,9 @@ impl FilesProvider {
         loop {
             let generation = self.generation.load(Ordering::SeqCst);
             let started = Instant::now();
+            *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, None));
             let fresh = scan(&self.roots());
-            *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, started.elapsed()));
+            *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, Some(started.elapsed())));
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
@@ -410,14 +423,16 @@ impl FilesProvider {
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                let Some(p) = weak.upgrade() else { return };
-                let last = *p.last_scan.lock().unwrap_or_else(|e| e.into_inner());
-                drop(p);
-                // Too soon after the last scan: wait, swallowing further events
-                // (they collapse into the one rescan at the end of the wait).
-                let start = next_rescan_at(last, Instant::now());
+                // Too soon after the last scan, or one is running: wait,
+                // swallowing further events (they collapse into the one rescan
+                // at the end of the wait). Re-checked after each wait, so a scan
+                // that started meanwhile pushes the rescan back too.
                 loop {
-                    let left = start.saturating_duration_since(Instant::now());
+                    let Some(p) = weak.upgrade() else { return };
+                    let last = *p.last_scan.lock().unwrap_or_else(|e| e.into_inner());
+                    drop(p);
+                    let now = Instant::now();
+                    let left = next_rescan_at(last_scan_so_far(last, now), now).saturating_duration_since(now);
                     if left.is_zero() {
                         break;
                     }
@@ -1018,6 +1033,12 @@ mod tests {
         assert_eq!(next_rescan_at(Some((t0, s(2))), t0 + s(5)), t0 + s(30));
         // Slow scan: three times its duration.
         assert_eq!(next_rescan_at(Some((t0, s(20))), t0 + s(25)), t0 + s(60));
+        // A scan still running counts with the time it has run so far.
+        assert_eq!(last_scan_so_far(None, t0), None);
+        assert_eq!(last_scan_so_far(Some((t0, Some(s(4)))), t0 + s(90)), Some((t0, s(4))));
+        assert_eq!(last_scan_so_far(Some((t0, None)), t0 + s(5)), Some((t0, s(5))));
+        // Running 40 s: the rescan waits until 3 x 40 s after it started.
+        assert_eq!(next_rescan_at(last_scan_so_far(Some((t0, None)), t0 + s(40)), t0 + s(40)), t0 + s(120));
     }
 
     #[test]
