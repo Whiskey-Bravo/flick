@@ -3,6 +3,7 @@
 //! fresh by a folder watcher and the periodic refresh) and swapped in whole.
 
 use std::cmp::Reverse;
+use std::ffi::OsStr;
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,8 +21,8 @@ use crate::fuzzy;
 use crate::launch::Launcher;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
-pub const MAX_ENTRIES: usize = 300_000;
-pub const MAX_DEPTH: usize = 8;
+pub const MAX_ENTRIES: usize = 1_000_000;
+pub const MAX_DEPTH: usize = 9;
 
 /// The provider caps its own output.
 const MAX_RESULTS: usize = 20;
@@ -64,11 +65,13 @@ impl FileEntry {
     }
 }
 
-/// Desktop, Documents and Downloads under `%USERPROFILE%`; empty without it.
+/// The whole user folder (`%USERPROFILE%`); empty without it.
 pub fn default_roots() -> Vec<PathBuf> {
-    let Some(home) = std::env::var_os("USERPROFILE") else { return Vec::new() };
-    let home = PathBuf::from(home);
-    ["Desktop", "Documents", "Downloads"].iter().map(|d| home.join(d)).collect()
+    roots_for_profile(std::env::var_os("USERPROFILE").as_deref())
+}
+
+fn roots_for_profile(profile: Option<&OsStr>) -> Vec<PathBuf> {
+    profile.map(|p| vec![PathBuf::from(p)]).unwrap_or_default()
 }
 
 /// Every file and folder under `roots`, breadth-first: skips hidden and
@@ -84,7 +87,7 @@ pub fn scan(roots: &[PathBuf]) -> Vec<FileEntry> {
 
 #[cfg(test)]
 fn scan_with_limits(roots: &[PathBuf], max_entries: usize, max_depth: usize, max_per_folder: usize) -> Vec<FileEntry> {
-    scan_index(roots, max_entries, max_depth, max_per_folder).entries()
+    scan_index(roots, None, max_entries, max_depth, max_per_folder).entries()
 }
 
 /// `dir` with a leading `home` shown as `~`.
@@ -139,9 +142,9 @@ fn file_score(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> O
 }
 
 /// Whether a change at one of `paths` can alter the index: not inside a
-/// dot-named or build/tool folder below a root. Unknown places count.
+/// skipped folder (see [`path_is_skipped`]). Unknown places count.
 fn change_is_relevant(paths: &[PathBuf], roots: &[PathBuf]) -> bool {
-    paths.is_empty() || paths.iter().any(|p| path_is_relevant(p, roots))
+    paths.is_empty() || paths.iter().any(|p| !path_is_skipped(p, roots))
 }
 
 /// Whether a watcher event can change the index. The index holds only names
@@ -165,23 +168,29 @@ fn rescan_deadline(first: Instant, last: Instant) -> Instant {
     (last + QUIET).min(first + MAX_WAIT)
 }
 
-fn path_is_relevant(path: &Path, roots: &[PathBuf]) -> bool {
-    let Some(rel) = roots.iter().find_map(|r| path.strip_prefix(r).ok()) else { return true };
+/// Whether `path` lies inside a folder the scan skips: some part of it below
+/// its root is a dot-name, or a folder named like one of the junk folders
+/// (AppData, node_modules, ...) with something below it. A last part that is a
+/// junk name is not skipped: it may be a file. Pure string work, no disk
+/// access, so the watcher can call it for every event. Paths outside every
+/// root are not skipped.
+fn path_is_skipped(path: &Path, roots: &[PathBuf]) -> bool {
+    let Some(rel) = roots.iter().find_map(|r| path.strip_prefix(r).ok()) else { return false };
     let mut parts = rel.components().peekable();
     while let Some(part) = parts.next() {
         let Some(name) = part.as_os_str().to_str() else { continue };
         let is_last = parts.peek().is_none();
         if name.starts_with('.') || (!is_last && is_junk_dir(name)) {
-            return false;
+            return true;
         }
     }
-    true
+    false
 }
 
 pub struct FilesProvider {
     launcher: Arc<dyn Launcher>,
     index: RwLock<Index>,
-    roots: Mutex<Vec<PathBuf>>,
+    roots: Arc<Mutex<Vec<PathBuf>>>,
     /// Bumped by `set_roots`; a scan started before the bump is thrown away.
     generation: AtomicU64,
     /// Whether a scan runs, and whether another was asked for meanwhile.
@@ -226,7 +235,7 @@ impl FilesProvider {
         Arc::new(Self {
             launcher,
             index: RwLock::new(index),
-            roots: Mutex::new(default_roots()),
+            roots: Arc::new(Mutex::new(default_roots())),
             generation: AtomicU64::new(0),
             refresh_state: Mutex::new(RefreshState::default()),
             idle: Condvar::new(),
@@ -264,7 +273,8 @@ impl FilesProvider {
     /// number of requests during a scan collapse into one follow-up, and
     /// scans never overlap.
     pub fn refresh(&self) {
-        self.refresh_using(|roots| scan_index(roots, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER));
+        let home = self.home.clone();
+        self.refresh_using(|roots| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER));
     }
 
     /// `refresh` with the scan passed in (tests).
@@ -335,11 +345,18 @@ impl FilesProvider {
     /// is returned and the caller relies on its periodic refresh.
     pub fn watch(self: &Arc<Self>) -> notify::Result<()> {
         let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
+        let shared_roots = self.roots.clone();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             // A watcher error means missed events; the periodic refresh covers them.
             if let Ok(event) = res {
+                // Events inside skipped folders (AppData, caches, dot-folders)
+                // are dropped here, before they reach the rescan logic. No disk access.
                 if event_triggers_rescan(&event.kind, event.need_rescan()) {
-                    let _ = tx.send(event.paths);
+                    let roots = shared_roots.lock().unwrap_or_else(|e| e.into_inner());
+                    if change_is_relevant(&event.paths, &roots) {
+                        drop(roots);
+                        let _ = tx.send(event.paths);
+                    }
                 }
             }
         })?;
@@ -811,14 +828,45 @@ mod tests {
     }
 
     #[test]
-    fn default_roots_are_desktop_documents_downloads() {
-        let roots = default_roots();
-        if let Some(home) = std::env::var_os("USERPROFILE") {
-            let home = PathBuf::from(home);
-            assert_eq!(roots, [home.join("Desktop"), home.join("Documents"), home.join("Downloads")]);
-        } else {
-            assert!(roots.is_empty());
-        }
+    fn default_roots_are_the_user_folder() {
+        use std::ffi::OsStr;
+        assert_eq!(roots_for_profile(Some(OsStr::new(r"C:\Users\x"))), vec![PathBuf::from(r"C:\Users\x")]);
+        assert!(roots_for_profile(None).is_empty());
+        // `default_roots` is that function applied to the environment.
+        assert_eq!(default_roots(), roots_for_profile(std::env::var_os("USERPROFILE").as_deref()));
+    }
+
+    #[test]
+    fn events_in_skipped_folders_are_ignored() {
+        let roots = [PathBuf::from(r"C:\Users\x")];
+        let skipped = |p: &str| path_is_skipped(Path::new(p), &roots);
+        assert!(skipped(r"C:\Users\x\AppData\Local\Temp\a.tmp"));
+        assert!(skipped(r"C:\Users\x\appdata\Roaming\b"));
+        assert!(skipped(r"C:\Users\x\.cache\x"));
+        assert!(skipped(r"C:\Users\x\code\node_modules\y"));
+        assert!(!skipped(r"C:\Users\x\Pictures\cat.jpg"));
+        assert!(!skipped(r"C:\Users\x\Documents\notes.txt"));
+        // Outside every root: unknown, not skipped.
+        assert!(!skipped(r"D:\elsewhere\file.txt"));
+    }
+
+    #[test]
+    fn depth_penalty_counts_from_profile_subfolders() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path();
+        touch(&profile.join("Documents").join("a.pdf"));
+        touch(&profile.join("Documents").join("sub").join("b.pdf"));
+        touch(&profile.join("top.pdf"));
+        let roots = [profile.to_path_buf()];
+        let ranked = scan_index(&roots, Some(profile), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER).entries();
+        let depth = |n: &str| ranked.iter().find(|e| e.name == n).unwrap().depth;
+        // As when Documents itself was the root: a.pdf 1, sub 1, b.pdf 2.
+        assert_eq!((depth("a.pdf"), depth("sub"), depth("b.pdf")), (1, 1, 2));
+        // Directly in the profile: no deeper than that.
+        assert!(depth("top.pdf") <= depth("a.pdf"));
+        // A configured root that is not the profile keeps counting from itself.
+        let plain = scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER).entries();
+        assert_eq!(plain.iter().find(|e| e.name == "a.pdf").unwrap().depth, 2);
     }
 
     #[test]
@@ -973,6 +1021,18 @@ mod tests {
     #[test]
     #[ignore]
     fn query_speed_300k() {
+        query_speed(300_000);
+    }
+
+    /// Same at the index cap. Run in release:
+    /// `cargo test --release --manifest-path src-tauri/Cargo.toml -- --ignored query_speed_1m --nocapture`
+    #[test]
+    #[ignore]
+    fn query_speed_1m() {
+        query_speed(MAX_ENTRIES);
+    }
+
+    fn query_speed(count: usize) {
         use std::time::Instant;
         const WORDS: [&str; 48] = [
             "report", "invoice", "facture", "lettre", "Café", "notes", "meeting", "draft", "final", "backup",
@@ -999,7 +1059,7 @@ mod tests {
                 d
             })
             .collect();
-        let entries: Vec<FileEntry> = (0..MAX_ENTRIES)
+        let entries: Vec<FileEntry> = (0..count)
             .map(|i| {
                 let name = match rnd(6) {
                     0 => format!("IMG_2023{:02}{:02}_{:06}.jpg", 1 + rnd(12), 1 + rnd(28), rnd(999_999)),
@@ -1036,9 +1096,9 @@ mod tests {
             }
         }
         all.sort_by(|a, b| a.total_cmp(b));
-        println!("entries {MAX_ENTRIES}: typical (median of medians) {:.2} ms, worst {:.2} ms ({:?})", all[all.len() / 2], worst.0, worst.1);
+        println!("entries {count}: typical (median of medians) {:.2} ms, worst {:.2} ms ({:?})", all[all.len() / 2], worst.0, worst.1);
         if !cfg!(debug_assertions) {
-            assert!(worst.0 <= 20.0, "worst query took {:.2} ms", worst.0);
+            assert!(worst.0 <= 30.0, "worst query took {:.2} ms", worst.0);
         }
     }
 

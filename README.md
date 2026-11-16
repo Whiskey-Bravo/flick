@@ -5,7 +5,7 @@ Flick is a small keyboard launcher for Windows 11, built for personal use with T
 ## What it does today
 
 - Finds and opens installed apps (Start-menu shortcuts and Store apps).
-- Finds files and folders by name in your Desktop, Documents and Downloads (or the folders you choose).
+- Finds files and folders by name in your whole user folder (or the folders you choose).
 - Runs your own shortcuts from the config: commands, commands that take what you type, links, and lists to pick from.
 - Runs commands in WSL: type `>` and the command.
 - Opens Windows Settings pages (for example "Bluetooth & devices" or "Installed apps").
@@ -60,9 +60,9 @@ Type `help` (in any case) to see one line for each kind of result, with an examp
 Type part of a file or folder name. Search is by name only, not by content. Two characters find only an exact name (`db`); the start of a name or word needs three, any other part of the name four.
 
 - Enter opens the file or folder; Ctrl+Enter shows it selected in Explorer.
-- The searched folders are your Desktop, Documents and Downloads, or the ones listed in `file_roots` in the config.
+- The searched folder is your whole user folder, or the ones listed in `file_roots` in the config.
 - Hidden and system files, names starting with `.`, and build, package or tool folders (`node_modules`, `target`, `dist`, `build`, `__pycache__`, `venv`, `AppData`, `vendor`, `site-packages`, `Pods`, `bower_components`, `obj`) are skipped.
-- At most 300 000 entries are indexed (shared equally between the folders), down to eight folder levels.
+- At most 1 000 000 entries are indexed (shared equally between the folders), down to nine folder levels.
 - The list is built in the background when Flick starts, kept up to date as files are added, removed or renamed, and rebuilt every 30 minutes. A file that was moved since says "file not found".
 
 ## WSL commands
@@ -185,7 +185,7 @@ open = "https://docs.rs"
 
 - `hotkey`: the global shortcut that shows the bar.
 - `wsl_distro`: the WSL distro for `>` commands and `wsl` shortcuts. Leave it out to use WSL's default distro; without WSL, `>` commands are not offered.
-- `file_roots`: the folders searched for files. Leave it out for Desktop, Documents and Downloads.
+- `file_roots`: the folders searched for files. Leave it out to search your whole user folder.
 - `[[shortcut]]`: see Shortcuts.
 
 Changes are picked up as soon as you save the file; changed `file_roots` are searched again in the background. If the file has an error, Flick keeps the last good settings and shows the error in the bar. If the hotkey is not a valid shortcut or is in use by another program, the bar and the tray tooltip say so.

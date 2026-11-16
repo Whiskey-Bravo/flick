@@ -1,7 +1,7 @@
 //! The files index: a compact, query-friendly layout, and the folder walk that fills it.
 //!
 //! Names live in two string arenas (as shown, and normalised) and each entry
-//! points at its parent folder by number, so 300 000 entries cost a few
+//! points at its parent folder by number, so a million entries cost a few
 //! allocations instead of three per entry, and a query scans contiguous memory.
 
 use std::collections::VecDeque;
@@ -36,6 +36,13 @@ const JUNK_DIRS: [&str; 14] = [
 
 pub(super) fn skip_by_attributes(attrs: u32) -> bool {
     attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+}
+
+/// Whether two paths name the same folder (no disk access): equal without
+/// case, ignoring a trailing separator.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    norm(a) == norm(b)
 }
 
 pub(super) fn is_junk_dir(name: &str) -> bool {
@@ -182,7 +189,12 @@ impl Index {
 /// sub-folders already read from it are still walked). Skips hidden and system
 /// entries, dot-names and [`JUNK_DIRS`]; never descends into symlinks or
 /// junctions. Missing or unreadable folders are skipped.
-pub(super) fn scan_index(roots: &[PathBuf], max_entries: usize, max_depth: usize, max_per_folder: usize) -> Index {
+///
+/// `profile` is the user folder: when it is one of the roots, the ranking
+/// depth of its entries counts from its sub-folders (as if Desktop, Documents
+/// and the like were roots themselves), so their results rank as before. The
+/// walk limits still count from the root.
+pub(super) fn scan_index(roots: &[PathBuf], profile: Option<&Path>, max_entries: usize, max_depth: usize, max_per_folder: usize) -> Index {
     let mut ix = Index::default();
     if roots.is_empty() {
         return ix;
@@ -192,6 +204,7 @@ pub(super) fn scan_index(roots: &[PathBuf], max_entries: usize, max_depth: usize
         let root_start = ix.len();
         let mut queue: VecDeque<(u32, usize)> = VecDeque::new();
         let id = ix.add_dir(root.clone(), 0);
+        let rank_shift = usize::from(profile.is_some_and(|p| same_folder(p, root)));
         queue.push_back((id, 1));
         'walk: while let Some((dir, depth)) = queue.pop_front() {
             let Ok(read) = std::fs::read_dir(&ix.dirs[dir as usize]) else { continue };
@@ -226,7 +239,7 @@ pub(super) fn scan_index(roots: &[PathBuf], max_entries: usize, max_depth: usize
                 from_this_folder += 1;
                 if walk && depth < max_depth {
                     let path = ix.dirs[dir as usize].join(name);
-                    let id = ix.add_dir(path, u8::try_from(depth).unwrap_or(u8::MAX));
+                    let id = ix.add_dir(path, u8::try_from(depth - rank_shift).unwrap_or(u8::MAX));
                     queue.push_back((id, depth + 1));
                 }
             }

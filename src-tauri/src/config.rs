@@ -17,7 +17,7 @@ const DEFAULT_FILE: &str = "\
 ## wsl_distro: the WSL distro for > commands and wsl shortcuts. Leave unset to use WSL's default distro.
 # wsl_distro = \"Ubuntu\"
 ##
-## file_roots: folders searched for files. Leave unset for Desktop, Documents and Downloads.
+## file_roots: folders searched for files. Leave unset to search your whole user folder.
 # file_roots = [\"C:/Users/you/Desktop\", \"C:/Users/you/Documents\", \"C:/Users/you/Downloads\"]
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
