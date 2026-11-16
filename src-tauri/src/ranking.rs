@@ -1,6 +1,12 @@
 //! Ranking: silent pick counts persisted to `picks.json`. Counts feed `boost` only.
 
-use std::{collections::HashMap, path::PathBuf, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
+
+use serde::Serialize;
 
 const MAX_COUNTED_PICKS: u32 = 20;
 const BOOST_PER_PICK: u32 = 15;
@@ -33,7 +39,7 @@ impl Ranking {
             *count = count.saturating_add(1);
             picks.clone()
         };
-        let _ = self.save(&snapshot);
+        let _ = save_json(&self.path, &snapshot);
     }
 
     /// `min(picks, 20) * 15`.
@@ -42,20 +48,21 @@ impl Ranking {
         picks.get(&key(provider, id)).copied().unwrap_or(0).min(MAX_COUNTED_PICKS) * BOOST_PER_PICK
     }
 
-    /// Write a temp file next to the target, then rename over it.
-    fn save(&self, picks: &HashMap<String, u32>) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string(picks).map_err(std::io::Error::other)?;
-        let mut tmp = self.path.clone().into_os_string();
-        tmp.push(".tmp");
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &self.path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
+}
+
+/// Serialise `value` and write it to a temp file next to `path`, then rename over it.
+pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let json = serde_json::to_string(value).map_err(std::io::Error::other)?;
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 fn key(provider: &str, id: &str) -> String {
