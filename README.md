@@ -1,6 +1,6 @@
 # Flick
 
-A small keyboard launcher for Windows 11. Press Alt+Space, type a few letters, press Enter.
+A small keyboard launcher for Windows 11. Press Alt+Space (or your own hotkey), type a few letters, press Enter.
 
 <!-- screenshot: added with result icons -->
 
@@ -24,7 +24,7 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | Part of a file or folder name | Opens it (searches your whole user folder by default) | `invoice` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
-| The name of one of your shortcuts | Runs it | `search rust traits` |
+| The name of one of your shortcuts | Runs it | `search rust traits` (after adding the `search` shortcut shown below) |
 | `>` and a command | Runs the command in WSL | `> htop -d 10` |
 | `help`, or press F1 | Lists everything Flick can do | `help file` |
 | `flick config` | Opens the config file | `flick config` |
@@ -46,7 +46,7 @@ If you press Enter while results for what you just typed are still on their way,
 
 The hotkey does nothing while an exclusive full-screen app (such as a game) is in front.
 
-Run as administrator works for apps only, both shortcuts and Store apps. A Store app that cannot be elevated says "this app cannot be run as administrator" instead of opening normally. Cancelling the UAC prompt just closes the bar.
+Ctrl+Shift+Enter works for apps only, both Start-menu shortcuts and Store apps. Your own shortcuts with `admin = true` always run as administrator. A Store app that cannot be elevated says "this app cannot be run as administrator" instead of opening normally. Cancelling the UAC prompt just closes the bar.
 
 ## Help
 
