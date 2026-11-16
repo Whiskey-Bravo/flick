@@ -49,6 +49,7 @@ impl Engine {
     /// (or the built-in `help` route) goes to that provider alone, with the
     /// prefix removed; providers that own a route never see plain text.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
+        let untrimmed_empty = text.is_empty();
         let text = text.trim();
         if let Some(scope) = scope {
             let q = Query { text: text.to_string(), scope: Some(scope.to_string()) };
@@ -56,6 +57,11 @@ impl Engine {
             return self.rank(owners, &q, ROUTED_MAX_RESULTS, false);
         }
         if text.is_empty() {
+            // Only the unscoped, truly empty bar (not whitespace) asks the providers
+            // for their rows, in registration order.
+            if untrimmed_empty {
+                return self.providers.iter().flat_map(|p| p.empty_query()).collect();
+            }
             return vec![];
         }
         if let Some(rest) = strip_route(text, &HELP_ROUTE) {
@@ -266,6 +272,40 @@ mod tests {
     fn empty_and_whitespace_return_nothing() {
         let (e, _, _dir) = engine(vec![FakeProvider::new("a", vec![("1", "x", 500)])]);
         assert!(e.query("", None).is_empty());
+        assert!(e.query("   ", None).is_empty());
+    }
+
+    #[test]
+    fn empty_text_asks_empty_query_providers() {
+        struct Empty;
+        impl Provider for Empty {
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+            fn query(&self, _q: &Query) -> Vec<ResultItem> {
+                vec![]
+            }
+            fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+                Ok(Outcome::Hide)
+            }
+            fn empty_query(&self) -> Vec<ResultItem> {
+                vec![ResultItem {
+                    id: "w".into(),
+                    provider: "empty",
+                    title: "hello".into(),
+                    subtitle: String::new(),
+                    score: 0,
+                    confirm: false,
+                }]
+            }
+        }
+        let (e, _, _dir) = engine_boxed(vec![
+            Box::new(FakeProvider::new("a", vec![("1", "x", 500)])),
+            Box::new(Empty),
+        ]);
+        let rows = e.query("", None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "hello");
         assert!(e.query("   ", None).is_empty());
     }
 

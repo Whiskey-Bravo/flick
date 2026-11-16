@@ -90,6 +90,11 @@ pub trait Provider: Send + Sync {
     fn plain_share(&self) -> usize {
         usize::MAX
     }
+    /// Rows shown when the bar is opened with no text (welcome, later
+    /// favourites and history). Default: none.
+    fn empty_query(&self) -> Vec<ResultItem> {
+        vec![]
+    }
 }
 
 /// Lets a provider that is also used elsewhere (e.g. apps, refreshed by a
@@ -118,5 +123,8 @@ impl<P: Provider + ?Sized> Provider for Arc<P> {
     }
     fn plain_share(&self) -> usize {
         (**self).plain_share()
+    }
+    fn empty_query(&self) -> Vec<ResultItem> {
+        (**self).empty_query()
     }
 }

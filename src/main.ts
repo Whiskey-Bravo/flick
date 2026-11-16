@@ -147,13 +147,19 @@ document.addEventListener("mousedown", (e) => {
 
 const listenFailed = (err: unknown) => dispatch({ type: "failed", message: `Event listener failed: ${err}` });
 
-listen("bar:shown", () => {
+const shownListener = listen("bar:shown", () => {
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
   dispatch({ type: "shown" });
   input.focus();
-}).catch(listenFailed);
+});
+shownListener.catch(listenFailed);
 listen<string | null>("config:error", (e) => dispatch({ type: "configError", message: e.payload })).catch(listenFailed);
 
 render();
 input.focus();
+
+// The first show (first start) can fire before the listener above is in place,
+// so its `bar:shown` is lost. Ask for the empty-bar rows once the listener is
+// registered. A typed query bumps `querySeq` and so wins over a late answer.
+void shownListener.then(() => run({ type: "query", text: "", scope: null }), () => {});

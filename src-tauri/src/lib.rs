@@ -30,6 +30,7 @@ use providers::flick::{FlickProvider, Opener};
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
 use providers::settings::SettingsProvider;
 use providers::shortcuts::ShortcutsProvider;
+use providers::welcome::WelcomeProvider;
 use providers::wsl::WslProvider;
 use ranking::Ranking;
 
@@ -45,6 +46,7 @@ struct Providers {
     files: Arc<FilesProvider>,
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
+    welcome: Arc<WelcomeProvider>,
 }
 
 impl Providers {
@@ -55,6 +57,7 @@ impl Providers {
             files: FilesProvider::new(launcher.clone()),
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
+            welcome: WelcomeProvider::new(Box::new(window::shows)),
         }
     }
 }
@@ -96,6 +99,8 @@ fn build_engine(p: &Providers, power: Box<dyn PowerRunner>, open_config: Opener,
         Box::new(SettingsProvider),
         Box::new(PowerProvider::new(power)),
         Box::new(FlickProvider::new(open_config)),
+        // Last: it has no help line, so the help list is unchanged.
+        Box::new(p.welcome.clone()),
     ];
     Engine::new(providers, ranking)
 }
@@ -203,6 +208,12 @@ fn setup(app: &AppHandle) {
     window::install_handlers(app);
 
     let hotkey_error = apply_hotkey(app, &loaded.config.hotkey);
+    if first_run {
+        // Armed before the show: the empty query that `bar:shown` triggers must find it ready.
+        let state = app.state::<AppState>();
+        state.providers.welcome.arm(hotkey_error.is_none().then_some(loaded.config.hotkey.as_str()));
+        window::show(app);
+    }
 
     // Before the tray, so its check mark reads the new state. Debug builds would
     // register the debug exe for start-at-login, so they skip this.
@@ -392,6 +403,7 @@ mod tests {
             files: FilesProvider::with_entries(launcher.clone(), files),
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
+            welcome: WelcomeProvider::new(Box::new(|| 0)),
         };
         let power = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));

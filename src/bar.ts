@@ -79,7 +79,12 @@ const done = (state: State, effects: Effect[] = []): Result => ({ state, effects
 export function reduce(s: State, e: Event): Result {
   switch (e.type) {
     case "shown":
-      return done({ ...initial, configError: s.configError, error: s.configError });
+      // The empty text is queried so providers can offer rows for an empty bar
+      // (the first-start welcome). `awaiting` stays false: an Enter on the empty
+      // bar is not queued, and typing right away supersedes this query.
+      return done({ ...initial, configError: s.configError, error: s.configError }, [
+        { type: "query", text: "", scope: null },
+      ]);
     case "blurred":
       return done({ ...s, armed: null, queued: null });
     case "configError":
