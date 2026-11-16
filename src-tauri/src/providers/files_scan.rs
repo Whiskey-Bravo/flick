@@ -39,9 +39,9 @@ pub(super) fn skip_by_attributes(attrs: u32) -> bool {
 }
 
 /// Whether two paths name the same folder (no disk access): equal without
-/// case, ignoring a trailing separator.
+/// case, `/` and `\` alike, ignoring a trailing separator.
 fn same_folder(a: &Path, b: &Path) -> bool {
-    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+    let norm = |p: &Path| p.to_string_lossy().replace('/', r"\").trim_end_matches('\\').to_ascii_lowercase();
     norm(a) == norm(b)
 }
 
@@ -246,4 +246,17 @@ pub(super) fn scan_index(roots: &[PathBuf], profile: Option<&Path>, max_entries:
         }
     }
     ix
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_folder;
+    use std::path::Path;
+
+    #[test]
+    fn same_folder_ignores_separator_case_and_trailing_slash() {
+        assert!(same_folder(Path::new("C:/Users/x"), Path::new(r"C:\Users\x")));
+        assert!(same_folder(Path::new(r"c:\users\X\"), Path::new("C:/Users/x")));
+        assert!(!same_folder(Path::new(r"C:\Users\x"), Path::new(r"C:\Users\y")));
+    }
 }

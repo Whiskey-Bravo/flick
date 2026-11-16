@@ -3,8 +3,8 @@
 //! fresh by a folder watcher and the periodic refresh) and swapped in whole.
 
 use std::cmp::Reverse;
-use std::ffi::OsStr;
 use std::collections::BinaryHeap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -36,6 +36,10 @@ pub const MAX_PER_FOLDER: usize = 20_000;
 const QUIET: Duration = Duration::from_secs(2);
 /// ...but no later than this long after the first change of a burst.
 const MAX_WAIT: Duration = Duration::from_secs(10);
+/// Watcher-triggered rescans start at least this long apart...
+const MIN_RESCAN_GAP: Duration = Duration::from_secs(30);
+/// ...and at least this many times the duration of the last full scan.
+const RESCAN_GAP_FACTOR: u32 = 3;
 const NOT_FOUND: &str = "file not found";
 
 /// One indexed file or folder in list form, for tests (the provider keeps the
@@ -164,6 +168,16 @@ fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
 /// When a burst of changes that began at `first` and last saw a change at
 /// `last` should be rescanned: `QUIET` after the last change, capped at
 /// `MAX_WAIT` after the first.
+/// When a watcher-triggered rescan wanted at `ready` may start, given when the
+/// last full scan started and how long it took (`None`: none yet): not before
+/// `max(30 s, 3 x duration)` after that scan started.
+fn next_rescan_at(last: Option<(Instant, Duration)>, ready: Instant) -> Instant {
+    match last {
+        Some((start, took)) => ready.max(start + MIN_RESCAN_GAP.max(took * RESCAN_GAP_FACTOR)),
+        None => ready,
+    }
+}
+
 fn rescan_deadline(first: Instant, last: Instant) -> Instant {
     (last + QUIET).min(first + MAX_WAIT)
 }
@@ -195,6 +209,8 @@ pub struct FilesProvider {
     generation: AtomicU64,
     /// Whether a scan runs, and whether another was asked for meanwhile.
     refresh_state: Mutex<RefreshState>,
+    /// Start and duration of the last full scan.
+    last_scan: Mutex<Option<(Instant, Duration)>>,
     /// Signalled when a refresh run (with its follow-ups) ends.
     idle: Condvar,
     /// `%USERPROFILE%`, shown as `~` in subtitles.
@@ -238,6 +254,7 @@ impl FilesProvider {
             roots: Arc::new(Mutex::new(default_roots())),
             generation: AtomicU64::new(0),
             refresh_state: Mutex::new(RefreshState::default()),
+            last_scan: Mutex::new(None),
             idle: Condvar::new(),
             home: std::env::var_os("USERPROFILE").map(PathBuf::from),
             watcher: Mutex::new(None),
@@ -328,7 +345,9 @@ impl FilesProvider {
     fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf]) -> Index) {
         loop {
             let generation = self.generation.load(Ordering::SeqCst);
+            let started = Instant::now();
             let fresh = scan(&self.roots());
+            *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, started.elapsed()));
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
@@ -388,6 +407,22 @@ impl FilesProvider {
                         }
                         Ok(_) => {}
                         Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                let Some(p) = weak.upgrade() else { return };
+                let last = *p.last_scan.lock().unwrap_or_else(|e| e.into_inner());
+                drop(p);
+                // Too soon after the last scan: wait, swallowing further events
+                // (they collapse into the one rescan at the end of the wait).
+                let start = next_rescan_at(last, Instant::now());
+                loop {
+                    let left = start.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(left) {
+                        Ok(_) | Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
@@ -829,7 +864,6 @@ mod tests {
 
     #[test]
     fn default_roots_are_the_user_folder() {
-        use std::ffi::OsStr;
         assert_eq!(roots_for_profile(Some(OsStr::new(r"C:\Users\x"))), vec![PathBuf::from(r"C:\Users\x")]);
         assert!(roots_for_profile(None).is_empty());
         // `default_roots` is that function applied to the environment.
@@ -973,6 +1007,20 @@ mod tests {
     }
 
     #[test]
+    fn watcher_rescans_keep_a_gap_from_the_last_scan() {
+        use std::time::{Duration, Instant};
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        // No scan yet, or the gap has passed: as soon as wanted.
+        assert_eq!(next_rescan_at(None, t0), t0);
+        assert_eq!(next_rescan_at(Some((t0, s(2))), t0 + s(40)), t0 + s(40));
+        // Quick scan: 30 s after it started.
+        assert_eq!(next_rescan_at(Some((t0, s(2))), t0 + s(5)), t0 + s(30));
+        // Slow scan: three times its duration.
+        assert_eq!(next_rescan_at(Some((t0, s(20))), t0 + s(25)), t0 + s(60));
+    }
+
+    #[test]
     fn refresh_requests_during_a_scan_collapse_into_one_follow_up() {
         use std::sync::atomic::AtomicUsize;
         let (p, _) = provider(vec![]);
@@ -1021,7 +1069,7 @@ mod tests {
     #[test]
     #[ignore]
     fn query_speed_300k() {
-        query_speed(300_000);
+        query_speed(300_000, 20.0);
     }
 
     /// Same at the index cap. Run in release:
@@ -1029,10 +1077,10 @@ mod tests {
     #[test]
     #[ignore]
     fn query_speed_1m() {
-        query_speed(MAX_ENTRIES);
+        query_speed(MAX_ENTRIES, 30.0);
     }
 
-    fn query_speed(count: usize) {
+    fn query_speed(count: usize, limit_ms: f64) {
         use std::time::Instant;
         const WORDS: [&str; 48] = [
             "report", "invoice", "facture", "lettre", "Café", "notes", "meeting", "draft", "final", "backup",
@@ -1098,7 +1146,7 @@ mod tests {
         all.sort_by(|a, b| a.total_cmp(b));
         println!("entries {count}: typical (median of medians) {:.2} ms, worst {:.2} ms ({:?})", all[all.len() / 2], worst.0, worst.1);
         if !cfg!(debug_assertions) {
-            assert!(worst.0 <= 30.0, "worst query took {:.2} ms", worst.0);
+            assert!(worst.0 <= limit_ms, "worst query took {:.2} ms", worst.0);
         }
     }
 
