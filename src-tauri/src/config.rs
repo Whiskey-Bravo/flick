@@ -14,8 +14,8 @@ const DEFAULT_FILE: &str = "\
 ## hotkey: global shortcut that shows the launcher, e.g. \"Alt+Space\".
 # hotkey = \"Alt+Space\"
 ##
-## wsl_distro: the WSL distro that shortcuts with `wsl = ...` run in.
-# wsl_distro = \"Debian\"
+## wsl_distro: the WSL distro for > commands and wsl shortcuts. Leave unset to use WSL's default distro.
+# wsl_distro = \"Ubuntu\"
 ##
 ## file_roots: folders searched for files. Leave unset for Desktop, Documents and Downloads.
 # file_roots = [\"C:/Users/you/Desktop\", \"C:/Users/you/Documents\", \"C:/Users/you/Downloads\"]
@@ -57,7 +57,7 @@ const DEFAULT_FILE: &str = "\
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hotkey: String,
-    /// WSL distro for `wsl` shortcuts and `>` commands.
+    /// WSL distro for `wsl` shortcuts and `>` commands; empty means WSL's default distro.
     pub wsl_distro: String,
     /// Folders to index for file search; empty means the defaults.
     pub file_roots: Vec<PathBuf>,
@@ -70,7 +70,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hotkey: "Alt+Space".to_string(),
-            wsl_distro: "Debian".to_string(),
+            wsl_distro: String::new(),
             file_roots: Vec::new(),
             shortcuts: Vec::new(),
         }
@@ -292,7 +292,7 @@ mod tests {
     fn defaults() {
         let c = Config::default();
         assert_eq!(c.hotkey, "Alt+Space");
-        assert_eq!(c.wsl_distro, "Debian");
+        assert_eq!(c.wsl_distro, "");
         assert!(c.file_roots.is_empty());
         assert!(c.shortcuts.is_empty());
     }
@@ -393,7 +393,7 @@ name = \"{name}\"
     fn parses_full_example() {
         let c = parse(&uncommented_default_file()).unwrap();
         assert_eq!(c.hotkey, "Alt+Space");
-        assert_eq!(c.wsl_distro, "Debian");
+        assert_eq!(c.wsl_distro, "Ubuntu");
         assert_eq!(c.file_roots.len(), 3);
         assert_eq!(c.shortcuts.len(), 4);
         let base = ShortcutDef {

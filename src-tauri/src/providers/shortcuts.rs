@@ -131,6 +131,9 @@ pub fn prepare(def: &ShortcutDef, sub: &Substitution, distro: &str) -> Result<Pr
     }
 
     if let Some(script) = &def.wsl {
+        if distro.is_empty() {
+            return Err(NO_WSL.into());
+        }
         if !valid_distro(distro) {
             return Err("invalid wsl distro name".into());
         }
@@ -318,6 +321,9 @@ fn find<'a>(defs: &'a [ShortcutDef], name: &str, want: Kind) -> Option<&'a Short
 }
 
 /// `about`, or the command when there is none.
+/// Shown for a `wsl` shortcut when there is no WSL to run it in.
+const NO_WSL: &str = "WSL is not installed";
+
 fn describe(def: &ShortcutDef) -> String {
     if def.about.is_empty() {
         template(def).to_string()
@@ -393,11 +399,16 @@ impl Provider for ShortcutsProvider {
             let words = || std::iter::once(&def.name).chain(&def.aliases);
             let n = &def.name;
             let k = kind(def);
+            // The user's own shortcut stays listed and says why it cannot run.
+            let no_wsl = def.wsl.is_some() && st.distro.is_empty();
+            let about = || if no_wsl { NO_WSL.to_string() } else { describe(def) };
 
             if let Some(score) = words().filter_map(|w| fuzzy::score(text, w)).max() {
                 let (id, subtitle) = match k {
-                    Kind::Plain => (format!("run:{n}"), describe(def)),
+                    Kind::Plain => (format!("run:{n}"), about()),
+                    Kind::Arg if no_wsl => (format!("need:{n}"), about()),
                     Kind::Arg => (format!("need:{n}"), format!("type: {n} <argument>")),
+                    Kind::Pick if no_wsl => (format!("step:{n}"), about()),
                     Kind::Pick => (format!("step:{n}"), "choose…".to_string()),
                 };
                 push(item(id, n.clone(), subtitle, score + BONUS));
@@ -408,14 +419,14 @@ impl Provider for ShortcutsProvider {
             }
             match k {
                 Kind::Plain => {}
-                Kind::Arg => push(item(format!("arg:{n}:{rest}"), format!("{n} {rest}"), describe(def), 1000 + BONUS)),
+                Kind::Arg => push(item(format!("arg:{n}:{rest}"), format!("{n} {rest}"), about(), 1000 + BONUS)),
                 Kind::Pick => {
                     if let Some(Ok(entries)) = st.entries.get(n) {
                         for (e, score) in matching(entries, rest) {
                             push(item(
                                 format!("pick:{n}:{}", e.name),
                                 format!("{n} › {}", e.name),
-                                describe(def),
+                                about(),
                                 score + BONUS,
                             ));
                         }
@@ -989,6 +1000,25 @@ mod tests {
                 "run_command Wsl(Debian) env=[] keep=false elevated=false cwd=-: apt update",
             ]
         );
+    }
+
+    #[test]
+    fn wsl_shortcut_without_wsl_says_so() {
+        assert_eq!(
+            prepare(&wsl("v", "x"), &Substitution::default(), ""),
+            Err("WSL is not installed".to_string())
+        );
+    }
+
+    #[test]
+    fn wsl_shortcut_is_listed_but_explains_itself_without_wsl() {
+        let (p, rec) = setup(vec![wsl("upgrade", "x"), run("calc", "calc.exe")]);
+        p.set(vec![wsl("upgrade", "x"), run("calc", "calc.exe")], "");
+        assert_eq!(p.query(&Query { text: "upgrade".into(), scope: None })[0].subtitle, "WSL is not installed");
+        assert_eq!(p.query(&Query { text: "calc".into(), scope: None })[0].subtitle, "calc.exe");
+        assert_eq!(p.help().len(), 2);
+        assert_eq!(p.activate("run:upgrade", Modifier::None), Err("WSL is not installed".to_string()));
+        assert!(rec.calls().is_empty());
     }
 
     #[test]

@@ -57,7 +57,7 @@ Type part of a file or folder name. Search is by name only, not by content. Two 
 
 ## WSL commands
 
-Type `>` followed by a command, for example `> htop -d 10`, and press Enter. The command runs in a new terminal window in your WSL distro (`Debian` unless `wsl_distro` in the config says otherwise), and the window stays open afterwards. Commands are never saved or learned.
+Type `>` followed by a command, for example `> htop -d 10`, and press Enter. The command runs in a new terminal window in your default WSL distro unless `wsl_distro` in the config says otherwise, and the window stays open afterwards. Commands are never saved or learned. Without WSL installed, `>` commands are not offered, and a `wsl` shortcut says "WSL is not installed".
 
 ## Shortcuts
 
@@ -165,7 +165,7 @@ The config file is `%APPDATA%\Flick\config.toml`. It is created with commented d
 
 ```toml
 hotkey = "Alt+Space"
-wsl_distro = "Debian"
+wsl_distro = "Ubuntu"
 file_roots = ["C:/Users/you/Desktop", "C:/Users/you/Documents", "C:/Users/you/Downloads"]
 
 [[shortcut]]
@@ -174,7 +174,7 @@ open = "https://docs.rs"
 ```
 
 - `hotkey`: the global shortcut that shows the bar.
-- `wsl_distro`: the WSL distro for `>` commands and `wsl` shortcuts.
+- `wsl_distro`: the WSL distro for `>` commands and `wsl` shortcuts. Leave it out to use WSL's default distro; without WSL, `>` commands are not offered.
 - `file_roots`: the folders searched for files. Leave it out for Desktop, Documents and Downloads.
 - `[[shortcut]]`: see Shortcuts.
 

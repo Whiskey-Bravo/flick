@@ -1,6 +1,4 @@
 //! Find the WSL distro to run commands in, from `wsl.exe -l -v`.
-// Not wired into the app yet; the next task calls `detect`.
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::time::Duration;

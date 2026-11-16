@@ -31,7 +31,8 @@ impl Provider for WslProvider {
     }
 
     fn query(&self, q: &Query) -> Vec<ResultItem> {
-        if q.text.trim().is_empty() {
+        // No distro means no WSL: offer nothing.
+        if q.text.trim().is_empty() || self.distro().is_empty() {
             return Vec::new();
         }
         vec![ResultItem {
@@ -61,6 +62,9 @@ impl Provider for WslProvider {
     }
 
     fn help(&self) -> Vec<HelpLine> {
+        if self.distro().is_empty() {
+            return Vec::new();
+        }
         vec![HelpLine {
             example: "> htop -d 10".into(),
             about: format!("run a command in WSL ({}) in a new terminal", self.distro()),
@@ -131,6 +135,14 @@ mod tests {
         assert_eq!(p.help()[0].about, "run a command in WSL (Ubuntu) in a new terminal");
         p.activate("whoami", Modifier::None).unwrap();
         assert_eq!(rec.calls(), vec!["run_command Wsl(Ubuntu) env=[] keep=true elevated=false cwd=-: whoami"]);
+    }
+
+    #[test]
+    fn no_distro_hides_wsl_results_and_help() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = WslProvider::new(rec.clone(), "");
+        assert!(p.query(&q("ls")).is_empty());
+        assert!(p.help().is_empty());
     }
 
     #[test]
