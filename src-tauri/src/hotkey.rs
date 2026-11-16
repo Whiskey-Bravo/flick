@@ -26,7 +26,7 @@ pub fn apply(app: &AppHandle, accelerator: &str) -> Result<(), String> {
         let _ = gs.unregister(old);
     }
     let attempt = parse(accelerator).and_then(|shortcut| {
-        gs.on_shortcut(shortcut, on_hotkey).map(|_| shortcut).map_err(|_| in_use(accelerator))
+        gs.on_shortcut(shortcut, on_hotkey).map(|_| shortcut).map_err(|_| in_use(accelerator, powertoys_run_running()))
     });
     match attempt {
         Ok(shortcut) => {
@@ -51,8 +51,40 @@ fn parse(accelerator: &str) -> Result<Shortcut, String> {
         .map_err(|_| format!("hotkey \"{accelerator}\" is not a valid shortcut"))
 }
 
-fn in_use(accelerator: &str) -> String {
-    format!("hotkey \"{accelerator}\" is in use by another program")
+fn in_use(accelerator: &str, powertoys_run: bool) -> String {
+    if powertoys_run {
+        format!(
+            "hotkey \"{accelerator}\" is taken, probably by PowerToys Run: turn PowerToys Run off in PowerToys, or set hotkey in Flick's config"
+        )
+    } else {
+        format!("hotkey \"{accelerator}\" is in use by another program")
+    }
+}
+
+/// True when a process named PowerToys.PowerLauncher.exe is running. Only
+/// called after a registration failure.
+fn powertoys_run_running() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    };
+
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return false;
+    };
+    let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+    let mut found = false;
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more {
+        let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+        if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case("PowerToys.PowerLauncher.exe") {
+            found = true;
+            break;
+        }
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    found
 }
 
 fn on_hotkey(app: &AppHandle, _shortcut: &Shortcut, event: ShortcutEvent) {
@@ -72,7 +104,11 @@ mod tests {
     }
 
     #[test]
-    fn taken_hotkey_reads_in_use() {
-        assert_eq!(in_use("Alt+Space"), "hotkey \"Alt+Space\" is in use by another program");
+    fn taken_hotkey_names_powertoys_when_it_runs() {
+        assert_eq!(in_use("Alt+Space", false), "hotkey \"Alt+Space\" is in use by another program");
+        assert_eq!(
+            in_use("Alt+Space", true),
+            "hotkey \"Alt+Space\" is taken, probably by PowerToys Run: turn PowerToys Run off in PowerToys, or set hotkey in Flick's config"
+        );
     }
 }

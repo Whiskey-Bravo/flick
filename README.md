@@ -219,7 +219,7 @@ Do not run a bare `cargo update`: `Cargo.lock` pins `notify-types` to a version 
 
 ## Hotkey conflict with PowerToys Run
 
-PowerToys Run also uses Alt+Space by default. Only one program can own a hotkey, so change one of the two (set `hotkey` in Flick's config, or change the shortcut in PowerToys).
+PowerToys Run also uses Alt+Space by default. Only one program can own a hotkey, so change one of the two (set `hotkey` in Flick's config, or change the shortcut in PowerToys). When Flick cannot register its hotkey and PowerToys Run is running, the bar and the tray tooltip name PowerToys Run as the likely cause.
 
 ## Not yet
 
