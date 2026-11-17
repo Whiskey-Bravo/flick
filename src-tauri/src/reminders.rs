@@ -98,9 +98,11 @@ struct State {
     loaded: bool,
     /// The file does not match `items` (a save failed); the thread retries.
     dirty: bool,
-    /// Unix seconds (rounded down) when the file was read: items due by then
-    /// were missed while Flick was not running.
-    loaded_at: i64,
+    /// Ids of the items that were already due when the file was read: missed
+    /// while Flick was not running. Decided once, at the read: an item set in
+    /// this run is never missed, even when the clock is later set back past
+    /// that read (it would otherwise ring early, as `Missed: …`).
+    overdue: Vec<u64>,
 }
 
 pub struct Reminders {
@@ -131,7 +133,7 @@ impl Reminders {
             now,
             fire,
             max_sleep,
-            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false, loaded_at: 0 }),
+            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false, overdue: vec![] }),
             wake: Condvar::new(),
             started: AtomicBool::new(false),
         })
@@ -224,7 +226,8 @@ impl Reminders {
             .filter(|f| f.version == VERSION)
             .map(|f| f.items)
             .unwrap_or_default();
-        let latest = unix_ceil((self.now)()).saturating_add((MAX_AHEAD + SLACK).as_secs() as i64);
+        let now = (self.now)();
+        let latest = unix_ceil(now).saturating_add((MAX_AHEAD + SLACK).as_secs() as i64);
         let mut items: Vec<Reminder> = read.iter().filter(|r| r.due <= latest).cloned().collect();
         let mut changed = items.len() != read.len();
         items.sort_by_key(|r| r.due);
@@ -238,11 +241,12 @@ impl Reminders {
                 changed = true;
             }
         }
+        let read_at = unix_floor(now).0;
+        st.overdue = items.iter().filter(|r| r.due <= read_at).map(|r| r.id).collect();
         st.next_id = next;
         st.items = items;
         st.loaded = true;
         st.dirty = changed;
-        st.loaded_at = unix_floor((self.now)()).0;
     }
 
     /// Saves `items` and records whether the file now matches them.
@@ -267,12 +271,6 @@ impl Reminders {
         self.load(st);
         // Whole Unix seconds: no time arithmetic that could overflow on an odd due.
         let (now, _) = unix_floor((self.now)());
-        self.take_due_by(st, now)
-    }
-
-    /// Takes the items due by `cutoff` (Unix seconds) out and saves the rest.
-    fn take_due_by(&self, st: &mut State, cutoff: i64) -> Vec<Reminder> {
-        let now = cutoff;
         let n = st.items.partition_point(|r| r.due <= now);
         if n == 0 {
             return vec![];
@@ -280,6 +278,24 @@ impl Reminders {
         let due: Vec<Reminder> = st.items.drain(..n).collect();
         self.persist(st);
         due
+    }
+
+    /// Takes the items missed while Flick was not running (those already due
+    /// when the file was read, see [`State::overdue`]) out and saves the rest.
+    /// Only once: later calls take nothing.
+    fn take_missed(&self, st: &mut State) -> Vec<Reminder> {
+        self.load(st);
+        let overdue = std::mem::take(&mut st.overdue);
+        if overdue.is_empty() {
+            return vec![];
+        }
+        let (missed, rest): (Vec<Reminder>, Vec<Reminder>) =
+            std::mem::take(&mut st.items).into_iter().partition(|r| overdue.contains(&r.id));
+        st.items = rest;
+        if !missed.is_empty() {
+            self.persist(st);
+        }
+        missed
     }
 
     /// Waits once, until the earliest item is due, an `add`/`cancel`, or
@@ -319,10 +335,9 @@ fn run(weak: Weak<Reminders>) {
     let missed = {
         let mut st = me.lock();
         // Only what was already overdue when the file was read is "missed";
-        // anything set since fires normally, even if this thread starts late.
-        me.load(&mut st);
-        let cutoff = st.loaded_at;
-        me.take_due_by(&mut st, cutoff)
+        // anything set since fires normally, even if this thread starts late
+        // or the clock went back meanwhile.
+        me.take_missed(&mut st)
     };
     for r in &missed {
         me.fire_one(&format!("Missed: {}", body(r)));
@@ -858,6 +873,28 @@ mod tests {
         g.r.start();
         assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
         assert_eq!(g.quiet_for(100), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_clock_set_back_never_makes_one_set_this_run_missed_or_early() {
+        let dir = tempfile::tempdir().unwrap();
+        write_items(&dir, serde_json::json!([
+            {"id": 1, "due": unix_ceil(t0()) - 60, "text": "call mum", "timer": false},
+        ]));
+        let g = rig_in(dir, FAST);
+        // The file is read at t0 (by an add before the thread starts) ...
+        g.r.add(g.now() + Duration::from_secs(3600), "later", false).unwrap();
+        // ... then the clock is set back an hour, and a reminder is set for
+        // five minutes from the new now: still before the moment of the read.
+        g.set_clock(t0() - Duration::from_secs(3600));
+        g.r.add(g.now() + Duration::from_secs(300), "pizza", false).unwrap();
+        g.r.start();
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Missed: call mum");
+        assert_eq!(g.quiet_for(100), Vec::<String>::new(), "pizza is not due yet and was never missed");
+        g.advance(Duration::from_secs(300));
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
+        assert_eq!(g.quiet_for(100), Vec::<String>::new());
+        assert_eq!(g.r.pending().iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["later"]);
     }
 
     #[test]

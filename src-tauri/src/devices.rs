@@ -572,6 +572,10 @@ pub mod testing {
         pub fn lists(&self) -> usize {
             lock(&self.0.state).reads.len()
         }
+        /// What `list` answers from now on (a device was paired meanwhile).
+        pub fn set(&self, devices: Vec<BtDevice>) {
+            lock(&self.0.state).list = Ok(devices);
+        }
         /// `list` calls started on `thread`.
         pub fn lists_on(&self, thread: ThreadId) -> usize {
             lock(&self.0.state).reads.iter().filter(|t| **t == thread).count()
