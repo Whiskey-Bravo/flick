@@ -3,3 +3,6 @@
 // Consumed by later tasks (calculator, units, time, currency).
 #[allow(dead_code)]
 pub mod number;
+
+#[allow(dead_code)]
+pub mod calc;
