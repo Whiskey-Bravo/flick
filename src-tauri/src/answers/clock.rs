@@ -2,7 +2,7 @@
 
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
-use jiff::{Timestamp, ToSpan};
+use jiff::Timestamp;
 
 /// A named place with its IANA zone and extra spellings (all matched case-insensitively).
 pub struct Place {
@@ -134,19 +134,23 @@ fn parse_date(words: &[&str], today: Date) -> Option<Date> {
 }
 
 /// Adds `amount` units to a date; month and year steps clamp to the end of the month.
-pub fn shift(d: Date, amount: i64, unit: Span) -> Date {
+/// None when the amount or the result is outside the supported range.
+pub fn shift(d: Date, amount: i64, unit: Span) -> Option<Date> {
+    let zero = jiff::Span::new();
     let span = match unit {
-        Span::Days => amount.days(),
-        Span::Weeks => amount.weeks(),
-        Span::Months => amount.months(),
-        Span::Years => amount.years(),
-    };
-    d.checked_add(span).unwrap_or(d)
+        Span::Days => zero.try_days(amount),
+        Span::Weeks => zero.try_weeks(amount),
+        Span::Months => zero.try_months(amount),
+        Span::Years => zero.try_years(amount),
+    }
+    .ok()?;
+    d.checked_add(span).ok()
 }
 
 /// The place's local date and time, and how many minutes it is ahead of the PC's zone.
 pub fn time_in(place: &Place, now: Timestamp) -> Option<(DateTime, i64)> {
-    time_in_from(place, now, &TimeZone::system())
+    static LOCAL: std::sync::OnceLock<TimeZone> = std::sync::OnceLock::new();
+    time_in_from(place, now, LOCAL.get_or_init(TimeZone::system))
 }
 
 /// Like [`time_in`] with an explicit "local" zone, so tests do not depend on the PC.
@@ -392,11 +396,21 @@ mod tests {
         assert!(matches!(parse_clock("3 weeks ago", today), Some(ClockAsk::Shift { amount: -3, unit: Span::Weeks })));
         assert!(matches!(parse_clock("in 1 year", today), Some(ClockAsk::Shift { amount: 1, unit: Span::Years })));
         assert!(matches!(parse_clock("2 months ago", today), Some(ClockAsk::Shift { amount: -2, unit: Span::Months })));
-        assert_eq!(shift(jiff::civil::date(2027, 1, 31), 1, Span::Months), jiff::civil::date(2027, 2, 28));
-        assert_eq!(shift(jiff::civil::date(2026, 11, 17), 45, Span::Days), jiff::civil::date(2027, 1, 1));
-        assert_eq!(shift(jiff::civil::date(2026, 11, 17), -3, Span::Weeks), jiff::civil::date(2026, 10, 27));
+        assert_eq!(shift(jiff::civil::date(2027, 1, 31), 1, Span::Months), Some(jiff::civil::date(2027, 2, 28)));
+        assert_eq!(shift(jiff::civil::date(2026, 11, 17), 45, Span::Days), Some(jiff::civil::date(2027, 1, 1)));
+        assert_eq!(shift(jiff::civil::date(2026, 11, 17), -3, Span::Weeks), Some(jiff::civil::date(2026, 10, 27)));
         assert!(matches!(parse_clock("days until 24 dec", today), Some(ClockAsk::DaysUntil(d)) if d == jiff::civil::date(2026, 12, 24)));
         assert!(matches!(parse_clock("days until 1 jan", today), Some(ClockAsk::DaysUntil(d)) if d == jiff::civil::date(2027, 1, 1)));
+    }
+
+    #[test]
+    fn huge_amounts_never_panic() {
+        let today = jiff::civil::date(2026, 11, 17);
+        for s in ["in 100000 years", "in 99999999999 days", "2000000 weeks ago", "in 9223372036854775807 months"] {
+            if let Some(ClockAsk::Shift { amount, unit }) = parse_clock(s, today) {
+                assert!(shift(today, amount, unit).is_none(), "{s}");
+            }
+        }
     }
 
     #[test]
