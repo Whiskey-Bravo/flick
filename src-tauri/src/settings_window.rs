@@ -24,6 +24,14 @@ pub fn open(app: &AppHandle) {
         .build();
     match built {
         Ok(w) => {
+            // A pause for hotkey capture must never outlive the window.
+            let handle = app.clone();
+            w.on_window_event(move |event| {
+                if matches!(event, tauri::WindowEvent::Destroyed) {
+                    let app = handle.clone();
+                    std::thread::spawn(move || crate::hotkey::set_paused(&app, false));
+                }
+            });
             let _ = w.set_focus();
         }
         Err(e) => eprintln!("could not open the Settings window: {e}"),

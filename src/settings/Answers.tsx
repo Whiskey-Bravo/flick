@@ -30,6 +30,13 @@ export function Answers({ state }: { state: SettingsState }) {
       void save("weather_city", { key: "weather_city", value: "" });
       return;
     }
+    // Saved only when the lookup finds the city, or unchecked while online is off.
+    // A miss keeps the typed text and shows the error under it.
+    if (!config.online) {
+      setCityNote(null);
+      void save("weather_city", { key: "weather_city", value: wanted });
+      return;
+    }
     try {
       const label = await settingsCheckCity(wanted);
       setCityNote({ ok: true, text: label });

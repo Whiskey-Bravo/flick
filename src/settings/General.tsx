@@ -3,6 +3,8 @@ import { settingsClearHistory, settingsPauseHotkey, settingsSetStartAtLogin, typ
 import { hotkeyFromEvent, hotkeyKeys } from "./hotkey";
 import { useSaver } from "./saver";
 
+let calls: Promise<unknown> = Promise.resolve();
+
 export function General({ state }: { state: SettingsState }) {
   const { config, distros } = state;
   const { errors, save } = useSaver(state);
@@ -18,7 +20,8 @@ export function General({ state }: { state: SettingsState }) {
   const pause = (on: boolean) => {
     if (paused.current === on) return;
     paused.current = on;
-    settingsPauseHotkey(on).catch(() => {});
+    // One chain, so a quick pause then resume reach Rust in that order.
+    calls = calls.then(() => settingsPauseHotkey(on)).catch(() => {});
   };
   const startCapture = () => {
     pause(true);
