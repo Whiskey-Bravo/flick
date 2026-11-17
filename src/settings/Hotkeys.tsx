@@ -10,16 +10,13 @@ import {
   type SettingsState,
 } from "./api";
 import { DIRECT_HINT, WEAK_COMBO, directComboOk, hotkeyFromEvent, hotkeyKeys } from "./hotkey";
+import { emptyHkForm as empty, hkSync, isHkDirty, type HkForm } from "./hotkeyForm";
 import { ItemPicker } from "./ItemPicker";
 import type { LeaveGuard } from "./Shortcuts";
 import "./shortcuts.css";
 import "./workspaces.css";
 
 type Choice = "save" | "discard" | "stay";
-type HkForm = { keys: string; item: { provider: string; id: string; title: string } | null };
-
-const empty = (): HkForm => ({ keys: "", item: null });
-const same = (a: HkForm | null, b: HkForm) => JSON.stringify(a ?? empty()) === JSON.stringify(b);
 const message = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : "Could not save.");
 
 let calls: Promise<unknown> = Promise.resolve();
@@ -45,6 +42,8 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
   const [form, setForm] = useState<HkForm>(empty());
   const [saved, setSaved] = useState<HkForm | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [changedNote, setChangedNote] = useState(false);
   const [asking, setAsking] = useState<((c: Choice) => void) | null>(null);
   const [capturing, setCapturing] = useState(false);
   const paused = useRef(false);
@@ -110,9 +109,28 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
     stopCapture();
   };
 
-  const dirty = open && !same(saved, form);
+  const dirty = open && isHkDirty(saved, form);
   const weak = form.keys !== "" && !directComboOk(form.keys);
   const valid = form.keys !== "" && !weak && form.item !== null;
+
+  // The file changed: follow it unless there is an unsaved edit.
+  const latest = useRef({ open, dirty, saved, original });
+  latest.current = { open, dirty, saved, original };
+  useEffect(() => {
+    const { open, dirty, saved, original } = latest.current;
+    const act = hkSync(open, original, dirty, saved, defs);
+    if (act.kind === "note") {
+      setChangedNote(true);
+    } else if (act.kind === "reload") {
+      setSaved(act.form);
+      setForm(act.form);
+    } else if (act.kind === "close") {
+      setOpen(false);
+      setOriginal(null);
+      setSaved(null);
+      setForm(empty());
+    }
+  }, [state]);
 
   const doSave = async (): Promise<boolean> => {
     if (!form.item) return false;
@@ -121,6 +139,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
       await settingsSaveHotkey(original, { keys: form.keys, item: form.item });
       setSaved(form);
       setOriginal(form.keys);
+      setChangedNote(false);
       return true;
     } catch (e) {
       setSaveError(message(e));
@@ -153,6 +172,8 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
     setSaved(def ? f : null);
     setForm(f);
     setSaveError(null);
+    setRemoveError(null);
+    setChangedNote(false);
   };
 
   const select = async (def: { keys: string; item: HkForm["item"] } | null) => {
@@ -161,6 +182,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
   };
 
   const remove = async (keys: string) => {
+    setRemoveError(null);
     try {
       await settingsDeleteHotkey(keys);
       if (open && original === keys) {
@@ -171,7 +193,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
       }
       setSaveError(null);
     } catch (e) {
-      setSaveError(message(e));
+      setRemoveError(message(e));
     }
   };
 
@@ -204,6 +226,11 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
           );
         })}
         {defs.length === 0 && <p class="sc-hint">No hotkeys yet.</p>}
+        {removeError !== null && (
+          <p class="sc-error" role="alert">
+            {removeError}
+          </p>
+        )}
       </div>
 
       {!open ? (
@@ -220,6 +247,8 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
               <button onClick={() => asking("stay")}>Stay</button>
             </div>
           )}
+
+          {changedNote && <p class="sc-note">The config file changed. Your unsaved edit is kept.</p>}
 
           <div class="sc-field">
             <span>Keys</span>
