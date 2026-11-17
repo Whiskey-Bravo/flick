@@ -158,6 +158,7 @@ export function reduce(s: State, e: Event): Result {
           ...s,
           scope: { name: scope, prompt },
           text: "",
+          recall: -1,
           items: [],
           selected: 0,
           top: 0,
@@ -210,7 +211,7 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       if (t.armed) return done({ ...t, armed: null });
       if (t.scope) {
         return done(
-          { ...t, scope: null, text: "", items: [], selected: 0, top: 0, awaiting: true },
+          { ...t, scope: null, text: "", recall: -1, items: [], selected: 0, top: 0, awaiting: true },
           [{ type: "query", text: "", scope: null }],
         );
       }

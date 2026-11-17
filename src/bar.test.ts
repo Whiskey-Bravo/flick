@@ -487,6 +487,17 @@ describe("bar", () => {
       expect(pinned.items[1].pinned).toBe(false);
     });
 
+    it("leaving a scope after recalling resets recall", () => {
+      const recalled = run(withPast("b", "a"), key("ArrowUp"), key("ArrowUp")).state;
+      const out = run(
+        recalled,
+        { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } },
+        key("Escape"),
+      ).state;
+      expect(out.recall).toBe(-1);
+      expect(run(out, key("ArrowUp")).state.text).toBe("b");
+    });
+
     it("activate effect carries text and scope", () => {
       const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } }).state;
       const s = run(scoped, { type: "input", text: "cats" }, { type: "results", items: [item("a")] }).state;

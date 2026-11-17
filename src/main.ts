@@ -48,6 +48,8 @@ let shows = 0;
 
 // A fixed 24x24 box, so a late image never moves the row. Server icons fade in
 // once loaded; a 404 swaps in the bundled SVG for the kind of thing.
+const loadedIcons = new Set<string>();
+
 function renderIcon(item: Item): HTMLSpanElement {
   const box = document.createElement("span");
   box.className = "icon";
@@ -55,16 +57,22 @@ function renderIcon(item: Item): HTMLSpanElement {
   img.alt = "";
   img.draggable = false;
   const name = builtinName(item.icon);
+  const url = serverUrl(item.icon, window.devicePixelRatio || 1);
   if (name !== null) {
     img.src = svgUrl(name);
     img.className = "loaded";
   } else {
-    img.onload = () => img.classList.add("loaded");
+    img.onload = () => {
+      loadedIcons.add(url);
+      img.classList.add("loaded");
+    };
     img.onerror = () => {
       img.onerror = null;
       img.src = svgUrl(fallbackName(item));
     };
-    img.src = serverUrl(item.icon, window.devicePixelRatio || 1);
+    img.src = url;
+    // Rows are rebuilt on every render: an icon seen before shows at once.
+    if (loadedIcons.has(url)) img.classList.add("loaded");
   }
   box.append(img);
   return box;
