@@ -22,9 +22,15 @@ const PX_DEFAULT: u32 = 32;
 /// Worker threads answering icon requests: one slow file does not hold up the rest.
 const WORKERS: usize = 2;
 
+/// Shell parsing names served as icons: Store apps, `shell:AppsFolder\<AUMID>`.
+const APPS_FOLDER: &str = "shell:AppsFolder\\";
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum IconKey {
     File(PathBuf),
+    /// A Store app's parsing name, `shell:AppsFolder\<AUMID>` (from the key
+    /// `file:shell:AppsFolder\<AUMID>`): no file, resolved by the Shell.
+    App(String),
     /// Lower-case, with the leading dot: `.pdf`.
     Ext(String),
     Folder,
@@ -36,6 +42,11 @@ pub fn parse_key(s: &str) -> Option<IconKey> {
         return Some(IconKey::Folder);
     }
     if let Some(path) = s.strip_prefix("file:") {
+        let head = path.get(..APPS_FOLDER.len());
+        if head.is_some_and(|h| h.eq_ignore_ascii_case(APPS_FOLDER)) {
+            let aumid = &path[APPS_FOLDER.len()..];
+            return (!aumid.is_empty() && !aumid.contains(['\\', '/'])).then(|| IconKey::App(path.to_string()));
+        }
         return (!path.is_empty()).then(|| IconKey::File(PathBuf::from(path)));
     }
     if let Some(ext) = s.strip_prefix("ext:") {
@@ -79,6 +90,7 @@ impl IconCache {
 fn cache_key(key: &IconKey, px: u32) -> String {
     match key {
         IconKey::File(p) => format!("file:{}@{px}", p.display()),
+        IconKey::App(name) => format!("app:{name}@{px}"),
         IconKey::Ext(e) => format!("ext:{e}@{px}"),
         IconKey::Folder => format!("folder@{px}"),
     }
@@ -233,12 +245,14 @@ fn encode_png(rgba: &[u8], px: u32) -> Option<Vec<u8>> {
 }
 
 /// Real icons from Windows Shell. `Ext` and `Folder` keys touch no file.
+/// Icons come from the system image list without the shortcut-arrow overlay;
+/// above 32 px from the 48 px list, so they are not upscaled from 32.
 pub struct ShellIcons;
 
 impl IconSource for ShellIcons {
     fn png(&self, key: &IconKey, px: u32) -> Option<Vec<u8>> {
         let _com = shell::Com::init();
-        let icon = shell::icon(key)?;
+        let icon = shell::icon(key, px)?;
         let drawn = shell::draw(icon, px, 0x00).zip(shell::draw(icon, px, 0xFF));
         shell::destroy(icon);
         let (black, white) = drawn?;
@@ -256,9 +270,14 @@ mod shell {
         BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
     };
     use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES};
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
+        SHGetFileInfoW, SHGetImageList, SHParseDisplayName, SHFILEINFOW, SHGFI_FLAGS, SHGFI_PIDL, SHGFI_SYSICONINDEX,
+        SHGFI_USEFILEATTRIBUTES, SHIL_EXTRALARGE, SHIL_LARGE,
     };
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, DrawIconEx, DI_NORMAL, HICON};
 
@@ -282,26 +301,69 @@ mod shell {
         }
     }
 
-    /// The Shell's large icon for `key`; the caller destroys it.
-    pub(super) fn icon(key: &IconKey) -> Option<HICON> {
-        let (name, attrs, extra): (OsString, FILE_FLAGS_AND_ATTRIBUTES, SHGFI_FLAGS) = match key {
-            IconKey::File(p) => (p.as_os_str().to_owned(), FILE_FLAGS_AND_ATTRIBUTES(0), SHGFI_FLAGS(0)),
-            // Attributes only: no file is looked at.
-            IconKey::Ext(e) => (OsString::from(e), FILE_ATTRIBUTE_NORMAL, SHGFI_USEFILEATTRIBUTES),
-            IconKey::Folder => (OsString::from("folder"), FILE_ATTRIBUTE_DIRECTORY, SHGFI_USEFILEATTRIBUTES),
-        };
-        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// An item id list from the Shell, freed on drop.
+    struct Pidl(*mut ITEMIDLIST);
+
+    impl Pidl {
+        fn parse(name: &str) -> Option<Self> {
+            let name = wide(name.as_ref());
+            let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+            unsafe { SHParseDisplayName(PCWSTR(name.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None) }.ok()?;
+            (!pidl.is_null()).then_some(Pidl(pidl))
+        }
+    }
+
+    impl Drop for Pidl {
+        fn drop(&mut self) {
+            unsafe { CoTaskMemFree(Some(self.0 as *const c_void)) };
+        }
+    }
+
+    /// The system image list index of `key`'s icon.
+    fn sys_index(key: &IconKey) -> Option<i32> {
         let mut info = SHFILEINFOW::default();
-        let found = unsafe {
-            SHGetFileInfoW(
-                PCWSTR(wide.as_ptr()),
-                attrs,
-                Some(&mut info),
-                std::mem::size_of::<SHFILEINFOW>() as u32,
-                SHGFI_ICON | SHGFI_LARGEICON | extra,
-            )
+        let size = std::mem::size_of::<SHFILEINFOW>() as u32;
+        let found = match key {
+            IconKey::App(name) => {
+                let pidl = Pidl::parse(name)?;
+                unsafe {
+                    SHGetFileInfoW(
+                        PCWSTR(pidl.0 as *const u16),
+                        FILE_FLAGS_AND_ATTRIBUTES(0),
+                        Some(&mut info),
+                        size,
+                        SHGFI_PIDL | SHGFI_SYSICONINDEX,
+                    )
+                }
+            }
+            _ => {
+                let (name, attrs, extra): (OsString, FILE_FLAGS_AND_ATTRIBUTES, SHGFI_FLAGS) = match key {
+                    IconKey::File(p) => (p.as_os_str().to_owned(), FILE_FLAGS_AND_ATTRIBUTES(0), SHGFI_FLAGS(0)),
+                    // Attributes only: no file is looked at.
+                    IconKey::Ext(e) => (OsString::from(e), FILE_ATTRIBUTE_NORMAL, SHGFI_USEFILEATTRIBUTES),
+                    _ => (OsString::from("folder"), FILE_ATTRIBUTE_DIRECTORY, SHGFI_USEFILEATTRIBUTES),
+                };
+                let name = wide(&name);
+                unsafe { SHGetFileInfoW(PCWSTR(name.as_ptr()), attrs, Some(&mut info), size, SHGFI_SYSICONINDEX | extra) }
+            }
         };
-        (found != 0 && !info.hIcon.is_invalid()).then_some(info.hIcon)
+        // With SHGFI_SYSICONINDEX the result is the (shared) system image list: never destroyed.
+        (found != 0).then_some(info.iIcon)
+    }
+
+    /// The Shell's icon for `key` (32 px, or 48 px when `px` > 32) without the
+    /// shortcut-arrow overlay: overlays are separate images in the system image
+    /// list, drawn only when asked for. The caller destroys it.
+    pub(super) fn icon(key: &IconKey, px: u32) -> Option<HICON> {
+        let index = sys_index(key)?;
+        let list_size = if px > 32 { SHIL_EXTRALARGE } else { SHIL_LARGE };
+        let list: IImageList = unsafe { SHGetImageList(list_size as i32) }.ok()?;
+        let icon = unsafe { list.GetIcon(index, ILD_TRANSPARENT.0) }.ok()?;
+        (!icon.is_invalid()).then_some(icon)
     }
 
     pub(super) fn destroy(icon: HICON) {
@@ -401,6 +463,16 @@ mod tests {
         assert_eq!(parse_key("garbage"), None);
         assert_eq!(parse_key("file:"), None);
         assert_eq!(parse_key("ext:pdf"), None);
+    }
+
+    #[test]
+    fn parse_key_reads_store_app_keys() {
+        let calc = r"shell:AppsFolder\Microsoft.WindowsCalculator_x!App";
+        assert_eq!(parse_key(&format!("file:{calc}")), Some(IconKey::App(calc.into())));
+        assert_eq!(parse_key(r"file:SHELL:appsfolder\A!b"), Some(IconKey::App(r"SHELL:appsfolder\A!b".into())));
+        assert_eq!(parse_key(r"file:shell:AppsFolder\"), None);
+        assert_eq!(parse_key(r"file:shell:AppsFolder\a\b"), None);
+        assert_ne!(cache_key(&IconKey::App(calc.into()), 32), cache_key(&IconKey::File(calc.into()), 32));
     }
 
     #[test]
@@ -541,5 +613,34 @@ mod tests {
         // Extension and folder keys touch no file.
         assert!(ShellIcons.png(&IconKey::Ext(".txt".into()), 48).unwrap().starts_with(b"\x89PNG"));
         assert!(ShellIcons.png(&IconKey::Folder, 16).unwrap().starts_with(b"\x89PNG"));
+        // A Store app by its parsing name (Calculator ships with Windows 11).
+        let calc = r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+        assert!(ShellIcons.png(&IconKey::App(calc.into()), 48).unwrap().starts_with(b"\x89PNG"));
+    }
+
+    /// Manual probe: a `.lnk` to notepad gets notepad's own icon, with no
+    /// shortcut arrow drawn in. Writes one shortcut to a temp folder; starts nothing.
+    #[test]
+    #[ignore]
+    fn shell_icon_of_a_shortcut_has_no_arrow() {
+        use windows::core::{Interface, HSTRING};
+        use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+        let _com = shell::Com::init();
+        let root = std::env::var_os("SystemRoot").expect("SystemRoot");
+        let notepad = PathBuf::from(root).join(r"System32\notepad.exe");
+        let dir = tempfile::tempdir().unwrap();
+        let lnk = dir.path().join("probe.lnk");
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
+            link.SetPath(&HSTRING::from(notepad.as_os_str())).unwrap();
+            link.cast::<IPersistFile>().unwrap().Save(&HSTRING::from(lnk.as_os_str()), true).unwrap();
+        }
+        for px in [32, 48] {
+            let target = ShellIcons.png(&IconKey::File(notepad.clone()), px).expect("target icon");
+            let shortcut = ShellIcons.png(&IconKey::File(lnk.clone()), px).expect("shortcut icon");
+            assert_eq!(target, shortcut, "at {px} px the shortcut icon differs (arrow overlay?)");
+        }
     }
 }
