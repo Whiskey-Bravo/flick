@@ -25,6 +25,10 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | A folder path (a drive, `~`, or a network share) | Lists that folder's contents; Enter opens an item | `C:\`, `~\Documents\` |
 | `dl` | The 20 newest files in your Downloads folder | `dl` |
 | `recent` | Files and folders you opened recently, from Windows' own Recent list | `recent` |
+| `v`, then text to filter | Your clipboard history (Win+V); Enter pastes the item | `v`, `v invoice` |
+| `qr`, or `qr` and some text | Shows the clipboard text, or the typed text, as a QR code | `qr`, `qr some text` |
+| `snip` (also `screenshot`) | Opens Windows' snip tool | `snip` |
+| `color` (also `colour`, `picker`) | Picks a colour on screen and copies it as `#RRGGBB` | `color` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
 | A sum, a unit or currency conversion, a time or date, or `weather` | Shows the answer on top; Enter copies it (on a weather answer, Enter opens a web search) | `12*7`, `20 usd in eur`, `time tokyo` (see Quick answers) |
@@ -187,6 +191,16 @@ The list shows up to 50 results and scrolls. Files take at most five of every ei
 - The list is built in the background when Flick starts, kept up to date as files are added, removed or renamed, and rebuilt every 30 minutes. A file that was moved since says "file not found".
 
 </details>
+
+## Clipboard and capture
+
+`v` lists the text items of Windows' clipboard history (the one Win+V shows), newest first, up to 50. Type after it to filter (`v invoice`). Enter pastes the item into the window you were in before the bar opened. It only copies it when that window is gone, runs as administrator or does not come to the front. Ctrl+Enter, or Copy in the row's menu, only copies. This needs Windows' Clipboard history setting; when it is off the row says `Clipboard history is off`, `Turn it on in Settings`, and Enter opens that setting.
+
+`qr` draws the clipboard text as a QR code in the bar; `qr some text` draws the typed text instead. Enter copies the text.
+
+`snip` (also `screenshot`) opens Windows' snip tool; the snip lands on the clipboard.
+
+`color` (also `colour` or `picker`) freezes the monitor under the mouse and shows a magnifier. Click to copy the colour under the cursor as `#RRGGBB`; Esc or right-click cancels.
 
 ## WSL commands
 
@@ -406,6 +420,8 @@ Flick goes online when you ask a currency or weather question, when you type `ip
 - `ip` (also `my ip` and `ip address`) asks api.ipify.org for your public address, only while `online` is on, and only after the text has stayed exactly `ip` for a moment (so typing `ipconfig` sends nothing). api.ipify.org sees the request; nothing about you is sent. Without it you see just your local addresses.
 - Nothing else goes online. `online = false` stops all of the above. Web search only opens your browser; Flick itself sends nothing.
 
+`v` reads Windows' clipboard history only when you type it. Flick stores none of it and forgets it when the bar closes; copies that password managers ask Windows to leave out of the history stay out. `qr` codes are drawn on your PC and nothing is sent. `v`, `qr`, `snip` and `color` rows are never counted, kept as recent launches or saved as searches.
+
 Paths you type, and the `dl` and `recent` rows, are never counted, kept as recent launches or saved as searches. `recent` only reads the list Windows already keeps; Flick adds nothing to it. Uninstall reads the installed-programs list on this PC and sends nothing anywhere.
 
 Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
@@ -427,7 +443,6 @@ PowerToys Run also uses Alt+Space by default. Only one program can own a hotkey,
 
 ## Not yet
 
-- Clipboard history
 - Taking over the Win key
 
 ## Build from source

@@ -12,7 +12,6 @@ pub trait Clipboard: Send + Sync {
 }
 
 /// Reading the text on the clipboard (read only).
-#[cfg_attr(not(test), allow(dead_code))] // until the qr provider is registered (Task 8)
 pub trait ClipboardText: Send + Sync {
     /// The Unicode text on the clipboard; `None` when it holds no text.
     fn text(&self) -> Result<Option<String>, String>;

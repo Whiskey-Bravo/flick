@@ -1,3 +1,4 @@
+mod after_hide;
 mod answers;
 mod clipboard;
 mod cliphistory;
@@ -42,13 +43,17 @@ use tauri_plugin_autostart::ManagerExt;
 use answers::number::{Formats, WindowsFormats};
 use answers::rates::RatesStore;
 use answers::weather::WeatherStore;
-use clipboard::WindowsClipboard;
+use after_hide::FollowUps;
+use cliphistory::{ClipHistory, WinRtHistory};
+use clipboard::{ClipboardText, WindowsClipboard};
+use commands::AfterHide;
 use config::Config;
 use engine::Engine;
 use launch::{Launcher, SystemLauncher};
 use provider::Provider;
 use providers::answers::{AnswersConfig, AnswersProvider, DUCKDUCKGO};
 use providers::apps::AppsProvider;
+use providers::clips::ClipsProvider;
 use providers::files::FilesProvider;
 use providers::flick::{FlickProvider, Opener};
 use providers::path::PathProvider;
@@ -56,6 +61,8 @@ use providers::recent::{DownloadsProvider, RecentProvider};
 use dirs::{DirEntry, FileSystem, Loader, SystemFolders, KnownFolders, Links, ShellLinks, SystemFs};
 use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
+use providers::qr::QrProvider;
+use providers::screen::{ColorProvider, SnipProvider};
 use providers::settings::SettingsProvider;
 use providers::status::StatusProvider;
 use providers::system::SystemProvider;
@@ -99,6 +106,10 @@ struct Providers {
     path: Arc<PathProvider>,
     downloads: Arc<DownloadsProvider>,
     recent: Arc<RecentProvider>,
+    /// `v`: Windows' clipboard history, held until the bar hides.
+    clips: Arc<ClipsProvider>,
+    /// `qr`: the clipboard text, held until the bar hides.
+    qr: Arc<QrProvider>,
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
@@ -111,6 +122,7 @@ impl Providers {
         answers: Answers,
         control: Control,
         browse: Browse,
+        capture: Capture,
         apps: Arc<AppsProvider>,
         launcher: Arc<dyn Launcher>,
         distro: &str,
@@ -131,6 +143,8 @@ impl Providers {
             path: browse.path,
             downloads: browse.downloads,
             recent: browse.recent,
+            clips: capture.clips,
+            qr: capture.qr,
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
@@ -142,6 +156,12 @@ impl Providers {
     /// runs on its own thread and never on the caller's.
     pub(crate) fn refresh_on_show(&self) {
         self.refresher.request();
+    }
+
+    /// The bar hid: drop the clipboard history and clipboard text read for it.
+    pub(crate) fn on_hide(&self) {
+        self.clips.forget();
+        self.qr.forget();
     }
 }
 
@@ -244,6 +264,42 @@ impl Browse {
                 now.clone(),
             )),
             recent: Arc::new(RecentProvider::new(store, fs, links, recent, launcher, clipboard, now)),
+        }
+    }
+}
+
+/// The clipboard rows: `v` and `qr`.
+struct Capture {
+    clips: Arc<ClipsProvider>,
+    qr: Arc<QrProvider>,
+}
+
+impl Capture {
+    /// Cheap: nothing is read until `v` or `qr` is typed. Reads run on loader
+    /// threads; `on_ready` runs when one has finished.
+    fn new(launcher: Arc<dyn Launcher>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self::over(
+            Arc::new(WinRtHistory::new()),
+            Arc::new(WindowsClipboard),
+            Arc::new(WindowsClipboard),
+            launcher,
+            Arc::new(std::time::SystemTime::now),
+            on_ready,
+        )
+    }
+
+    /// The providers over any history, clipboard and clock (tests use fakes).
+    fn over(
+        history: Arc<dyn ClipHistory>,
+        text: Arc<dyn ClipboardText>,
+        clipboard: Arc<dyn clipboard::Clipboard>,
+        launcher: Arc<dyn Launcher>,
+        now: dirs::Clock,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        Capture {
+            clips: Arc::new(ClipsProvider::new(history, launcher, now, on_ready.clone())),
+            qr: Arc::new(QrProvider::new(text, clipboard, on_ready)),
         }
     }
 }
@@ -352,6 +408,10 @@ fn build_engine(
         Box::new(p.path.clone()),
         Box::new(p.downloads.clone()),
         Box::new(p.recent.clone()),
+        Box::new(p.clips.clone()),
+        Box::new(p.qr.clone()),
+        Box::new(SnipProvider),
+        Box::new(ColorProvider),
         Box::new(p.shortcuts.clone()),
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
@@ -543,10 +603,19 @@ fn setup(app: &AppHandle) {
     });
     let answers = Answers::new(launcher.clone(), on_ready.clone());
     let browse = Browse::new(launcher.clone(), on_ready.clone());
+    let capture = Capture::new(launcher.clone(), on_ready.clone());
     let control = Control::new(launcher.clone(), on_ready);
+    // Paste, Win+V, the snip and the colour picker, run once the bar has hidden.
+    app.manage::<Arc<dyn AfterHide>>(Arc::new(FollowUps {
+        desktop: Arc::new(paste::SystemDesktop::new()),
+        launcher: launcher.clone(),
+        previous: paste::previous,
+        pick_color: Box::new(|| picker::start(Arc::new(picker::GdiScreen), Arc::new(WindowsClipboard))),
+        settle: after_hide::settle,
+    }));
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);
-    let providers = Providers::new(answers, control, browse, AppsProvider::new(launcher.clone()), launcher,
+    let providers = Providers::new(answers, control, browse, capture, AppsProvider::new(launcher.clone()), launcher,
         &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
         settings_opener(app),
         updates.clone(),
@@ -882,6 +951,12 @@ mod tests {
         /// Signalled when a folder, Downloads or Recent read has finished.
         browse_ready: std::sync::mpsc::Receiver<()>,
         links: Arc<dirs::testing::FakeLinks>,
+        /// Windows' clipboard history as `v` reads it.
+        clip_history: Arc<cliphistory::testing::FakeHistory>,
+        /// The clipboard text as `qr` reads it.
+        clip_text: Arc<clipboard::FakeText>,
+        /// Signalled when a clipboard history or clipboard read has finished.
+        capture_ready: std::sync::mpsc::Receiver<()>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
@@ -947,6 +1022,20 @@ mod tests {
         );
         let apps = make_apps(launcher.clone());
         apps.set_windows(windows.clone());
+        let clip_history = Arc::new(cliphistory::testing::FakeHistory::new());
+        let clip_text = Arc::new(clipboard::FakeText::new(Some("hello")));
+        let (capture_tx, capture_ready) = std::sync::mpsc::channel();
+        let capture_tx = Mutex::new(capture_tx);
+        let capture = Capture::over(
+            clip_history.clone(),
+            clip_text.clone(),
+            Arc::new(clipboard::FakeClipboard::default()),
+            launcher.clone(),
+            Arc::new(|| std::time::UNIX_EPOCH + Duration::from_secs(1_000_000)),
+            Arc::new(move || {
+                let _ = capture_tx.lock().unwrap().send(());
+            }),
+        );
         let providers = Providers {
             refresher: refresh_windows_and_audio(windows.clone(), system.clone(), Arc::new(|| {})),
             windows,
@@ -961,6 +1050,8 @@ mod tests {
             path: browse.path,
             downloads: browse.downloads,
             recent: browse.recent,
+            clips: capture.clips,
+            qr: capture.qr,
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
             welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
@@ -985,7 +1076,22 @@ mod tests {
             history.clone(),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
         );
-        Rig { engine, providers, launcher, power, opened, dir, ranking, history, status_ready, browse_ready, links }
+        Rig {
+            engine,
+            providers,
+            launcher,
+            power,
+            opened,
+            dir,
+            ranking,
+            history,
+            status_ready,
+            browse_ready,
+            links,
+            clip_history,
+            clip_text,
+            capture_ready,
+        }
     }
 
     fn app(name: &str) -> AppEntry {
@@ -1286,6 +1392,10 @@ mod tests {
                 r"C:\ / ~\Documents\",
                 "dl",
                 "recent",
+                "v / v invoice",
+                "qr / qr some text",
+                "snip",
+                "color",
                 "your shortcuts",
                 "> htop -d 10",
                 "bluetooth",
@@ -1302,7 +1412,7 @@ mod tests {
                 "Tab",
             ]
         );
-        let flick = &help[18];
+        let flick = &help[22];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -1310,7 +1420,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 26);
+        assert_eq!(r.engine.query("Help", None).len(), 30);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
@@ -1525,5 +1635,134 @@ mod tests {
         assert!(!hotkey_needs_apply(Some("Alt+Space"), "Alt+Space"));
         assert!(hotkey_needs_apply(Some("Alt+Space"), "Ctrl+Space"));
         assert!(hotkey_needs_apply(None, "Alt+Space"));
+    }
+
+    fn clip(id: &str, text: &str, secs_ago: u64) -> cliphistory::Clip {
+        cliphistory::Clip {
+            id: id.into(),
+            text: text.into(),
+            copied: std::time::UNIX_EPOCH + Duration::from_secs(1_000_000 - secs_ago),
+            pinned: false,
+        }
+    }
+
+    /// A rig whose clipboard history holds an invoice, a link and a note.
+    fn clip_rig() -> Rig {
+        let r = rig(vec![app("VLC media player")], vec![]);
+        r.clip_history.set(Ok(cliphistory::History::Items(vec![
+            clip("a", "invoice 2026-114", 60),
+            clip("b", "https://example.com/vlc", 300),
+            clip("c", "meeting notes", 900),
+        ])));
+        r
+    }
+
+    /// Waits for a clipboard (history) read to finish, then asks again.
+    fn query_capture(r: &Rig, text: &str) -> Vec<provider::ResultItem> {
+        let first = r.engine.query(text, None);
+        if first.iter().any(|i| i.title.starts_with("Reading clipboard")) {
+            r.capture_ready.recv_timeout(Duration::from_secs(5)).expect("the clipboard read finishes");
+            return r.engine.query(text, None);
+        }
+        first
+    }
+
+    fn of<'a>(rows: &'a [provider::ResultItem], provider: &str) -> Vec<&'a str> {
+        rows.iter().filter(|i| i.provider == provider).map(|i| i.title.as_str()).collect()
+    }
+
+    #[test]
+    fn v_is_a_word_route() {
+        let r = clip_rig();
+        let first = r.engine.query("v", None);
+        assert_eq!(titles(&first), ["Reading clipboard history\u{2026}"]);
+        let all = query_capture(&r, "v");
+        assert!(all.iter().all(|i| i.provider == "clips"), "{:?}", titles(&all));
+        assert_eq!(titles(&all), ["invoice 2026-114", "https://example.com/vlc", "meeting notes"]);
+        assert_eq!(all[0].subtitle, "1 min ago");
+        // A word that only starts with v is a normal search.
+        let vlc = r.engine.query("vlc", None);
+        assert!(of(&vlc, "clips").is_empty(), "{:?}", titles(&vlc));
+        assert_eq!(vlc[0].provider, "apps");
+        // Typing after `v ` filters what was read, without reading again.
+        let inv = r.engine.query("v inv", None);
+        assert_eq!(titles(&inv), ["invoice 2026-114"]);
+        assert_eq!(r.clip_history.reads(), 1);
+        assert!(r.launcher.calls().is_empty());
+    }
+
+    #[test]
+    fn clipboard_rows_are_never_recorded() {
+        let r = clip_rig();
+        let row = query_capture(&r, "v").into_iter().find(|i| i.title == "meeting notes").unwrap();
+        assert_eq!(
+            r.engine.activate("clips", &row.id, provider::Modifier::None, "v", None),
+            Ok(Outcome::HideThen { then: provider::Then::Paste })
+        );
+        assert_eq!(r.clip_history.set_calls(), ["c"]);
+        assert_eq!(r.ranking.boost("clips", &row.id), 0);
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+        assert!(!r.engine.toggle_pin("clips", &row.id));
+        let empty = r.engine.query("", None);
+        assert!(of(&empty, "clips").is_empty() && of(&empty, "qr").is_empty(), "{:?}", titles(&empty));
+    }
+
+    #[test]
+    fn qr_rows_are_never_recorded() {
+        let r = rig(vec![], vec![]);
+        let res = r.engine.query("qr hi", None);
+        assert_eq!(res.len(), 1);
+        assert_eq!((res[0].provider, res[0].title.as_str()), ("qr", "hi"));
+        assert!(!res[0].panel.is_empty());
+        assert_eq!(r.engine.activate("qr", &res[0].id, provider::Modifier::None, "qr hi", None), Ok(Outcome::Hide));
+        assert_eq!(r.ranking.boost("qr", &res[0].id), 0);
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+        assert!(!r.engine.toggle_pin("qr", &res[0].id));
+        // Bare `qr` shows the clipboard text.
+        let bare = query_capture(&r, "qr");
+        assert_eq!(titles(&bare), ["hello"]);
+        let empty = r.engine.query("", None);
+        assert!(of(&empty, "clips").is_empty() && of(&empty, "qr").is_empty(), "{:?}", titles(&empty));
+    }
+
+    #[test]
+    fn snip_and_color_top_their_words() {
+        let r = rig(vec![], vec![]);
+        assert_eq!(r.engine.query("snip", None)[0].provider, "snip");
+        assert_eq!(r.engine.query("screenshot", None)[0].provider, "snip");
+        let color = r.engine.query("color", None);
+        assert_eq!(color[0].provider, "color");
+        assert!(color.iter().any(|i| i.provider == "settings"), "{:?}", titles(&color));
+        assert_eq!(r.engine.query("colour", None)[0].provider, "color");
+        assert_eq!(
+            r.engine.activate("snip", "snip", provider::Modifier::None, "snip", None),
+            Ok(Outcome::HideThen { then: provider::Then::Snip })
+        );
+        assert_eq!(
+            r.engine.activate("color", "color", provider::Modifier::None, "color", None),
+            Ok(Outcome::HideThen { then: provider::Then::PickColor })
+        );
+        assert!(!r.dir.path().join("picks.json").exists());
+        assert!(r.history.recents().is_empty());
+        assert!(r.launcher.calls().is_empty(), "the snip opens only after the bar hides");
+    }
+
+    #[test]
+    fn hiding_the_bar_forgets_what_was_read() {
+        let r = clip_rig();
+        query_capture(&r, "v");
+        query_capture(&r, "qr");
+        assert_eq!((r.clip_history.reads(), r.clip_text.calls()), (1, 1));
+        r.providers.on_hide();
+        assert_eq!(r.clip_history.forgets(), 1);
+        assert_eq!(titles(&r.engine.query("v", None)), ["Reading clipboard history\u{2026}"]);
+        assert_eq!(titles(&query_capture(&r, "v")).len(), 3);
+        assert_eq!(r.clip_history.reads(), 2);
+        assert_eq!(titles(&query_capture(&r, "qr")), ["hello"]);
+        assert_eq!(r.clip_text.calls(), 2);
     }
 }

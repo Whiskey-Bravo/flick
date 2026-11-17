@@ -1,7 +1,6 @@
 //! `v`: Windows' clipboard history, searchable. The history is read on a
 //! [`Loader`] thread and held in memory until [`ClipsProvider::forget`];
 //! nothing is stored or logged.
-#![cfg_attr(not(test), allow(dead_code))] // until the provider is registered (Task 8)
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

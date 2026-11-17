@@ -56,6 +56,8 @@ fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
 /// Centre horizontally, top edge at 25% of the monitor under the mouse cursor;
 /// show; focus; emit `bar:shown`, then `config:error` with the stored error (or null).
 pub fn show(app: &AppHandle) {
+    // Before the bar takes focus: `v`'s Enter pastes into this window.
+    crate::paste::remember_foreground();
     let Some(w) = bar(app) else { return };
     SHOWS.fetch_add(1, Ordering::SeqCst);
     set_weather_hidden(app, false);
@@ -98,6 +100,10 @@ pub fn hide(app: &AppHandle) {
     // A weather city still waiting for the typing pause is forgotten, so a
     // hidden bar never sends a request.
     set_weather_hidden(app, true);
+    // Clipboard history and clipboard text are held only while the bar is open.
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.providers.on_hide();
+    }
     let _ = app.emit_to(LABEL, "bar:hidden", ());
     if let Some(w) = bar(app) {
         let _ = w.hide();
