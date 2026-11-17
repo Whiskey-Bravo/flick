@@ -28,9 +28,11 @@ png = "0.18"
 qrcodegen = "1.8"
 windows = { version = "0.61", features = [
     "ApplicationModel_DataTransfer",
+    "Data_Xml_Dom",
     "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
+    "UI_Notifications",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Dwm",

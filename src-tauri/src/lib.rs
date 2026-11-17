@@ -14,6 +14,7 @@ mod hotkey;
 mod icon;
 mod launch;
 mod net;
+mod notifications;
 mod paste;
 mod pins;
 mod picker;
