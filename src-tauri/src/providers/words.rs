@@ -2,13 +2,14 @@
 //! shows definitions from English Wiktionary. Online, after typing pauses, and
 //! only the typed text is sent; answers are kept in memory only.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::answers::lookup::{Lookup, LookupError, Lookups, PAUSE};
 pub use crate::clipboard::Clipboard;
 use crate::dirs;
+use crate::engine::query_seq;
 use crate::net::{Fetch, FetchError};
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 use crate::providers::flick::Opener;
@@ -284,10 +285,12 @@ pub struct WordsProvider {
     online: AtomicBool,
     /// Copy text of the answer rows of the latest query, by the `<n>` of their id.
     copies: Mutex<Vec<String>>,
-    /// This provider answered the latest query (the engine then calls `skipped` on every provider).
-    /// Assumes the engine runs `query` and the `skipped` calls of one bar query back to back,
-    /// with no other query in between (one query at a time, as the engine does today).
-    answered: AtomicBool,
+    /// The number (`engine::query_seq`) of the newest query that reached this
+    /// provider. Queries overlap: an older one arriving late changes nothing.
+    newest: AtomicU64,
+    /// The number of the query this provider answered, until that query's
+    /// `skipped` (the engine calls `skipped` on every provider after a routed query).
+    answered: Mutex<Option<u64>>,
 }
 
 impl WordsProvider {
@@ -325,8 +328,18 @@ impl WordsProvider {
             open_settings,
             online: AtomicBool::new(true),
             copies: Mutex::new(Vec::new()),
-            answered: AtomicBool::new(false),
+            newest: AtomicU64::new(0),
+            answered: Mutex::new(None),
         }
+    }
+
+    /// True for the newest query so far, whose number it keeps; false for an
+    /// older query that arrives after a newer one (its answer is dropped by the
+    /// bar anyway), which must neither ask nor forget. Calls outside a query
+    /// (number 0) always count as the newest.
+    fn is_newest(&self) -> bool {
+        let seq = query_seq();
+        seq == 0 || self.newest.fetch_max(seq, Ordering::SeqCst) <= seq
     }
 
     /// Follows the `online` config key: off means nothing is ever fetched.
@@ -428,13 +441,16 @@ impl Provider for WordsProvider {
 
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let mut copies = self.copies.lock().unwrap();
+        if !self.is_newest() {
+            return vec![];
+        }
         copies.clear();
         let Some((cmd, rest)) = split(&q.text) else {
-            self.answered.store(false, Ordering::Relaxed);
+            *self.answered.lock().unwrap() = None;
             self.forget_waiting();
             return vec![];
         };
-        self.answered.store(true, Ordering::Relaxed);
+        *self.answered.lock().unwrap() = Some(query_seq());
         match cmd {
             Command::Translate => self.translate(rest, &mut copies),
             Command::Define => self.define(rest, &mut copies),
@@ -442,8 +458,12 @@ impl Provider for WordsProvider {
     }
 
     /// Text that went elsewhere (another route, a scope, help): what was waiting is not sent.
+    /// An older query arriving late forgets nothing.
     fn skipped(&self) {
-        if !self.answered.swap(false, Ordering::Relaxed) {
+        if !self.is_newest() {
+            return;
+        }
+        if self.answered.lock().unwrap().take() != Some(query_seq()) {
             self.forget_waiting();
         }
     }
@@ -451,8 +471,10 @@ impl Provider for WordsProvider {
     /// The bar was cleared (the engine calls neither `query` nor `skipped` then):
     /// what was waiting is not sent. Memory only.
     fn empty_query(&self) -> Vec<ResultItem> {
-        self.answered.store(false, Ordering::Relaxed);
-        self.forget_waiting();
+        if self.is_newest() {
+            *self.answered.lock().unwrap() = None;
+            self.forget_waiting();
+        }
         vec![]
     }
 
@@ -730,6 +752,40 @@ mod tests {
         r.p.skipped();
         r.wait();
         assert_eq!(r.fetch.urls().len(), 1);
+    }
+
+    #[test]
+    fn an_older_query_arriving_late_keeps_the_newer_waiting_text() {
+        let r = rig(FakeFetch::new(Ok(MYMEMORY_GUTEN_MORGEN.as_bytes().to_vec())));
+        // Query 2 (`tr hallo welt`) reaches the provider first ...
+        crate::engine::as_query(2, || r.p.query(&q("tr hallo welt")));
+        // ... then query 1, older, arrives: plain text, a skip, a cleared bar or
+        // older words text. None of it may forget or replace query 2's text.
+        crate::engine::as_query(1, || {
+            assert!(r.p.query(&q("notepad")).is_empty());
+            r.p.skipped();
+            assert!(r.p.empty_query().is_empty());
+            assert!(r.p.query(&q("tr hal")).is_empty());
+        });
+        // Query 2's own `skipped` keeps its text waiting.
+        crate::engine::as_query(2, || r.p.skipped());
+        r.wait();
+        assert_eq!(r.fetch.urls(), vec![TR_HALLO_WELT.to_string()]);
+    }
+
+    #[test]
+    fn a_newer_query_elsewhere_still_forgets_the_waiting_text() {
+        let r = rig(FakeFetch::new(Ok(MYMEMORY_GUTEN_MORGEN.as_bytes().to_vec())));
+        crate::engine::as_query(5, || {
+            r.p.query(&q("tr hallo welt"));
+            r.p.skipped();
+        });
+        // Query 6 went to another route: only `skipped` reaches this provider.
+        crate::engine::as_query(6, || r.p.skipped());
+        // Query 5's skip arriving late changes nothing either.
+        crate::engine::as_query(5, || r.p.skipped());
+        std::thread::sleep(P * 3);
+        assert!(r.fetch.urls().is_empty());
     }
 
     #[test]
