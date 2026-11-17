@@ -1,5 +1,7 @@
 //! Tray icon and its menu: Open, Settings, Edit config, Reload, Start at login, Quit.
 
+use std::sync::Mutex;
+
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
@@ -9,6 +11,12 @@ use crate::{launch, settings_window, window};
 
 /// The "Start at login" menu item, in managed state.
 struct LoginItem(CheckMenuItem<tauri::Wry>);
+
+/// The tray menu and the "Update to x.y" item in it while one is shown.
+struct UpdateItem {
+    menu: Menu<tauri::Wry>,
+    item: Mutex<Option<MenuItem<tauri::Wry>>>,
+}
 
 const TRAY_ID: &str = "flick";
 pub const DEFAULT_TOOLTIP: &str = "Flick";
@@ -33,6 +41,8 @@ pub fn build(
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&open, &settings, &edit, &reload, &login, &separator, &quit])?;
 
+    app.manage(UpdateItem { menu: menu.clone(), item: Mutex::new(None) });
+
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip(tooltip)
@@ -46,6 +56,11 @@ pub fn build(
                 });
             }
             "reload" => on_reload(app),
+            "update" => {
+                // Installing blocks for as long as the download takes.
+                let app = app.clone();
+                std::thread::spawn(move || app.state::<crate::AppState>().updates.install());
+            }
             "start_at_login" => set_start_at_login(app, &login),
             "quit" => app.exit(0),
             _ => {}
@@ -81,5 +96,29 @@ pub fn set_login_checked(app: &AppHandle, on: bool) {
 pub fn set_tooltip(app: &AppHandle, tooltip: &str) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
+/// Puts "Update to <version>" at the top of the menu, or takes it out on `None`.
+/// No-op until the tray exists.
+pub fn set_update(app: &AppHandle, version: Option<&str>) {
+    let Some(holder) = app.try_state::<UpdateItem>() else { return };
+    let mut current = holder.item.lock().unwrap_or_else(|e| e.into_inner());
+    match version {
+        Some(v) => {
+            let text = format!("Update to {v}");
+            if let Some(item) = current.as_ref() {
+                let _ = item.set_text(text);
+            } else if let Ok(item) = MenuItem::with_id(app, "update", text, true, None::<&str>) {
+                if holder.menu.insert(&item, 0).is_ok() {
+                    *current = Some(item);
+                }
+            }
+        }
+        None => {
+            if let Some(item) = current.take() {
+                let _ = holder.menu.remove(&item);
+            }
+        }
     }
 }

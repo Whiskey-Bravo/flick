@@ -1,5 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { onSettingsChanged, settingsOpenFile, settingsState, type SettingsState } from "./api";
+import { Updates } from "./Updates";
 import { TABS, TAB_LABELS, nextTab, type Tab } from "./tabs";
 
 export function App() {
@@ -54,7 +55,7 @@ export function App() {
       {/* While the file is broken every input inside is disabled. */}
       <fieldset class="page" disabled={broken}>
         <h1>{TAB_LABELS[tab]}</h1>
-        <p class="placeholder">Coming soon.</p>
+        {tab === "updates" ? <Updates /> : <p class="placeholder">Coming soon.</p>}
       </fieldset>
     </div>
   );

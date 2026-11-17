@@ -18,6 +18,7 @@ mod quote;
 mod ranking;
 mod settings;
 mod settings_window;
+mod updates;
 mod tray;
 mod window;
 mod wsl_detect;
@@ -45,7 +46,9 @@ use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
 use providers::settings::SettingsProvider;
 use providers::shortcuts::ShortcutsProvider;
+use providers::update::UpdateProvider;
 use providers::welcome::WelcomeProvider;
+use updates::{PluginSource, Updates};
 use providers::wsl::WslProvider;
 use history::History;
 use pins::Pins;
@@ -70,6 +73,7 @@ struct Providers {
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
+    update: Arc<UpdateProvider>,
 }
 
 impl Providers {
@@ -80,6 +84,7 @@ impl Providers {
         launcher: Arc<dyn Launcher>,
         distro: &str,
         open_settings: Opener,
+        updates: Arc<Updates>,
     ) -> Self {
         Self {
             answers: answers.provider,
@@ -91,6 +96,7 @@ impl Providers {
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
+            update: UpdateProvider::new(updates),
         }
     }
 }
@@ -154,6 +160,8 @@ pub(crate) struct AppState {
     /// Shared with the engine; the config's `history` switch is applied to it.
     pub(crate) history: Arc<History>,
     providers: Providers,
+    /// What the last update check found; in memory only.
+    pub(crate) updates: Arc<Updates>,
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
     pub(crate) config: Mutex<Config>,
@@ -188,6 +196,8 @@ fn build_engine(
     pins: Arc<Pins>,
 ) -> Engine {
     let providers: Vec<Box<dyn Provider>> = vec![
+        // First, so its row tops the empty bar. It has no help line.
+        Box::new(p.update.clone()),
         Box::new(p.answers.clone()),
         Box::new(p.apps.clone()),
         Box::new(p.files.clone()),
@@ -321,6 +331,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::query,
             commands::activate,
@@ -339,7 +350,10 @@ pub fn run() {
             settings::settings_pins,
             settings::settings_move_pin,
             settings::settings_check_city,
-            settings::settings_open_file
+            settings::settings_open_file,
+            updates::settings_update_status,
+            updates::settings_check_now,
+            updates::settings_install_update
         ])
         // Result-row icons. Answered on the icon workers, never on this thread.
         .register_asynchronous_uri_scheme_protocol(icon::SCHEME, move |_ctx, request, responder| {
@@ -371,9 +385,12 @@ fn setup(app: &AppHandle) {
     let answers = Answers::new(launcher.clone(), Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
     }));
+    let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
+    updates.set_enabled(loaded.config.check_updates);
     let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher,
         &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
         settings_opener(app),
+        updates.clone(),
     );
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
@@ -394,6 +411,7 @@ fn setup(app: &AppHandle) {
         engine: Arc::new(engine),
         history,
         providers: providers.clone(),
+        updates,
         config: Mutex::new(loaded.config.clone()),
         detected: Mutex::new(WslState::Unknown),
         hotkey: Mutex::new(None),
@@ -402,6 +420,7 @@ fn setup(app: &AppHandle) {
     });
 
     start_index_threads(app, providers);
+    updates::start_scheduler(app);
 
     window::install_handlers(app);
 
@@ -563,6 +582,9 @@ pub(crate) fn reload_config(app: &AppHandle) {
         p.weather.set_home(loaded.config.weather_city.trim());
     }
     *config = loaded.config;
+    if loaded.error.is_none() {
+        state.updates.set_enabled(config.check_updates);
+    }
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let hotkey_error = if hotkey_needs_apply(applied.as_deref(), &config.hotkey) {
         apply_hotkey(app, &config.hotkey)
@@ -654,6 +676,10 @@ mod tests {
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
             welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
+            update: UpdateProvider::new(Arc::new(Updates::new(
+                Arc::new(updates::tests::FakeSource::default()),
+                Arc::new(|| {}),
+            ))),
         };
         let power = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
