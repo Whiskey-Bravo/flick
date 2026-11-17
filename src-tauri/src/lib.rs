@@ -14,6 +14,7 @@ mod games;
 mod history;
 mod hotkey;
 mod icon;
+mod item_search;
 mod launch;
 mod net;
 mod notifications;

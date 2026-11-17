@@ -20,4 +20,5 @@ pub mod system;
 pub mod update;
 pub mod welcome;
 pub mod windows;
+pub mod workspaces;
 pub mod wsl;

@@ -298,6 +298,17 @@ impl Engine {
         self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action)
     }
 
+    /// Runs an item like Enter on its row (no modifier) for a workspace or a
+    /// direct hotkey. Nothing is ranked or recorded. An item that asks for a
+    /// confirm is refused: there is no second Enter to give.
+    pub fn open_item(&self, provider: &str, id: &str) -> Result<Outcome, String> {
+        let item = self.item(provider, id).ok_or_else(|| "not found".to_string())?;
+        if item.confirm {
+            return Err("needs a second Enter".to_string());
+        }
+        self.provider(provider).ok_or_else(|| "not found".to_string())?.activate(id, Modifier::None)
+    }
+
     /// `text` and `scope` are what the bar held when the row was picked. A launch
     /// that is learned (`rank_key`) is ranked; when its provider can also rebuild
     /// the row (`item`) it is recorded as a recent launch (unless it asks for a
@@ -379,6 +390,8 @@ mod tests {
         claims: Option<&'static str>,
         /// Every `act` call.
         acted: std::sync::Mutex<Vec<(String, Action)>>,
+        /// Every `activate` call: id and modifier.
+        activated: std::sync::Mutex<Vec<(String, Modifier)>>,
     }
 
     impl FakeProvider {
@@ -400,6 +413,7 @@ mod tests {
                 seen: Default::default(),
                 claims: None,
                 acted: Default::default(),
+                activated: Default::default(),
             }
         }
     }
@@ -458,7 +472,8 @@ mod tests {
         fn rank_key(&self, id: &str) -> Option<String> {
             self.learn.then(|| id.to_string())
         }
-        fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+        fn activate(&self, id: &str, m: Modifier) -> Result<Outcome, String> {
+            self.activated.lock().unwrap().push((id.to_string(), m));
             if let Some(e) = self.fail {
                 return Err(e.to_string());
             }
@@ -1315,5 +1330,30 @@ mod tests {
         scoped.scope = Some("proj");
         let (e, _, _dir) = engine(vec![scoped]);
         assert_eq!(e.query("x", Some("proj"))[0].id, "b", "scoped: score order");
+    }
+
+    #[test]
+    fn open_item_records_nothing() {
+        let a = Arc::new(FakeProvider::new("a", vec![("x", "Ex", 500)]));
+        let (e, ranking, h, _, dir) = engine_stores(vec![Box::new(a.clone())]);
+        assert_eq!(e.open_item("a", "x"), Ok(Outcome::Hide));
+        assert_eq!(*a.activated.lock().unwrap(), [("x".to_string(), Modifier::None)]);
+        assert_eq!(ranking.boost("a", "x"), 0);
+        assert!(h.recents().is_empty() && h.searches().is_empty());
+        assert!(!dir.path().join("picks.json").exists());
+    }
+
+    #[test]
+    fn open_item_refuses_confirm_and_unknown() {
+        let mut c = FakeProvider::new("c", vec![("off", "Shut down", 1)]);
+        c.confirm = true;
+        let c = Arc::new(c);
+        let a = Arc::new(FakeProvider::new("a", vec![("x", "Ex", 500)]));
+        let (e, _, _dir) = engine_boxed(vec![Box::new(c.clone()), Box::new(a.clone())]);
+        assert_eq!(e.open_item("c", "off"), Err("needs a second Enter".to_string()));
+        assert_eq!(e.open_item("a", "gone"), Err("not found".to_string()));
+        assert_eq!(e.open_item("nowhere", "x"), Err("not found".to_string()));
+        assert_eq!(e.open_item(HELP, "timer"), Err("not found".to_string()));
+        assert!(c.activated.lock().unwrap().is_empty() && a.activated.lock().unwrap().is_empty());
     }
 }
