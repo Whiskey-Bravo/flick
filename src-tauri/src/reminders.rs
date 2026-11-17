@@ -166,7 +166,7 @@ impl Reminders {
             return Err(SAVE_FAILED.to_string());
         }
         st.dirty = false;
-        st.next_id += 1;
+        st.next_id = st.next_id.saturating_add(1);
         self.wake.notify_all();
         Ok(r)
     }
@@ -737,6 +737,19 @@ mod tests {
         let r = g.r.add(g.now() + Duration::from_secs(60), "y", false).unwrap();
         assert_eq!(r.id, 8);
         assert_eq!(g.r.pending().len(), 2, "add reads the file first, never writes over it");
+    }
+
+    #[test]
+    fn the_largest_id_in_the_file_never_overflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = serde_json::json!({"version": 1, "items": [
+            {"id": u64::MAX, "due": unix_ceil(t0()) + 600, "text": "x", "timer": false},
+        ]});
+        std::fs::write(dir.path().join("reminders.json"), file.to_string()).unwrap();
+        let g = rig_in(dir, None);
+        g.r.add(g.now() + Duration::from_secs(60), "y", false).unwrap();
+        g.r.add(g.now() + Duration::from_secs(90), "z", false).unwrap();
+        assert_eq!(g.r.pending().len(), 3);
     }
 
     fn write_items(dir: &tempfile::TempDir, items: serde_json::Value) {
