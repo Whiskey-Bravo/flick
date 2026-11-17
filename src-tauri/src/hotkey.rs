@@ -138,6 +138,12 @@ mod tests {
             "hotkey \"Alt+Space\" is taken, probably by PowerToys Run: turn PowerToys Run off in PowerToys, or set hotkey in Flick's config"
         );
     }
+    #[test]
+    fn resume_skips_when_a_new_hotkey_was_applied() {
+        assert_eq!(resume_target(&None, Some(1)), Some(1));
+        assert_eq!(resume_target(&Some(2), Some(1)), None);
+        assert_eq!(resume_target::<i32>(&None, None), None);
+    }
 
     #[test]
     fn settings_hotkey_strings_parse() {
