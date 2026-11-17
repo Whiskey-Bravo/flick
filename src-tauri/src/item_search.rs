@@ -47,15 +47,14 @@ pub fn found(item: Option<&ResultItem>, provider_ready: bool) -> bool {
     item.is_some() || !provider_ready
 }
 
-/// Providers the picker never asks anything. Their rows cannot be stored
-/// (answers, status values, `tr`/`def`, timers, devices, the clipboard), or
-/// building them reads the Recycle Bin or drives (chores): asking them would
-/// go online or read devices for text typed in Settings. A chore can still be
-/// put on a hotkey by hand in the config.
-pub const PICKER_SKIPS: [&str; 8] = ["answers", "status", "words", "timers", "devices", "chores", "clips", "qr"];
+/// Providers the picker never asks anything: their rows cannot be stored, and
+/// asking would go online (answers, `ip`, `tr`/`def`) or read the clipboard
+/// (`v`, `qr`). Devices and chores are asked, so a hotkey can connect
+/// headphones or empty the bin; that only reads lists on this PC.
+pub const PICKER_SKIPS: [&str; 6] = ["answers", "status", "words", "timers", "clips", "qr"];
 
 /// The picker's search: the bar's search over every provider except
-/// [`PICKER_SKIPS`], so nothing is fetched or read from a device for it.
+/// [`PICKER_SKIPS`], so nothing is fetched online for it.
 pub fn search(engine: &Engine, text: &str, for_workspace: bool) -> Vec<PickRow> {
     pick_rows(engine.query_except(text, &PICKER_SKIPS), for_workspace)
 }

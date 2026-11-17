@@ -1265,8 +1265,6 @@ mod tests {
         /// What a workspace run reported: `(name, message)`.
         reports: std::sync::mpsc::Receiver<(String, String)>,
         bt: Arc<devices::testing::FakeBt>,
-        wifi: Arc<devices::testing::FakeWifi>,
-        chores: Arc<chores::testing::FakeChores>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
@@ -1378,8 +1376,8 @@ mod tests {
                 clipboard: Arc::new(clipboard::FakeClipboard::default()),
                 fetch: fetch.clone(),
                 bt: bt.clone(),
-                wifi: wifi.clone(),
-                chores: chores.clone(),
+                wifi,
+                chores,
                 reminders: dir.path().join("reminders.json"),
                 now: Arc::new(|| std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap())),
                 tz: jiff::tz::TimeZone::UTC,
@@ -1457,8 +1455,6 @@ mod tests {
             extras_ready,
             reports,
             bt,
-            wifi,
-            chores,
         }
     }
 
@@ -2336,6 +2332,9 @@ mod tests {
     #[test]
     fn the_item_picker_never_fetches_or_reads() {
         let r = rig(vec![], vec![]);
+        // A stored device row resolves before any list was read (a hotkey right after start).
+        let standin = r.engine.item("devices", "connect:bt-9").expect("rebuilt from its id");
+        assert_eq!((standin.title.as_str(), standin.pinnable), ("Bluetooth audio device", true));
         for text in ["ip", "weather vienna", "20 usd in eur", "tr hallo", "def Haus", "wifi home", "connect", "empty bin", "eject", "v"] {
             let rows = item_search::search(&r.engine, text, false);
             assert!(rows.iter().all(|row| !item_search::PICKER_SKIPS.contains(&row.provider.as_str())), "{text}");
@@ -2343,12 +2342,21 @@ mod tests {
         // Longer than every typing pause (ip, weather, tr/def).
         std::thread::sleep(Duration::from_millis(800));
         assert!(r.fetch.urls().is_empty(), "{:?}", r.fetch.urls());
-        assert_eq!((r.bt.lists(), r.wifi.lists()), (0, 0));
-        assert!(r.chores.calls().is_empty(), "{:?}", r.chores.calls());
         assert_eq!(r.clip_history.reads(), 0);
-        // It still finds what can be stored.
+        // What can be stored is found: a game, the empty-bin chore (armed on a
+        // hotkey) and, once the list is read, a paired device.
         let found = item_search::search(&r.engine, "hades", false);
         assert_eq!(found.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["games"]);
+        let bin = item_search::search(&r.engine, "empty bin", false);
+        let bin = bin.iter().find(|p| p.provider == "chores" && p.title == "Empty Recycle Bin").expect("the empty-bin row");
+        assert!(bin.confirm);
+        let devices = item_search::search(&r.engine, "connect", false);
+        let headphones = devices.iter().find(|p| p.provider == "devices").expect("a device row");
+        assert_eq!((headphones.id.as_str(), headphones.title.as_str()), ("connect:bt-1", "Headphones"));
+        assert_eq!(r.engine.item("devices", "connect:bt-1").map(|i| i.subtitle), Some("Not connected".to_string()));
+        // Once the list is read, a device that is not in it is gone.
+        assert!(r.engine.item("devices", "connect:bt-9").is_none());
+        assert!(r.bt.calls().iter().all(|c| !c.starts_with("connect")), "{:?}", r.bt.calls());
     }
 
     /// The global-shortcut plugin's one app-wide map, shared by the bar hotkey

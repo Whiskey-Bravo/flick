@@ -1,6 +1,7 @@
 //! `connect` / `disconnect`: paired Bluetooth audio devices; `wifi <name>`:
 //! saved Wi-Fi networks. Both lists are read on [`Loader`] threads; the query
-//! path only reads memory. Nothing is learned or stored.
+//! path only reads memory. Nothing is learned; a row can be pinned or put on
+//! a direct hotkey (its id is the device's id or the network's name).
 
 use std::sync::Arc;
 
@@ -16,6 +17,8 @@ const NONE_CONNECTED: &str = "No connected Bluetooth audio devices";
 const NO_MATCH: &str = "No device matches that name";
 const READING_WIFI: &str = "Reading Wi-Fi networks\u{2026}";
 const BT_ICON: &str = "builtin:bluetooth";
+/// The title of a stored device row before the device list was read.
+const BT_STANDIN: &str = "Bluetooth audio device";
 const WIFI_ICON: &str = "builtin:wifi";
 /// The id of the one inert row a query may show.
 const INERT_ID: &str = "info";
@@ -55,6 +58,38 @@ fn wifi_name(text: &str) -> Option<&str> {
     let name = after_word(text, "wifi")?;
     let toggle = name.eq_ignore_ascii_case("on") || name.eq_ignore_ascii_case("off");
     (!name.is_empty() && !toggle).then_some(name)
+}
+
+/// A device row; `connected` is `None` when the list was not read yet.
+fn bt_row(verb: Verb, id: &str, title: String, connected: Option<bool>, score: u32) -> ResultItem {
+    ResultItem {
+        id: format!("{}:{id}", verb.word()),
+        provider: NAME,
+        title,
+        subtitle: match connected {
+            Some(true) => "Connected",
+            Some(false) => "Not connected",
+            None => "",
+        }
+        .to_string(),
+        score,
+        icon: BT_ICON.to_string(),
+        pinnable: true,
+        ..Default::default()
+    }
+}
+
+fn wifi_row(name: &str, connected: bool, score: u32) -> ResultItem {
+    ResultItem {
+        id: format!("wifi:{name}"),
+        provider: NAME,
+        title: name.to_string(),
+        subtitle: if connected { "Connected" } else { "Saved network" }.to_string(),
+        score,
+        icon: WIFI_ICON.to_string(),
+        pinnable: true,
+        ..Default::default()
+    }
 }
 
 fn inert(title: &str, icon: &str) -> ResultItem {
@@ -114,15 +149,7 @@ impl DevicesProvider {
             .enumerate()
             .filter_map(|(i, d)| {
                 let score = if name.is_empty() { 1000u32.saturating_sub(i as u32) } else { score(name, &d.name)? };
-                Some(ResultItem {
-                    id: format!("{}:{}", verb.word(), d.id),
-                    provider: NAME,
-                    title: d.name.clone(),
-                    subtitle: if d.connected { "Connected" } else { "Not connected" }.to_string(),
-                    score,
-                    icon: BT_ICON.to_string(),
-                    ..Default::default()
-                })
+                Some(bt_row(verb, &d.id, d.name.clone(), Some(d.connected), score))
             })
             .collect();
         if rows.is_empty() {
@@ -140,16 +167,7 @@ impl DevicesProvider {
         profiles
             .iter()
             .filter_map(|p| {
-                Some(ResultItem {
-                    id: format!("wifi:{}", p.name),
-                    provider: NAME,
-                    title: p.name.clone(),
-                    subtitle: if p.connected { "Connected" } else { "Saved network" }.to_string(),
-                    score: score(name, &p.name)?,
-                    icon: WIFI_ICON.to_string(),
-                    top: true,
-                    ..Default::default()
-                })
+                Some(ResultItem { top: true, ..wifi_row(&p.name, p.connected, score(name, &p.name)?) })
             })
             .collect()
     }
@@ -206,6 +224,28 @@ impl Provider for DevicesProvider {
     /// Rows carry typed and read names: never learned.
     fn rank_key(&self, _id: &str) -> Option<String> {
         None
+    }
+
+    /// A stored row (a pin or a direct hotkey), from memory only: the last
+    /// list read decides, and a device or network missing from it is gone.
+    /// Before any read the row is rebuilt from its id alone.
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        if let Some(network) = id.strip_prefix("wifi:") {
+            return match self.wifi_list.peek("wifi") {
+                Some(profiles) => profiles.iter().find(|p| p.name == network).map(|p| wifi_row(&p.name, p.connected, 0)),
+                None => Some(wifi_row(network, false, 0)),
+            };
+        }
+        let (verb, device) = [Verb::Connect, Verb::Disconnect]
+            .into_iter()
+            .find_map(|v| id.strip_prefix(v.word()).and_then(|r| r.strip_prefix(':')).map(|d| (v, d)))?;
+        match self.bt_list.peek("bt") {
+            Some(devices) => {
+                let d = devices.iter().find(|d| d.id == device)?;
+                Some(bt_row(verb, &d.id, d.name.clone(), Some(d.connected), 0))
+            }
+            None => Some(bt_row(verb, device, BT_STANDIN.to_string(), None, 0)),
+        }
     }
 
     fn claims(&self, text: &str) -> bool {
@@ -456,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_never_learned() {
+    fn rows_are_never_learned_but_can_be_stored() {
         let t = t(two());
         let mut rows = ready(&t, "connect");
         rows.extend(ready(&t, "disconnect"));
@@ -464,8 +504,13 @@ mod tests {
         assert_eq!(rows.len(), 4);
         for r in &rows {
             assert_eq!(t.p.rank_key(&r.id), None, "{}", r.id);
-            assert!(t.p.item(&r.id).is_none(), "{}", r.id);
+            assert!(r.pinnable, "{}", r.id);
+            // Rebuilt from the list in memory, for a pin or a direct hotkey.
+            let item = t.p.item(&r.id).unwrap_or_else(|| panic!("{}", r.id));
+            assert_eq!((item.title.as_str(), item.subtitle.as_str()), (r.title.as_str(), r.subtitle.as_str()));
         }
+        assert!(t.p.item("connect:gone").is_none() && t.p.item("wifi:gone").is_none());
+        assert!(t.p.item("info").is_none());
     }
 
     #[test]

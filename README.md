@@ -380,7 +380,7 @@ Games and bookmarks are learned, pinned and kept as recent launches like apps.
 
 ## Workspaces and hotkeys
 
-Both are set up in Settings, on the Workspaces and Hotkeys tabs. You pick their items with the search box there, which finds what the bar finds: apps, files, folders, games, bookmarks, shortcuts, Settings pages and more.
+Both are set up in Settings, on the Workspaces and Hotkeys tabs. You pick their items with the search box there, which finds what the bar finds: apps, files, folders, games, bookmarks, shortcuts, Settings pages, Bluetooth devices and Wi-Fi networks (`connect headphones`, `wifi home`), chores and more. Answers, `tr`/`def` and timers are not offered there, so nothing typed in Settings goes online.
 
 **Workspaces.** A workspace is a name for a set of items (`work`, `gaming`). Type its name and the bar shows `Open workspace work`; Enter opens every item in order, with a short pause between them, and the bar hides. An item that no longer exists, or one that asks for a second Enter (`empty bin`, power actions), is skipped. If any item could not open, the bar comes back with the workspace's name and, for example, `1 of 3 could not open`. Workspaces do not arrange or close windows.
 
