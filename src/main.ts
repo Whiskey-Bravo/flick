@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
-  capOf, failureText, initial, movedEnough, reduce, visibleItems,
+  capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
   type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
@@ -106,7 +106,11 @@ function renderItem(item: Item, index: number): HTMLLIElement {
   title.textContent = item.title;
   const sub = document.createElement("span");
   sub.className = "subtitle";
-  sub.textContent = armed ? "Press Enter again to confirm" : item.subtitle;
+  sub.textContent = !armed
+    ? item.subtitle
+    : state.armedAction === "uninstall"
+      ? `Uninstall ${item.title}? Enter again`
+      : "Press Enter again to confirm";
   li.append(renderIcon(item), title, sub);
   if (item.pinned) {
     const star = document.createElement("img");
@@ -122,7 +126,12 @@ const MENU_LABELS: Record<MenuAction, string> = {
   pin: "Pin",
   unpin: "Unpin",
   reveal: "Open file location",
+  open_folder: "Open in Explorer",
+  copy_path: "Copy path",
   admin: "Run as administrator",
+  uninstall: "Uninstall",
+  close: "Close",
+  close_window: "Close window",
 };
 /// Where the right-click happened, in window coordinates.
 let menuAt: Point = { x: 0, y: 0 };
@@ -145,11 +154,21 @@ function renderMenu() {
       return entry;
     }),
   );
+  let at = menuAt;
+  if (m.at === "row") {
+    // Under the selected row, past its icon.
+    const li = list.querySelector<HTMLElement>("li.result.selected");
+    const icon = li?.querySelector<HTMLElement>(".icon");
+    if (li) {
+      const box = li.getBoundingClientRect();
+      at = { x: box.left + (icon?.offsetWidth ?? 0), y: box.bottom };
+    }
+  }
   // Flip up / shift left when the menu would run past the window edge.
   const w = menuEl.offsetWidth;
   const h = menuEl.offsetHeight;
-  const left = menuAt.x + w > window.innerWidth ? menuAt.x - w : menuAt.x;
-  const top = menuAt.y + h > window.innerHeight ? menuAt.y - h : menuAt.y;
+  const left = at.x + w > window.innerWidth ? at.x - w : at.x;
+  const top = at.y + h > window.innerHeight ? at.y - h : at.y;
   menuEl.style.left = `${Math.max(0, left)}px`;
   menuEl.style.top = `${Math.max(0, top)}px`;
 }
@@ -224,13 +243,15 @@ function run(effect: Effect) {
         .then((pinned) => dispatch({ type: "pinned", provider: effect.item.provider, id: effect.item.id, pinned }))
         .catch((err) => dispatch({ type: "failed", message: failureText(effect.item, err) }));
       break;
-    case "reveal": {
-      // On success the back end hides the bar; a failure shows like a failed
-      // activation, unless the bar was shown again meanwhile.
+    case "act": {
       const at = shows;
-      invoke("reveal", { provider: effect.item.provider, id: effect.item.id }).catch((err) => {
-        if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
-      });
+      invoke<Outcome>("act", { provider: effect.item.provider, id: effect.item.id, action: effect.action })
+        .then((outcome) => {
+          if (at === shows) dispatch({ type: "outcome", outcome });
+        })
+        .catch((err) => {
+          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+        });
       break;
     }
     case "hide":
@@ -241,7 +262,7 @@ function run(effect: Effect) {
 
 input.addEventListener("input", () => dispatch({ type: "input", text: input.value }));
 
-const KEYS = ["ArrowUp", "ArrowDown", "Enter", "Escape", "F1", "p"] as const;
+const KEYS = ["ArrowUp", "ArrowDown", "Enter", "Escape", "F1", "p", "Tab"] as const;
 // Browser defaults that make no sense in a launcher: focus change, help, reload, print, find.
 const SWALLOWED = ["Tab", "F1", "F5"];
 const SWALLOWED_CTRL = ["p", "f", "r"];
@@ -270,9 +291,22 @@ input.addEventListener("keydown", (e) => {
   if (key === "p" && !e.ctrlKey) return; // plain p is text
   e.preventDefault();
   // Held Enter/Escape must not repeat: it would skip the two-step confirm.
-  if (e.repeat && (key === "Enter" || key === "Escape" || key === "F1" || key === "p")) return;
+  if (e.repeat && (key === "Enter" || key === "Escape" || key === "F1" || key === "p" || key === "Tab")) return;
   dispatch({ type: "key", key, ctrl: e.ctrlKey, shift: e.shiftKey });
 });
+
+// The wheel scrolls the list by whole rows; leftover pixels carry to the next tick.
+let wheelAcc = 0;
+listWrap.addEventListener(
+  "wheel",
+  (e) => {
+    e.preventDefault();
+    const r = rowsFromWheel(wheelAcc, e.deltaY);
+    wheelAcc = r.acc;
+    if (r.rows !== 0) dispatch({ type: "wheel", rows: r.rows });
+  },
+  { passive: false },
+);
 
 // Hover selects only when the pointer really moved: rows replaced under a still
 // pointer fire mouse events too, and must not steal the keyboard selection.
