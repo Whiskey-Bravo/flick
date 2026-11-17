@@ -2,7 +2,7 @@
 
 A small keyboard launcher for Windows 11. Press Alt+Space (or your own hotkey), type a few letters, press Enter.
 
-<!-- screenshot: added with result icons -->
+![Flick showing an app and two files for the search "term"](screenshots/search.png)
 
 Flick finds apps, files, folders and Settings pages, runs power actions, runs commands in WSL, and runs your own shortcuts. Each result has its icon, and you can use the mouse as well as the keyboard. It is built for personal use with Tauri 2 (a Rust core and a plain TypeScript front end).
 
@@ -64,6 +64,8 @@ Each result shows the icon of its app, file or folder. Icons load in the backgro
 ## Pins and recent launches
 
 Pin the things you open every day. Select a row and press Ctrl+P (again to unpin), or use the right-click menu. With an empty bar, Flick shows your pins first, each with a star, and under them your last 5 launches. Pins stay until you unpin them.
+
+![The empty bar with four pinned rows: an app, a file, a Settings page and a folder](screenshots/pins.png)
 
 ## Past searches
 
