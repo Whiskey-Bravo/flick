@@ -223,7 +223,17 @@ pub fn validate(c: &Config) -> Result<(), String> {
 /// The field of a shortcut a problem is about (`Target` is whichever of run/wsl/open is set).
 #[derive(serde::Serialize, Debug, PartialEq, Clone, Copy)]
 #[serde(rename_all = "snake_case")]
-pub enum Field { Name, Aliases, Target, Terminal, Admin, Pick, Choices }
+pub enum Field {
+    Name,
+    Aliases,
+    Target,
+    /// No rule reports it yet; kept so the Settings form has a name for the field.
+    #[allow(dead_code)]
+    Terminal,
+    Admin,
+    Pick,
+    Choices,
+}
 
 #[derive(serde::Serialize, Debug, PartialEq)]
 pub struct FieldError {
