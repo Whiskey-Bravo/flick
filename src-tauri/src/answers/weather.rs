@@ -310,17 +310,12 @@ impl WeatherStore {
     }
 
     /// The configured `weather_city` (empty for none). Saves its coordinates when
-    /// they are already known. Not for the query path: may write `weather.json`.
+    /// they are already known, and drops a former home city from `weather.json`.
+    /// Not for the query path: reads and may write `weather.json`.
     pub fn set_home(&self, city: &str) {
         let norm = tidy(city).to_lowercase();
-        let known = {
-            let mut st = self.inner.lock();
-            st.home = (!norm.is_empty()).then(|| norm.clone());
-            st.place(&norm).is_some()
-        };
-        if known {
-            self.inner.save_home();
-        }
+        self.inner.lock().home = (!norm.is_empty()).then_some(norm);
+        self.inner.save_home();
     }
 
     /// Forgets the city waiting for the pause (the text is no longer a weather question).
@@ -339,10 +334,14 @@ impl WeatherStore {
             st.pending = None;
             return WeatherState::Off;
         }
+        let key = (norm.clone(), fahrenheit);
+        // Only the city asked for now may still be fetched after the pause.
+        if st.pending.as_ref().is_some_and(|p| p.key != key) {
+            st.pending = None;
+        }
         if norm.is_empty() {
             return WeatherState::NotFound(city);
         }
-        let key = (norm.clone(), fahrenheit);
         if let Some(c) = st.forecasts.get(&key) {
             if now.saturating_duration_since(c.at) < FRESH_FOR {
                 return WeatherState::Ready(c.forecast.clone());
@@ -361,9 +360,7 @@ impl WeatherStore {
             return WeatherState::Offline;
         }
         if place.is_some() && st.home.as_deref() == Some(norm.as_str()) {
-            if st.pending.as_ref().is_some_and(|p| p.key == key) {
-                st.pending = None;
-            }
+            st.pending = None;
             let job = st.begin(key, city, now);
             drop(st);
             return if spawn_fetch(&self.inner, job) { WeatherState::Fetching(shown) } else { WeatherState::Offline };
@@ -393,17 +390,29 @@ impl Inner {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Writes the home city's coordinates (and nothing else) to `weather.json`.
+    /// Makes `weather.json` hold the home city's coordinates and nothing else: a
+    /// former home city is removed even when the new one's coordinates are not known
+    /// yet. Writes only when that changes the file.
     fn save_home(&self) {
         let _saving = self.saving.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = {
+        let (home, place) = {
             let st = self.lock();
-            st.home.clone().and_then(|home| st.place(&home).map(|p| (home, p)))
+            let place = st.home.as_deref().and_then(|h| st.place(h));
+            (st.home.clone(), place)
         };
-        if let Some((home, p)) = entry {
-            let places = BTreeMap::from([(home, (p.lat, p.lon, p.name))]);
+        let current = std::fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Stored>(&bytes).ok())
+            .map(|s| s.places)
+            .unwrap_or_default();
+        let wanted: BTreeMap<_, _> = match (home, place) {
+            (Some(home), Some(p)) => BTreeMap::from([(home, (p.lat, p.lon, p.name))]),
+            // Coordinates not known yet: keep only an entry for the home city itself.
+            (home, _) => current.iter().filter(|(k, _)| Some(*k) == home.as_ref()).map(|(k, v)| (k.clone(), v.clone())).collect(),
+        };
+        if wanted != current {
             // Not saved = one more place search after a restart.
-            let _ = crate::ranking::save_json(&self.path, &Stored { version: 1, places });
+            let _ = crate::ranking::save_json(&self.path, &Stored { version: 1, places: wanted });
         }
     }
 }
@@ -608,12 +617,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fetch = Arc::new(FakeFetch::offline());
         let (store, rx) = store_with(&dir, fetch.clone());
+        let first = Instant::now();
         for city in ["l", "lo", "lon"] {
+            if city != "l" {
+                std::thread::sleep(Duration::from_millis(150));
+            }
             assert_eq!(store.lookup(city, Instant::now(), true, false), WeatherState::Fetching(city.into()));
-            std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(fetch.urls().is_empty(), "nothing before the pause");
-        std::thread::sleep(Duration::from_millis(500));
+        let last = Instant::now();
+        std::thread::sleep(Duration::from_millis(200));
+        // Measured from the latest city: past 400 ms since `l`, well short of it since `lon`.
+        assert!(first.elapsed() > Duration::from_millis(450));
+        assert!(fetch.urls().is_empty(), "nothing before the pause after `lon`");
+        assert!(last.elapsed() < PAUSE, "test machine too slow to judge the pause");
         wait(&rx);
         assert_eq!(fetch.urls(), vec![geocode_url("lon")]);
         assert!(rx.recv_timeout(Duration::from_millis(1200)).is_err(), "one attempt only");
@@ -729,6 +745,81 @@ mod tests {
         store.set_home("London");
         let saved = std::fs::read_to_string(dir.path().join("weather.json")).unwrap();
         assert!(saved.contains("\"london\"") && !saved.contains("vienna"), "{saved}");
+    }
+
+    fn saved_places(dir: &tempfile::TempDir) -> serde_json::Value {
+        let bytes = std::fs::read(dir.path().join("weather.json")).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["places"].clone()
+    }
+
+    #[test]
+    fn a_former_home_city_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(london_fetch());
+        let (store, rx) = store_with(&dir, fetch.clone());
+        store.set_home("London");
+        store.lookup("London", Instant::now(), true, false);
+        wait(&rx);
+        assert_eq!(saved_places(&dir), serde_json::json!({"london":[51.51,-0.13,"London"]}));
+
+        // Home cleared: the old city leaves the file.
+        store.set_home("");
+        assert_eq!(saved_places(&dir), serde_json::json!({}));
+        // Nothing to change: no write (a missing file counts as no places).
+        std::fs::remove_file(dir.path().join("weather.json")).unwrap();
+        store.set_home("Vienna");
+        assert!(!dir.path().join("weather.json").exists());
+
+        // A new home whose coordinates are not known yet also removes the old one.
+        store.set_home("London");
+        assert_eq!(saved_places(&dir), serde_json::json!({"london":[51.51,-0.13,"London"]}));
+        store.set_home("Vienna");
+        assert_eq!(saved_places(&dir), serde_json::json!({}));
+
+        // The stored entry for the home city itself stays, even before `load`.
+        std::fs::write(dir.path().join("weather.json"), r#"{"version":1,"places":{"tokyo":[35.69,139.69,"Tokyo"]}}"#).unwrap();
+        let (fresh, _rx) = store_with(&dir, Arc::new(FakeFetch::offline()));
+        fresh.set_home("Tokyo");
+        assert_eq!(saved_places(&dir), serde_json::json!({"tokyo":[35.69,139.69,"Tokyo"]}));
+    }
+
+    #[test]
+    fn an_answered_city_drops_the_waiting_one() {
+        // London cached: `londo` waits for the pause, then `london` answers at once.
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(london_fetch());
+        let (store, rx) = store_with(&dir, fetch.clone());
+        let now = Instant::now();
+        store.lookup("London", now, true, false);
+        wait(&rx);
+        assert_eq!(store.lookup("londo", now, true, false), WeatherState::Fetching("londo".into()));
+        assert_eq!(store.lookup("london", now, true, false), WeatherState::Ready(london()));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(fetch.urls(), vec![geocode_url("London"), london_forecast_url(false)]);
+
+        // Home with stored coordinates: `weather l` then bare `weather` (home).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("weather.json"), r#"{"version":1,"places":{"london":[51.51,-0.13,"London"]}}"#).unwrap();
+        let fetch = Arc::new(london_fetch());
+        let (store, rx) = store_with(&dir, fetch.clone());
+        store.load();
+        store.set_home("London");
+        assert_eq!(store.lookup("l", Instant::now(), true, false), WeatherState::Fetching("l".into()));
+        assert_eq!(store.lookup("London", Instant::now(), true, false), WeatherState::Fetching("London".into()));
+        wait(&rx);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(fetch.urls(), vec![london_forecast_url(false)]);
+
+        // Any other early answer (not found, offline) drops it too.
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(FakeFetch::offline().respond(&geocode_url("xyz"), Ok(NO_RESULTS.to_vec())));
+        let (store, rx) = store_with(&dir, fetch.clone());
+        store.lookup("xyz", Instant::now(), true, false);
+        wait(&rx);
+        store.lookup("xy", Instant::now(), true, false);
+        assert_eq!(store.lookup("xyz", Instant::now(), true, false), WeatherState::NotFound("xyz".into()));
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(fetch.urls(), vec![geocode_url("xyz")]);
     }
 
     #[test]
