@@ -59,6 +59,23 @@ impl Pins {
         now_pinned
     }
 
+    /// Moves a pin one place up or down; a no-op at the ends or for an unknown
+    /// pin. Saved like `toggle`.
+    pub fn move_pin(&self, provider: &str, id: &str, up: bool) {
+        let _saving = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(i) = pins.iter().position(|p| p.provider == provider && p.id == id) else {
+                return;
+            };
+            let j = if up { i.checked_sub(1) } else { Some(i + 1).filter(|&j| j < pins.len()) };
+            let Some(j) = j else { return };
+            pins.swap(i, j);
+            pins.clone()
+        };
+        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+    }
+
     pub fn is_pinned(&self, provider: &str, id: &str) -> bool {
         let pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
         pins.iter().any(|p| p.provider == provider && p.id == id)
@@ -90,6 +107,25 @@ mod tests {
         assert_eq!(p.list(), vec![pair("apps", "a"), pair("apps", "c")]);
         assert!(p.is_pinned("apps", "a"));
         assert!(!p.is_pinned("apps", "b"));
+    }
+
+    #[test]
+    fn pins_move_up_and_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.json");
+        let p = Pins::load(path.clone());
+        for id in ["a", "b", "c"] {
+            p.toggle("apps", id);
+        }
+        p.move_pin("apps", "b", true);
+        assert_eq!(p.list(), vec![pair("apps", "b"), pair("apps", "a"), pair("apps", "c")]);
+        p.move_pin("apps", "b", true); // first: no-op
+        p.move_pin("apps", "c", false); // last: no-op
+        p.move_pin("apps", "zzz", true); // unknown: no-op
+        assert_eq!(p.list(), vec![pair("apps", "b"), pair("apps", "a"), pair("apps", "c")]);
+        p.move_pin("apps", "b", false);
+        assert_eq!(p.list(), vec![pair("apps", "a"), pair("apps", "b"), pair("apps", "c")]);
+        assert_eq!(Pins::load(path).list(), vec![pair("apps", "a"), pair("apps", "b"), pair("apps", "c")]);
     }
 
     #[test]

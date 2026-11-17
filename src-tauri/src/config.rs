@@ -390,6 +390,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn check_shortcut_in_rejects_the_builtin_help_name() {
+        let def: ShortcutDef = toml::from_str("name = \"Help\"
+run = \"notepad\"").unwrap();
+        let err = check_shortcut_in(&Config::default(), None, &def).unwrap_err();
+        assert_eq!(err.field, Field::Name);
+        assert_eq!(err.message, "name is already used");
+    }
+
+    #[test]
     fn defaults() {
         let c = Config::default();
         assert_eq!(c.hotkey, "Alt+Space");

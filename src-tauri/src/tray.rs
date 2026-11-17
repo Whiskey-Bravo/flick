@@ -2,10 +2,13 @@
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
 use crate::{launch, window};
+
+/// The "Start at login" menu item, in managed state.
+struct LoginItem(CheckMenuItem<tauri::Wry>);
 
 const TRAY_ID: &str = "flick";
 pub const DEFAULT_TOOLTIP: &str = "Flick";
@@ -23,6 +26,8 @@ pub fn build(
     let reload = MenuItem::with_id(app, "reload", "Reload", true, None::<&str>)?;
     let login =
         CheckMenuItem::with_id(app, "start_at_login", "Start at login", true, start_at_login, None::<&str>)?;
+    // Kept so the Settings window can move the check mark.
+    app.manage(LoginItem(login.clone()));
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&open, &edit, &reload, &login, &separator, &quit])?;
@@ -59,6 +64,14 @@ fn set_start_at_login(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     let actual = manager.is_enabled().unwrap_or(false);
     if actual != wanted {
         let _ = item.set_checked(actual);
+    }
+    let _ = app.emit_to(crate::settings::WINDOW, "settings:changed", ());
+}
+
+/// Puts the tray's "Start at login" check mark on `on`. No-op until the tray exists.
+pub fn set_login_checked(app: &AppHandle, on: bool) {
+    if let Some(item) = app.try_state::<LoginItem>() {
+        let _ = item.0.set_checked(on);
     }
 }
 

@@ -11,10 +11,18 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Outcome of [`detect`].
 #[derive(Debug, PartialEq)]
 pub enum Detection {
-    /// WSL answered (or is not installed): the distro to use, if any.
-    Found(Option<String>),
+    /// WSL answered (or is not installed): the distro to use and every usable
+    /// distro (Docker's internal ones left out), `None` when there is none.
+    Found(Option<Found>),
     /// `wsl.exe` timed out; the caller keeps its previous state and retries later.
     Failed,
+}
+
+/// What `wsl.exe` reported.
+#[derive(Debug, PartialEq)]
+pub struct Found {
+    pub default: String,
+    pub distros: Vec<String>,
 }
 
 /// Decode `wsl.exe` output: UTF-16LE (with or without BOM) as it normally
@@ -69,6 +77,14 @@ pub fn choose(list: &[(String, bool)]) -> Option<String> {
         .map(|(n, _)| n.clone())
 }
 
+/// The chosen distro with the names of all non-Docker distros; `None` when no
+/// distro is usable.
+fn found(list: &[(String, bool)]) -> Option<Found> {
+    let default = choose(list)?;
+    let distros = list.iter().filter(|(n, _)| !is_docker(n)).map(|(n, _)| n.clone()).collect();
+    Some(Found { default, distros })
+}
+
 /// Ask `wsl.exe` for its distros.
 pub fn detect() -> Detection {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
@@ -81,7 +97,7 @@ pub fn detect() -> Detection {
 /// but could not be started, is `Failed` and gets retried.
 fn from_run(res: Result<Vec<u8>, RunError>, exe_exists: bool) -> Detection {
     match res {
-        Ok(out) => Detection::Found(choose(&parse_list(&out))),
+        Ok(out) => Detection::Found(found(&parse_list(&out))),
         Err(RunError::Exit) => Detection::Found(None),
         Err(RunError::Spawn) if !exe_exists => Detection::Found(None),
         Err(RunError::Spawn | RunError::Timeout) => Detection::Failed,
@@ -125,6 +141,13 @@ mod tests {
     #[test]
     fn chooses_default() {
         assert_eq!(choose(&parse_list(LIST.as_bytes())), Some("Ubuntu".into()));
+    }
+
+    #[test]
+    fn found_lists_every_non_docker_distro() {
+        let f = found(&parse_list(LIST.as_bytes())).unwrap();
+        assert_eq!(f, Found { default: "Ubuntu".into(), distros: vec!["Ubuntu".into(), "Debian".into()] });
+        assert_eq!(found(&[("docker-desktop".into(), true)]), None);
     }
 
     #[test]

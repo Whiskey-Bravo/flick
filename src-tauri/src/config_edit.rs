@@ -1,8 +1,6 @@
 //! Edits `config.toml` text in place with `toml_edit`: comments, order and untouched
 //! shortcuts survive, and nothing is returned that `config::parse` would reject.
 
-#![allow(dead_code)] // used by the settings commands (Task 3)
-
 use std::path::{Path, PathBuf};
 
 use toml_edit::{value, Array, ArrayOfTables, Decor, DocumentMut, Item, Table, Value};

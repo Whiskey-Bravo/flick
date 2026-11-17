@@ -16,6 +16,7 @@ mod process;
 mod providers;
 mod quote;
 mod ranking;
+mod settings;
 mod tray;
 mod window;
 mod wsl_detect;
@@ -144,17 +145,17 @@ fn answers_config(c: &Config, formats: &dyn Formats) -> AnswersConfig {
 pub(crate) struct AppState {
     pub(crate) engine: Arc<Engine>,
     /// Shared with the engine; the config's `history` switch is applied to it.
-    history: Arc<History>,
+    pub(crate) history: Arc<History>,
     providers: Providers,
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
-    config: Mutex<Config>,
+    pub(crate) config: Mutex<Config>,
     /// Result of the last successful WSL detection; `Unknown` until one
     /// succeeds. Lock order: `config`, then this.
-    detected: Mutex<WslState>,
+    pub(crate) detected: Mutex<WslState>,
     /// Configured accelerator last applied successfully; `None` when the last
     /// `hotkey::apply` failed (the previous hotkey may then still be active).
-    hotkey: Mutex<Option<String>>,
+    pub(crate) hotkey: Mutex<Option<String>>,
     /// Keeps the config watcher alive for the life of the app.
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Latest config/hotkey error text, re-sent on every show so an error from
@@ -196,20 +197,20 @@ fn build_engine(
 
 /// What detection has said about WSL so far.
 #[derive(Clone, Debug, PartialEq)]
-enum WslState {
+pub(crate) enum WslState {
     /// No detection has succeeded yet (not run, or it timed out).
     Unknown,
     /// Detection found no usable WSL.
     NoWsl,
-    /// Detection found this default distro.
-    Distro(String),
+    /// Detection found these distros; `default` is the one to use.
+    Present { default: String, distros: Vec<String> },
 }
 
 impl WslState {
     /// `None` for a failed detection: the caller keeps its previous state.
     fn from_detection(detection: wsl_detect::Detection) -> Option<WslState> {
         match detection {
-            wsl_detect::Detection::Found(Some(d)) => Some(WslState::Distro(d)),
+            wsl_detect::Detection::Found(Some(f)) => Some(WslState::Present { default: f.default, distros: f.distros }),
             wsl_detect::Detection::Found(None) => Some(WslState::NoWsl),
             wsl_detect::Detection::Failed => None,
         }
@@ -222,7 +223,7 @@ fn effective_distro(configured: &str, detected: &WslState) -> String {
     match detected {
         WslState::NoWsl => String::new(),
         _ if !configured.is_empty() => configured.to_string(),
-        WslState::Distro(d) => d.clone(),
+        WslState::Present { default, .. } => default.clone(),
         WslState::Unknown => String::new(),
     }
 }
@@ -302,13 +303,25 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::query,
             commands::activate,
             commands::hide,
             commands::toggle_pin,
             commands::past_searches,
-            commands::reveal
+            commands::reveal,
+            settings::settings_state,
+            settings::settings_set,
+            settings::settings_save_shortcut,
+            settings::settings_check_shortcut,
+            settings::settings_delete_shortcut,
+            settings::settings_set_start_at_login,
+            settings::settings_clear_history,
+            settings::settings_pick_folder,
+            settings::settings_pins,
+            settings::settings_move_pin,
+            settings::settings_check_city
         ])
         // Result-row icons. Answered on the icon workers, never on this thread.
         .register_asynchronous_uri_scheme_protocol(icon::SCHEME, move |_ctx, request, responder| {
@@ -485,7 +498,7 @@ fn load_answer_stores(app: &AppHandle, p: &Providers) {
 
 /// Registers `accelerator`, records the result and updates the tray tooltip.
 /// Returns the user-facing error text on failure.
-fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
+pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
     let result = hotkey::apply(app, accelerator);
     let state = app.state::<AppState>();
     *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then(|| accelerator.to_string());
@@ -506,7 +519,7 @@ fn tooltip(error: Option<&str>) -> String {
 /// providers (rescanning files in the background when their folders changed);
 /// re-apply the hotkey if it changed (or the last attempt failed); emit
 /// `config:error`. Never call on the main thread.
-fn reload_config(app: &AppHandle) {
+pub(crate) fn reload_config(app: &AppHandle) {
     let state = app.state::<AppState>();
     let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     let loaded = config::load(&config::config_path(), Some(&config));
@@ -535,6 +548,7 @@ fn reload_config(app: &AppHandle) {
         None
     };
     emit_config_error(app, join_errors(loaded.error, hotkey_error));
+    let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
 }
 
 /// `applied` is the configured hotkey that last registered successfully (`None`
@@ -889,9 +903,13 @@ mod tests {
         assert!(r.launcher.calls().is_empty());
     }
 
+    fn ubuntu() -> WslState {
+        WslState::Present { default: "Ubuntu".into(), distros: vec!["Ubuntu".into(), "Debian".into()] }
+    }
+
     #[test]
     fn config_distro_wins_over_detected() {
-        let ubuntu = WslState::Distro("Ubuntu".into());
+        let ubuntu = ubuntu();
         assert_eq!(effective_distro("Debian", &ubuntu), "Debian");
         assert_eq!(effective_distro("", &ubuntu), "Ubuntu");
         assert_eq!(effective_distro("", &WslState::Unknown), "");
@@ -907,7 +925,8 @@ mod tests {
     #[test]
     fn detection_maps_to_state_and_failure_keeps_the_old_one() {
         use wsl_detect::Detection::{Failed, Found};
-        assert_eq!(WslState::from_detection(Found(Some("Ubuntu".into()))), Some(WslState::Distro("Ubuntu".into())));
+        let found = wsl_detect::Found { default: "Ubuntu".into(), distros: vec!["Ubuntu".into(), "Debian".into()] };
+        assert_eq!(WslState::from_detection(Found(Some(found))), Some(ubuntu()));
         assert_eq!(WslState::from_detection(Found(None)), Some(WslState::NoWsl));
         assert_eq!(WslState::from_detection(Failed), None);
     }
@@ -918,10 +937,10 @@ mod tests {
         let old = Config::default();
         assert!(!push_config(&r.providers, &old, &old, &WslState::Unknown));
         assert!(r.engine.query("> ls", None).is_empty(), "no WSL: nothing offered");
-        assert!(!push_config(&r.providers, &old, &old, &WslState::Distro("Ubuntu".into())));
+        assert!(!push_config(&r.providers, &old, &old, &ubuntu()));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         let set = Config { wsl_distro: "Debian".into(), ..Config::default() };
-        push_config(&r.providers, &old, &set, &WslState::Distro("Ubuntu".into()));
+        push_config(&r.providers, &old, &set, &ubuntu());
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Debian");
     }
 
@@ -929,7 +948,7 @@ mod tests {
     fn push_distro_applies_the_effective_distro_to_wsl_and_shortcuts() {
         let r = rig(vec![], vec![]);
         let config = Config { shortcuts: vec![shortcut("hello", "notepad")], ..Config::default() };
-        push_distro(&r.providers, &config, &WslState::Distro("Ubuntu".into()));
+        push_distro(&r.providers, &config, &ubuntu());
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
         push_distro(&r.providers, &config, &WslState::NoWsl);
