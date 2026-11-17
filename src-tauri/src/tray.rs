@@ -1,11 +1,11 @@
-//! Tray icon and its menu: Open, Edit config, Reload, Start at login, Quit.
+//! Tray icon and its menu: Open, Settings, Edit config, Reload, Start at login, Quit.
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
-use crate::{launch, window};
+use crate::{launch, settings_window, window};
 
 /// The "Start at login" menu item, in managed state.
 struct LoginItem(CheckMenuItem<tauri::Wry>);
@@ -22,6 +22,7 @@ pub fn build(
 ) -> tauri::Result<()> {
     let start_at_login = app.autolaunch().is_enabled().unwrap_or(false);
     let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let edit = MenuItem::with_id(app, "edit_config", "Edit config", true, None::<&str>)?;
     let reload = MenuItem::with_id(app, "reload", "Reload", true, None::<&str>)?;
     let login =
@@ -30,13 +31,14 @@ pub fn build(
     app.manage(LoginItem(login.clone()));
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &edit, &reload, &login, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &settings, &edit, &reload, &login, &separator, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip(tooltip)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => window::show(app),
+            "settings" => settings_window::open_soon(app),
             "edit_config" => {
                 // ShellExecute can block (it waits for the shell); keep it off the main thread.
                 std::thread::spawn(|| {

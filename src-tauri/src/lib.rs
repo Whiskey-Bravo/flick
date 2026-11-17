@@ -17,6 +17,7 @@ mod providers;
 mod quote;
 mod ranking;
 mod settings;
+mod settings_window;
 mod tray;
 mod window;
 mod wsl_detect;
@@ -73,7 +74,13 @@ struct Providers {
 
 impl Providers {
     /// Cheap: no disk access. File roots and shortcuts arrive with the config.
-    fn new(answers: Answers, apps: Arc<AppsProvider>, launcher: Arc<dyn Launcher>, distro: &str) -> Self {
+    fn new(
+        answers: Answers,
+        apps: Arc<AppsProvider>,
+        launcher: Arc<dyn Launcher>,
+        distro: &str,
+        open_settings: Opener,
+    ) -> Self {
         Self {
             answers: answers.provider,
             weather: answers.weather,
@@ -83,7 +90,7 @@ impl Providers {
             files: FilesProvider::new(launcher.clone()),
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
-            welcome: WelcomeProvider::new(Box::new(window::shows)),
+            welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
         }
     }
 }
@@ -175,6 +182,7 @@ fn build_engine(
     p: &Providers,
     power: Box<dyn PowerRunner>,
     open_config: Opener,
+    open_settings: Opener,
     ranking: Arc<Ranking>,
     history: Arc<History>,
     pins: Arc<Pins>,
@@ -187,12 +195,21 @@ fn build_engine(
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
         Box::new(PowerProvider::new(power)),
-        Box::new(FlickProvider::new(open_config)),
+        Box::new(FlickProvider::new(open_config, open_settings)),
         Box::new(HistoryProvider::new(history.clone())),
         // Last: it has no help line, so the help list is unchanged.
         Box::new(p.welcome.clone()),
     ];
     Engine::new(providers, ranking, history, pins)
+}
+
+/// Opens the Settings window; builds it off the calling thread.
+fn settings_opener(app: &AppHandle) -> Opener {
+    let app = app.clone();
+    Box::new(move || {
+        settings_window::open_soon(&app);
+        Ok(())
+    })
 }
 
 /// What detection has said about WSL so far.
@@ -321,7 +338,8 @@ pub fn run() {
             settings::settings_pick_folder,
             settings::settings_pins,
             settings::settings_move_pin,
-            settings::settings_check_city
+            settings::settings_check_city,
+            settings::settings_open_file
         ])
         // Result-row icons. Answered on the icon workers, never on this thread.
         .register_asynchronous_uri_scheme_protocol(icon::SCHEME, move |_ctx, request, responder| {
@@ -353,7 +371,10 @@ fn setup(app: &AppHandle) {
     let answers = Answers::new(launcher.clone(), Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
     }));
-    let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
+    let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher,
+        &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
+        settings_opener(app),
+    );
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
@@ -364,6 +385,7 @@ fn setup(app: &AppHandle) {
         &providers,
         Box::new(SystemPower),
         Box::new(launch::open_config),
+        settings_opener(app),
         ranking,
         history.clone(),
         pins,
@@ -631,7 +653,7 @@ mod tests {
             files: FilesProvider::with_entries(launcher.clone(), files),
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
-            welcome: WelcomeProvider::new(Box::new(|| 0)),
+            welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
         };
         let power = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
@@ -643,6 +665,7 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
+            Box::new(|| Ok(())),
             ranking,
             Arc::new(History::load(dir.path().join("history.json"), true)),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
@@ -784,6 +807,7 @@ mod tests {
                 "bluetooth",
                 "lock / sleep / restart / shut down / sign out",
                 "flick config",
+                "settings",
                 "clear history",
                 "help",
                 "Esc",
@@ -799,7 +823,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 18);
+        assert_eq!(r.engine.query("Help", None).len(), 19);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
@@ -878,7 +902,11 @@ mod tests {
         let r = rig(vec![], vec![]);
         for text in ["flick config", "edit config", "flick", "config"] {
             let res = r.engine.query(text, None);
-            assert_eq!((res[0].provider, res[0].title.as_str()), ("flick", "Flick: edit config"), "{text}");
+            let row = res.iter().find(|i| i.id == "config").unwrap_or_else(|| panic!("{text}"));
+            assert_eq!((row.provider, row.title.as_str()), ("flick", "Flick: edit config"), "{text}");
+        }
+        for text in ["flick config", "edit config"] {
+            assert_eq!(r.engine.query(text, None)[0].id, "config", "{text}");
         }
         let id = r.engine.query("flick config", None)[0].id.clone();
         assert_eq!(r.engine.activate("flick", &id, provider::Modifier::None, "", None), Ok(Outcome::Hide));

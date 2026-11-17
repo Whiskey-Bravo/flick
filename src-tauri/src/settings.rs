@@ -386,3 +386,9 @@ mod tests {
         assert!(fetch.urls().is_empty());
     }
 }
+
+/// Opens config.toml like the tray's "Edit config" (the file-error banner's button).
+#[tauri::command(async)]
+pub fn settings_open_file() -> Result<(), String> {
+    crate::launch::open_config()
+}

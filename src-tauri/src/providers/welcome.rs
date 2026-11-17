@@ -2,13 +2,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::providers::flick::Opener;
 use crate::provider::{Modifier, Outcome, Provider, Query, ResultItem};
 
 /// Reads the number of times the bar has been shown.
 pub type Shows = Box<dyn Fn() -> u64 + Send + Sync>;
 
 const HOTKEY_ID: &str = "hotkey";
-const HELP_ID: &str = "help";
+const SETTINGS_ID: &str = "settings";
 
 /// What `arm` recorded: the show it is armed for, and the hotkey (`None` = it
 /// could not be registered).
@@ -19,12 +20,14 @@ struct Armed {
 
 pub struct WelcomeProvider {
     shows: Shows,
+    /// Opens the Settings window.
+    open_settings: Opener,
     armed: Mutex<Option<Armed>>,
 }
 
 impl WelcomeProvider {
-    pub fn new(shows: Shows) -> Arc<Self> {
-        Arc::new(Self { shows, armed: Mutex::new(None) })
+    pub fn new(shows: Shows, open_settings: Opener) -> Arc<Self> {
+        Arc::new(Self { shows, open_settings, armed: Mutex::new(None) })
     }
 
     /// Arms the welcome for the next show (the one about to happen). Call
@@ -66,13 +69,16 @@ impl Provider for WelcomeProvider {
             Some(h) => format!("Press {h} anytime to open Flick"),
             None => "Open Flick from its tray icon until the hotkey works".to_string(),
         };
-        vec![row(HOTKEY_ID, first), row(HELP_ID, "Type help to see what it can do".into())]
+        vec![row(HOTKEY_ID, first), row(SETTINGS_ID, "Open Settings to change the hotkey and more".into())]
     }
 
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
         match id {
             HOTKEY_ID => Ok(Outcome::Hide),
-            HELP_ID => Ok(Outcome::Fill { text: "help".into() }),
+            SETTINGS_ID => {
+                (self.open_settings)()?;
+                Ok(Outcome::Hide)
+            }
             _ => Err("unknown item".into()),
         }
     }
@@ -89,9 +95,24 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn provider() -> (Arc<WelcomeProvider>, Arc<AtomicU64>) {
+        let (w, count, _) = provider_with_opener();
+        (w, count)
+    }
+
+    /// Also returns the counter of the settings opener.
+    fn provider_with_opener() -> (Arc<WelcomeProvider>, Arc<AtomicU64>, Arc<AtomicU64>) {
         let count = Arc::new(AtomicU64::new(0));
         let c = count.clone();
-        (WelcomeProvider::new(Box::new(move || c.load(Ordering::SeqCst))), count)
+        let opened = Arc::new(AtomicU64::new(0));
+        let o = opened.clone();
+        let w = WelcomeProvider::new(
+            Box::new(move || c.load(Ordering::SeqCst)),
+            Box::new(move || {
+                o.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        (w, count, opened)
     }
 
     #[test]
@@ -103,7 +124,7 @@ mod tests {
         count.store(1, Ordering::SeqCst);
         let rows = w.empty_query();
         assert_eq!(rows[0].title, "Press Alt+Space anytime to open Flick");
-        assert_eq!(rows[1].title, "Type help to see what it can do");
+        assert_eq!(rows[1].title, "Open Settings to change the hotkey and more");
         count.store(2, Ordering::SeqCst);
         assert!(w.empty_query().is_empty());
     }
@@ -117,11 +138,17 @@ mod tests {
     }
 
     #[test]
-    fn help_row_fills_help() {
-        let (w, _) = provider();
-        assert_eq!(w.activate("help", Modifier::None), Ok(Outcome::Fill { text: "help".into() }));
+    fn second_row_opens_settings_and_hides() {
+        let (w, count, opened) = provider_with_opener();
+        w.arm(Some("Alt+Space"));
+        count.store(1, Ordering::SeqCst);
+        assert_eq!(w.empty_query()[1].id, "settings");
+        assert_eq!(w.activate("settings", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
         assert_eq!(w.activate("hotkey", Modifier::None), Ok(Outcome::Hide));
-        assert_eq!(w.rank_key("help"), None);
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert_eq!(w.activate("help", Modifier::None), Err("unknown item".to_string()));
+        assert_eq!(w.rank_key("settings"), None);
         assert!(w.help().is_empty());
     }
 }
