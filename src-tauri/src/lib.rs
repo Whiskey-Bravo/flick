@@ -48,6 +48,9 @@ use providers::answers::{AnswersConfig, AnswersProvider, DUCKDUCKGO};
 use providers::apps::AppsProvider;
 use providers::files::FilesProvider;
 use providers::flick::{FlickProvider, Opener};
+use providers::path::PathProvider;
+use providers::recent::{DownloadsProvider, RecentProvider};
+use dirs::{DirEntry, FileSystem, Loader, SystemFolders, KnownFolders, Links, ShellLinks, SystemFs};
 use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
 use providers::settings::SettingsProvider;
@@ -90,6 +93,9 @@ struct Providers {
     /// Battery, CPU, memory, disk and IP answers.
     status: Arc<StatusProvider>,
     files: Arc<FilesProvider>,
+    path: Arc<PathProvider>,
+    downloads: Arc<DownloadsProvider>,
+    recent: Arc<RecentProvider>,
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
@@ -101,6 +107,7 @@ impl Providers {
     fn new(
         answers: Answers,
         control: Control,
+        browse: Browse,
         apps: Arc<AppsProvider>,
         launcher: Arc<dyn Launcher>,
         distro: &str,
@@ -118,6 +125,9 @@ impl Providers {
             system: control.system,
             status: control.status,
             files: FilesProvider::new(launcher.clone(), Arc::new(WindowsClipboard)),
+            path: browse.path,
+            downloads: browse.downloads,
+            recent: browse.recent,
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
@@ -140,7 +150,8 @@ fn refresh_windows_and_audio(
 ) -> Arc<refresh::Refresher> {
     refresh::Refresher::new(
         Box::new(move || {
-            windows.refresh();
+            // The window list reads each window's AppUserModelID through COM.
+            launch::with_com(|| windows.refresh());
             system.refresh();
         }),
         Box::new(move || on_done()),
@@ -174,6 +185,62 @@ impl Control {
             windows,
             system,
             status: Arc::new(StatusProvider::new(store, Arc::new(WindowsClipboard))),
+        }
+    }
+}
+
+/// Folder browsing: a typed path, `dl` and `recent`.
+struct Browse {
+    path: Arc<PathProvider>,
+    downloads: Arc<DownloadsProvider>,
+    recent: Arc<RecentProvider>,
+}
+
+impl Browse {
+    /// Cheap: nothing is read until a path, `dl` or `recent` is typed. Reads
+    /// run on loader threads; `on_ready` runs when one has finished.
+    fn new(launcher: Arc<dyn Launcher>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+        let folders = SystemFolders;
+        Self::over(
+            launcher,
+            on_ready,
+            Arc::new(SystemFs),
+            Arc::new(ShellLinks),
+            home,
+            folders.downloads(),
+            folders.recent(),
+            Arc::new(std::time::SystemTime::now),
+        )
+    }
+
+    /// The providers over any file system, links, folders and clock (tests use fakes).
+    #[allow(clippy::too_many_arguments)]
+    fn over(
+        launcher: Arc<dyn Launcher>,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+        fs: Arc<dyn FileSystem>,
+        links: Arc<dyn Links>,
+        home: Option<PathBuf>,
+        downloads: Option<PathBuf>,
+        recent: Option<PathBuf>,
+        now: dirs::Clock,
+    ) -> Self {
+        // One loader for path browsing and `dl`: they read the same kind of listing.
+        let dirs: Arc<Loader<Vec<DirEntry>>> = Loader::new(on_ready.clone(), dirs::FRESH, dirs::SLOW);
+        let store = Loader::new(on_ready, dirs::FRESH, dirs::SLOW);
+        let clipboard: Arc<dyn clipboard::Clipboard> = Arc::new(WindowsClipboard);
+        Browse {
+            path: Arc::new(PathProvider::new(dirs.clone(), fs.clone(), home, launcher.clone(), clipboard.clone())),
+            downloads: Arc::new(DownloadsProvider::new(
+                dirs,
+                fs.clone(),
+                downloads,
+                launcher.clone(),
+                clipboard.clone(),
+                now.clone(),
+            )),
+            recent: Arc::new(RecentProvider::new(store, fs, links, recent, launcher, clipboard, now)),
         }
     }
 }
@@ -279,6 +346,9 @@ fn build_engine(
         Box::new(p.apps.clone()),
         Box::new(WindowsProvider::new(p.windows.clone())),
         Box::new(p.files.clone()),
+        Box::new(p.path.clone()),
+        Box::new(p.downloads.clone()),
+        Box::new(p.recent.clone()),
         Box::new(p.shortcuts.clone()),
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
@@ -469,14 +539,16 @@ fn setup(app: &AppHandle) {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
     });
     let answers = Answers::new(launcher.clone(), on_ready.clone());
+    let browse = Browse::new(launcher.clone(), on_ready.clone());
     let control = Control::new(launcher.clone(), on_ready);
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);
-    let providers = Providers::new(answers, control, AppsProvider::new(launcher.clone()), launcher,
+    let providers = Providers::new(answers, control, browse, AppsProvider::new(launcher.clone()), launcher,
         &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
         settings_opener(app),
         updates.clone(),
     );
+    providers.apps.set_windows(providers.windows.clone());
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     providers.status.set_online(loaded.config.online);
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
@@ -804,13 +876,25 @@ mod tests {
         history: Arc<History>,
         /// Signalled when a status sample has finished.
         status_ready: std::sync::mpsc::Receiver<()>,
+        /// Signalled when a folder, Downloads or Recent read has finished.
+        browse_ready: std::sync::mpsc::Receiver<()>,
+        links: Arc<dirs::testing::FakeLinks>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
-        rig_with(apps, files, vec![])
+        rig_with(apps, files, vec![], Default::default())
     }
 
-    fn rig_with(apps: Vec<AppEntry>, files: Vec<FileEntry>, wins: Vec<WinInfo>) -> Rig {
+    fn rig_with(apps: Vec<AppEntry>, files: Vec<FileEntry>, wins: Vec<WinInfo>, fs: Arc<dirs::testing::FakeFs>) -> Rig {
+        rig_apps(|l| AppsProvider::with_launcher(l, apps), files, wins, fs)
+    }
+
+    fn rig_apps(
+        make_apps: impl FnOnce(Arc<RecordingLauncher>) -> Arc<AppsProvider>,
+        files: Vec<FileEntry>,
+        wins: Vec<WinInfo>,
+        fs: Arc<dirs::testing::FakeFs>,
+    ) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let ranking = Arc::new(Ranking::load(dir.path().join("picks.json")));
         let launcher = Arc::new(RecordingLauncher::default());
@@ -843,6 +927,23 @@ mod tests {
             Arc::new(clipboard::FakeClipboard::default()),
         ));
         let system = Arc::new(SystemProvider::new(Arc::new(FakeControls), launcher.clone()));
+        let (browse_tx, browse_ready) = std::sync::mpsc::channel();
+        let browse_tx = Mutex::new(browse_tx);
+        let links = Arc::new(dirs::testing::FakeLinks::default());
+        let browse = Browse::over(
+            launcher.clone(),
+            Arc::new(move || {
+                let _ = browse_tx.lock().unwrap().send(());
+            }),
+            fs.clone(),
+            links.clone(),
+            Some(PathBuf::from(r"C:\Users\someone")),
+            Some(PathBuf::from(r"C:\Users\someone\Downloads")),
+            Some(PathBuf::from(r"C:\Users\someone\Recent")),
+            Arc::new(|| std::time::UNIX_EPOCH + Duration::from_secs(1_000_000)),
+        );
+        let apps = make_apps(launcher.clone());
+        apps.set_windows(windows.clone());
         let providers = Providers {
             refresher: refresh_windows_and_audio(windows.clone(), system.clone(), Arc::new(|| {})),
             windows,
@@ -852,8 +953,11 @@ mod tests {
             weather,
             rates,
             formats,
-            apps: AppsProvider::with_entries(apps),
+            apps,
             files: FilesProvider::with_entries(launcher.clone(), files),
+            path: browse.path,
+            downloads: browse.downloads,
+            recent: browse.recent,
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
             welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
@@ -878,7 +982,7 @@ mod tests {
             history.clone(),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
         );
-        Rig { engine, providers, launcher, power, opened, dir, ranking, history, status_ready }
+        Rig { engine, providers, launcher, power, opened, dir, ranking, history, status_ready, browse_ready, links }
     }
 
     fn app(name: &str) -> AppEntry {
@@ -999,12 +1103,89 @@ mod tests {
 
     #[test]
     fn an_open_window_ranks_above_its_app_even_when_learned() {
-        let r = rig_with(vec![app("Google Chrome")], vec![], vec![chrome_window()]);
+        let r = rig_with(vec![app("Google Chrome")], vec![], vec![chrome_window()], Default::default());
         let id = r.engine.query("chrome", None).iter().find(|i| i.provider == "apps").unwrap().id.clone();
         for _ in 0..30 {
             r.ranking.record("apps", &id);
         }
         assert_eq!(r.engine.query("chrome", None)[0].provider, "windows");
+    }
+
+    /// Waits for a background folder read to finish, then asks again.
+    fn query_ready(r: &Rig, text: &str) -> Vec<provider::ResultItem> {
+        let first = r.engine.query(text, None);
+        if first.iter().any(|i| i.title == "Reading\u{2026}") {
+            r.browse_ready.recv_timeout(Duration::from_secs(5)).expect("the folder read finishes");
+            return r.engine.query(text, None);
+        }
+        first
+    }
+
+    #[test]
+    fn typing_a_path_shows_only_path_rows() {
+        let fs = Arc::new(dirs::testing::FakeFs::default());
+        fs.add_dir(r"C:\", vec![dirs::testing::folder("Games")]);
+        let r = rig_with(vec![], vec![file(r"C:\d\Games.txt")], vec![], fs);
+        let first = r.engine.query("C:\\", None);
+        assert!(!first.is_empty() && first.iter().all(|i| i.provider == "path"), "{:?}", titles(&first));
+        assert_eq!(first[0].title, "Reading\u{2026}");
+        let ready = query_ready(&r, "C:\\");
+        assert!(ready.iter().all(|i| i.provider == "path"), "{:?}", titles(&ready));
+        assert!(titles(&ready).contains(&"Games".to_string()), "{:?}", titles(&ready));
+    }
+
+    #[test]
+    fn dl_and_recent_are_words() {
+        let fs = Arc::new(dirs::testing::FakeFs::default());
+        fs.add_dir(r"C:\Users\someone\Downloads", vec![dirs::testing::file("setup.zip", 2048)]);
+        fs.add_dir(r"C:\Users\someone\Recent", vec![dirs::testing::file("notes.txt.lnk", 1)]);
+        fs.set_kind(r"C:\Users\someone\Documents\notes.txt", Some(false));
+        let r = rig_with(vec![], vec![], vec![], fs);
+        let lnk = PathBuf::from(r"C:\Users\someone\Recent\notes.txt.lnk");
+        r.links.add(&lnk, r"C:\Users\someone\Documents\notes.txt");
+        let dl = query_ready(&r, "dl");
+        assert!(dl.iter().any(|i| i.provider == "downloads" && i.title == "setup.zip"), "{:?}", titles(&dl));
+        assert!(!r.engine.query("dlls", None).iter().any(|i| i.provider == "downloads"));
+        let recent = query_ready(&r, "recent");
+        assert!(!recent.is_empty() && recent.iter().any(|i| i.provider == "recent"), "{:?}", titles(&recent));
+        let empty = r.engine.query("", None);
+        assert!(!empty.iter().any(|i| matches!(i.provider, "path" | "downloads" | "recent")));
+    }
+
+    #[test]
+    fn path_and_list_rows_are_never_recorded() {
+        let fs = Arc::new(dirs::testing::FakeFs::default());
+        fs.add_dir(r"C:\", vec![dirs::testing::folder("Games")]);
+        fs.add_dir(r"C:\Users\someone\Downloads", vec![dirs::testing::file("setup.zip", 2048)]);
+        let r = rig_with(vec![], vec![], vec![], fs);
+        let path_row = query_ready(&r, "C:\\").into_iter().find(|i| i.title == "Games").unwrap();
+        assert_eq!(r.engine.activate("path", &path_row.id, provider::Modifier::None, "C:\\", None), Ok(Outcome::Hide));
+        let dl_row = query_ready(&r, "dl").into_iter().find(|i| i.provider == "downloads").unwrap();
+        assert_eq!(r.engine.activate("downloads", &dl_row.id, provider::Modifier::None, "dl", None), Ok(Outcome::Hide));
+        assert!(!r.dir.path().join("picks.json").exists());
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert_eq!(r.launcher.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_running_app_offers_close() {
+        let r = rig_apps(
+            |l| {
+                AppsProvider::with_programs(
+                    l,
+                    vec![app("Google Chrome")],
+                    vec![(r"C:\definitely\missing\Google Chrome.lnk", r"C:\Apps\Chrome\chrome.exe")],
+                    vec![],
+                )
+            },
+            vec![],
+            vec![chrome_window()],
+            Default::default(),
+        );
+        let row = r.engine.query("google chrome", None).into_iter().find(|i| i.provider == "apps").unwrap();
+        assert!(row.actions.contains(&provider::Action::Close), "{:?}", row.actions);
+        assert_eq!(r.engine.act("apps", &row.id, provider::Action::Close), Ok(Outcome::Hide));
     }
 
     fn chrome_tab(hwnd: isize, title: &str) -> WinInfo {
@@ -1013,7 +1194,7 @@ mod tests {
 
     #[test]
     fn an_unrelated_window_title_does_not_beat_an_exact_app() {
-        let r = rig_with(vec![app("Word")], vec![], vec![chrome_tab(1, "Wordle - Google Chrome")]);
+        let r = rig_with(vec![app("Word")], vec![], vec![chrome_tab(1, "Wordle - Google Chrome")], Default::default());
         let res = r.engine.query("word", None);
         assert_eq!((res[0].provider, res[0].title.as_str()), ("apps", "Word"));
     }
@@ -1022,7 +1203,7 @@ mod tests {
     fn many_windows_of_one_app_do_not_fill_the_list() {
         let apps = ["Gimp", "Git Bash", "Godot", "Gedit", "Gnome Boxes"].map(app).to_vec();
         let wins = (1..=8).map(|n| chrome_tab(n, &format!("Tab {n}"))).collect();
-        let r = rig_with(apps, vec![], wins);
+        let r = rig_with(apps, vec![], wins, Default::default());
         let res = r.engine.query("g", None);
         // The first page of eight, what the bar shows.
         let windows = res[..8].iter().filter(|i| i.provider == "windows").count();
@@ -1050,7 +1231,7 @@ mod tests {
 
     #[test]
     fn windows_rows_are_never_recorded() {
-        let r = rig_with(vec![], vec![], vec![chrome_window()]);
+        let r = rig_with(vec![], vec![], vec![chrome_window()], Default::default());
         let res = r.engine.query("docs", None);
         let row = res.iter().find(|i| i.provider == "windows").unwrap();
         assert_eq!(r.engine.activate("windows", &row.id, provider::Modifier::None, "docs", None), Ok(Outcome::Hide));
@@ -1099,6 +1280,9 @@ mod tests {
                 "blender",
                 "close chrome / quit all",
                 "report.pdf",
+                r"C:\ / ~\Documents\",
+                "dl",
+                "recent",
                 "your shortcuts",
                 "> htop -d 10",
                 "bluetooth",
@@ -1115,7 +1299,7 @@ mod tests {
                 "Tab",
             ]
         );
-        let flick = &help[15];
+        let flick = &help[18];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -1123,7 +1307,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 23);
+        assert_eq!(r.engine.query("Help", None).len(), 26);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));

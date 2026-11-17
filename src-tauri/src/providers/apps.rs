@@ -448,7 +448,6 @@ impl AppsProvider {
     }
 
     /// Where `Close` looks for open windows. Set once, at startup.
-    #[allow(dead_code)] // called from setup
     pub fn set_windows(&self, list: Arc<WindowList>) {
         let _ = self.windows.set(list);
     }

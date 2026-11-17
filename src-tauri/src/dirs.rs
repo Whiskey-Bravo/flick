@@ -3,9 +3,6 @@
 //! and a small keyed [`Loader`] runs them on background threads so the query
 //! path only ever reads memory.
 
-// Nothing here is wired into the app until the providers are registered.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashMap;
 use std::os::windows::fs::MetadataExt;
 use std::panic::AssertUnwindSafe;
@@ -96,10 +93,8 @@ impl FileSystem for SystemFs {
 }
 
 /// Windows' own Downloads and Recent locations.
-#[allow(dead_code)] // never built in tests; built by the app wiring
 pub struct SystemFolders;
 
-#[allow(dead_code)] // never built in tests
 impl SystemFolders {
     fn known(id: &windows::core::GUID) -> Option<PathBuf> {
         use windows::Win32::System::Com::CoTaskMemFree;
@@ -125,7 +120,6 @@ impl KnownFolders for SystemFolders {
 }
 
 /// Real `.lnk` targets, read without resolving.
-#[allow(dead_code)] // never built in tests; built by the app wiring
 pub struct ShellLinks;
 
 impl Links for ShellLinks {
@@ -232,6 +226,7 @@ impl<T: Send + Sync + 'static> Loader<T> {
     }
 
     /// The last value read for `key`, however old.
+    #[cfg(test)]
     pub fn peek(&self, key: &str) -> Option<Arc<T>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &state.slots.get(key)?.done {

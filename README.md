@@ -22,6 +22,9 @@ To uninstall, use Settings, Apps. This also removes start at login.
 |---|---|---|
 | Part of an app name | Opens the app (Start-menu shortcuts and Store apps) | `vsc` opens Visual Studio Code |
 | Part of a file or folder name | Opens it (searches your whole user folder by default) | `invoice` |
+| A folder path (a drive, `~`, or a network share) | Lists that folder's contents; Enter opens an item | `C:\`, `~\Documents\` |
+| `dl` | The 20 newest files in your Downloads folder | `dl` |
+| `recent` | Files and folders you opened recently, from Windows' own Recent list | `recent` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
 | A sum, a unit or currency conversion, a time or date, or `weather` | Shows the answer on top; Enter copies it (on a weather answer, Enter opens a web search) | `12*7`, `20 usd in eur`, `time tokyo` (see Quick answers) |
@@ -45,6 +48,8 @@ If you press Enter while results for what you just typed are still on their way,
 | Ctrl+Shift+Enter | Run the selected app as administrator |
 | Enter again | Confirm restart, shut down or sign out |
 | Up / Down | Move the selection |
+| Tab | Open the actions menu of the selected row; while a path is typed, complete the selected name |
+| Mouse wheel | Scroll the list |
 | Up (empty bar) | Recall your past searches, newest first |
 | Ctrl+P | Pin or unpin the selected row |
 | F1 | Show the help list |
@@ -62,7 +67,7 @@ Each result shows the icon of its app, file or folder. Icons load in the backgro
 
 - Moving the mouse over a row selects it.
 - A click opens it.
-- A right click opens a small menu: Pin or Unpin, Open file location, Run as administrator. Entries that do not apply to that row are left out.
+- A right click (or Tab) opens a menu of the row's own actions: Open file location, Open in Explorer, Copy path, Run as administrator, Uninstall (asks for a second Enter), Close, Close window, Pin or Unpin. Entries that do not apply to that row are left out.
 
 ## Pins and recent launches
 
@@ -164,6 +169,14 @@ Apps that run as administrator cannot be closed or ended from Flick and say so. 
 ## Files and folders
 
 Type part of a file or folder name. Search is by name only, not by content. Two characters find only an exact name (`db`); the start of a name or word needs three, any other part of the name four. Enter opens the file or folder; Ctrl+Enter shows it selected in Explorer.
+
+### Browsing by path
+
+Type a path to look inside a folder: a drive (`C:\`), your user folder (`~\`, as in `~\Documents\`) or a network share (`\server\share\`). Folders come first, then files; hidden and system entries are skipped. Typing more after the last `\` narrows the list, and Tab completes the selected name. While a folder is being read the list says `Reading…`; a folder that does not exist says `Folder not found` and one that cannot be read says `Can't open this folder`.
+
+`dl` lists the 20 newest files in your Downloads folder, and `recent` lists what Windows' own Recent list holds. Add text after either to filter it (`dl invoice`).
+
+The list shows up to 50 results and scrolls. Files take at most five of every eight rows, so folders, apps and other results stay in view.
 
 <details>
 <summary>What is searched, and how the list is kept up to date</summary>
@@ -392,6 +405,8 @@ Flick goes online when you ask a currency or weather question, when you type `ip
 - Flick asks GitHub once a day whether a new version exists (GitHub sees the request; nothing about you is sent). `check_updates = false` or `online = false` stops it.
 - `ip` (also `my ip` and `ip address`) asks api.ipify.org for your public address, only while `online` is on, and only after the text has stayed exactly `ip` for a moment (so typing `ipconfig` sends nothing). api.ipify.org sees the request; nothing about you is sent. Without it you see just your local addresses.
 - Nothing else goes online. `online = false` stops all of the above. Web search only opens your browser; Flick itself sends nothing.
+
+Paths you type, and the `dl` and `recent` rows, are never counted, kept as recent launches or saved as searches. `recent` only reads the list Windows already keeps; Flick adds nothing to it. Uninstall reads the installed-programs list on this PC and sends nothing anywhere.
 
 Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
 

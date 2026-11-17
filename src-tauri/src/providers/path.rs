@@ -5,9 +5,6 @@
 //!
 //! The row and action helpers here are shared with `dl` and `recent`.
 
-// Registered with the engine by the app wiring.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

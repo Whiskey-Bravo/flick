@@ -1,9 +1,6 @@
 //! `dl` (newest files in Downloads) and `recent` (Windows' own Recent list).
 //! Both folders are read on [`Loader`] threads; rows act like file rows.
 
-// Registered with the engine by the app wiring.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
