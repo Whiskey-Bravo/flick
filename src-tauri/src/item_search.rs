@@ -2,7 +2,7 @@
 //! bar, and keeps only rows a workspace or a direct hotkey can store.
 
 use crate::config::ItemRef;
-use crate::engine::HELP;
+use crate::engine::{Engine, HELP};
 use crate::provider::ResultItem;
 use crate::providers::workspaces;
 use crate::AppState;
@@ -47,14 +47,22 @@ pub fn found(item: Option<&ResultItem>, provider_ready: bool) -> bool {
     item.is_some() || !provider_ready
 }
 
+/// Providers the picker never asks anything. Their rows cannot be stored
+/// (answers, status values, `tr`/`def`, timers, devices, the clipboard), or
+/// building them reads the Recycle Bin or drives (chores): asking them would
+/// go online or read devices for text typed in Settings. A chore can still be
+/// put on a hotkey by hand in the config.
+pub const PICKER_SKIPS: [&str; 8] = ["answers", "status", "words", "timers", "devices", "chores", "clips", "qr"];
+
+/// The picker's search: the bar's search over every provider except
+/// [`PICKER_SKIPS`], so nothing is fetched or read from a device for it.
+pub fn search(engine: &Engine, text: &str, for_workspace: bool) -> Vec<PickRow> {
+    pick_rows(engine.query_except(text, &PICKER_SKIPS), for_workspace)
+}
+
 #[tauri::command(async)]
 pub fn settings_search_items(text: String, for_workspace: bool, state: State<AppState>) -> Vec<PickRow> {
-    // Typed commands give no row that can be stored: never start a `tr`/`def`
-    // lookup or a device or drive read for text typed in the picker.
-    if state.providers.typed_command(&text) {
-        return Vec::new();
-    }
-    pick_rows(state.engine.query(&text, None), for_workspace)
+    search(&state.engine, &text, for_workspace)
 }
 
 #[tauri::command(async)]

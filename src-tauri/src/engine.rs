@@ -80,9 +80,21 @@ impl Engine {
     /// provider claims by its shape (a typed path) goes, whole, to the first
     /// such provider alone; `help` wins over a claim, a claim over prefixes.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
-        let (mut rows, plain) = self.query_rows(text, scope);
+        self.query_among(text, scope, &|_| true)
+    }
+
+    /// Like [`Engine::query`], but only the providers named nowhere in `skip`
+    /// are asked anything (routes, claims and plain text alike): the others
+    /// are never queried, told `skipped`, or asked for empty-bar rows. For
+    /// callers that must not start a provider's network or device reads.
+    pub fn query_except(&self, text: &str, skip: &[&str]) -> Vec<ResultItem> {
+        self.query_among(text, None, &|p| !skip.contains(&p.name()))
+    }
+
+    fn query_among(&self, text: &str, scope: Option<&str>, asked: &dyn Fn(&dyn Provider) -> bool) -> Vec<ResultItem> {
+        let (mut rows, plain) = self.query_rows(text, scope, asked);
         if !plain {
-            for p in &self.providers {
+            for p in self.providers.iter().filter(|p| asked(p.as_ref())) {
                 p.skipped();
             }
         }
@@ -94,18 +106,25 @@ impl Engine {
 
     /// The rows, and whether the plain providers were asked (a plain query or
     /// the truly empty bar); when not, the engine tells them with `skipped`.
-    fn query_rows(&self, text: &str, scope: Option<&str>) -> (Vec<ResultItem>, bool) {
+    /// Only providers `asked` accepts take part.
+    fn query_rows(
+        &self,
+        text: &str,
+        scope: Option<&str>,
+        asked: &dyn Fn(&dyn Provider) -> bool,
+    ) -> (Vec<ResultItem>, bool) {
+        let providers = || self.providers.iter().filter(|p| asked(p.as_ref()));
         let untrimmed_empty = text.is_empty();
         let text = text.trim();
         if let Some(scope) = scope {
             let q = Query { text: text.to_string(), scope: Some(scope.to_string()) };
-            let owners = self.providers.iter().filter(|p| p.owns_scope(scope));
+            let owners = providers().filter(|p| p.owns_scope(scope));
             return (self.rank(owners, &q, ROUTED_MAX_RESULTS, false), false);
         }
         if text.is_empty() {
             // Only the unscoped, truly empty bar (not whitespace) shows rows.
             if untrimmed_empty {
-                return (self.empty_bar(), true);
+                return (self.empty_bar(asked), true);
             }
             return (vec![], false);
         }
@@ -113,18 +132,18 @@ impl Engine {
             return (self.help_items(rest), false);
         }
         // The first provider that claims the text by its shape.
-        if let Some(p) = self.providers.iter().find(|p| p.claims(text)) {
+        if let Some(p) = providers().find(|p| p.claims(text)) {
             let q = Query { text: text.to_string(), scope: None };
             return (self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false), false);
         }
-        for p in &self.providers {
+        for p in providers() {
             if let Some(rest) = p.route().and_then(|r| strip_route(text, &r)) {
                 let q = Query { text: rest.to_string(), scope: None };
                 return (self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false), false);
             }
         }
         let q = Query { text: text.to_string(), scope: None };
-        (self.rank(self.providers.iter().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true), true)
+        (self.rank(providers().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true), true)
     }
 
     /// The truly empty bar: the providers' own rows (welcome) in registration
@@ -133,8 +152,9 @@ impl Engine {
     /// recent that does not resolve is forgotten, but only once its (known)
     /// provider has finished its first scan; before that it may just be missing
     /// from an index that is not built yet.
-    fn empty_bar(&self) -> Vec<ResultItem> {
-        let mut rows: Vec<ResultItem> = self.providers.iter().flat_map(|p| p.empty_query()).collect();
+    fn empty_bar(&self, asked: &dyn Fn(&dyn Provider) -> bool) -> Vec<ResultItem> {
+        let mut rows: Vec<ResultItem> =
+            self.providers.iter().filter(|p| asked(p.as_ref())).flat_map(|p| p.empty_query()).collect();
         let pins = self.pins.list();
         for (provider, id) in &pins {
             if let Some(item) = self.item(provider, id) {

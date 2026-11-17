@@ -30,6 +30,8 @@ struct State {
     list: Arc<Vec<Entry>>,
     last_attempt: Option<Instant>,
     running: bool,
+    /// A forced read was asked for while one was running: read once more after it.
+    again: bool,
 }
 
 pub struct BookmarksProvider {
@@ -102,10 +104,36 @@ impl BookmarksProvider {
             state.running = true;
             state.last_attempt = Some(now);
         }
+        self.spawn_reads();
+    }
+
+    /// Starts a background read now, however fresh the list is (the tray's
+    /// Reload). With one already running it does not start a second, which
+    /// would copy Firefox's database to the same temp file: that one reads
+    /// once more when it is done.
+    pub fn refresh_now(self: &Arc<Self>) {
+        {
+            let mut state = self.state();
+            if state.running {
+                state.again = true;
+                return;
+            }
+            state.running = true;
+        }
+        self.spawn_reads();
+    }
+
+    /// The one reading thread (the caller has set `running`): reads, then
+    /// again while a forced read was asked for meanwhile.
+    fn spawn_reads(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        std::thread::spawn(move || {
+        std::thread::spawn(move || loop {
             this.refresh();
-            this.state().running = false;
+            let mut state = this.state();
+            if !std::mem::take(&mut state.again) {
+                state.running = false;
+                return;
+            }
         });
     }
 }
@@ -288,6 +316,62 @@ mod tests {
         p.refresh_if_stale();
         wait_idle(&p);
         assert_eq!(source.reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// Reads block until released; records how many ran at once.
+    #[derive(Default)]
+    struct Slow {
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+        reads: AtomicUsize,
+        active: AtomicUsize,
+        most: AtomicUsize,
+    }
+
+    impl Slow {
+        fn release(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    impl BookmarkSource for Slow {
+        fn read(&self) -> Result<Vec<Bookmark>, String> {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            drop(open);
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(books())
+        }
+    }
+
+    #[test]
+    fn a_forced_read_never_runs_beside_another_and_follows_it() {
+        let source = Arc::new(Slow::default());
+        let p = BookmarksProvider::new(source.clone(), Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()));
+        p.refresh_if_stale();
+        let end = Instant::now() + Duration::from_secs(2);
+        while source.active.load(Ordering::SeqCst) == 0 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Reload twice while the first read is still copying: no second copy now.
+        p.refresh_now();
+        p.refresh_now();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(source.active.load(Ordering::SeqCst), 1);
+        source.release();
+        wait_idle(&p);
+        assert_eq!(source.most.load(Ordering::SeqCst), 1, "never two reads at once");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 2, "the asked-for read ran once, after");
+        // Idle: a forced read starts at once, however fresh the list is.
+        p.refresh_now();
+        wait_idle(&p);
+        assert_eq!(source.reads.load(Ordering::SeqCst), 3);
     }
 
     #[test]

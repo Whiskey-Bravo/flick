@@ -151,7 +151,18 @@ impl UpdateSource for PluginSource {
     fn check(&self) -> Result<Option<Available>, String> {
         // Called from a worker thread, never from the main thread.
         let update = tauri::async_runtime::block_on(async {
-            let updater = self.app.updater().map_err(|e| e.to_string())?;
+            // On Windows the install ends the process itself (no `RunEvent::Exit`):
+            // its hook does Flick's quit cleanup, then what the plugin's own hook did.
+            let app = self.app.clone();
+            let updater = self
+                .app
+                .updater_builder()
+                .on_before_exit(move || {
+                    crate::on_exit(&app);
+                    app.cleanup_before_exit();
+                })
+                .build()
+                .map_err(|e| e.to_string())?;
             updater.check().await.map_err(|e| e.to_string())
         })?;
         let available =

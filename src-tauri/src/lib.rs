@@ -213,14 +213,6 @@ impl Providers {
         self.qr.forget();
         self.words.forget_waiting();
     }
-
-    /// Text that only typed-command rows answer (`tr`, `timer`, `connect`,
-    /// `eject`…): none of them can be stored, so the Settings item picker skips
-    /// it rather than start a lookup or a device read for it.
-    pub(crate) fn typed_command(&self, text: &str) -> bool {
-        let text = text.trim();
-        self.words.claims(text) || self.timers.claims(text) || self.devices.claims(text) || self.chores.claims(text)
-    }
 }
 
 /// Games, bookmarks, workspaces, timers and reminders, `tr`/`def`, devices and chores.
@@ -871,7 +863,7 @@ fn setup(app: &AppHandle) {
             p.shortcuts.refresh();
             p.apps.refresh();
             p.games.refresh();
-            p.bookmarks.refresh();
+            p.bookmarks.refresh_now();
             p.files.refresh();
         });
     });
@@ -1031,12 +1023,20 @@ impl PressTarget for AppPress {
     }
 }
 
-/// Flick is quitting: a reminder change whose save failed is written now (or
-/// it would ring again as missed at the next start), and a notification
-/// balloon still showing takes its icon out of the notification area.
-fn on_exit(app: &AppHandle) {
-    if let Some(state) = app.try_state::<AppState>() {
-        state.providers.reminders.flush();
+/// Flick is quitting, by Quit (`RunEvent::Exit`) or by the updater, which
+/// starts the installer and ends the process without that event (it runs this
+/// as its `on_before_exit`). Safe to run more than once.
+pub(crate) fn on_exit(app: &AppHandle) {
+    quit_cleanup(app.try_state::<AppState>().as_ref().map(|s| s.providers.reminders.as_ref()));
+}
+
+/// A reminder change whose save failed is written now (or it would ring again
+/// as missed at the next start), and a notification balloon still showing
+/// takes its icon out of the notification area. A second run finds nothing
+/// left to do.
+fn quit_cleanup(reminders: Option<&Reminders>) {
+    if let Some(reminders) = reminders {
+        reminders.flush();
     }
     notifications::remove_balloons();
 }
@@ -1264,6 +1264,9 @@ mod tests {
         extras_ready: std::sync::mpsc::Receiver<()>,
         /// What a workspace run reported: `(name, message)`.
         reports: std::sync::mpsc::Receiver<(String, String)>,
+        bt: Arc<devices::testing::FakeBt>,
+        wifi: Arc<devices::testing::FakeWifi>,
+        chores: Arc<chores::testing::FakeChores>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
@@ -1344,6 +1347,13 @@ mod tests {
             }),
             Arc::new(|| 7),
         );
+        let bt = Arc::new(devices::testing::FakeBt::new(vec![devices::BtDevice {
+            id: "bt-1".into(),
+            name: "Headphones".into(),
+            connected: false,
+        }]));
+        let wifi = Arc::new(devices::testing::FakeWifi::new(vec![]));
+        let chores = Arc::new(chores::testing::FakeChores::default());
         let (extras_tx, extras_ready) = std::sync::mpsc::channel();
         let extras_tx = Mutex::new(extras_tx);
         let (report_tx, reports) = std::sync::mpsc::channel();
@@ -1367,13 +1377,9 @@ mod tests {
                 }])),
                 clipboard: Arc::new(clipboard::FakeClipboard::default()),
                 fetch: fetch.clone(),
-                bt: Arc::new(devices::testing::FakeBt::new(vec![devices::BtDevice {
-                    id: "bt-1".into(),
-                    name: "Headphones".into(),
-                    connected: false,
-                }])),
-                wifi: Arc::new(devices::testing::FakeWifi::new(vec![])),
-                chores: Arc::new(chores::testing::FakeChores::default()),
+                bt: bt.clone(),
+                wifi: wifi.clone(),
+                chores: chores.clone(),
                 reminders: dir.path().join("reminders.json"),
                 now: Arc::new(|| std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap())),
                 tz: jiff::tz::TimeZone::UTC,
@@ -1450,6 +1456,9 @@ mod tests {
             fetch,
             extras_ready,
             reports,
+            bt,
+            wifi,
+            chores,
         }
     }
 
@@ -2303,14 +2312,43 @@ mod tests {
     }
 
     #[test]
-    fn the_item_picker_skips_typed_commands() {
+    fn quitting_writes_a_failed_reminder_save_once() {
         let r = rig(vec![], vec![]);
-        for text in ["tr hallo", "def Haus", "timer 5m", "connect", "eject E:"] {
-            assert!(r.providers.typed_command(text), "{text}");
+        let path = r.dir.path().join("reminders.json");
+        let now = std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap());
+        let first = r.providers.reminders.add(now + Duration::from_secs(600), "first", false).unwrap();
+        r.providers.reminders.add(now + Duration::from_secs(1200), "second", false).unwrap();
+        // A folder with the file's name: the cancel's save fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(r.providers.reminders.cancel(first.id));
+        std::fs::remove_dir(&path).unwrap();
+        quit_cleanup(Some(&r.providers.reminders));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("second") && !saved.contains("first"), "{saved}");
+        // Run again (Quit after the updater's hook): nothing left to write.
+        std::fs::remove_file(&path).unwrap();
+        quit_cleanup(Some(&r.providers.reminders));
+        quit_cleanup(None);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_item_picker_never_fetches_or_reads() {
+        let r = rig(vec![], vec![]);
+        for text in ["ip", "weather vienna", "20 usd in eur", "tr hallo", "def Haus", "wifi home", "connect", "empty bin", "eject", "v"] {
+            let rows = item_search::search(&r.engine, text, false);
+            assert!(rows.iter().all(|row| !item_search::PICKER_SKIPS.contains(&row.provider.as_str())), "{text}");
         }
-        for text in ["blender", "hades", "empty", "timeline"] {
-            assert!(!r.providers.typed_command(text), "{text}");
-        }
+        // Longer than every typing pause (ip, weather, tr/def).
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(r.fetch.urls().is_empty(), "{:?}", r.fetch.urls());
+        assert_eq!((r.bt.lists(), r.wifi.lists()), (0, 0));
+        assert!(r.chores.calls().is_empty(), "{:?}", r.chores.calls());
+        assert_eq!(r.clip_history.reads(), 0);
+        // It still finds what can be stored.
+        let found = item_search::search(&r.engine, "hades", false);
+        assert_eq!(found.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["games"]);
     }
 
     /// The global-shortcut plugin's one app-wide map, shared by the bar hotkey
