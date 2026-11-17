@@ -3,9 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use toml_edit::{value, Array, ArrayOfTables, Decor, DocumentMut, Item, Table, Value};
+use toml_edit::{value, Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Table, Value};
 
-use crate::config::{self, ShortcutDef};
+use crate::config::{self, DirectHotkeyDef, ItemRef, ShortcutDef, WorkspaceDef};
 
 /// One setting of the Settings window. An empty string or list means "unset" (remove the line).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -222,11 +222,58 @@ fn build_shortcut(def: &ShortcutDef) -> Table {
     t
 }
 
-fn position_of(tables: &ArrayOfTables, name: &str) -> Result<usize, String> {
-    tables
-        .iter()
-        .position(|t| t.get("name").and_then(Item::as_str) == Some(name))
-        .ok_or_else(|| format!("no shortcut named \"{name}\""))
+const SHORTCUT_KEYS: [&str; 10] = ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices"];
+const WORKSPACE_KEYS: [&str; 3] = ["name", "aliases", "items"];
+const HOTKEY_KEYS: [&str; 2] = ["keys", "item"];
+
+/// `{ provider = "...", id = "...", title = "..." }`; an empty title is left out.
+fn item_value(item: &ItemRef) -> Value {
+    let mut t = InlineTable::new();
+    t.insert("provider", Value::from(item.provider.as_str()));
+    t.insert("id", Value::from(item.id.as_str()));
+    if !item.title.is_empty() {
+        t.insert("title", Value::from(item.title.as_str()));
+    }
+    Value::InlineTable(t)
+}
+
+fn build_workspace(def: &WorkspaceDef) -> Table {
+    let mut t = Table::new();
+    t.insert("name", value(def.name.as_str()));
+    if !def.aliases.is_empty() {
+        t.insert("aliases", value(def.aliases.iter().map(String::as_str).collect::<Array>()));
+    }
+    // One inline table per line, in order.
+    let mut items = Array::new();
+    for item in &def.items {
+        let mut v = item_value(item);
+        v.decor_mut().set_prefix("\n    ");
+        v.decor_mut().set_suffix("");
+        items.push_formatted(v);
+    }
+    if !items.is_empty() {
+        items.set_trailing_comma(true);
+        items.set_trailing("\n");
+    }
+    t.insert("items", value(items));
+    t
+}
+
+fn build_direct_hotkey(def: &DirectHotkeyDef) -> Table {
+    let mut t = Table::new();
+    t.insert("keys", value(def.keys.as_str()));
+    t.insert("item", value(item_value(&def.item)));
+    t
+}
+
+fn named(name: &str) -> impl Fn(&Table) -> bool + '_ {
+    move |t| t.get("name").and_then(Item::as_str) == Some(name)
+}
+
+/// Matches a hotkey table by its keys in any spelling.
+fn with_keys(keys: &str) -> impl Fn(&Table) -> bool {
+    let wanted = config::normalize_combo(keys);
+    move |t| t.get("keys").and_then(Item::as_str).map(config::normalize_combo).as_deref() == Some(wanted.as_str())
 }
 
 fn same_value(old: &Value, new: &Value) -> bool {
@@ -236,17 +283,36 @@ fn same_value(old: &Value, new: &Value) -> bool {
         (Value::Array(a), Value::Array(b)) => {
             a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| same_value(x, y))
         }
+        (Value::InlineTable(a), Value::InlineTable(b)) => {
+            a.len() == b.len() && a.iter().all(|(k, x)| b.get(k).is_some_and(|y| same_value(x, y)))
+        }
         _ => false,
     }
 }
 
-/// Brings an existing shortcut table in line with `def` without rewriting it: changed values
+/// The largest document position of any table, so a new table can go after all of them.
+fn last_position(table: &Table) -> isize {
+    let mut last = table.position().unwrap_or(0);
+    for (_, item) in table.iter() {
+        match item {
+            Item::Table(t) => last = last.max(last_position(t)),
+            Item::ArrayOfTables(ts) => {
+                for t in ts.iter() {
+                    last = last.max(last_position(t));
+                }
+            }
+            _ => {}
+        }
+    }
+    last
+}
+
+/// Brings an existing table in line with `wanted` without rewriting it: changed values
 /// keep their old decor, unset keys go (their comment moves on), new keys are appended in the
-/// canonical order, everything else stays byte for byte. Returns a comment that had nowhere to go.
-fn edit_shortcut(table: &mut Table, def: &ShortcutDef) -> Option<String> {
-    let wanted = build_shortcut(def);
+/// canonical order `keys`, everything else stays byte for byte. Returns a comment that had nowhere to go.
+fn edit_table(table: &mut Table, wanted: &Table, keys: &[&str]) -> Option<String> {
     let mut leftover = String::new();
-    for key in ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices"] {
+    for &key in keys {
         match wanted.get(key) {
             Some(Item::Value(new)) => match table.get_mut(key) {
                 Some(Item::Value(old)) => {
@@ -270,35 +336,43 @@ fn edit_shortcut(table: &mut Table, def: &ShortcutDef) -> Option<String> {
     (!leftover.is_empty()).then_some(leftover)
 }
 
-/// Adds a shortcut at the end (`original` is `None`) or replaces the one named `original`
-/// where it stands, keeping the comments above it.
-pub fn upsert_shortcut(text: &str, original: Option<&str>, def: &ShortcutDef) -> Result<String, String> {
+/// Adds `wanted` as a new `[[kind]]` table after every other table (`at` is `None`), or
+/// edits the first `[[kind]]` table `at` matches where it stands, keeping the comments above it.
+fn upsert_table(
+    text: &str,
+    kind: &str,
+    at: Option<(&dyn Fn(&Table) -> bool, String)>,
+    wanted: Table,
+    keys: &[&str],
+) -> Result<String, String> {
     let (mut doc, text_before) = open(text)?;
+    let next_position = last_position(doc.as_table()) + 1;
     let root = doc.as_table_mut();
-    if !root.contains_key("shortcut") {
-        root.insert("shortcut", Item::ArrayOfTables(ArrayOfTables::new()));
+    if !root.contains_key(kind) {
+        root.insert(kind, Item::ArrayOfTables(ArrayOfTables::new()));
     }
-    let Some(Item::ArrayOfTables(tables)) = root.get_mut("shortcut") else {
-        return Err("shortcut must be a list of [[shortcut]] tables".into());
+    let Some(Item::ArrayOfTables(tables)) = root.get_mut(kind) else {
+        return Err(format!("{kind} must be a list of [[{kind}]] tables"));
     };
     let mut leftover = None;
-    match original {
-        Some(name) => {
-            let at = position_of(tables, name)?;
+    match at {
+        Some((matches, missing)) => {
+            let at = tables.iter().position(matches).ok_or(missing)?;
             if let Some(table) = tables.get_mut(at) {
-                leftover = edit_shortcut(table, def).map(|p| (at, p));
+                leftover = edit_table(table, &wanted, keys).map(|p| (at, p));
             }
         }
         None => {
-            let mut table = build_shortcut(def);
+            let mut table = wanted;
             if !text.trim().is_empty() {
                 table.decor_mut().set_prefix("\n");
             }
+            table.set_position(Some(next_position));
             tables.push(table);
         }
     }
     if let Some((at, prefix)) = leftover {
-        let next = match doc.as_table_mut().get_mut("shortcut") {
+        let next = match doc.as_table_mut().get_mut(kind) {
             Some(Item::ArrayOfTables(t)) => t.get_mut(at + 1),
             _ => None,
         };
@@ -313,18 +387,67 @@ pub fn upsert_shortcut(text: &str, original: Option<&str>, def: &ShortcutDef) ->
     finish(&doc, &text_before)
 }
 
-pub fn delete_shortcut(text: &str, name: &str) -> Result<String, String> {
+/// Removes the first `[[kind]]` table `matches` accepts, and the key when none are left.
+fn delete_table(text: &str, kind: &str, matches: &dyn Fn(&Table) -> bool, missing: String) -> Result<String, String> {
     let (mut doc, original) = open(text)?;
     let root = doc.as_table_mut();
-    let Some(Item::ArrayOfTables(tables)) = root.get_mut("shortcut") else {
-        return Err(format!("no shortcut named \"{name}\""));
+    let Some(Item::ArrayOfTables(tables)) = root.get_mut(kind) else {
+        return Err(missing);
     };
-    let at = position_of(tables, name)?;
+    let at = tables.iter().position(matches).ok_or(missing)?;
     tables.remove(at);
     if tables.is_empty() {
-        root.remove("shortcut");
+        root.remove(kind);
     }
     finish(&doc, &original)
+}
+
+fn no_shortcut(name: &str) -> String {
+    format!("no shortcut named \"{name}\"")
+}
+
+fn no_workspace(name: &str) -> String {
+    format!("no workspace named \"{name}\"")
+}
+
+fn no_hotkey(keys: &str) -> String {
+    format!("no hotkey \"{keys}\"")
+}
+
+/// Adds a shortcut at the end (`original` is `None`) or replaces the one named `original`
+/// where it stands, keeping the comments above it.
+pub fn upsert_shortcut(text: &str, original: Option<&str>, def: &ShortcutDef) -> Result<String, String> {
+    let matcher = original.map(named);
+    let at = matcher.as_ref().zip(original).map(|(m, n)| (m as &dyn Fn(&Table) -> bool, no_shortcut(n)));
+    upsert_table(text, "shortcut", at, build_shortcut(def), &SHORTCUT_KEYS)
+}
+
+pub fn delete_shortcut(text: &str, name: &str) -> Result<String, String> {
+    delete_table(text, "shortcut", &named(name), no_shortcut(name))
+}
+
+/// Adds a workspace at the end (`original` is `None`) or replaces the one named `original`
+/// where it stands. Its items are written one inline table per line.
+pub fn upsert_workspace(text: &str, original: Option<&str>, def: &WorkspaceDef) -> Result<String, String> {
+    let matcher = original.map(named);
+    let at = matcher.as_ref().zip(original).map(|(m, n)| (m as &dyn Fn(&Table) -> bool, no_workspace(n)));
+    upsert_table(text, "workspace", at, build_workspace(def), &WORKSPACE_KEYS)
+}
+
+pub fn delete_workspace(text: &str, name: &str) -> Result<String, String> {
+    delete_table(text, "workspace", &named(name), no_workspace(name))
+}
+
+/// Adds a direct hotkey at the end (`original` is `None`) or replaces the one whose keys
+/// equal `original` (in any spelling) where it stands.
+pub fn upsert_direct_hotkey(text: &str, original: Option<&str>, def: &DirectHotkeyDef) -> Result<String, String> {
+    let matcher = original.map(with_keys);
+    let at = matcher.as_ref().zip(original).map(|(m, k)| (m as &dyn Fn(&Table) -> bool, no_hotkey(k)));
+    upsert_table(text, "direct_hotkey", at, build_direct_hotkey(def), &HOTKEY_KEYS)
+}
+
+pub fn delete_direct_hotkey(text: &str, keys: &str) -> Result<String, String> {
+    delete_table(text, "direct_hotkey", &with_keys(keys), no_hotkey(keys))
 }
 
 /// Writes to a temp file next to `path`, then renames it over, so a reader never sees half a file.
@@ -514,6 +637,141 @@ mod tests {
         assert_eq!(c.shortcuts[0], d);
         assert!(out.contains("# why\n"), "{out}");
         assert!(out.contains("open = \"https://a.example\" # where\nname = \"s1\"\n"), "{out}");
+    }
+
+    fn item(provider: &str, id: &str, title: &str) -> ItemRef {
+        ItemRef { provider: provider.into(), id: id.into(), title: title.into() }
+    }
+
+    fn ws(name: &str, items: &[(&str, &str)]) -> WorkspaceDef {
+        WorkspaceDef {
+            name: name.into(),
+            aliases: vec![],
+            items: items.iter().map(|(p, i)| item(p, i, &format!("T {i}"))).collect(),
+        }
+    }
+
+    fn hk(keys: &str, id: &str) -> DirectHotkeyDef {
+        DirectHotkeyDef { keys: keys.into(), item: item("apps", id, "") }
+    }
+
+    const SPACES: &str = "# top\nhotkey = \"Alt+Space\" # keep\n\n# my work\n[[workspace]]\nname = \"work\"\nitems = [\n    { provider = \"apps\", id = \"a\" },\n]\n\n[[shortcut]]\nname = \"s1\"\nopen = \"x\"\n\n[[workspace]]\nname = \"home\"\nitems = [{ provider = \"apps\", id = \"h\" }]\n\n[[direct_hotkey]]\nkeys = \"Ctrl+Alt+T\"\nitem = { provider = \"apps\", id = \"t\" }\n";
+
+    #[test]
+    fn upsert_workspace_adds_and_edits_in_place() {
+        let added = upsert_workspace(SPACES, None, &ws("play", &[("apps", "p")])).unwrap();
+        let c = config::parse(&added).unwrap();
+        assert_eq!(c.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["work", "home", "play"]);
+        assert!(added.ends_with("[[workspace]]\nname = \"play\"\nitems = [\n    { provider = \"apps\", id = \"p\", title = \"T p\" },\n]\n"), "{added}");
+        assert!(added.starts_with(SPACES), "{added}");
+
+        let mut edited = ws("job", &[("apps", "a"), ("bookmarks", "https://example.com/")]);
+        edited.aliases = vec!["j".into()];
+        let out = upsert_workspace(SPACES, Some("work"), &edited).unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!(c.workspaces[0], edited);
+        assert_eq!(c.workspaces[1].name, "home");
+        assert!(out.find("# my work").unwrap() < out.find("name = \"job\"").unwrap(), "{out}");
+        assert!(out.find("name = \"job\"").unwrap() < out.find("[[shortcut]]").unwrap(), "{out}");
+        assert!(out.contains("hotkey = \"Alt+Space\" # keep"));
+        assert!(upsert_workspace(SPACES, Some("nope"), &ws("z", &[("a", "b")])).is_err());
+    }
+
+    #[test]
+    fn workspace_items_keep_their_order_one_per_line() {
+        let d = ws("w", &[("apps", "3"), ("apps", "1"), ("files", "2")]);
+        let out = upsert_workspace("", None, &d).unwrap();
+        assert_eq!(
+            out,
+            "[[workspace]]\nname = \"w\"\nitems = [\n    { provider = \"apps\", id = \"3\", title = \"T 3\" },\n    { provider = \"apps\", id = \"1\", title = \"T 1\" },\n    { provider = \"files\", id = \"2\", title = \"T 2\" },\n]\n"
+        );
+        assert_eq!(config::parse(&out).unwrap().workspaces, [d]);
+        // An unchanged list keeps its own layout.
+        let same = upsert_workspace(SPACES, Some("home"), &WorkspaceDef { items: vec![item("apps", "h", "")], ..ws("home", &[]) }).unwrap();
+        assert_eq!(same, SPACES);
+    }
+
+    #[test]
+    fn rename_workspace_to_a_used_name_is_refused() {
+        let e = upsert_workspace(SPACES, Some("work"), &ws("Home", &[("a", "b")])).unwrap_err();
+        assert!(e.contains("name is already used"), "{e}");
+        let e = upsert_workspace(SPACES, None, &ws("help", &[("a", "b")])).unwrap_err();
+        assert!(e.contains("name is already used"), "{e}");
+        let e = upsert_workspace(SPACES, None, &ws("x", &[])).unwrap_err();
+        assert!(e.contains("needs at least one item"), "{e}");
+    }
+
+    #[test]
+    fn delete_workspace_removes_only_that_table() {
+        let out = delete_workspace(SPACES, "work").unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!(c.workspaces.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["home"]);
+        assert_eq!(c.shortcuts.len(), 1);
+        assert_eq!(c.direct_hotkeys.len(), 1);
+        assert!(out.contains("hotkey = \"Alt+Space\" # keep"));
+        let none = delete_workspace(&out, "home").unwrap();
+        assert!(!none.contains("[[workspace]]"), "{none}");
+        assert!(config::parse(&none).unwrap().workspaces.is_empty());
+        assert!(delete_workspace(SPACES, "nope").is_err());
+    }
+
+    #[test]
+    fn upsert_and_delete_direct_hotkey() {
+        let added = upsert_direct_hotkey(SPACES, None, &hk("Win+N", "n")).unwrap();
+        assert!(added.ends_with("[[direct_hotkey]]\nkeys = \"Win+N\"\nitem = { provider = \"apps\", id = \"n\" }\n"), "{added}");
+        let c = config::parse(&added).unwrap();
+        assert_eq!(c.direct_hotkeys.len(), 2);
+
+        // Edited by its original keys, in any spelling.
+        let out = upsert_direct_hotkey(&added, Some("alt+ctrl+t"), &hk("Ctrl+Shift+T", "t2")).unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!(c.direct_hotkeys, [hk("Ctrl+Shift+T", "t2"), hk("Win+N", "n")]);
+        assert!(out.contains("item = { provider = \"apps\", id = \"t2\" }"), "{out}");
+
+        let e = upsert_direct_hotkey(&added, None, &hk("super+n", "x")).unwrap_err();
+        assert!(e.contains("Already used by another hotkey"), "{e}");
+        assert!(upsert_direct_hotkey(&added, Some("Ctrl+K"), &hk("Ctrl+Alt+K", "x")).is_err());
+
+        let out = delete_direct_hotkey(&out, "ctrl+shift+t").unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!(c.direct_hotkeys, [hk("Win+N", "n")]);
+        let out = delete_direct_hotkey(&out, "Win+N").unwrap();
+        assert!(!out.contains("[[direct_hotkey]]"), "{out}");
+        assert_eq!(config::parse(&out).unwrap().workspaces.len(), 2);
+        assert!(delete_direct_hotkey(&out, "Win+N").is_err());
+    }
+
+    #[test]
+    fn comments_and_crlf_survive_workspace_edits() {
+        let crlf = SPACES.replace('\n', "\r\n");
+        let edits = [
+            upsert_workspace(&crlf, None, &ws("play", &[("apps", "p"), ("apps", "q")])).unwrap(),
+            upsert_workspace(&crlf, Some("work"), &ws("work", &[("apps", "a"), ("apps", "b")])).unwrap(),
+            delete_workspace(&crlf, "home").unwrap(),
+            upsert_direct_hotkey(&crlf, Some("Ctrl+Alt+T"), &hk("Ctrl+Alt+Y", "y")).unwrap(),
+            upsert_direct_hotkey(&crlf, None, &hk("Ctrl+Alt+Y", "y")).unwrap(),
+            delete_direct_hotkey(&crlf, "Ctrl+Alt+T").unwrap(),
+        ];
+        for out in edits {
+            assert!(!out.replace("\r\n", "").contains('\n'), "{out:?}");
+            for comment in ["# top\r\n", "# keep\r\n", "# my work\r\n"] {
+                assert!(out.contains(comment), "lost {comment:?} in {out:?}");
+            }
+            config::parse(&out).unwrap();
+        }
+    }
+
+    #[test]
+    fn set_adds_a_missing_key_before_any_table() {
+        let text = "[[workspace]]\nname = \"w\"\nitems = [{ provider = \"apps\", id = \"a\" }]\n\n[[shortcut]]\nname = \"a\"\nopen = \"x\"\n";
+        let out = set(text, &Setting::Online(false)).unwrap();
+        assert!(out.find("online = false").unwrap() < out.find("[[workspace]]").unwrap(), "{out}");
+        let c = config::parse(&out).unwrap();
+        assert!(!c.online);
+        assert_eq!(c.workspaces.len(), 1);
+        let text = "[[direct_hotkey]]\nkeys = \"Ctrl+Alt+T\"\nitem = { provider = \"apps\", id = \"t\" }\n";
+        let out = set(text, &Setting::Hotkey("Ctrl+Space".into())).unwrap();
+        assert!(out.starts_with("hotkey = \"Ctrl+Space\"\n"), "{out}");
     }
 
     #[test]
