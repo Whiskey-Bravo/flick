@@ -98,6 +98,9 @@ struct State {
     loaded: bool,
     /// The file does not match `items` (a save failed); the thread retries.
     dirty: bool,
+    /// Unix seconds (rounded down) when the file was read: items due by then
+    /// were missed while Flick was not running.
+    loaded_at: i64,
 }
 
 pub struct Reminders {
@@ -129,7 +132,7 @@ impl Reminders {
             now,
             fire,
             max_sleep,
-            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false }),
+            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false, loaded_at: 0 }),
             wake: Condvar::new(),
             started: AtomicBool::new(false),
         })
@@ -229,6 +232,7 @@ impl Reminders {
         st.items = items;
         st.loaded = true;
         st.dirty = changed;
+        st.loaded_at = unix_floor((self.now)()).0;
     }
 
     /// Saves `items` and records whether the file now matches them.
@@ -253,6 +257,12 @@ impl Reminders {
         self.load(st);
         // Whole Unix seconds: no time arithmetic that could overflow on an odd due.
         let (now, _) = unix_floor((self.now)());
+        self.take_due_by(st, now)
+    }
+
+    /// Takes the items due by `cutoff` (Unix seconds) out and saves the rest.
+    fn take_due_by(&self, st: &mut State, cutoff: i64) -> Vec<Reminder> {
+        let now = cutoff;
         let n = st.items.partition_point(|r| r.due <= now);
         if n == 0 {
             return vec![];
@@ -298,7 +308,11 @@ fn run(weak: Weak<Reminders>) {
     let Some(me) = weak.upgrade() else { return };
     let missed = {
         let mut st = me.lock();
-        me.take_due(&mut st)
+        // Only what was already overdue when the file was read is "missed";
+        // anything set since fires normally, even if this thread starts late.
+        me.load(&mut st);
+        let cutoff = st.loaded_at;
+        me.take_due_by(&mut st, cutoff)
     };
     for r in &missed {
         me.fire_one(&format!("Missed: {}", body(r)));
@@ -779,16 +793,28 @@ mod tests {
         let g = rig(FAST);
         g.r.start();
         g.r.add(g.now() + Duration::from_secs(1), "pizza", false).unwrap();
-        std::fs::remove_file(g.path()).unwrap();
-        std::fs::create_dir(g.path()).unwrap();
-        std::fs::write(g.path().join("x"), "keeps the folder from being removed as a file").unwrap();
+        // Held open without delete sharing, the file cannot be removed: the
+        // save after firing fails until the handle is dropped.
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(g.path()).unwrap();
         g.advance(Duration::from_secs(1));
         assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
-        std::fs::remove_dir_all(g.path()).unwrap();
-        // Stand-in for the stale file a failed save leaves behind.
-        std::fs::write(g.path(), "stale").unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(g.path().exists(), "still blocked");
+        drop(held);
         wait_until("the fired text stayed on disk", 500, || !g.path().exists());
         assert_eq!(g.quiet_for(50), Vec::<String>::new());
+    }
+
+    #[test]
+    fn one_set_this_run_is_never_missed_even_if_the_thread_starts_late() {
+        let g = rig(FAST);
+        g.r.add(g.now() + Duration::from_secs(1), "pizza", false).unwrap();
+        g.advance(Duration::from_secs(2));
+        g.r.start();
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
+        assert_eq!(g.quiet_for(100), Vec::<String>::new());
     }
 
     #[test]
