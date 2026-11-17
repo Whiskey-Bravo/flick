@@ -26,8 +26,11 @@ pub enum RegisterError {
 /// Where combos are registered. `keys` is always the normalized combo
 /// (`normalize_combo`). Never call on the main thread.
 pub trait KeyRegistry: Send + Sync {
+    /// Registers `keys`; a combo held by anyone (another program, or the bar
+    /// hotkey) is `Taken` and is left alone.
     fn register(&self, keys: &str) -> Result<(), RegisterError>;
-    fn unregister(&self, keys: &str);
+    /// Releases a combo this module registered; false when it is still held.
+    fn unregister(&self, keys: &str) -> bool;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -71,6 +74,9 @@ struct Work {
     defs: Vec<DirectHotkeyDef>,
     /// Normalized combos registered now.
     registered: Vec<String>,
+    /// Combos we registered whose release failed: still ours, retried on every
+    /// release. The only combos this module ever frees besides `registered`.
+    stale: Vec<String>,
     /// Released while Settings captures keys; `apply` then only remembers.
     paused: bool,
 }
@@ -97,13 +103,22 @@ impl DirectKeys {
     }
 
     /// Releases every combo registered before, then registers `defs` in order,
-    /// skipping the bar's combo, weak combos and repeats. While paused it only
-    /// remembers `bar` and `defs` for the resume. Never on the main thread.
+    /// skipping the bar's combo, weak combos and repeats. `bar` must be the bar
+    /// shortcut actually registered (after any fallback), not just the one asked
+    /// for. While paused it only remembers `bar` and `defs` for the resume and
+    /// shows them in the status without registering (`item_for` stays None).
+    /// Never on the main thread.
     pub fn apply(&self, bar: &str, defs: &[DirectHotkeyDef]) {
         let mut work = self.work.lock().unwrap_or_else(|e| e.into_inner());
         if work.paused {
             work.bar = bar.to_string();
             work.defs = defs.to_vec();
+            let rows = defs
+                .iter()
+                .zip(refused_states(bar, defs))
+                .map(|(def, refused)| (def.clone(), refused.unwrap_or(KeyState::Ok)))
+                .collect();
+            *self.view.lock().unwrap_or_else(|e| e.into_inner()) = View { rows, live: false };
             return;
         }
         self.apply_locked(&mut work, bar, defs);
@@ -113,28 +128,19 @@ impl DirectKeys {
     /// between reading the remembered set and registering it.
     fn apply_locked(&self, work: &mut Work, bar: &str, defs: &[DirectHotkeyDef]) {
         self.release(work);
-        let bar_combo = normalize_combo(bar);
-        let mut seen: Vec<String> = Vec::new();
         let mut rows = Vec::with_capacity(defs.len());
-        for def in defs {
-            let combo = normalize_combo(&def.keys);
-            let state = if combo == bar_combo {
-                KeyState::Clash
-            } else if !combo_allowed(&def.keys) {
-                KeyState::Weak
-            } else if seen.contains(&combo) {
-                KeyState::Duplicate
-            } else {
+        for (def, refused) in defs.iter().zip(refused_states(bar, defs)) {
+            let state = refused.unwrap_or_else(|| {
+                let combo = normalize_combo(&def.keys);
                 match self.registry.register(&combo) {
                     Ok(()) => {
-                        work.registered.push(combo.clone());
+                        work.registered.push(combo);
                         KeyState::Ok
                     }
                     Err(RegisterError::Invalid) => KeyState::Invalid,
                     Err(RegisterError::Taken) => KeyState::Taken,
                 }
-            };
-            seen.push(combo);
+            });
             rows.push((def.clone(), state));
         }
         work.bar = bar.to_string();
@@ -144,8 +150,11 @@ impl DirectKeys {
 
     fn release(&self, work: &mut Work) {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).live = false;
-        for combo in work.registered.drain(..) {
-            self.registry.unregister(&combo);
+        let ours: Vec<String> = work.stale.drain(..).chain(work.registered.drain(..)).collect();
+        for combo in ours {
+            if !self.registry.unregister(&combo) && !work.stale.contains(&combo) {
+                work.stale.push(combo);
+            }
         }
     }
 
@@ -196,6 +205,29 @@ impl DirectKeys {
     }
 }
 
+/// For each def, the state it gets without asking the registry (`Clash`, `Weak`,
+/// `Duplicate`), or None when it is to be registered.
+fn refused_states(bar: &str, defs: &[DirectHotkeyDef]) -> Vec<Option<KeyState>> {
+    let bar_combo = normalize_combo(bar);
+    let mut seen: Vec<String> = Vec::new();
+    defs.iter()
+        .map(|def| {
+            let combo = normalize_combo(&def.keys);
+            let state = if combo == bar_combo {
+                Some(KeyState::Clash)
+            } else if !combo_allowed(&def.keys) {
+                Some(KeyState::Weak)
+            } else if seen.contains(&combo) {
+                Some(KeyState::Duplicate)
+            } else {
+                None
+            };
+            seen.push(combo);
+            state
+        })
+        .collect()
+}
+
 /// The Shortcut for a combo, built from its normalized spelling (modifiers first,
 /// Win as `super`), which is the only form global-hotkey reads for every spelling
 /// the config accepts.
@@ -219,10 +251,10 @@ impl KeyRegistry for PluginKeys {
     fn register(&self, keys: &str) -> Result<(), RegisterError> {
         let shortcut = shortcut(keys)?;
         let gs = self.app.global_shortcut();
-        // Our own leftover from a release that failed: free it, or it would read
-        // as taken by another program. (The bar's combo never gets here: Clash.)
+        // Held in the plugin's app-wide map, which the bar hotkey shares: never
+        // touch it here. (`DirectKeys` frees its own leftovers before this.)
         if gs.is_registered(shortcut) {
-            self.unregister(keys);
+            return Err(RegisterError::Taken);
         }
         let on_press = self.on_press;
         let keys = keys.to_string();
@@ -234,10 +266,15 @@ impl KeyRegistry for PluginKeys {
             .map_err(|_| RegisterError::Taken)
     }
 
-    fn unregister(&self, keys: &str) {
-        if let Ok(shortcut) = shortcut(keys) {
-            if let Err(e) = self.app.global_shortcut().unregister(shortcut) {
+    fn unregister(&self, keys: &str) -> bool {
+        let Ok(shortcut) = shortcut(keys) else {
+            return true;
+        };
+        match self.app.global_shortcut().unregister(shortcut) {
+            Ok(()) => true,
+            Err(e) => {
                 eprintln!("could not release direct hotkey {keys}: {}", error_kind(&e));
+                false
             }
         }
     }
@@ -311,11 +348,15 @@ mod tests {
     use super::*;
     use tauri_plugin_global_shortcut::{Code, Modifiers};
 
+    /// Models the plugin's one app-wide map: `taken` is held by someone else
+    /// (another program or the bar), `held` by us; `stuck` fails one release each.
     #[derive(Default)]
     struct FakeRegistry {
         calls: Mutex<Vec<String>>,
         taken: Vec<&'static str>,
         invalid: Vec<&'static str>,
+        held: Mutex<Vec<String>>,
+        stuck: Mutex<Vec<&'static str>>,
     }
 
     impl FakeRegistry {
@@ -329,14 +370,23 @@ mod tests {
             if self.invalid.contains(&keys) {
                 return Err(RegisterError::Invalid);
             }
-            if self.taken.contains(&keys) {
+            let mut held = self.held.lock().unwrap();
+            if self.taken.contains(&keys) || held.iter().any(|k| k == keys) {
                 return Err(RegisterError::Taken);
             }
+            held.push(keys.to_string());
             self.calls.lock().unwrap().push(format!("register {keys}"));
             Ok(())
         }
-        fn unregister(&self, keys: &str) {
+        fn unregister(&self, keys: &str) -> bool {
             self.calls.lock().unwrap().push(format!("unregister {keys}"));
+            let mut stuck = self.stuck.lock().unwrap();
+            if let Some(i) = stuck.iter().position(|k| *k == keys) {
+                stuck.remove(i);
+                return false;
+            }
+            self.held.lock().unwrap().retain(|k| k != keys);
+            true
         }
     }
 
@@ -453,6 +503,8 @@ mod tests {
         keys.apply("Ctrl+Alt+E", &[def("Ctrl+Alt+E", "e"), def("Win+N", "n")]);
         assert_eq!(reg.calls(), ["register ctrl+alt+t", "unregister ctrl+alt+t"]);
         assert_eq!(keys.item_for("Ctrl+Alt+T"), None);
+        assert_eq!(keys.item_for("Win+N"), None);
+        assert_eq!(states(&keys), [("Ctrl+Alt+E".to_string(), KeyState::Clash), ("Win+N".to_string(), KeyState::Ok)]);
         keys.pause(false);
         assert_eq!(reg.calls(), ["register ctrl+alt+t", "unregister ctrl+alt+t", "register super+n"]);
         assert_eq!(states(&keys), [("Ctrl+Alt+E".to_string(), KeyState::Clash), ("Win+N".to_string(), KeyState::Ok)]);
@@ -460,6 +512,34 @@ mod tests {
         keys.pause(false);
         assert_eq!(reg.calls().len(), 3, "a second resume neither releases nor registers again");
         assert_eq!(keys.item_for("Win+N"), Some(item("n")));
+    }
+
+    #[test]
+    fn a_combo_held_by_someone_else_is_taken_and_left_alone() {
+        // e.g. the bar hotkey really registered is not the `bar` passed in.
+        let (reg, keys) = keys_with(FakeRegistry { taken: vec!["ctrl+alt+b"], ..Default::default() });
+        keys.apply("Alt+Space", &[def("Ctrl+Alt+B", "b"), def("Ctrl+Alt+T", "t")]);
+        keys.apply("Alt+Space", &[def("Ctrl+Alt+B", "b")]);
+        keys.release_all();
+        assert_eq!(states(&keys), [("Ctrl+Alt+B".to_string(), KeyState::Taken)]);
+        assert!(!reg.calls().iter().any(|c| c.ends_with("ctrl+alt+b")), "{:?}", reg.calls());
+    }
+
+    #[test]
+    fn a_combo_whose_release_failed_is_freed_and_registered_again() {
+        let (reg, keys) = keys_with(FakeRegistry::default());
+        keys.apply("Alt+Space", &[def("Ctrl+Alt+T", "t")]);
+        reg.stuck.lock().unwrap().push("ctrl+alt+t");
+        keys.release_all();
+        keys.apply("Alt+Space", &[def("Ctrl+Alt+T", "t")]);
+        assert_eq!(
+            reg.calls(),
+            ["register ctrl+alt+t", "unregister ctrl+alt+t", "unregister ctrl+alt+t", "register ctrl+alt+t"]
+        );
+        assert_eq!(states(&keys)[0].1, KeyState::Ok);
+        assert_eq!(keys.item_for("Ctrl+Alt+T"), Some(item("t")));
+        keys.apply("Alt+Space", &[]);
+        assert_eq!(reg.calls().len(), 5, "freed once, not retried again");
     }
 
     #[test]
