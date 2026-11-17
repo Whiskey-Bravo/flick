@@ -10,6 +10,9 @@ use crate::dirs::{one_line, Load, Loader, ReadError, NEVER_STALE, SLOW};
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route};
 
 /// Characters of the text shown as the row title.
+/// `qr` / `qr some text`.
+pub const ROUTE: Route = Route { prefix: "qr", needs_space: true };
+
 pub const MAX_PREVIEW: usize = 80;
 
 const READING: &str = "Reading clipboard\u{2026}";
@@ -136,7 +139,7 @@ impl Provider for QrProvider {
     }
 
     fn route(&self) -> Option<Route> {
-        Some(Route { prefix: "qr", needs_space: true })
+        Some(ROUTE)
     }
 
     fn help(&self) -> Vec<HelpLine> {

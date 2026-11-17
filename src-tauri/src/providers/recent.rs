@@ -15,6 +15,10 @@ use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, Resu
 
 /// Rows each list keeps before filtering.
 const NEWEST: usize = 20;
+/// `dl`.
+pub const DOWNLOADS_ROUTE: Route = Route { prefix: "dl", needs_space: true };
+/// `recent`.
+pub const RECENT_ROUTE: Route = Route { prefix: "recent", needs_space: true };
 
 /// Keeps the items whose name matches `text` fuzzily, in their order; all when `text` is empty.
 fn keep_matching<T>(items: Vec<T>, text: &str, name: impl Fn(&T) -> String) -> Vec<T> {
@@ -98,7 +102,7 @@ impl Provider for DownloadsProvider {
     }
 
     fn route(&self) -> Option<Route> {
-        Some(Route { prefix: "dl", needs_space: true })
+        Some(DOWNLOADS_ROUTE)
     }
 
     fn item(&self, id: &str) -> Option<ResultItem> {
@@ -211,7 +215,7 @@ impl Provider for RecentProvider {
     }
 
     fn route(&self) -> Option<Route> {
-        Some(Route { prefix: "recent", needs_space: true })
+        Some(RECENT_ROUTE)
     }
 
     fn item(&self, id: &str) -> Option<ResultItem> {

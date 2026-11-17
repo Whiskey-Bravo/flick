@@ -63,6 +63,8 @@ enum Shown<'a> {
     Armed(&'a ResultItem),
     /// `bar:reopen` with `{ text, error }`: the text is put back with the error under it.
     Reopen { text: &'a str, error: &'a str },
+    /// `bar:step` with `{ prompt, scope }`: the bar opens in that pick list.
+    Step { prompt: &'a str, scope: &'a str },
 }
 
 /// Centre horizontally, top edge at 25% of the monitor under the mouse cursor;
@@ -79,8 +81,15 @@ pub fn show_armed(app: &AppHandle, item: &ResultItem) {
 
 /// Like [`show`], but the bar opens with `text` and `error` under it (a
 /// workspace whose items did not all open): `bar:reopen` instead of `bar:shown`.
+/// An empty `error` shows none (a direct hotkey on an item that needs typing).
 pub fn reopen(app: &AppHandle, text: &str, error: &str) {
     show_as(app, Shown::Reopen { text, error });
+}
+
+/// Like [`show`], but the bar opens in the pick list `scope` under `prompt`,
+/// as after Enter on its row (a direct hotkey on an item that asks to choose).
+pub fn show_step(app: &AppHandle, prompt: &str, scope: &str) {
+    show_as(app, Shown::Step { prompt, scope });
 }
 
 fn show_as(app: &AppHandle, shown: Shown) {
@@ -107,6 +116,9 @@ fn show_as(app: &AppHandle, shown: Shown) {
         Shown::Armed(item) => app.emit_to(LABEL, "bar:armed", item),
         Shown::Reopen { text, error } => {
             app.emit_to(LABEL, "bar:reopen", serde_json::json!({ "text": text, "error": error }))
+        }
+        Shown::Step { prompt, scope } => {
+            app.emit_to(LABEL, "bar:step", serde_json::json!({ "prompt": prompt, "scope": scope }))
         }
     };
     // Re-send the stored error so one raised before the page listened is not lost.

@@ -756,8 +756,10 @@ fn setup(app: &AppHandle) {
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
     let ready = app.clone();
     // The bar re-runs its query when the text is unchanged, so a placeholder turns into the answer.
+    // The Settings item picker asks again too (a device list read for `connect` has ended).
     let on_ready: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
+        let _ = ready.emit_to(settings::WINDOW, "answers:ready", ());
     });
     let answers = Answers::new(launcher.clone(), on_ready.clone());
     let browse = Browse::new(launcher.clone(), on_ready.clone());
@@ -1002,12 +1004,24 @@ impl PressTarget for AppPress {
         self.app.state::<AppState>().engine.item(provider, id)
     }
 
+    fn ready(&self, provider: &str) -> bool {
+        self.app.state::<AppState>().engine.ready(provider)
+    }
+
     fn open(&self, provider: &str, id: &str) -> Result<Outcome, String> {
         self.app.state::<AppState>().engine.open_item(provider, id)
     }
 
     fn show_armed(&self, item: ResultItem) {
         window::show_armed(&self.app, &item);
+    }
+
+    fn show_filled(&self, text: &str) {
+        window::reopen(&self.app, text, "");
+    }
+
+    fn show_step(&self, prompt: &str, scope: &str) {
+        window::show_step(&self.app, prompt, scope);
     }
 
     fn follow_up(&self, then: Then) {
@@ -1120,15 +1134,47 @@ fn reapply_hotkeys(
     apply_bar: impl FnOnce(&str) -> Option<String>,
     registered_bar: impl FnOnce() -> String,
 ) -> Option<String> {
-    let direct = direct_keys_need_apply(old, new, bar_needs_apply);
-    if direct {
-        keys.release_all();
+    if bar_needs_apply {
+        return swap_bar_hotkey(keys, &new.hotkey, &new.direct_hotkeys, apply_bar, registered_bar);
     }
-    let error = if bar_needs_apply { apply_bar(&new.hotkey) } else { None };
-    if direct {
+    if direct_keys_need_apply(old, new, false) {
+        keys.release_all();
         keys.apply(&registered_bar(), &new.direct_hotkeys);
     }
+    None
+}
+
+/// Moves the bar hotkey to `wanted` with the direct keys `defs` around it: they
+/// let go first (the bar may move onto one of their combos), the bar registers,
+/// then they register again against `registered_bar`, the bar hotkey that is
+/// registered now (the old one when `wanted` failed). Used by a reload and by
+/// the Settings window, so both let the bar win. Returns the bar hotkey's error.
+/// Never on the main thread; callers hold the config lock.
+pub(crate) fn swap_bar_hotkey(
+    keys: &DirectKeys,
+    wanted: &str,
+    defs: &[config::DirectHotkeyDef],
+    apply_bar: impl FnOnce(&str) -> Option<String>,
+    registered_bar: impl FnOnce() -> String,
+) -> Option<String> {
+    keys.release_all();
+    let error = apply_bar(wanted);
+    keys.apply(&registered_bar(), defs);
     error
+}
+
+/// The Settings window's bar hotkey change, under the config lock (so a reload
+/// never interleaves): the direct keys follow it as on a reload, and the reload
+/// that follows finds the bar and the direct keys already in line.
+pub(crate) fn change_bar_hotkey(app: &AppHandle, wanted: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let keys = app.state::<Arc<DirectKeys>>();
+    settings::set_hotkey(&config::config_path(), applied.as_deref(), wanted, |h| {
+        swap_bar_hotkey(&keys, h, &config.direct_hotkeys, |a| apply_hotkey(app, a), || registered_bar(app, &config.hotkey))
+            .map_or(Ok(()), Err)
+    })
 }
 
 /// Config error first, then hotkey error.
@@ -2214,6 +2260,23 @@ mod tests {
     }
 
     #[test]
+    fn a_wifi_name_is_claimed_and_never_a_past_search() {
+        let r = rig(vec![app("Notepad")], vec![]);
+        let res = r.engine.query("wifi home", None);
+        assert!(!res.is_empty() && res.iter().all(|i| i.provider == "devices"), "{:?}", providers_of(&res));
+        // Claimed text is never a past search (`Engine::searchable`).
+        let claimed = |text: &str| r.engine.providers().any(|p| p.claims(text));
+        assert!(claimed("wifi home"));
+        // The toggles keep their words, unclaimed.
+        for text in ["wifi on", "wifi off", "wifi"] {
+            assert!(!claimed(text), "{text}");
+        }
+        for text in ["wifi on", "wifi off"] {
+            assert!(r.engine.query(text, None).iter().any(|i| i.provider == "system"), "{text}");
+        }
+    }
+
+    #[test]
     fn typed_extras_are_never_recorded() {
         let r = rig(vec![], vec![]);
         let res = r.engine.query("timer 5m", None);
@@ -2423,5 +2486,84 @@ mod tests {
         // Nothing changed: nothing is released or registered again.
         let untouched = reapply_hotkeys(&keys, &moved, &moved, false, |_| panic!("no bar apply"), || panic!("no direct apply"));
         assert_eq!(untouched, None);
+    }
+
+    #[test]
+    fn every_route_and_claimed_help_word_is_kept_from_workspace_names() {
+        let r = rig(vec![], vec![]);
+        let mut checked = 0;
+        for p in r.engine.providers() {
+            if let Some(route) = p.route() {
+                let typed = if route.needs_space { route.prefix.to_string() } else { format!("{}x", route.prefix) };
+                assert!(config::is_command_word(&typed), "{} routes {}", p.name(), route.prefix);
+                checked += 1;
+            }
+            for line in p.help() {
+                let Some(word) = line.fill.split_whitespace().next() else { continue };
+                if p.claims(word) || p.claims(&format!("{word} x")) {
+                    assert!(config::is_command_word(word), "{} claims {word}", p.name());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 10, "{checked}");
+    }
+
+    #[test]
+    fn a_settings_bar_hotkey_change_lets_the_bar_win_and_frees_the_old_clash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let defs = vec![direct("Ctrl+Alt+T")];
+        let registry = Arc::new(SharedKeys::default());
+        let keys = DirectKeys::new(registry.clone());
+        let bar = Mutex::new("Alt+Space".to_string());
+        registry.register(&config::normalize_combo("Alt+Space")).unwrap();
+        keys.apply("Alt+Space", &defs);
+        assert!(keys.item_for("Ctrl+Alt+T").is_some());
+
+        // As `change_bar_hotkey` does, with the plugin's one map faked.
+        let change = |applied: &str, wanted: &str| {
+            settings::set_hotkey(&path, Some(applied), wanted, |h| {
+                swap_bar_hotkey(
+                    &keys,
+                    h,
+                    &defs,
+                    |accel| {
+                        let mut bar = bar.lock().unwrap();
+                        registry.unregister(&config::normalize_combo(&bar));
+                        match registry.register(&config::normalize_combo(accel)) {
+                            Ok(()) => {
+                                *bar = accel.to_string();
+                                None
+                            }
+                            Err(_) => {
+                                registry.register(&config::normalize_combo(&bar)).unwrap();
+                                Some(format!("hotkey \"{accel}\" is in use by another program"))
+                            }
+                        }
+                    },
+                    || bar.lock().unwrap().clone(),
+                )
+                .map_or(Ok(()), Err)
+            })
+        };
+        let states = || keys.status(&|_| true).into_iter().map(|s| s.state).collect::<Vec<_>>();
+
+        // The bar moves onto the direct key's combo: the bar wins.
+        change("Alt+Space", "Ctrl+Alt+T").expect("the direct key let go first");
+        assert_eq!(*bar.lock().unwrap(), "Ctrl+Alt+T");
+        assert_eq!(states(), [direct_keys::KeyState::Clash]);
+        assert_eq!(keys.item_for("Ctrl+Alt+T"), None);
+        assert_eq!(*registry.held.lock().unwrap(), ["ctrl+alt+t"], "held once, by the bar");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Ctrl+Alt+T"));
+
+        // The bar moves away: the entry that clashed registers now, with no reload.
+        change("Ctrl+Alt+T", "Ctrl+Shift+K").unwrap();
+        assert_eq!(states(), [direct_keys::KeyState::Ok]);
+        assert_eq!(keys.item_for("Ctrl+Alt+T").map(|i| i.id), Some(r"C:\x\Term.lnk".to_string()));
+        let mut held = registry.held.lock().unwrap().clone();
+        held.sort();
+        assert_eq!(held, [config::normalize_combo("Ctrl+Alt+T"), config::normalize_combo("Ctrl+Shift+K")]);
     }
 }

@@ -127,10 +127,19 @@ fn show_balloon(title: &str, body: &str) -> Result<(), String> {
 }
 
 /// Copies `text` into a fixed UTF-16 buffer, cut to leave room for the NUL.
+/// The cut falls between characters: never half of a surrogate pair.
 fn fill(buf: &mut [u16], text: &str) {
-    let units: Vec<u16> = text.encode_utf16().take(buf.len() - 1).collect();
-    buf[..units.len()].copy_from_slice(&units);
-    buf[units.len()] = 0;
+    let room = buf.len() - 1;
+    let mut len = 0;
+    for c in text.chars() {
+        let n = c.len_utf16();
+        if len + n > room {
+            break;
+        }
+        c.encode_utf16(&mut buf[len..len + n]);
+        len += n;
+    }
+    buf[len] = 0;
 }
 
 /// The windows of the balloons whose icon is in the notification area now
@@ -331,6 +340,22 @@ mod tests {
         let mut small = [7u16; 4];
         fill(&mut small, "ab");
         assert_eq!(small[..3], ['a' as u16, 'b' as u16, 0]);
+    }
+
+    #[test]
+    fn a_cut_never_leaves_half_a_surrogate_pair() {
+        // 62 units, then an emoji (two units) that would end at unit 64 of 63.
+        let text = format!("{}\u{1F355} pizza", "x".repeat(62));
+        let mut buf = [7u16; 64];
+        fill(&mut buf, &text);
+        assert_eq!(buf[61], 'x' as u16);
+        assert_eq!(buf[62], 0, "the emoji is left out whole");
+        assert_eq!(String::from_utf16(&buf[..62]).unwrap(), "x".repeat(62));
+        // One unit earlier it fits whole.
+        let text = format!("{}\u{1F355}", "x".repeat(61));
+        fill(&mut buf, &text);
+        assert_eq!(String::from_utf16(&buf[..63]).unwrap(), text);
+        assert_eq!(buf[63], 0);
     }
 
     #[test]

@@ -12,6 +12,8 @@ use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 use crate::providers::power::POWER_PENALTY;
 
 const NAME: &str = "chores";
+/// The word this provider claims (alone or with a drive after it).
+pub const EJECT: &str = "eject";
 
 const EMPTY_BIN: &str = "empty-bin";
 const FLUSH_DNS: &str = "flush-dns";
@@ -192,11 +194,11 @@ fn drive_row(d: &Drive, score: u32) -> ResultItem {
 /// The text after a leading `eject` word, if `text` starts with one.
 fn eject_filter(text: &str) -> Option<&str> {
     let text = text.trim();
-    let head = text.get(..5)?;
-    if !head.eq_ignore_ascii_case("eject") {
+    let head = text.get(..EJECT.len())?;
+    if !head.eq_ignore_ascii_case(EJECT) {
         return None;
     }
-    let rest = &text[5..];
+    let rest = &text[EJECT.len()..];
     if rest.is_empty() {
         return Some("");
     }

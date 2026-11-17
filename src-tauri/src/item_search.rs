@@ -22,13 +22,19 @@ pub struct PickRow {
 /// Rows the picker shows at most.
 pub const MAX_PICKS: usize = 20;
 
+/// A shortcut that needs typing: one taking an argument (`need:`) or a pick
+/// list (`step:`). A hotkey shows the bar for it; a workspace cannot open it.
+pub fn needs_typing(provider: &str, id: &str) -> bool {
+    provider == "shortcuts" && (id.starts_with("need:") || id.starts_with("step:"))
+}
+
 /// Keeps the rows that can be stored by key (the test pins use: `pinnable`),
-/// never help lines. A workspace also leaves out rows that ask for a confirm and
-/// other workspaces. First [`MAX_PICKS`], order kept.
+/// never help lines. A workspace also leaves out rows that ask for a confirm,
+/// rows that need typing and other workspaces. First [`MAX_PICKS`], order kept.
 pub fn pick_rows(rows: Vec<ResultItem>, for_workspace: bool) -> Vec<PickRow> {
     rows.into_iter()
         .filter(|r| r.pinnable && r.provider != HELP)
-        .filter(|r| !for_workspace || (!r.confirm && r.provider != workspaces::NAME))
+        .filter(|r| !for_workspace || (!r.confirm && r.provider != workspaces::NAME && !needs_typing(r.provider, &r.id)))
         .take(MAX_PICKS)
         .map(|r| PickRow {
             provider: r.provider.to_string(),
@@ -128,20 +134,25 @@ mod tests {
         let rows = vec![
             row("power", "off", true, true),
             row(workspaces::NAME, "work", true, false),
+            row("shortcuts", "need:search", true, false),
+            row("shortcuts", "step:proj", true, false),
+            row("shortcuts", "run:hello", true, false),
             row("apps", "a", true, false),
         ];
-        assert_eq!(ids(&pick_rows(rows, true)), ["apps:a"]);
+        assert_eq!(ids(&pick_rows(rows, true)), ["shortcuts:run:hello", "apps:a"]);
     }
 
     #[test]
-    fn hotkey_picker_keeps_confirm_rows_and_workspaces() {
+    fn hotkey_picker_keeps_confirm_rows_workspaces_and_rows_that_need_typing() {
         let rows = vec![
             row("power", "off", true, true),
             row(workspaces::NAME, "work", true, false),
+            row("shortcuts", "need:search", true, false),
+            row("shortcuts", "step:proj", true, false),
             row("apps", "a", true, false),
         ];
         let picks = pick_rows(rows, false);
-        assert_eq!(ids(&picks), ["power:off", "workspaces:work", "apps:a"]);
+        assert_eq!(ids(&picks), ["power:off", "workspaces:work", "shortcuts:need:search", "shortcuts:step:proj", "apps:a"]);
         assert!(picks[0].confirm);
     }
 

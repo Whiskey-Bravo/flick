@@ -287,10 +287,41 @@ fn error_kind(e: &tauri_plugin_global_shortcut::Error) -> String {
 /// What a press acts on. `open` may block; never called on the main thread.
 pub trait PressTarget: Send + Sync {
     fn item(&self, provider: &str, id: &str) -> Option<ResultItem>;
+    /// False while the provider has not finished its first scan.
+    fn ready(&self, provider: &str) -> bool;
     fn open(&self, provider: &str, id: &str) -> Result<Outcome, String>;
     fn show_armed(&self, item: ResultItem);
+    /// The bar opens with `text` typed (an item that needs an argument).
+    fn show_filled(&self, text: &str);
+    /// The bar opens in the pick list `scope` (an item that asks to choose).
+    fn show_step(&self, prompt: &str, scope: &str);
     fn follow_up(&self, then: Then);
     fn failed(&self, message: &str);
+}
+
+/// How long a press or a workspace waits for a provider's first scan (right
+/// after login) before it gives up with [`STILL_STARTING`].
+pub const STARTUP_WAIT: Duration = Duration::from_secs(3);
+
+/// Said when an item's provider has not finished its first scan in time.
+pub const STILL_STARTING: &str = "Flick is still starting";
+
+/// Time between two looks at `ready` while waiting.
+const READY_POLL: Duration = Duration::from_millis(50);
+
+/// Waits until `ready` says true or `deadline` passes (looking every 50 ms);
+/// true when it got ready. Blocks: never on the main thread.
+pub fn wait_ready(ready: impl Fn() -> bool, deadline: Instant) -> bool {
+    loop {
+        if ready() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(READY_POLL.min(deadline - now));
+    }
 }
 
 pub const REPEAT_GATE: Duration = Duration::from_millis(500);
@@ -316,10 +347,25 @@ impl PressGate {
     }
 }
 
-/// Opens `item` for a direct hotkey: a confirm item shows the bar armed; a gone
-/// item does nothing; a failure is reported once; a cancel is silent.
+/// Opens `item` for a direct hotkey: a confirm item shows the bar armed; an
+/// item that needs typing shows the bar filled or in its pick list; a gone item
+/// does nothing; a failure is reported once; a cancel is silent. Right after
+/// login the item's provider may not have scanned yet: the press waits up to
+/// [`STARTUP_WAIT`] for it, then says [`STILL_STARTING`]. Never on the main thread.
 pub fn press(target: &dyn PressTarget, item: &ItemRef) {
-    let Some(row) = target.item(&item.provider, &item.id) else {
+    press_waiting(target, item, STARTUP_WAIT);
+}
+
+fn press_waiting(target: &dyn PressTarget, item: &ItemRef, wait: Duration) {
+    let mut row = target.item(&item.provider, &item.id);
+    if row.is_none() && !target.ready(&item.provider) {
+        if !wait_ready(|| target.ready(&item.provider), Instant::now() + wait) {
+            target.failed(STILL_STARTING);
+            return;
+        }
+        row = target.item(&item.provider, &item.id);
+    }
+    let Some(row) = row else {
         return;
     };
     if row.confirm {
@@ -328,6 +374,8 @@ pub fn press(target: &dyn PressTarget, item: &ItemRef) {
     }
     match target.open(&item.provider, &item.id) {
         Ok(Outcome::HideThen { then }) => target.follow_up(then),
+        Ok(Outcome::Fill { text }) => target.show_filled(&text),
+        Ok(Outcome::Step { prompt, scope }) => target.show_step(&prompt, &scope),
         Ok(_) => {}
         Err(e) if e == CANCELLED => {}
         Err(e) => target.failed(&e),
@@ -597,6 +645,8 @@ mod tests {
         item: Option<ResultItem>,
         open: Mutex<Option<Result<Outcome, String>>>,
         calls: Mutex<Vec<String>>,
+        /// Answers of `ready`, one per call; the last one stays. Empty: ready.
+        ready: Mutex<Vec<bool>>,
     }
 
     impl FakeTarget {
@@ -611,7 +661,19 @@ mod tests {
     impl PressTarget for FakeTarget {
         fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
             self.calls.lock().unwrap().push(format!("item {provider} {id}"));
+            let ready = self.ready.lock().unwrap();
+            if ready.first() == Some(&false) {
+                return None;
+            }
             self.item.clone()
+        }
+        fn ready(&self, _provider: &str) -> bool {
+            let mut ready = self.ready.lock().unwrap();
+            let now = ready.first().copied().unwrap_or(true);
+            if ready.len() > 1 {
+                ready.remove(0);
+            }
+            now
         }
         fn open(&self, provider: &str, id: &str) -> Result<Outcome, String> {
             self.calls.lock().unwrap().push(format!("open {provider} {id}"));
@@ -619,6 +681,12 @@ mod tests {
         }
         fn show_armed(&self, item: ResultItem) {
             self.calls.lock().unwrap().push(format!("armed {}", item.id));
+        }
+        fn show_filled(&self, text: &str) {
+            self.calls.lock().unwrap().push(format!("filled {text}"));
+        }
+        fn show_step(&self, prompt: &str, scope: &str) {
+            self.calls.lock().unwrap().push(format!("step {prompt} {scope}"));
         }
         fn follow_up(&self, then: Then) {
             self.calls.lock().unwrap().push(format!("follow_up {then:?}"));
@@ -665,6 +733,37 @@ mod tests {
         let t = FakeTarget::with(Some(row("x", false)), Err("file not found".into()));
         press(&t, &item("x"));
         assert_eq!(t.calls(), ["item apps x", "open apps x", "failed file not found"]);
+    }
+
+    #[test]
+    fn an_item_that_needs_typing_shows_the_bar_filled_or_in_its_list() {
+        let fill = Outcome::Fill { text: "search ".into() };
+        let t = FakeTarget::with(Some(row("need:search", false)), Ok(fill));
+        press(&t, &item("need:search"));
+        assert_eq!(t.calls(), ["item apps need:search", "open apps need:search", "filled search "]);
+
+        let step = Outcome::Step { prompt: "proj".into(), scope: "shortcut:proj".into() };
+        let t = FakeTarget::with(Some(row("step:proj", false)), Ok(step));
+        press(&t, &item("step:proj"));
+        assert_eq!(t.calls(), ["item apps step:proj", "open apps step:proj", "step proj shortcut:proj"]);
+    }
+
+    #[test]
+    fn a_press_before_the_first_scan_waits_for_it() {
+        let t = FakeTarget::with(Some(row("x", false)), Ok(Outcome::Hide));
+        *t.ready.lock().unwrap() = vec![false, false, false, true];
+        press_waiting(&t, &item("x"), Duration::from_secs(5));
+        assert_eq!(t.calls(), ["item apps x", "item apps x", "open apps x"]);
+    }
+
+    #[test]
+    fn a_press_says_still_starting_when_the_scan_takes_too_long() {
+        let t = FakeTarget::with(Some(row("x", false)), Ok(Outcome::Hide));
+        *t.ready.lock().unwrap() = vec![false];
+        let start = Instant::now();
+        press_waiting(&t, &item("x"), Duration::from_millis(120));
+        assert!(start.elapsed() >= Duration::from_millis(120));
+        assert_eq!(t.calls(), ["item apps x", "failed Flick is still starting"]);
     }
 
     #[test]

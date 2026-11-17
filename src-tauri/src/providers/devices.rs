@@ -11,6 +11,8 @@ use crate::fuzzy::score;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 const NAME: &str = "devices";
+/// The words this provider claims (with text after them for `wifi`).
+pub const WORDS: [&str; 3] = ["connect", "disconnect", "wifi"];
 const READING_BT: &str = "Reading Bluetooth devices\u{2026}";
 const NONE_PAIRED: &str = "No paired Bluetooth audio devices";
 const NONE_CONNECTED: &str = "No connected Bluetooth audio devices";
@@ -248,8 +250,11 @@ impl Provider for DevicesProvider {
         }
     }
 
+    /// `connect …`, `disconnect …` and `wifi <name>`: claimed text is never a
+    /// past search. `wifi`, `wifi on` and `wifi off` stay with the system toggles.
     fn claims(&self, text: &str) -> bool {
-        verb(text.trim()).is_some()
+        let text = text.trim();
+        verb(text).is_some() || wifi_name(text).is_some()
     }
 
     fn help(&self) -> Vec<HelpLine> {
@@ -485,12 +490,12 @@ mod tests {
     }
 
     #[test]
-    fn only_connect_and_disconnect_are_claimed() {
+    fn connect_disconnect_and_wifi_names_are_claimed() {
         let t = t(two());
-        for yes in ["connect", "Connect x", "disconnect", "DISCONNECT head phones"] {
+        for yes in ["connect", "Connect x", "disconnect", "DISCONNECT head phones", "wifi home", " WiFi Home Net "] {
             assert!(t.p.claims(yes), "{yes}");
         }
-        for no in ["connections", "wifi home", "disconnected", "reconnect", ""] {
+        for no in ["connections", "wifi", "wifi on", "WIFI OFF", "wifihome", "disconnected", "reconnect", ""] {
             assert!(!t.p.claims(no), "{no}");
         }
     }

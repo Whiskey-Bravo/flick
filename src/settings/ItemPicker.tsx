@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { builtinName, serverUrl } from "../icons";
-import { settingsSearchItems, type PickRow } from "./api";
+import { onAnswersReady, settingsSearchItems, type PickRow } from "./api";
+import { askItems } from "./pickerSearch";
 
 const MAX_ROWS = 20;
 
@@ -23,28 +24,39 @@ export function ItemPicker({ forWorkspace, onPick }: { forWorkspace: boolean; on
   const [text, setText] = useState("");
   const [rows, setRows] = useState<PickRow[]>([]);
   const [sel, setSel] = useState(0);
+  // Bumped when a device, drive or Wi-Fi list has been read while nothing showed.
+  const [reread, setReread] = useState(0);
+  const empty = useRef(true);
+  empty.current = rows.length === 0;
+
+  useEffect(() => {
+    const off = onAnswersReady(() => {
+      if (empty.current) setReread((n) => n + 1);
+    });
+    return () => void off.then((f) => f(), () => {});
+  }, []);
 
   useEffect(() => {
     if (text.trim() === "") {
       setRows([]);
       return;
     }
-    let stale = false;
+    let cancel = () => {};
     const t = setTimeout(() => {
-      settingsSearchItems(text, forWorkspace).then(
+      cancel = askItems(
+        text,
+        (q) => settingsSearchItems(q, forWorkspace),
         (found) => {
-          if (stale) return;
           setRows(found.slice(0, MAX_ROWS));
           setSel(0);
         },
-        () => !stale && setRows([]),
       );
     }, 150);
     return () => {
-      stale = true;
+      cancel();
       clearTimeout(t);
     };
-  }, [text, forWorkspace]);
+  }, [text, forWorkspace, reread]);
 
   const pick = (row: PickRow) => {
     onPick(row);

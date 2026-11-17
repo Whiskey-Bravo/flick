@@ -55,6 +55,15 @@ fn windows_dir() -> PathBuf {
         .unwrap_or_else(|| r"C:\Windows".into())
 }
 
+/// True when an Explorer process that ran before the restart (`before`) still
+/// runs (`now`): it never stopped. Unknown lists (`None`) tell nothing.
+fn never_stopped(before: Option<&[u32]>, now: Option<&[u32]>) -> bool {
+    match (before, now) {
+        (Some(before), Some(now)) => before.iter().any(|pid| now.contains(pid)),
+        _ => false,
+    }
+}
+
 mod win {
     use std::mem::size_of;
     use std::time::{Duration, Instant};
@@ -220,23 +229,27 @@ mod win {
     }
 
     fn explorer_running() -> bool {
-        let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
-            // Unknown: assume it runs rather than start a second shell.
-            return true;
-        };
-        let snapshot = Handle(snapshot);
+        // Unknown: assume it runs rather than start a second shell.
+        explorer_pids().is_none_or(|pids| !pids.is_empty())
+    }
+
+    /// The process ids of every explorer.exe; `None` when they can't be listed.
+    fn explorer_pids() -> Option<Vec<u32>> {
+        // SAFETY: plain flags; the handle is closed by `Handle`.
+        let snapshot = Handle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.ok()?);
         let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut pids = Vec::new();
         // SAFETY: a valid snapshot; `entry` is sized above.
         let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) }.is_ok();
         while more {
             let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
             if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case("explorer.exe") {
-                return true;
+                pids.push(entry.th32ProcessID);
             }
             // SAFETY: as above.
             more = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
         }
-        false
+        Some(pids)
     }
 
     /// The volume's label, or `None` when it has no readable volume (an
@@ -284,10 +297,11 @@ mod win {
             let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
             // Removable volumes on USB (sticks; a built-in USB card reader
             // can't be told apart and is kept) or SD/MMC; fixed disks on USB.
-            let bus = bus_type(letter);
+            // The bus is read only for those two kinds: a network or optical
+            // drive is never opened.
             let wanted = match kind {
-                DRIVE_REMOVABLE => bus.is_some_and(|b| b == BusTypeUsb || b == BusTypeSd || b == BusTypeMmc),
-                DRIVE_FIXED => bus == Some(BusTypeUsb),
+                DRIVE_REMOVABLE => bus_type(letter).is_some_and(|b| b == BusTypeUsb || b == BusTypeSd || b == BusTypeMmc),
+                DRIVE_FIXED => bus_type(letter) == Some(BusTypeUsb),
                 _ => false,
             };
             if !wanted {
@@ -388,15 +402,22 @@ mod win {
         let files = [PCWSTR(exe.as_ptr())];
         // SAFETY: `files` holds one NUL-terminated path that outlives the call.
         check(unsafe { RmRegisterResources(session.0, Some(&files), None, None) }, "RmRegisterResources")?;
+        let before = explorer_pids();
         // Once a shutdown has been tried, Explorer may be gone, so from here
         // on nothing returns early. Order: 1) RmRestart whatever RmShutdown
-        // said; 2) if no explorer.exe runs, start it ourselves; 3) Err only
-        // when Explorer still isn't running.
+        // said; 2) when RmShutdown failed and the Explorer that ran before
+        // still runs, nothing restarted: Err; 3) if no explorer.exe runs,
+        // start it ourselves; 4) Err only when Explorer still isn't running.
         // SAFETY: a started session; no callback.
         let shutdown = check(unsafe { RmShutdown(session.0, RmForceShutdown.0 as u32, None) }, "RmShutdown");
         // SAFETY: a started session; no callback.
         let restart = check(unsafe { RmRestart(session.0, None, None) }, "RmRestart");
         drop(session);
+        if let Err(e) = &shutdown {
+            if super::never_stopped(before.as_deref(), explorer_pids().as_deref()) {
+                return Err(e.clone());
+            }
+        }
         if wait_for_explorer(Duration::from_secs(2)) {
             return Ok(());
         }
@@ -565,6 +586,16 @@ pub mod testing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_never_stopped_only_when_an_old_process_still_runs() {
+        assert!(never_stopped(Some(&[10, 20]), Some(&[20])), "the old one still runs: nothing restarted");
+        assert!(!never_stopped(Some(&[10]), Some(&[30])), "a new Explorer");
+        assert!(!never_stopped(Some(&[10]), Some(&[])), "gone, to be started again");
+        assert!(!never_stopped(Some(&[]), Some(&[30])));
+        assert!(!never_stopped(None, Some(&[10])), "unknown before");
+        assert!(!never_stopped(Some(&[10]), None), "unknown now");
+    }
 
     /// Reads only: prints the Recycle Bin's item count and how many
     /// removable drives there are. Empties, ejects and flushes nothing.

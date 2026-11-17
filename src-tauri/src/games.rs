@@ -300,7 +300,9 @@ pub fn steam_games(steam: &Path, files: &dyn GameFiles) -> Vec<Game> {
 pub fn epic_games(manifests: &Path, files: &dyn GameFiles) -> Vec<Game> {
     let mut out: Vec<Game> = Vec::new();
     for item in files.list(manifests, "", "item") {
-        let Some(json) = files.read(&item).and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else {
+        // Some manifests start with a byte order mark, which the JSON parser refuses.
+        let parsed = files.read(&item).and_then(|t| serde_json::from_str::<serde_json::Value>(t.trim_start_matches('\u{feff}')).ok());
+        let Some(json) = parsed else {
             continue;
         };
         let text = |k: &str| json.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
@@ -663,6 +665,14 @@ mod tests {
         assert_eq!(f.start, Start::Uri("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true".into()));
         assert_eq!(f.folder, Some(PathBuf::from(r"D:\Epic\Fortnite")));
         assert_eq!(f.icon, r"file:D:\Epic\Fortnite\Fortnite.exe");
+    }
+
+    #[test]
+    fn an_epic_manifest_with_a_byte_order_mark_is_read() {
+        let dir = r"C:\ProgramData\Epic\EpicGamesLauncher\Data\Manifests";
+        let files = FakeGameFiles::new().with(&format!(r"{dir}\a.item"), &format!("\u{feff}{}", item("Rocket", "Rocket", "")));
+        let games = epic_games(Path::new(dir), &files);
+        assert_eq!(games.iter().map(|g| g.id.as_str()).collect::<Vec<_>>(), ["epic:Rocket"]);
     }
 
     fn program(name: &str, location: Option<&str>, uninstall: &str) -> Program {

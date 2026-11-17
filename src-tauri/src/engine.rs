@@ -1,5 +1,7 @@
 //! Engine: fans a query out to providers, merges, ranks and truncates.
 
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::fuzzy;
@@ -20,6 +22,55 @@ pub const ROUTED_MAX_RESULTS: usize = 50;
 pub const HELP: &str = "help";
 
 const HELP_ROUTE: Route = Route { prefix: HELP, needs_space: true };
+
+/// Numbers the queries in the order they reach the engine (the first is 1).
+static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The number of the query running on this thread; 0 outside one.
+    static CURRENT_QUERY: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The number of the query this provider call belongs to: a later query has a
+/// higher number. Queries run on their own threads and may overlap, so a
+/// provider keeping state across calls can tell an older query that arrives
+/// late from the newest one. 0 when called outside a query (tests).
+pub fn query_seq() -> u64 {
+    CURRENT_QUERY.with(Cell::get)
+}
+
+/// Gives the thread's query its number while it runs.
+struct SeqGuard(u64);
+
+impl SeqGuard {
+    fn enter() -> Self {
+        let seq = QUERY_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        SeqGuard(CURRENT_QUERY.with(|c| c.replace(seq)))
+    }
+}
+
+impl Drop for SeqGuard {
+    fn drop(&mut self) {
+        CURRENT_QUERY.with(|c| c.set(self.0));
+    }
+}
+
+/// Every provider, in order (tests only).
+#[cfg(test)]
+impl Engine {
+    pub fn providers(&self) -> impl Iterator<Item = &dyn Provider> {
+        self.providers.iter().map(|p| p.as_ref())
+    }
+}
+
+/// Runs `f` as if inside query number `seq`.
+#[cfg(test)]
+pub fn as_query<R>(seq: u64, f: impl FnOnce() -> R) -> R {
+    let previous = CURRENT_QUERY.with(|c| c.replace(seq));
+    let r = f();
+    CURRENT_QUERY.with(|c| c.set(previous));
+    r
+}
 
 /// The text after `route.prefix`, trimmed, when `text` is routed there: the
 /// prefix alone, the prefix and a space, or (symbol prefixes) the prefix
@@ -92,6 +143,7 @@ impl Engine {
     }
 
     fn query_among(&self, text: &str, scope: Option<&str>, asked: &dyn Fn(&dyn Provider) -> bool) -> Vec<ResultItem> {
+        let _seq = SeqGuard::enter();
         let (mut rows, plain) = self.query_rows(text, scope, asked);
         if !plain {
             for p in self.providers.iter().filter(|p| asked(p.as_ref())) {

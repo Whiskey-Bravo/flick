@@ -260,6 +260,40 @@ pub fn combo_allowed(keys: &str) -> bool {
     keys_count == 1 && (parts.contains(&"super") || plain >= 2)
 }
 
+/// Said when a workspace name or alias is a word Flick answers to itself.
+pub const COMMAND_NAME: &str = "name is a Flick command";
+
+/// True when `word` is something Flick answers to itself, so a workspace by
+/// that name could never be opened by typing it: `help`, a route (`v`, `qr`,
+/// `dl`, `recent`, anything starting with `>`), a word a provider claims
+/// (`timer`, `remind`, `tr`, `def`, `connect`, `wifi`, `eject`, a path such as
+/// `~\x`, …) or one that shows its own row (`snip`, `color`, …). Taken from the
+/// providers' own lists.
+pub fn is_command_word(word: &str) -> bool {
+    use crate::providers::{chores, clips, devices, path, qr, recent, screen, timers, words, wsl};
+    let word = word.trim();
+    if path::looks_like_path(word) {
+        return true;
+    }
+    let routes = [clips::ROUTE, qr::ROUTE, recent::DOWNLOADS_ROUTE, recent::RECENT_ROUTE, wsl::ROUTE];
+    let routed = routes.iter().any(|r| {
+        if r.needs_space {
+            r.prefix.eq_ignore_ascii_case(word)
+        } else {
+            word.starts_with(r.prefix)
+        }
+    });
+    routed
+        || std::iter::once(crate::engine::HELP)
+            .chain(timers::WORDS)
+            .chain(words::WORDS)
+            .chain(devices::WORDS)
+            .chain([chores::EJECT])
+            .chain(screen::SNIP_WORDS)
+            .chain(screen::COLOR_WORDS)
+            .any(|w| w.eq_ignore_ascii_case(word))
+}
+
 /// Checks one workspace; `used` holds the lowercase names and aliases taken so far and
 /// grows with this workspace's own.
 fn check_workspace(def: &WorkspaceDef, used: &mut Vec<String>) -> Result<(), String> {
@@ -268,6 +302,9 @@ fn check_workspace(def: &WorkspaceDef, used: &mut Vec<String>) -> Result<(), Str
     }
     if std::iter::once(&def.name).chain(&def.aliases).any(|w| w.contains(':')) {
         return Err("name cannot contain :".into());
+    }
+    if std::iter::once(&def.name).chain(&def.aliases).any(|w| is_command_word(w)) {
+        return Err(COMMAND_NAME.into());
     }
     for word in std::iter::once(&def.name).chain(&def.aliases) {
         let lower = word.to_lowercase();
@@ -290,9 +327,9 @@ fn item_ok(item: &ItemRef) -> bool {
 }
 
 /// Checks `def` against the other workspaces of `config` (the one named `original` is
-/// left out, as it is being replaced) and the built-in `help`.
+/// left out, as it is being replaced) and Flick's own command words.
 pub fn check_workspace_in(config: &Config, original: Option<&str>, def: &WorkspaceDef) -> Result<(), String> {
-    let mut used: Vec<String> = vec!["help".to_string()];
+    let mut used: Vec<String> = Vec::new();
     for w in config.workspaces.iter().filter(|w| Some(w.name.as_str()) != original) {
         used.extend(std::iter::once(&w.name).chain(&w.aliases).map(|n| n.to_lowercase()));
     }
@@ -427,7 +464,7 @@ pub fn validate(c: &Config) -> Result<(), String> {
         check_shortcut(s, &mut used)
             .map_err(|e| format!("shortcut \"{}\": {}", s.name, e.message))?;
     }
-    let mut used: Vec<String> = vec!["help".to_string()];
+    let mut used: Vec<String> = Vec::new();
     for w in &c.workspaces {
         check_workspace(w, &mut used).map_err(|e| format!("workspace \"{}\": {e}", w.name))?;
     }
@@ -1130,8 +1167,18 @@ item = { provider = \"apps\", id = \"C:/x/Term.lnk\", title = \"Term\" }
         assert_eq!(check(&ws("two words")), "name must be one word");
         assert_eq!(check(&WorkspaceDef { aliases: vec!["b c".into()], ..ws("a") }), "name must be one word");
         assert_eq!(check(&ws("a:b")), "name cannot contain :");
-        assert_eq!(check(&ws("HELP")), "name is already used");
-        assert_eq!(check(&WorkspaceDef { aliases: vec!["help".into()], ..ws("a") }), "name is already used");
+        assert_eq!(check(&ws("HELP")), "name is a Flick command");
+        assert_eq!(check(&WorkspaceDef { aliases: vec!["help".into()], ..ws("a") }), "name is a Flick command");
+        for word in [
+            "timer", "Timers", "remind", "reminders", "tr", "DEF", "connect", "disconnect", "wifi", "eject", "v", "dl",
+            "recent", "qr", "snip", "screenshot", "color", "colour", "picker", ">", ">top", r"~\x", "//srv",
+        ] {
+            assert_eq!(check(&ws(word)), "name is a Flick command", "{word}");
+            assert_eq!(check(&WorkspaceDef { aliases: vec![word.into()], ..ws("a") }), "name is a Flick command", "{word}");
+        }
+        for word in ["work", "timerx", "vv", "trip", "define", "wifi2", "ejector", "a>b"] {
+            assert!(check_workspace_in(&none, None, &ws(word)).is_ok(), "{word}");
+        }
         assert_eq!(check(&WorkspaceDef { items: vec![], ..ws("a") }), "needs at least one item");
         assert_eq!(check(&WorkspaceDef { items: vec![item("apps", "", "")], ..ws("a") }), "an item needs a provider and an id");
         assert_eq!(check(&WorkspaceDef { items: vec![item("", "x", "")], ..ws("a") }), "an item needs a provider and an id");

@@ -4,12 +4,13 @@
 //! the provider itself only reads its list on the query path.
 
 use crate::config::{ItemRef, WorkspaceDef};
+use crate::direct_keys::{wait_ready, STARTUP_WAIT, STILL_STARTING};
 use crate::engine::Engine;
 use crate::fuzzy;
 use crate::provider::{Modifier, Outcome, Provider, Query, ResultItem};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Provider name of workspace rows.
 pub const NAME: &str = "workspaces";
@@ -23,6 +24,8 @@ pub type Report = Arc<dyn Fn(&str, &str) + Send + Sync>;
 /// Resolves and opens items by `(provider, id)`, like Enter on their rows.
 pub trait ItemRunner: Send + Sync {
     fn item(&self, provider: &str, id: &str) -> Option<ResultItem>;
+    /// False while the provider has not finished its first scan.
+    fn ready(&self, provider: &str) -> bool;
     fn open(&self, provider: &str, id: &str) -> Result<Outcome, String>;
 }
 
@@ -30,35 +33,71 @@ impl ItemRunner for Engine {
     fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
         Engine::item(self, provider, id)
     }
+    fn ready(&self, provider: &str) -> bool {
+        Engine::ready(self, provider)
+    }
     fn open(&self, provider: &str, id: &str) -> Result<Outcome, String> {
         self.open_item(provider, id)
     }
 }
 
+/// How a run went.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Run {
+    /// Items that could not open.
+    pub failed: usize,
+    /// Of those, items whose provider had not finished its first scan in time.
+    pub starting: usize,
+}
+
+impl Run {
+    /// What the user is told, if anything: `Flick is still starting` when that
+    /// is the only reason, else `<k> of <n> could not open`.
+    pub fn message(&self, n: usize) -> Option<String> {
+        match self.failed {
+            0 => None,
+            k if k == self.starting => Some(STILL_STARTING.to_string()),
+            k => Some(format!("{k} of {n} could not open")),
+        }
+    }
+}
+
 /// Opens `items` in order, `pause` between two opens (never after the last).
 /// An item that does not resolve, asks for a confirm, is a workspace (no
-/// nesting) or fails to open is skipped and counted; nothing is retried. A
-/// follow-up (`HideThen`) is not run: the item counts as opened. Returns the
-/// number of items that could not open.
-pub fn run_items(runner: &dyn ItemRunner, items: &[ItemRef], pause: Duration) -> usize {
-    let mut failed = 0;
+/// nesting), needs typing (`Fill`/`Step`: nobody types in a workspace) or fails
+/// to open is skipped and counted; nothing is retried. A follow-up (`HideThen`)
+/// is not run: the item counts as opened. An item whose provider has not
+/// finished its first scan (right after login) is waited for until `wait` after
+/// the start of the run, then counted as `starting`.
+pub fn run_items(runner: &dyn ItemRunner, items: &[ItemRef], pause: Duration, wait: Duration) -> Run {
+    let deadline = Instant::now() + wait;
+    let mut run = Run::default();
     let mut first = true;
     for it in items {
-        let openable = it.provider != NAME
-            && runner.item(&it.provider, &it.id).is_some_and(|row| !row.confirm && row.provider != NAME);
+        let mut row = runner.item(&it.provider, &it.id);
+        if row.is_none() && it.provider != NAME && !runner.ready(&it.provider) {
+            if !wait_ready(|| runner.ready(&it.provider), deadline) {
+                run.failed += 1;
+                run.starting += 1;
+                continue;
+            }
+            row = runner.item(&it.provider, &it.id);
+        }
+        let openable = it.provider != NAME && row.is_some_and(|row| !row.confirm && row.provider != NAME);
         if !openable {
-            failed += 1;
+            run.failed += 1;
             continue;
         }
         if !first {
             std::thread::sleep(pause);
         }
         first = false;
-        if runner.open(&it.provider, &it.id).is_err() {
-            failed += 1;
+        match runner.open(&it.provider, &it.id) {
+            Ok(Outcome::Fill { .. } | Outcome::Step { .. }) | Err(_) => run.failed += 1,
+            Ok(_) => {}
         }
     }
-    failed
+    run
 }
 
 pub struct WorkspacesProvider {
@@ -68,6 +107,8 @@ pub struct WorkspacesProvider {
     running: Arc<AtomicBool>,
     report: Report,
     pause: Duration,
+    /// How long a run waits for providers still on their first scan.
+    wait: Duration,
 }
 
 /// Clears the running flag when the run ends, even by a panic.
@@ -81,21 +122,22 @@ impl Drop for Done {
 
 impl WorkspacesProvider {
     pub fn new(report: Report) -> Arc<Self> {
-        Self::build(report, PAUSE)
+        Self::build(report, PAUSE, STARTUP_WAIT)
     }
 
     #[cfg(test)]
     pub fn with_pause(report: Report, pause: Duration) -> Arc<Self> {
-        Self::build(report, pause)
+        Self::build(report, pause, Duration::from_millis(100))
     }
 
-    fn build(report: Report, pause: Duration) -> Arc<Self> {
+    fn build(report: Report, pause: Duration, wait: Duration) -> Arc<Self> {
         Arc::new(Self {
             defs: RwLock::new(Vec::new()),
             runner: Mutex::new(None),
             running: Arc::new(AtomicBool::new(false)),
             report,
             pause,
+            wait,
         })
     }
 
@@ -159,20 +201,20 @@ impl Provider for WorkspacesProvider {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .and_then(Weak::upgrade)
-            .ok_or_else(|| "Flick is still starting".to_string())?;
+            .ok_or_else(|| STILL_STARTING.to_string())?;
         if self.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return Err("This workspace is still opening".to_string());
         }
         let done = Done(self.running.clone());
-        let (report, pause) = (self.report.clone(), self.pause);
+        let (report, pause, wait) = (self.report.clone(), self.pause, self.wait);
         std::thread::Builder::new()
             .name("workspace".into())
             .spawn(move || {
                 let _done = done;
-                let failed = run_items(runner.as_ref(), &def.items, pause);
+                let run = run_items(runner.as_ref(), &def.items, pause, wait);
                 drop(runner);
-                if failed > 0 {
-                    report(&def.name, &format!("{failed} of {} could not open", def.items.len()));
+                if let Some(message) = run.message(def.items.len()) {
+                    report(&def.name, &message);
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -195,6 +237,9 @@ mod tests {
         failing: Vec<String>,
         /// `open` returns `HideThen` for these ids.
         then: Vec<String>,
+        /// Providers on their first scan: `ready` calls left until they are ready
+        /// (`usize::MAX`: never).
+        scanning: Mutex<HashMap<String, usize>>,
         opens: Mutex<Vec<(String, Instant)>>,
     }
 
@@ -211,12 +256,37 @@ mod tests {
 
     impl ItemRunner for FakeRunner {
         fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
+            if self.scanning.lock().unwrap().contains_key(provider) {
+                return None;
+            }
             self.items.get(&(provider.to_string(), id.to_string())).cloned()
+        }
+        fn ready(&self, provider: &str) -> bool {
+            let mut scanning = self.scanning.lock().unwrap();
+            match scanning.get_mut(provider) {
+                None => true,
+                Some(0) => {
+                    scanning.remove(provider);
+                    true
+                }
+                Some(left) => {
+                    if *left != usize::MAX {
+                        *left -= 1;
+                    }
+                    false
+                }
+            }
         }
         fn open(&self, _provider: &str, id: &str) -> Result<Outcome, String> {
             self.opens.lock().unwrap().push((id.to_string(), Instant::now()));
             if self.failing.iter().any(|f| f == id) {
                 return Err("boom".into());
+            }
+            if id.starts_with("need:") {
+                return Ok(Outcome::Fill { text: "x ".into() });
+            }
+            if id.starts_with("step:") {
+                return Ok(Outcome::Step { prompt: "x".into(), scope: "shortcut:x".into() });
             }
             if self.then.iter().any(|f| f == id) {
                 return Ok(Outcome::HideThen { then: crate::provider::Then::Snip });
@@ -338,7 +408,7 @@ mod tests {
             item("apps", "gone"),
             item("apps", "then"),
         ];
-        assert_eq!(run_items(runner.as_ref(), &items, Duration::ZERO), 3);
+        assert_eq!(run_items(runner.as_ref(), &items, Duration::ZERO, Duration::ZERO), Run { failed: 3, starting: 0 });
         assert_eq!(runner.opened(), ["good", "then"], "skipped items never reach open; HideThen counts as opened");
 
         let (p, rx) = provider(Duration::ZERO, vec![def("work", &[], items)]);
@@ -348,6 +418,46 @@ mod tests {
         assert_eq!(got, ("work".to_string(), "3 of 5 could not open".to_string()));
         wait_idle(&p);
         assert_eq!(runner.opened(), ["good", "then", "good", "then"]);
+    }
+
+    #[test]
+    fn items_that_need_typing_count_as_could_not_open() {
+        let runner = FakeRunner::default()
+            .with("shortcuts", "need:x", false)
+            .with("shortcuts", "step:x", false)
+            .with("apps", "a", false);
+        let items = vec![item("shortcuts", "need:x"), item("apps", "a"), item("shortcuts", "step:x")];
+        let run = run_items(&runner, &items, Duration::ZERO, Duration::ZERO);
+        assert_eq!(run, Run { failed: 2, starting: 0 });
+        assert_eq!(run.message(3).as_deref(), Some("2 of 3 could not open"));
+    }
+
+    #[test]
+    fn a_provider_still_scanning_is_waited_for() {
+        let runner = runner_for(&["a"]).with("games", "g", false);
+        runner.scanning.lock().unwrap().insert("games".into(), 3);
+        let items = vec![item("games", "g"), item("apps", "a")];
+        let run = run_items(&runner, &items, Duration::ZERO, Duration::from_secs(5));
+        assert_eq!(run, Run::default());
+        assert_eq!(run.message(2), None);
+        assert_eq!(runner.opened(), ["g", "a"]);
+    }
+
+    #[test]
+    fn a_provider_that_never_gets_ready_says_still_starting() {
+        let (p, rx) = provider(Duration::ZERO, vec![def("work", &[], vec![item("games", "g"), item("apps", "a")])]);
+        let runner = Arc::new(runner_for(&["a"]).with("games", "g", false));
+        runner.scanning.lock().unwrap().insert("games".into(), usize::MAX);
+        attach(&p, &runner);
+        let start = Instant::now();
+        p.activate("work", Modifier::None).unwrap();
+        let got = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(100), "waited for the scan");
+        assert_eq!(got, ("work".to_string(), "Flick is still starting".to_string()));
+        wait_idle(&p);
+        assert_eq!(runner.opened(), ["a"]);
+        // With another failure besides, the usual count.
+        assert_eq!(Run { failed: 2, starting: 1 }.message(3).as_deref(), Some("2 of 3 could not open"));
     }
 
     #[test]
