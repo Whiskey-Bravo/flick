@@ -64,16 +64,16 @@ pub fn toast_xml(title: &str, body: &str) -> String {
 }
 
 /// Unregistered: the balloon only. Registered: the toast, and the balloon
-/// only when the toast fails.
+/// only when the toast fails; both errors when both fail.
 pub fn deliver(
     registered: bool,
     toast: &dyn Fn() -> Result<(), String>,
     balloon: &dyn Fn() -> Result<(), String>,
 ) -> Result<(), String> {
-    if registered && toast().is_ok() {
-        return Ok(());
+    if !registered {
+        return balloon();
     }
-    balloon()
+    toast().or_else(|first| balloon().map_err(|second| format!("{first}; {second}")))
 }
 
 /// Whether the installer registered [`AUMID`] (its HKCU key exists).
@@ -327,8 +327,14 @@ mod tests {
 
     #[test]
     fn a_failed_balloon_is_reported() {
-        let out = deliver(true, &|| Err("toast".into()), &|| Err("balloon".into()));
+        let out = deliver(false, &|| panic!("no toast unregistered"), &|| Err("balloon".into()));
         assert_eq!(out, Err("balloon".into()));
+    }
+
+    #[test]
+    fn when_toast_and_balloon_both_fail_both_errors_are_reported() {
+        let out = deliver(true, &|| Err("toast: denied".into()), &|| Err("balloon: no icon".into()));
+        assert_eq!(out, Err("toast: denied; balloon: no icon".into()));
     }
 
     #[test]
