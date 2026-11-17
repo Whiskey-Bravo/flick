@@ -38,6 +38,7 @@ mod updates;
 mod tray;
 mod uninstall;
 mod window;
+mod winkey;
 mod winkey_logic;
 mod winlist;
 mod wsl_detect;
