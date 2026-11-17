@@ -3,6 +3,7 @@ pub mod answers;
 pub mod apps;
 pub mod bookmarks;
 pub mod clips;
+pub mod chores;
 pub mod files;
 mod files_scan;
 pub mod flick;

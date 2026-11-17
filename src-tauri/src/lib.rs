@@ -3,6 +3,7 @@ mod answers;
 mod bookmarks;
 mod clipboard;
 mod cliphistory;
+mod chores;
 mod commands;
 mod config;
 mod config_edit;
