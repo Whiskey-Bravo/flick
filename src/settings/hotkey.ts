@@ -59,3 +59,37 @@ export function hotkeyFromEvent(e: KeyInfo): string | null {
 export function hotkeyKeys(s: string): string[] {
   return s.split("+").map((p) => p.trim()).filter((p) => p !== "");
 }
+
+export const DIRECT_HINT = "Works everywhere — it can hide an app's own shortcut with the same keys.";
+export const WEAK_COMBO = "Use two modifiers (like Ctrl+Alt) or Win";
+
+const MOD_NAMES: Record<string, "ctrl" | "alt" | "shift" | "super"> = {
+  ctrl: "ctrl",
+  control: "ctrl",
+  cmdorctrl: "ctrl",
+  cmdorcontrol: "ctrl",
+  commandorctrl: "ctrl",
+  commandorcontrol: "ctrl",
+  alt: "alt",
+  option: "alt",
+  shift: "shift",
+  super: "super",
+  win: "super",
+  windows: "super",
+  meta: "super",
+  cmd: "super",
+  command: "super",
+};
+
+/** Same rule as the backend: one non-modifier key plus two of Ctrl/Alt/Shift, or Win with anything. */
+export function directComboOk(combo: string): boolean {
+  const mods = new Set<string>();
+  let keys = 0;
+  for (const part of combo.split("+").map((p) => p.trim().toLowerCase()).filter((p) => p !== "")) {
+    const m = MOD_NAMES[part];
+    if (m) mods.add(m);
+    else keys += 1;
+  }
+  const plain = ["ctrl", "alt", "shift"].filter((m) => mods.has(m)).length;
+  return keys === 1 && (mods.has("super") || plain >= 2);
+}
