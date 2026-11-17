@@ -398,3 +398,9 @@ pub fn settings_open_file() -> Result<(), String> {
 pub fn settings_currencies() -> Vec<String> {
     crate::answers::units::CURRENCIES.iter().map(|c| c.to_string()).collect()
 }
+
+/// Releases the global hotkey while the hotkey box captures keys, then restores it.
+#[tauri::command(async)]
+pub fn settings_pause_hotkey(paused: bool, app: AppHandle) {
+    crate::hotkey::set_paused(&app, paused);
+}

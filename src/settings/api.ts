@@ -86,6 +86,8 @@ export const settingsMovePin = (provider: string, id: string, up: boolean) =>
 export const settingsCheckCity = (city: string) => invoke<string>("settings_check_city", { city });
 /** The currencies `currency` accepts. */
 export const settingsCurrencies = () => invoke<string[]>("settings_currencies");
+/** Releases (true) or restores (false) the global hotkey while the hotkey box captures keys. */
+export const settingsPauseHotkey = (paused: boolean) => invoke<void>("settings_pause_hotkey", { paused });
 /** Pins or unpins an item; resolves to whether it is now pinned. */
 export const togglePin = (provider: string, id: string) => invoke<boolean>("toggle_pin", { provider, id });
 export const settingsOpenFile = () => invoke<void>("settings_open_file");

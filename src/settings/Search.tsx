@@ -8,6 +8,7 @@ export function Search({ state }: { state: SettingsState }) {
   const { errors, save } = useSaver(state);
   const [pins, setPins] = useState<PinRow[]>([]);
   const [pinError, setPinError] = useState("");
+  const [folderError, setFolderError] = useState("");
 
   const loadPins = () => {
     settingsPins().then(
@@ -22,11 +23,12 @@ export function Search({ state }: { state: SettingsState }) {
 
   const setRoots = (value: string[]) => void save("file_roots", { key: "file_roots", value });
   const add = async () => {
+    setFolderError("");
     try {
       const picked = await settingsPickFolder();
       if (picked !== null && !roots.includes(picked)) setRoots([...roots, picked]);
     } catch (e) {
-      setPinError(String(e));
+      setFolderError(String(e));
     }
   };
 
@@ -51,7 +53,7 @@ export function Search({ state }: { state: SettingsState }) {
         <div class="row">
           <button onClick={add}>Add folder…</button>
         </div>
-        {errors.file_roots && <p class="error">{errors.file_roots}</p>}
+        {(errors.file_roots || folderError) && <p class="error">{errors.file_roots || folderError}</p>}
       </div>
 
       <div class="field">

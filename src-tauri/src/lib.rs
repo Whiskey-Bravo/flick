@@ -340,7 +340,8 @@ pub fn run() {
             settings::settings_move_pin,
             settings::settings_check_city,
             settings::settings_open_file,
-            settings::settings_currencies
+            settings::settings_currencies,
+            settings::settings_pause_hotkey
         ])
         // Result-row icons. Answered on the icon workers, never on this thread.
         .register_asynchronous_uri_scheme_protocol(icon::SCHEME, move |_ctx, request, responder| {
