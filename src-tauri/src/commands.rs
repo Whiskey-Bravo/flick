@@ -3,7 +3,7 @@
 use tauri::{AppHandle, State};
 
 use crate::launch;
-use crate::provider::{Modifier, Outcome, ResultItem};
+use crate::provider::{Action, Modifier, Outcome, ResultItem};
 use crate::window;
 use crate::AppState;
 
@@ -88,17 +88,30 @@ pub fn past_searches(state: State<AppState>) -> Vec<String> {
     state.engine.past_searches()
 }
 
-/// Shows the item's location in the file manager, then hides the bar.
-/// Opening a window can block, so it runs on a blocking-pool thread.
+/// Runs a row's menu action (show in Explorer, copy path, ...). Opening a
+/// window can block, so it runs on a blocking-pool thread; the bar is then
+/// handled like after `activate`.
 #[tauri::command]
-pub async fn reveal(provider: String, id: String, state: State<'_, AppState>, app: AppHandle) -> Result<(), String> {
+pub async fn act(
+    provider: String,
+    id: String,
+    action: Action,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<Outcome, String> {
     let engine = state.engine.clone();
-    tauri::async_runtime::spawn_blocking(move || engine.reveal(&provider, &id))
+    let started = window::shows();
+    let result = tauri::async_runtime::spawn_blocking(move || engine.act(&provider, &id, action))
         .await
-        .map_err(|e| format!("reveal failed: {e}"))
-        .and_then(|r| r)?;
-    window::hide(&app);
-    Ok(())
+        .map_err(|e| format!("action failed: {e}"))
+        .and_then(|r| r);
+    let (result, after) = settle(result, Modifier::None);
+    match after_for(after, started, window::shows()) {
+        After::Hide => window::hide(&app),
+        After::Reveal => window::reveal(&app),
+        After::Leave => {}
+    }
+    result
 }
 
 #[tauri::command]

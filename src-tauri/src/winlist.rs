@@ -25,6 +25,10 @@ pub trait WindowOps: Send + Sync {
     fn close(&self, hwnd: isize, pid: u32) -> Result<(), String>;
     /// `exe` is the image the process had when listed; the live process must still match.
     fn kill(&self, pid: u32, exe: &str) -> Result<(), String>;
+    /// The window's AppUserModelID (set by Store apps and many shortcuts), if any.
+    fn aumid(&self, _hwnd: isize) -> Option<String> {
+        None
+    }
 }
 
 /// Window classes that belong to the shell, never offered.
@@ -66,16 +70,26 @@ pub fn may_close(live_pid: u32, expected_pid: u32, own_pid: u32, class: &str) ->
 pub struct WindowList {
     ops: Arc<dyn WindowOps>,
     snap: RwLock<Vec<WinInfo>>,
+    /// AppUserModelID per listed window, read with the list.
+    aumids: RwLock<HashMap<isize, String>>,
 }
 
 impl WindowList {
     pub fn new(ops: Arc<dyn WindowOps>) -> Arc<Self> {
-        Arc::new(Self { ops, snap: RwLock::new(Vec::new()) })
+        Arc::new(Self { ops, snap: RwLock::new(Vec::new()), aumids: RwLock::new(HashMap::new()) })
     }
 
     pub fn refresh(&self) {
         let fresh = self.ops.list();
+        let aumids: HashMap<isize, String> =
+            fresh.iter().filter_map(|w| self.ops.aumid(w.hwnd).map(|a| (w.hwnd, a))).collect();
         *self.snap.write().unwrap_or_else(|e| e.into_inner()) = fresh;
+        *self.aumids.write().unwrap_or_else(|e| e.into_inner()) = aumids;
+    }
+
+    /// The AppUserModelID found for `hwnd` by the last refresh. Memory only.
+    pub fn aumid(&self, hwnd: isize) -> Option<String> {
+        self.aumids.read().unwrap_or_else(|e| e.into_inner()).get(&hwnd).cloned()
     }
 
     pub fn snapshot(&self) -> Vec<WinInfo> {
@@ -110,6 +124,12 @@ mod sys {
         GetCurrentProcessId, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess,
         PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
+    use windows::core::GUID;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+    use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
         IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindowAsync, GWL_EXSTYLE, GW_OWNER, SW_RESTORE,
@@ -318,6 +338,52 @@ mod sys {
         }
     }
 
+    /// `PKEY_AppUserModel_ID`, spelled out: its home module is another `windows` feature.
+    const PKEY_APP_USER_MODEL_ID: PROPERTYKEY =
+        PROPERTYKEY { fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
+
+    pub fn aumid(h: isize) -> Option<String> {
+        window_aumid(h).or_else(|| process_aumid(h))
+    }
+
+    /// The window's own `PKEY_AppUserModel_ID`; many packaged apps do not set it.
+    fn window_aumid(h: isize) -> Option<String> {
+        // SAFETY: the property store and the string it hands out are released
+        // before returning; a window without the property reads as empty.
+        unsafe {
+            let store: IPropertyStore = SHGetPropertyStoreForWindow(hw(h)).ok()?;
+            let value = store.GetValue(&PKEY_APP_USER_MODEL_ID).ok()?;
+            let text = PropVariantToStringAlloc(&value).ok()?;
+            let id = text.to_string().ok().filter(|s| !s.is_empty());
+            windows::Win32::System::Com::CoTaskMemFree(Some(text.as_ptr() as *const c_void));
+            id
+        }
+    }
+
+    /// The AUMID of the window's process (a packaged app's identity). Windows
+    /// hosted by ApplicationFrameHost.exe report the host's process, which has
+    /// none, so those still do not match; that is accepted.
+    fn process_aumid(h: isize) -> Option<String> {
+        // SAFETY: the one handle is closed on every path; the buffer outlives the call.
+        unsafe {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hw(h), Some(&mut pid));
+            if pid == 0 {
+                return None;
+            }
+            let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = GetApplicationUserModelId(proc, &mut len, Some(PWSTR(buf.as_mut_ptr())));
+            let _ = CloseHandle(proc);
+            if rc != ERROR_SUCCESS || len < 2 {
+                return None;
+            }
+            // `len` counts the terminating nul.
+            String::from_utf16(&buf[..(len as usize - 1).min(buf.len())]).ok().filter(|s| !s.is_empty())
+        }
+    }
+
     pub fn kill(pid: u32, expected_exe: &str) -> Result<(), String> {
         const GONE: &str = "That app is gone.";
         // SAFETY: the one handle pins the process while it is checked and ended,
@@ -356,5 +422,68 @@ impl WindowOps for SystemWindows {
     }
     fn kill(&self, pid: u32, exe: &str) -> Result<(), String> {
         sys::kill(pid, exe)
+    }
+    fn aumid(&self, hwnd: isize) -> Option<String> {
+        sys::aumid(hwnd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lists two windows; only the first has an AUMID. Nothing real is read.
+    struct FakeOps;
+
+    impl WindowOps for FakeOps {
+        fn list(&self) -> Vec<WinInfo> {
+            [1, 2]
+                .iter()
+                .map(|&hwnd| WinInfo {
+                    hwnd,
+                    pid: 10,
+                    title: "t".into(),
+                    exe: r"C:\Apps\Foo\foo.exe".into(),
+                    app: "Foo".into(),
+                    elevated: false,
+                })
+                .collect()
+        }
+        fn exists(&self, _hwnd: isize) -> bool {
+            true
+        }
+        fn focus(&self, _hwnd: isize) -> Result<(), String> {
+            Ok(())
+        }
+        fn close(&self, _hwnd: isize, _pid: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn kill(&self, _pid: u32, _exe: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn aumid(&self, hwnd: isize) -> Option<String> {
+            (hwnd == 1).then(|| "Contoso.Foo_abc!App".to_string())
+        }
+    }
+
+    #[test]
+    fn refresh_stores_aumids() {
+        let list = WindowList::new(Arc::new(FakeOps));
+        assert_eq!(list.aumid(1), None);
+        list.refresh();
+        assert_eq!(list.aumid(1).as_deref(), Some("Contoso.Foo_abc!App"));
+        assert_eq!(list.aumid(2), None);
+        assert_eq!(list.snapshot().len(), 2);
+    }
+
+    /// Prints each real window's AUMID; reads only, closes nothing.
+    /// `cargo test real_windows -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_windows_list_aumids() {
+        let ops = SystemWindows::new();
+        for w in ops.list() {
+            println!("{:?} {} {} -> {:?}", w.hwnd, w.app, w.title, ops.aumid(w.hwnd));
+        }
     }
 }

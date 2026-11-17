@@ -1,15 +1,18 @@
 //! Apps provider: Start-menu shortcuts and Store apps, fuzzy-searched in memory.
 
 use std::collections::hash_map::{Entry, HashMap};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use crate::fuzzy;
 use crate::launch::{self, Launcher};
 use crate::process;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::uninstall::{self, plan, split_command, Program, ProgramSource, Uninstall};
+use crate::winlist::{WinInfo, WindowList};
 
 /// Shortcuts whose name has one of these as a whole word (case-insensitive,
 /// split like `fuzzy::words`) are not apps. "Revo Uninstaller" and "HelpNDoc" stay.
@@ -139,14 +142,113 @@ fn shortcut_alias(name: &str, target: &str) -> Option<String> {
 
 /// Fill each shortcut's alias from its `.lnk` target. Reads every link (a
 /// few hundred, local disk) with COM initialised once: refresh thread only.
-fn add_shortcut_aliases(entries: &mut [AppEntry]) {
+/// Returns each shortcut's `.exe` target, by shortcut path, and which
+/// shortcuts pass command-line arguments.
+fn add_shortcut_aliases(entries: &mut [AppEntry]) -> Targets {
+    let mut found = Targets::default();
     launch::with_com(|| {
         for e in entries.iter_mut().filter(|e| e.kind == AppKind::Shortcut) {
-            if let Some(target) = launch::shortcut_target(&e.target) {
+            if let Some((target, has_args)) = launch::shortcut_details(&e.target) {
                 e.aliases = shortcut_alias(&e.name, &target).into_iter().collect();
+                if Path::new(&target).extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
+                    found.exes.insert(e.target.clone(), target);
+                }
+                if has_args {
+                    found.with_args.insert(e.target.clone());
+                }
             }
         }
     });
+    found
+}
+
+/// What reading the shortcuts yields besides aliases.
+#[derive(Debug, Default)]
+pub struct Targets {
+    /// Each shortcut's exe, by shortcut path.
+    pub exes: HashMap<String, String>,
+    /// Shortcuts that pass command-line arguments.
+    pub with_args: HashSet<String>,
+}
+
+/// Prefix of a Store app's target; the rest is its AppUserModelID.
+const STORE_PREFIX: &str = "shell:AppsFolder\\";
+
+/// Where the uninstall list is read: the registry, except in tests, which
+/// must never touch it.
+fn real_programs() -> Arc<dyn ProgramSource> {
+    #[cfg(not(test))]
+    {
+        Arc::new(crate::uninstall::RegistryPrograms)
+    }
+    #[cfg(test)]
+    {
+        Arc::new(NoPrograms)
+    }
+}
+
+#[cfg(test)]
+struct NoPrograms;
+
+#[cfg(test)]
+impl ProgramSource for NoPrograms {
+    fn programs(&self) -> Vec<Program> {
+        Vec::new()
+    }
+}
+
+/// The folder Flick runs from, or empty when unknown (then no uninstall is offered).
+#[cfg(not(test))]
+fn own_dir() -> PathBuf {
+    std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_default()
+}
+
+#[cfg(not(test))]
+fn windows_dir() -> PathBuf {
+    std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| r"C:\Windows".into())
+}
+
+/// Uninstall plan per app target. Pure: the programs are passed in.
+fn plans_for(
+    entries: &[AppEntry],
+    targets: &Targets,
+    programs: &[Program],
+    windows_dir: &Path,
+    own_dir: &Path,
+    broad: &[PathBuf],
+) -> HashMap<String, Uninstall> {
+    if own_dir.as_os_str().is_empty() {
+        return HashMap::new();
+    }
+    entries
+        .iter()
+        .filter_map(|e| {
+            let (exe, store_id) = match e.kind {
+                AppKind::Shortcut => (targets.exes.get(&e.target).map(Path::new), None),
+                AppKind::Store => (None, Some(e.target.strip_prefix(STORE_PREFIX).unwrap_or(&e.target))),
+            };
+            plan(&e.name, targets.with_args.contains(&e.target), exe, store_id, programs, windows_dir, own_dir, broad).map(|p| (e.target.clone(), p))
+        })
+        .collect()
+}
+
+/// The open windows of an app: for a shortcut those of its exe, for a Store
+/// app those carrying its AppUserModelID.
+fn windows_of(e: &AppEntry, exes: &HashMap<String, String>, list: &WindowList, snap: &[WinInfo]) -> Vec<WinInfo> {
+    match e.kind {
+        AppKind::Shortcut => match exes.get(&e.target) {
+            Some(exe) => snap.iter().filter(|w| w.exe.eq_ignore_ascii_case(exe)).cloned().collect(),
+            None => Vec::new(),
+        },
+        AppKind::Store => match e.target.strip_prefix(STORE_PREFIX) {
+            Some(id) => snap
+                .iter()
+                .filter(|w| list.aumid(w.hwnd).is_some_and(|a| a.eq_ignore_ascii_case(id)))
+                .cloned()
+                .collect(),
+            None => Vec::new(),
+        },
+    }
 }
 
 /// One entry per normalised name. `Shortcut` beats `Store`; otherwise the
@@ -284,15 +386,78 @@ pub struct AppsProvider {
     store: Mutex<Vec<AppEntry>>,
     /// Held for a whole refresh, so overlapping refreshes queue.
     refreshing: Mutex<()>,
-    #[allow(dead_code)] // used by `reveal`, which the menu task calls
+    /// Shows a shortcut in Explorer.
     launcher: Arc<dyn Launcher>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
+    /// How each app is uninstalled; swapped by `refresh`, read by queries.
+    plans: RwLock<HashMap<String, Uninstall>>,
+    /// Each shortcut's exe, from the last refresh.
+    exes: RwLock<HashMap<String, String>>,
+    /// The open windows, for `Close`. Without it no Close is offered.
+    windows: OnceLock<Arc<WindowList>>,
+    /// The uninstall list; read on `refresh` only.
+    programs: Arc<dyn ProgramSource>,
+    windows_dir: PathBuf,
+    own_dir: PathBuf,
+    /// Shared folders no single program owns.
+    broad: Vec<PathBuf>,
+}
+
+/// What building rows needs besides the entry: held for a whole query, so
+/// the open windows are listed once, from memory.
+struct RowCtx<'a> {
+    plans: RwLockReadGuard<'a, HashMap<String, Uninstall>>,
+    exes: RwLockReadGuard<'a, HashMap<String, String>>,
+    windows: Option<(&'a Arc<WindowList>, Vec<WinInfo>)>,
+}
+
+impl RowCtx<'_> {
+    /// The row for an app; `score` 0 when rebuilt from an id.
+    fn row(&self, e: &AppEntry, score: u32) -> ResultItem {
+        let mut actions = match e.kind {
+            AppKind::Shortcut => vec![Action::Admin, Action::Reveal],
+            AppKind::Store => vec![],
+        };
+        if self.plans.contains_key(&e.target) {
+            actions.push(Action::Uninstall);
+        }
+        if let Some((list, snap)) = &self.windows {
+            if !windows_of(e, &self.exes, list, snap).is_empty() {
+                actions.push(Action::Close);
+            }
+        }
+        ResultItem {
+            id: e.target.clone(),
+            provider: "apps",
+            title: e.name.clone(),
+            subtitle: "App".into(),
+            score,
+            // Store apps too: `file:shell:AppsFolder\<AUMID>`, which the icon server resolves.
+            icon: format!("file:{}", e.target),
+            pinnable: true,
+            actions,
+            ..Default::default()
+        }
+    }
 }
 
 impl AppsProvider {
     pub fn new(launcher: Arc<dyn Launcher>) -> Arc<Self> {
-        Self::build(launcher, Vec::new(), false)
+        Self::build(launcher, Vec::new(), false, real_programs())
+    }
+
+    /// Where `Close` looks for open windows. Set once, at startup.
+    pub fn set_windows(&self, list: Arc<WindowList>) {
+        let _ = self.windows.set(list);
+    }
+
+    fn row_ctx(&self) -> RowCtx<'_> {
+        RowCtx {
+            plans: self.plans.read().unwrap_or_else(|e| e.into_inner()),
+            exes: self.exes.read().unwrap_or_else(|e| e.into_inner()),
+            windows: self.windows.get().map(|list| (list, list.snapshot())),
+        }
     }
 
     /// An index that counts as scanned already (tests).
@@ -303,11 +468,62 @@ impl AppsProvider {
 
     #[cfg(test)]
     pub fn with_launcher(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>) -> Arc<Self> {
-        Self::build(launcher, e, true)
+        Self::build(launcher, e, true, real_programs())
     }
 
-    fn build(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>, scanned: bool) -> Arc<Self> {
+    /// As `with_launcher`, with the uninstall list read from `programs` on refresh (tests).
+    #[cfg(test)]
+    pub fn with_source(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>, programs: Arc<dyn ProgramSource>) -> Arc<Self> {
+        Self::build(launcher, e, true, programs)
+    }
+
+    /// Entries with their exes and the uninstall list already applied; the
+    /// Windows folder is `C:\Windows` and Flick lives in `C:\Apps\Flick` (tests).
+    #[cfg(test)]
+    pub fn with_programs(
+        launcher: Arc<dyn Launcher>,
+        entries: Vec<AppEntry>,
+        exes: Vec<(&str, &str)>,
+        programs: Vec<Program>,
+    ) -> Arc<Self> {
+        let p = Self::build(launcher, entries, true, Arc::new(NoPrograms));
+        let targets = Targets {
+            exes: exes.into_iter().map(|(l, e)| (l.to_string(), e.to_string())).collect(),
+            with_args: HashSet::new(),
+        };
+        let index = p.index.read().unwrap_or_else(|e| e.into_inner()).clone();
+        *p.plans.write().unwrap_or_else(|e| e.into_inner()) =
+            plans_for(&index, &targets, &programs, &p.windows_dir, &p.own_dir, &p.broad);
+        *p.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes;
+        p
+    }
+
+    fn build(
+        launcher: Arc<dyn Launcher>,
+        e: Vec<AppEntry>,
+        scanned: bool,
+        programs: Arc<dyn ProgramSource>,
+    ) -> Arc<Self> {
+        #[cfg(test)]
+        let (windows_dir, own_dir, broad) = (
+            PathBuf::from(r"C:\Windows"),
+            PathBuf::from(r"C:\Apps\Flick"),
+            uninstall::broad_roots_from(|v| match v {
+                "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+                "LOCALAPPDATA" => Some(r"C:\Users\someone\AppData\Local".to_string()),
+                _ => None,
+            }),
+        );
+        #[cfg(not(test))]
+        let (windows_dir, own_dir, broad) = (windows_dir(), own_dir(), uninstall::broad_roots());
         Arc::new(Self {
+            plans: RwLock::new(HashMap::new()),
+            exes: RwLock::new(HashMap::new()),
+            windows: OnceLock::new(),
+            programs,
+            windows_dir,
+            own_dir,
+            broad,
             index: RwLock::new(e),
             store: Mutex::new(Vec::new()),
             refreshing: Mutex::new(()),
@@ -330,7 +546,7 @@ impl AppsProvider {
     fn refresh_from_stages(
         &self,
         start: Vec<AppEntry>,
-        add_aliases: impl FnOnce(&mut [AppEntry]),
+        add_aliases: impl FnOnce(&mut [AppEntry]) -> Targets,
         scan_store: impl FnOnce() -> Option<Vec<AppEntry>>,
     ) {
         let _queue = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
@@ -340,19 +556,20 @@ impl AppsProvider {
     /// `refresh` with the scans passed in and no shortcut aliases (tests).
     #[cfg(test)]
     fn refresh_from(&self, start: Vec<AppEntry>, scan_store: impl FnOnce() -> Option<Vec<AppEntry>>) {
-        self.refresh_from_stages(start, |_| {}, scan_store);
+        self.refresh_from_stages(start, |_| Targets::default(), scan_store);
     }
 
     /// `start` is published right away together with the last good Store list,
     /// each shortcut keeping the aliases the current index has for its target;
-    /// `add_aliases` then fills the shortcut aliases and `start` is published
-    /// again; `scan_store` then runs, and its result replaces that list unless
+    /// `add_aliases` then fills the shortcut aliases (and returns their exes),
+    /// the uninstall list is read once and `start` is published again;
+    /// `scan_store` then runs, and its result replaces that list unless
     /// it is `None`. Each publish swaps the whole index, so queries never see
     /// a partial one. The caller holds `refreshing`.
     fn refresh_locked(
         &self,
         mut start: Vec<AppEntry>,
-        add_aliases: impl FnOnce(&mut [AppEntry]),
+        add_aliases: impl FnOnce(&mut [AppEntry]) -> Targets,
         scan_store: impl FnOnce() -> Option<Vec<AppEntry>>,
     ) {
         {
@@ -367,15 +584,25 @@ impl AppsProvider {
         }
         let last_store = self.store.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.publish(&start, &last_store);
-        add_aliases(&mut start);
+        let targets = add_aliases(&mut start);
+        let programs = self.programs.programs();
+        self.set_plans(&start, &last_store, &targets, &programs);
+        *self.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes.clone();
         self.publish(&start, &last_store);
         if let Some(fresh) = scan_store() {
+            self.set_plans(&start, &fresh, &targets, &programs);
             self.publish(&start, &fresh);
             *self.store.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
         // Ready only after the Store attempt, so a pinned Store app is not
         // reported missing while the first Store scan is still running.
         self.scanned.store(true, Ordering::SeqCst);
+    }
+
+    fn set_plans(&self, start: &[AppEntry], store: &[AppEntry], targets: &Targets, programs: &[Program]) {
+        let all: Vec<AppEntry> = start.iter().chain(store).cloned().collect();
+        let plans = plans_for(&all, targets, programs, &self.windows_dir, &self.own_dir, &self.broad);
+        *self.plans.write().unwrap_or_else(|e| e.into_inner()) = plans;
     }
 
     fn publish(&self, start: &[AppEntry], store: &[AppEntry]) {
@@ -409,21 +636,45 @@ fn store_elevation_error(err: String) -> String {
     }
 }
 
-/// The row for an app; `score` 0 when rebuilt from an id.
-fn row(e: &AppEntry, score: u32) -> ResultItem {
-    let shortcut = e.kind == AppKind::Shortcut;
-    ResultItem {
-        id: e.target.clone(),
-        provider: "apps",
-        title: e.name.clone(),
-        subtitle: "App".into(),
-        score,
-        // Store apps too: `file:shell:AppsFolder\<AUMID>`, which the icon server resolves.
-        icon: format!("file:{}", e.target),
-        pinnable: true,
-        revealable: shortcut,
-        elevatable: true,
-        ..Default::default()
+impl AppsProvider {
+    fn entry(&self, id: &str) -> Option<AppEntry> {
+        self.index.read().unwrap_or_else(|e| e.into_inner()).iter().find(|e| e.target == id).cloned()
+    }
+
+    /// Runs the app's registered uninstaller, or opens Installed apps. The
+    /// command is split into program and parameters for the launcher, never
+    /// handed to a shell. Locks are released before launching.
+    fn uninstall(&self, id: &str) -> Result<Outcome, String> {
+        const NO: &str = "can't uninstall this";
+        self.entry(id).ok_or_else(|| NO.to_string())?;
+        let plan = self.plans.read().unwrap_or_else(|e| e.into_inner()).get(id).cloned();
+        match plan.ok_or_else(|| NO.to_string())? {
+            Uninstall::Direct { command } => {
+                let (program, params) = split_command(&command).ok_or_else(|| NO.to_string())?;
+                self.launcher.open_with(&program, &params, false)?;
+            }
+            Uninstall::Settings => self.launcher.open(uninstall::APPS_SETTINGS)?,
+        }
+        Ok(Outcome::Hide)
+    }
+
+    /// Asks every window of the app to close, skipping elevated ones.
+    fn close(&self, id: &str) -> Result<Outcome, String> {
+        const GONE: &str = "That window is gone.";
+        let list = self.windows.get().ok_or_else(|| GONE.to_string())?;
+        let entry = self.entry(id).ok_or_else(|| GONE.to_string())?;
+        let wins = {
+            let exes = self.exes.read().unwrap_or_else(|e| e.into_inner());
+            windows_of(&entry, &exes, list, &list.snapshot())
+        };
+        let closed = wins.iter().filter(|w| !w.elevated).filter(|w| list.ops().close(w.hwnd, w.pid).is_ok()).count();
+        if closed > 0 {
+            Ok(Outcome::Hide)
+        } else if wins.iter().any(|w| w.elevated) {
+            Err("Needs administrator".to_string())
+        } else {
+            Err(GONE.to_string())
+        }
     }
 }
 
@@ -438,6 +689,7 @@ impl Provider for AppsProvider {
             return Vec::new();
         }
         let needle = fuzzy::normalize(text);
+        let ctx = self.row_ctx();
         let index = self.index.read().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<ResultItem> = index
             .iter()
@@ -450,7 +702,7 @@ impl Provider for AppsProvider {
                     .max()
                     .map(|s| s.saturating_sub(ALIAS_PENALTY));
                 let score = fuzzy::score(text, &e.name).max(by_alias)?;
-                Some(row(e, score))
+                Some(ctx.row(e, score))
             })
             .collect();
         out.sort_by(|a, b| b.score.cmp(&a.score));
@@ -458,15 +710,23 @@ impl Provider for AppsProvider {
     }
 
     fn item(&self, id: &str) -> Option<ResultItem> {
+        let ctx = self.row_ctx();
         let index = self.index.read().unwrap_or_else(|e| e.into_inner());
-        index.iter().find(|e| e.target == id).map(|e| row(e, 0))
+        index.iter().find(|e| e.target == id).map(|e| ctx.row(e, 0))
     }
 
     fn ready(&self) -> bool {
         self.scanned.load(Ordering::SeqCst)
     }
 
-    fn reveal(&self, id: &str) -> Result<(), String> {
+    /// Reveal (a Start menu shortcut only), Uninstall and Close.
+    fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
+        match action {
+            Action::Reveal => {}
+            Action::Uninstall => return self.uninstall(id),
+            Action::Close => return self.close(id),
+            _ => return Err("can't do that here".into()),
+        }
         let shortcut = {
             let index = self.index.read().unwrap_or_else(|e| e.into_inner());
             index.iter().any(|e| e.target == id && e.kind == AppKind::Shortcut)
@@ -474,7 +734,8 @@ impl Provider for AppsProvider {
         if !shortcut {
             return Err("can't show this item's location".into());
         }
-        self.launcher.reveal(id)
+        self.launcher.reveal(id)?;
+        Ok(Outcome::Hide)
     }
 
     fn help(&self) -> Vec<HelpLine> {
@@ -508,6 +769,7 @@ impl Provider for AppsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Action;
     use std::fs;
 
     fn shortcut(name: &str, target: &str) -> AppEntry {
@@ -543,13 +805,16 @@ mod tests {
         );
         let r = p.item(r"C:\b.lnk").unwrap();
         assert_eq!((r.title.as_str(), r.icon.as_str(), r.score), ("Blender", r"file:C:\b.lnk", 0));
-        assert!(r.pinnable && r.revealable && r.elevatable);
+        assert!(r.pinnable);
+        assert_eq!(r.actions, [Action::Admin, Action::Reveal]);
         assert!(p.item("nope").is_none());
         let s = p.item(r"shell:AppsFolder\Microsoft.WindowsCalculator_x!App").unwrap();
         assert_eq!(s.icon, r"file:shell:AppsFolder\Microsoft.WindowsCalculator_x!App");
-        assert!(s.pinnable && !s.revealable && s.elevatable);
-        assert_eq!(p.reveal(r"C:\b.lnk"), Ok(()));
-        assert!(p.reveal(&s.id).is_err());
+        assert!(s.pinnable);
+        assert_eq!(s.actions, []);
+        assert_eq!(p.act(r"C:\b.lnk", Action::Reveal), Ok(Outcome::Hide));
+        assert!(p.act(&s.id, Action::Reveal).is_err());
+        assert!(p.act(r"C:\b.lnk", Action::CopyPath).is_err());
         assert_eq!(rec.calls(), [r"reveal C:\b.lnk".to_string()]);
         assert!(p.ready());
         assert!(!AppsProvider::new(rec).ready());
@@ -650,6 +915,7 @@ mod tests {
                 assert_eq!(p2.query(&q("word")).len(), 1);
                 assert!(p2.query(&q("winword")).is_empty());
                 start[0].aliases = vec!["winword".into()];
+                Targets::default()
             },
             move || {
                 // Aliases published before the Store scan returns.
@@ -664,7 +930,10 @@ mod tests {
     #[test]
     fn a_later_refresh_keeps_answering_aliases_while_links_are_read_again() {
         let p = AppsProvider::with_entries(vec![]);
-        let add = |start: &mut [AppEntry]| start[0].aliases = vec!["winword".into()];
+        let add = |start: &mut [AppEntry]| {
+            start[0].aliases = vec!["winword".into()];
+            Targets::default()
+        };
         p.refresh_from_stages(vec![shortcut("Word", r"C:\w.lnk")], add, || None);
         assert_eq!(p.query(&q("winword")).len(), 1);
         let p2 = p.clone();
@@ -674,6 +943,7 @@ mod tests {
                 // The first publish of this refresh kept the alias found last time.
                 assert_eq!(p2.query(&q("winword")).len(), 1);
                 start[0].aliases = vec!["winword".into()];
+                Targets::default()
             },
             || None,
         );
@@ -1007,5 +1277,241 @@ mod tests {
     fn failed_store_elevation_says_so_but_cancel_stays_cancel() {
         assert_eq!(store_elevation_error("access denied".into()), "this app cannot be run as administrator");
         assert_eq!(store_elevation_error(launch::CANCELLED.into()), launch::CANCELLED);
+    }
+
+    use crate::launch::testing::RecordingLauncher;
+    use crate::uninstall::{Program, ProgramSource};
+    use crate::winlist::{WinInfo, WindowList, WindowOps};
+    use std::sync::atomic::AtomicUsize;
+
+    const FOO_EXE: &str = r"C:\Program Files\Foo\foo.exe";
+    const CALC_ID: &str = "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App";
+
+    fn foo_program() -> Program {
+        Program {
+            name: "Foo".into(),
+            install_location: Some(r"C:\Program Files\Foo".into()),
+            uninstall: Some(r#""C:\Program Files\Foo\unins000.exe" /SILENT"#.into()),
+            system: false,
+        }
+    }
+
+    /// Windows that only record `close`; nothing real is touched.
+    struct FakeWins {
+        wins: Vec<WinInfo>,
+        aumids: HashMap<isize, String>,
+        closes: Mutex<Vec<String>>,
+    }
+
+    impl WindowOps for FakeWins {
+        fn list(&self) -> Vec<WinInfo> {
+            self.wins.clone()
+        }
+        fn exists(&self, _hwnd: isize) -> bool {
+            true
+        }
+        fn focus(&self, _hwnd: isize) -> Result<(), String> {
+            Ok(())
+        }
+        fn close(&self, hwnd: isize, pid: u32) -> Result<(), String> {
+            self.closes.lock().unwrap().push(format!("close {hwnd} {pid}"));
+            Ok(())
+        }
+        fn kill(&self, _pid: u32, _exe: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn aumid(&self, hwnd: isize) -> Option<String> {
+            self.aumids.get(&hwnd).cloned()
+        }
+    }
+
+    fn win(hwnd: isize, pid: u32, exe: &str, elevated: bool) -> WinInfo {
+        WinInfo { hwnd, pid, title: "t".into(), exe: exe.into(), app: "a".into(), elevated }
+    }
+
+    fn fake_windows(wins: Vec<WinInfo>, aumids: &[(isize, &str)]) -> (Arc<WindowList>, Arc<FakeWins>) {
+        let ops = Arc::new(FakeWins {
+            wins,
+            aumids: aumids.iter().map(|(h, a)| (*h, a.to_string())).collect(),
+            closes: Mutex::new(Vec::new()),
+        });
+        let list = WindowList::new(ops.clone());
+        list.refresh();
+        (list, ops)
+    }
+
+    fn app_with_programs(rec: &Arc<crate::launch::testing::RecordingLauncher>) -> Arc<AppsProvider> {
+        AppsProvider::with_programs(
+            rec.clone(),
+            vec![
+                shortcut("Foo", r"C:\Foo.lnk"),
+                shortcut("Command Prompt", r"C:\Cmd.lnk"),
+                shortcut("Loose", r"C:\Loose.lnk"),
+                store("Calculator", CALC_ID),
+                store("Settings", "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"),
+            ],
+            vec![(r"C:\Foo.lnk", FOO_EXE), (r"C:\Cmd.lnk", r"C:\Windows\System32\cmd.exe")],
+            vec![foo_program()],
+        )
+    }
+
+    fn actions_of(p: &AppsProvider, id: &str) -> Vec<Action> {
+        p.item(id).unwrap().actions
+    }
+
+    #[test]
+    fn app_rows_offer_the_spec_actions() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let calc = format!("shell:AppsFolder\\{CALC_ID}");
+        // Not running (no window list yet): no Close.
+        assert_eq!(actions_of(&p, r"C:\Foo.lnk"), [Action::Admin, Action::Reveal, Action::Uninstall]);
+        assert_eq!(actions_of(&p, &calc), [Action::Uninstall]);
+        // Windows parts never get Uninstall.
+        assert_eq!(actions_of(&p, r"C:\Cmd.lnk"), [Action::Admin, Action::Reveal]);
+        let settings = r"shell:AppsFolder\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+        assert_eq!(actions_of(&p, settings), []);
+        // No exe known: Installed apps.
+        assert_eq!(actions_of(&p, r"C:\Loose.lnk"), [Action::Admin, Action::Reveal, Action::Uninstall]);
+
+        let (list, _) = fake_windows(vec![win(1, 10, &FOO_EXE.to_uppercase(), false)], &[]);
+        p.set_windows(list);
+        assert_eq!(
+            actions_of(&p, r"C:\Foo.lnk"),
+            [Action::Admin, Action::Reveal, Action::Uninstall, Action::Close]
+        );
+        assert_eq!(actions_of(&p, r"C:\Loose.lnk"), [Action::Admin, Action::Reveal, Action::Uninstall]);
+        assert_eq!(actions_of(&p, &calc), [Action::Uninstall]);
+        // Query rows carry the same actions.
+        assert_eq!(p.query(&q("foo"))[0].actions.len(), 4);
+    }
+
+    #[test]
+    fn store_rows_offer_close_when_a_window_has_their_aumid() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let (list, _) = fake_windows(vec![win(2, 11, r"C:\Windows\ApplicationFrameHost.exe", false)], &[(2, CALC_ID)]);
+        p.set_windows(list);
+        let calc = format!("shell:AppsFolder\\{CALC_ID}");
+        assert_eq!(actions_of(&p, &calc), [Action::Uninstall, Action::Close]);
+        assert_eq!(actions_of(&p, r"C:\Foo.lnk"), [Action::Admin, Action::Reveal, Action::Uninstall]);
+    }
+
+    /// A window whose AUMID comes from its process (not a window property) and
+    /// differs only in case still makes the Store row offer Close.
+    #[test]
+    fn store_close_offered_for_process_aumid_ignoring_case() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let (list, _) = fake_windows(
+            vec![win(3, 12, r"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator\CalculatorApp.exe", false)],
+            &[(3, "MICROSOFT.WINDOWSCALCULATOR_8WEKYB3D8BBWE!APP")],
+        );
+        p.set_windows(list);
+        let calc = format!("shell:AppsFolder\\{CALC_ID}");
+        assert_eq!(actions_of(&p, &calc), [Action::Uninstall, Action::Close]);
+    }
+
+    #[test]
+    fn uninstall_runs_the_registered_uninstaller() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        assert_eq!(p.act(r"C:\Foo.lnk", Action::Uninstall), Ok(Outcome::Hide));
+        assert_eq!(rec.calls(), [r"open_with C:\Program Files\Foo\unins000.exe elevated=false: /SILENT".to_string()]);
+    }
+
+    #[test]
+    fn uninstall_falls_back_to_installed_apps_settings() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let calc = format!("shell:AppsFolder\\{CALC_ID}");
+        assert_eq!(p.act(&calc, Action::Uninstall), Ok(Outcome::Hide));
+        assert_eq!(p.act(r"C:\Loose.lnk", Action::Uninstall), Ok(Outcome::Hide));
+        assert_eq!(rec.calls(), ["open ms-settings:appsfeatures".to_string(), "open ms-settings:appsfeatures".to_string()]);
+        // No plan, no uninstall; and nothing was launched for it.
+        assert!(p.act(r"C:\Cmd.lnk", Action::Uninstall).is_err());
+        assert!(p.act(r"C:\Missing.lnk", Action::Uninstall).is_err());
+        assert_eq!(rec.calls().len(), 2);
+    }
+
+    #[test]
+    fn close_closes_every_window_of_the_app() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let (list, ops) = fake_windows(
+            vec![win(1, 10, FOO_EXE, false), win(2, 10, FOO_EXE, false), win(3, 12, r"C:\other.exe", false)],
+            &[],
+        );
+        p.set_windows(list);
+        assert_eq!(p.act(r"C:\Foo.lnk", Action::Close), Ok(Outcome::Hide));
+        assert_eq!(*ops.closes.lock().unwrap(), ["close 1 10", "close 2 10"]);
+    }
+
+    #[test]
+    fn close_skips_elevated_windows_and_says_so() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let (list, ops) = fake_windows(vec![win(1, 10, FOO_EXE, true)], &[]);
+        p.set_windows(list);
+        assert_eq!(p.act(r"C:\Foo.lnk", Action::Close), Err("Needs administrator".to_string()));
+        assert!(ops.closes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn close_without_windows_says_they_are_gone() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        assert_eq!(p.act(r"C:\Foo.lnk", Action::Close), Err("That window is gone.".to_string()));
+        let (list, ops) = fake_windows(vec![win(3, 12, r"C:\other.exe", false)], &[]);
+        p.set_windows(list);
+        assert_eq!(p.act(r"C:\Foo.lnk", Action::Close), Err("That window is gone.".to_string()));
+        assert!(ops.closes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_close_matches_by_aumid() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let host = r"C:\Windows\ApplicationFrameHost.exe";
+        let (list, ops) = fake_windows(vec![win(1, 10, host, false), win(2, 10, host, false)], &[(2, CALC_ID)]);
+        p.set_windows(list);
+        let calc = format!("shell:AppsFolder\\{CALC_ID}");
+        assert_eq!(p.act(&calc, Action::Close), Ok(Outcome::Hide));
+        assert_eq!(*ops.closes.lock().unwrap(), ["close 2 10"]);
+    }
+
+    /// Counts reads; returns fixed programs.
+    struct CountingPrograms {
+        reads: AtomicUsize,
+    }
+
+    impl ProgramSource for CountingPrograms {
+        fn programs(&self) -> Vec<Program> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            vec![foo_program()]
+        }
+    }
+
+    #[test]
+    fn query_never_reads_the_registry() {
+        let source = Arc::new(CountingPrograms { reads: AtomicUsize::new(0) });
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = AppsProvider::with_source(rec, vec![shortcut("Foo", r"C:\Foo.lnk")], source.clone());
+        let _ = p.query(&q("foo"));
+        let _ = p.item(r"C:\Foo.lnk");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        p.refresh_from_stages(
+            vec![shortcut("Foo", r"C:\Foo.lnk")],
+            |_| Targets {
+                exes: HashMap::from([(r"C:\Foo.lnk".to_string(), FOO_EXE.to_string())]),
+                with_args: HashSet::new(),
+            },
+            || Some(vec![store("Calculator", CALC_ID)]),
+        );
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(actions_of(&p, r"C:\Foo.lnk"), [Action::Admin, Action::Reveal, Action::Uninstall]);
+        assert_eq!(actions_of(&p, &format!("shell:AppsFolder\\{CALC_ID}")), [Action::Uninstall]);
+        let _ = p.query(&q("foo"));
+        assert_eq!(source.reads.load(Ordering::SeqCst), 1);
     }
 }

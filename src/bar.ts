@@ -9,17 +9,34 @@ export type Item = {
   origin: "search" | "pin" | "recent";
   pinned: boolean;
   pinnable: boolean;
-  revealable: boolean;
-  elevatable: boolean;
+  actions: Action[]; // what the row's actions menu offers, in order
+  complete: string; // text Tab puts in the bar, "" = none
 };
+export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
-export type MenuAction = "pin" | "unpin" | "reveal" | "admin";
-export type Menu = { index: number; actions: MenuAction[]; selected: number };
+export type MenuAction = Action | "pin" | "unpin";
+export type Menu = { index: number; actions: MenuAction[]; selected: number; at: "pointer" | "row" };
+
+// A row's menu: its own actions, then pin or unpin.
+export function menuActions(item: Item): MenuAction[] {
+  const actions: MenuAction[] = [...item.actions];
+  if (item.pinnable) actions.push(item.pinned ? "unpin" : "pin");
+  return actions;
+}
+
+// The mouse wheel scrolls the list by whole rows: the remainder carries over.
+export const WHEEL_PX_PER_ROW = 40;
+export function rowsFromWheel(acc: number, deltaY: number): { rows: number; acc: number } {
+  const total = acc + deltaY;
+  const rows = Math.trunc(total / WHEEL_PX_PER_ROW);
+  return { rows, acc: total - rows * WHEEL_PX_PER_ROW };
+}
 export type State = {
   text: string;
   items: Item[];
   selected: number; // index into the full `items` list
   armed: string | null; // id awaiting a second Enter
+  armedAction: "uninstall" | null; // what the armed second Enter does, besides activating
   scope: { name: string; prompt: string } | null;
   error: string | null; // what the UI should display
   configError: string | null; // last config error from the back end
@@ -40,7 +57,7 @@ export type Effect =
   | { type: "activate"; item: Item; modifier: Modifier; text: string; scope: string | null }
   | { type: "loadPast" }
   | { type: "togglePin"; item: Item }
-  | { type: "reveal"; item: Item }
+  | { type: "act"; item: Item; action: Action }
   | { type: "hide" };
 export type Event =
   | { type: "shown" }
@@ -56,8 +73,9 @@ export type Event =
   | { type: "menu"; index: number }
   | { type: "menuPick"; action: MenuAction }
   | { type: "menuClose" }
+  | { type: "wheel"; rows: number }
   | { type: "pinned"; provider: string; id: string; pinned: boolean }
-  | { type: "key"; key: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p"; ctrl: boolean; shift: boolean }
+  | { type: "key"; key: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p" | "Tab"; ctrl: boolean; shift: boolean }
   | {
       type: "outcome";
       outcome:
@@ -75,6 +93,7 @@ export const initial: State = {
   items: [],
   selected: 0,
   armed: null,
+  armedAction: null,
   scope: null,
   error: null,
   configError: null,
@@ -125,7 +144,11 @@ const done = (state: State, effects: Effect[] = []): Result => ({ state, effects
 // Remembers what the last query asked for, and drops a pending "keep this row"
 // unless the query is the re-query that asked for it.
 export function reduce(s: State, e: Event): Result {
-  const r = step(s, e);
+  const stepped = step(s, e);
+  // A second Enter's meaning goes when the row is no longer armed.
+  const r = stepped.state.armed === null && stepped.state.armedAction !== null
+    ? done({ ...stepped.state, armedAction: null }, stepped.effects)
+    : stepped;
   const q = [...r.effects].reverse().find((f): f is Extract<Effect, { type: "query" }> => f.type === "query");
   const hide = r.effects.some((f) => f.type === "hide");
   const hidden = e.type === "shown" || e.type === "input" ? false : r.state.hidden || e.type === "hidden" || hide;
@@ -185,28 +208,34 @@ function step(s: State, e: Event): Result {
     case "menu": {
       const item = s.items[e.index];
       if (!item) return done(s);
-      const actions: MenuAction[] = [];
-      if (item.pinnable) actions.push(item.pinned ? "unpin" : "pin");
-      if (item.revealable) actions.push("reveal");
-      if (item.elevatable) actions.push("admin");
+      const actions = menuActions(item);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
       if (actions.length === 0) return done({ ...sel, menu: null });
-      return done({ ...sel, menu: { index: e.index, actions, selected: 0 } });
+      return done({ ...sel, menu: { index: e.index, actions, selected: 0, at: "pointer" } });
     }
     case "menuPick": {
       const m = s.menu;
       const item = m && s.items[m.index];
-      const closed = { ...s, menu: null };
+      // Only picking Uninstall keeps (or sets) the arm: any other pick must never fire it.
+      const closed = { ...s, menu: null, ...(e.action === "uninstall" ? {} : { armed: null, armedAction: null }) };
       if (!m || !item || !m.actions.includes(e.action)) return done(closed);
       switch (e.action) {
         case "pin":
         case "unpin":
           return done(closed, [{ type: "togglePin", item }]);
-        case "reveal":
-          return done(closed, [{ type: "reveal", item }]);
         case "admin":
           return enter({ ...closed, selected: m.index }, "ctrl_shift");
+        case "uninstall":
+          return done({ ...closed, selected: m.index, armed: item.id, armedAction: "uninstall" });
+        default:
+          if (s.pending) return done(closed);
+          return done({ ...closed, pending: true }, [{ type: "act", item, action: e.action }]);
       }
+    }
+    case "wheel": {
+      // A row-anchored menu would be left in the wrong place, so it closes.
+      const top = Math.min(Math.max(0, s.top + e.rows), Math.max(0, s.items.length - capOf(s)));
+      return top === s.top ? done({ ...s, menu: null }) : done({ ...s, top, menu: null });
     }
     case "configError":
       return done(fit({ ...s, configError: e.message, error: s.failure ?? e.message }));
@@ -300,6 +329,7 @@ function onMenuKey(s: State, m: Menu, e: Extract<Event, { type: "key" }>): Resul
     case "Enter":
       return reduce(s, { type: "menuPick", action: m.actions[m.selected] });
     case "Escape":
+    case "Tab":
       return done({ ...s, menu: null });
     default:
       return done(s);
@@ -337,6 +367,19 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       // Not for a pick list still loading: its first entry was never seen.
       if (s.awaiting) return done({ ...s, queued: s.scope && s.text === "" ? null : modifier });
       return enter(s, modifier);
+    }
+    case "Tab": {
+      const item = s.items[s.selected];
+      if (s.awaiting || !item) return done(s);
+      if (item.complete !== "") {
+        // Like F1, not an activation finishing: `pending` stays.
+        const r = fill(s, item.complete);
+        return done({ ...r.state, pending: s.pending }, r.effects);
+      }
+      if (s.items.some((i) => i.provider === "path")) return done(s);
+      const actions = menuActions(item);
+      if (actions.length === 0) return done(s);
+      return done({ ...s, menu: { index: s.selected, actions, selected: 0, at: "row" } });
     }
     case "Escape": {
       const t = { ...s, queued: null };
@@ -397,6 +440,9 @@ function fill(s: State, text: string): Result {
 function enter(s: State, modifier: Modifier): Result {
   const item = s.items[s.selected];
   if (!item || s.pending) return done(s);
+  if (s.armed === item.id && s.armedAction === "uninstall") {
+    return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: "uninstall" }]);
+  }
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
   return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);
 }
