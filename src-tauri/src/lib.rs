@@ -12,6 +12,7 @@ mod hotkey;
 mod icon;
 mod launch;
 mod net;
+mod paste;
 mod pins;
 mod provider;
 mod process;

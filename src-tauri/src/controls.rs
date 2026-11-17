@@ -33,6 +33,26 @@ pub trait Controls: Send + Sync {
 /// The real thing. Never use in tests.
 pub struct SystemControls;
 
+/// One keyboard event for `SendInput`.
+pub(crate) fn key_input(
+    vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    up: bool,
+) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    };
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                ..Default::default()
+            },
+        },
+    }
+}
+
 mod real {
     use windows::core::{w, PCWSTR};
     use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioState};
@@ -44,14 +64,13 @@ mod real {
     };
     use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-        VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
+        SendInput, INPUT, VK_MEDIA_NEXT_TRACK, VK_MEDIA_PLAY_PAUSE, VK_MEDIA_PREV_TRACK,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
     };
 
-    use super::{Audio, Controls, MediaKey, RadioKind, SystemControls};
+    use super::{key_input, Audio, Controls, MediaKey, RadioKind, SystemControls};
 
     /// COM on the calling thread for the life of the guard.
     struct Com(bool);
@@ -85,19 +104,6 @@ mod real {
             device
                 .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
                 .map_err(|_| "can't reach the sound device".to_string())
-        }
-    }
-
-    fn key_input(vk: VIRTUAL_KEY, up: bool) -> INPUT {
-        INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: vk,
-                    dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
-                    ..Default::default()
-                },
-            },
         }
     }
 
