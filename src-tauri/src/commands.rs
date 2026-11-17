@@ -1,9 +1,11 @@
 //! Commands the bar front end invokes. None of them run on the main thread.
 
-use tauri::{AppHandle, State};
+use std::sync::Arc;
+
+use tauri::{AppHandle, Manager, State};
 
 use crate::launch;
-use crate::provider::{Action, Modifier, Outcome, ResultItem};
+use crate::provider::{Action, Modifier, Outcome, ResultItem, Then};
 use crate::window;
 use crate::AppState;
 
@@ -13,10 +15,21 @@ pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Vec
     state.engine.query(&text, scope.as_deref())
 }
 
+/// Runs a follow-up once the bar has hidden (paste, clipboard history, snip,
+/// colour picker). Looked up as managed state `Arc<dyn AfterHide>`; without
+/// it a follow-up is skipped.
+pub trait AfterHide: Send + Sync {
+    /// `started` is the show count when the bar hid: a follow-up that is
+    /// still waiting when the bar is shown again gives up.
+    fn run(&self, then: Then, started: u64);
+}
+
 /// What to do with the bar once an activation has finished.
 #[derive(Debug, PartialEq)]
 enum After {
     Hide,
+    /// Hide, then run the follow-up.
+    Then(Then),
     /// Show again (without `bar:shown`) so the error can be seen.
     Reveal,
     Leave,
@@ -30,6 +43,7 @@ enum After {
 fn settle(result: Result<Outcome, String>, modifier: Modifier) -> (Result<Outcome, String>, After) {
     match result {
         Ok(Outcome::Hide) => (Ok(Outcome::Hide), After::Hide),
+        Ok(Outcome::HideThen { then }) => (Ok(Outcome::Hide), After::Then(then)),
         // The bar stays: it shows the filled text, the next step, or stays as is.
         Ok(outcome @ (Outcome::Fill { .. } | Outcome::Step { .. } | Outcome::Keep)) => (Ok(outcome), After::Leave),
         Err(e) if e == launch::CANCELLED => (Ok(Outcome::Hide), After::Hide),
@@ -43,7 +57,7 @@ fn settle(result: Result<Outcome, String>, modifier: Modifier) -> (Result<Outcom
 /// session, which a late result must neither hide nor bring back.
 fn after_for(after: After, started: u64, now: u64) -> After {
     match after {
-        After::Hide | After::Reveal if started != now => After::Leave,
+        After::Hide | After::Then(_) | After::Reveal if started != now => After::Leave,
         other => other,
     }
 }
@@ -68,12 +82,27 @@ pub async fn activate(
         .map_err(|e| format!("activation failed: {e}"))
         .and_then(|r| r);
     let (result, after) = settle(result, modifier);
-    match after_for(after, started, window::shows()) {
-        After::Hide => window::hide(&app),
-        After::Reveal => window::reveal(&app),
+    finish(&app, after_for(after, started, window::shows()));
+    result
+}
+
+/// Does what `after` says to the bar. A follow-up runs on its own thread,
+/// never on the async runtime: a paste waits up to 500 ms and the colour
+/// picker runs a message loop.
+fn finish(app: &AppHandle, after: After) {
+    match after {
+        After::Hide => window::hide(app),
+        After::Then(then) => {
+            let started = window::shows();
+            window::hide(app);
+            if let Some(follow) = app.try_state::<Arc<dyn AfterHide>>() {
+                let follow = Arc::clone(&follow);
+                std::thread::spawn(move || follow.run(then, started));
+            }
+        }
+        After::Reveal => window::reveal(app),
         After::Leave => {}
     }
-    result
 }
 
 /// Pins or unpins an item; returns whether it is now pinned.
@@ -106,11 +135,7 @@ pub async fn act(
         .map_err(|e| format!("action failed: {e}"))
         .and_then(|r| r);
     let (result, after) = settle(result, Modifier::None);
-    match after_for(after, started, window::shows()) {
-        After::Hide => window::hide(&app),
-        After::Reveal => window::reveal(&app),
-        After::Leave => {}
-    }
+    finish(&app, after_for(after, started, window::shows()));
     result
 }
 
@@ -153,6 +178,21 @@ mod tests {
         assert_eq!(after_for(After::Hide, 3, 3), After::Hide);
         assert_eq!(after_for(After::Reveal, 3, 3), After::Reveal);
         assert_eq!(after_for(After::Leave, 3, 3), After::Leave);
+    }
+
+    #[test]
+    fn hide_then_hides_and_runs_the_follow_up() {
+        for m in [Modifier::None, Modifier::Ctrl, Modifier::CtrlShift] {
+            for then in [Then::Paste { before: 0 }, Then::ClipboardHistory, Then::Snip, Then::PickColor] {
+                assert_eq!(settle(Ok(Outcome::HideThen { then }), m), (Ok(Outcome::Hide), After::Then(then)));
+            }
+        }
+    }
+
+    #[test]
+    fn a_follow_up_is_dropped_when_the_bar_was_shown_again() {
+        assert_eq!(after_for(After::Then(Then::Paste { before: 0 }), 3, 4), After::Leave);
+        assert_eq!(after_for(After::Then(Then::Paste { before: 0 }), 3, 3), After::Then(Then::Paste { before: 0 }));
     }
 
     #[test]
