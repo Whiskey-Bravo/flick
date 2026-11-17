@@ -96,7 +96,7 @@ input {
 }
 
 .qr-panel {
-  height: calc(8 * 44px + 8px);
+  height: calc(8 * 44px + 8px + 1px);
   border-top: 1px solid #2e2e35;
   padding: 0 20px;
   display: flex;
