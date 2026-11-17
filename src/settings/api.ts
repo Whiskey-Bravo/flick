@@ -127,6 +127,9 @@ export const settingsDeleteHotkey = (keys: string) => invoke<void>("settings_del
 export const settingsHotkeyStatus = () => invoke<KeyStatusRow[]>("settings_hotkey_status");
 export const settingsOpenFile = () => invoke<void>("settings_open_file");
 
+/** Runs `handler` when a list the picker searches (devices, drives, Wi-Fi) has been read. */
+export const onAnswersReady = (handler: () => void): Promise<UnlistenFn> => listen("answers:ready", handler);
+
 /** Runs `handler` after every config reload. */
 export const onSettingsChanged = (handler: () => void): Promise<UnlistenFn> =>
   listen("settings:changed", handler);

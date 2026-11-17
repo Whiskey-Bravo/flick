@@ -756,8 +756,10 @@ fn setup(app: &AppHandle) {
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
     let ready = app.clone();
     // The bar re-runs its query when the text is unchanged, so a placeholder turns into the answer.
+    // The Settings item picker asks again too (a device list read for `connect` has ended).
     let on_ready: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
+        let _ = ready.emit_to(settings::WINDOW, "answers:ready", ());
     });
     let answers = Answers::new(launcher.clone(), on_ready.clone());
     let browse = Browse::new(launcher.clone(), on_ready.clone());
