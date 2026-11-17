@@ -1152,15 +1152,17 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
         |accelerator| apply_hotkey(app, accelerator),
         || registered_bar(app, &config.hotkey),
     );
+    // Under the config lock, so concurrent reloads report in order.
     emit_config_error(app, join_errors(loaded.error, hotkey_error));
-    // After the direct keys were applied, so the Hotkeys status read on this is fresh.
-    let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
     // Disk I/O, with the config lock released. Staged under it, so the last
     // reload's shortcuts win even if an earlier one finishes reading later.
     drop(config);
     if let Some(staged) = staged {
         state.providers.shortcuts.apply(staged);
     }
+    // After the direct keys and the shortcuts are in, so the Hotkeys status
+    // read on this is fresh. It carries nothing, so its order needs no lock.
+    let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
 }
 
 /// `applied` is the configured hotkey that last registered successfully (`None`
