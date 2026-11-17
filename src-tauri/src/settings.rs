@@ -489,6 +489,9 @@ mod tests {
             assert_eq!(save_direct_hotkey(&path, None, &hk("Ctrl+T"), "Alt+Space"), Err(config::WEAK_COMBO.to_string()));
             assert_eq!(save_direct_hotkey(&path, None, &hk("alt+space"), "Alt+Space"), Err(config::BAR_COMBO.to_string()));
             assert_eq!(save_direct_hotkey(&path, None, &hk("Alt+Ctrl+T"), "Ctrl+Alt+T"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("Ctrl+Alt+Esc"), "Ctrl+Alt+Escape"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("CmdOrCtrl+Alt+Space"), "Ctrl+Alt+Space"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("Win+N"), "Super+N"), Err(config::BAR_COMBO.to_string()));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
     }
@@ -514,6 +517,10 @@ mod tests {
         save_direct_hotkey(&path, None, &hk("Ctrl+Alt+T"), "Alt+Space").unwrap();
         assert_eq!(
             save_direct_hotkey(&path, None, &hk("alt+ctrl+t"), "Alt+Space"),
+            Err(config::DUPLICATE_COMBO.to_string())
+        );
+        assert_eq!(
+            save_direct_hotkey(&path, None, &hk("Ctrl+Alt+KeyT"), "Alt+Space"),
             Err(config::DUPLICATE_COMBO.to_string())
         );
         save_direct_hotkey(&path, Some("ctrl+alt+t"), &hk("Win+T"), "Alt+Space").unwrap();

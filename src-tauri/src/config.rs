@@ -182,20 +182,68 @@ fn modifier(part: &str) -> Option<&'static str> {
         "ctrl" | "control" => Some("ctrl"),
         "alt" | "option" => Some("alt"),
         "shift" => Some("shift"),
-        "super" | "win" | "meta" | "cmd" => Some("super"),
+        "super" | "win" | "meta" | "cmd" | "command" => Some("super"),
+        // What global-hotkey reads these as on Windows.
+        "cmdorctrl" | "cmdorcontrol" | "commandorctrl" | "commandorcontrol" => Some("ctrl"),
         _ => None,
     }
 }
 
-/// One spelling per combo: lower case, `win`/`meta`/`cmd` as `super`, modifiers in the
-/// order ctrl, alt, shift, super, then the key(s).
+/// One spelling for every name global-hotkey accepts for the same key (`part` is lower
+/// case): `KeyT` is `t`, `Digit1` is `1`, `Esc` is `escape`, `ArrowDown` is `down`,
+/// `Num0` is `numpad0`, `-` is `minus`, and so on.
+fn canonical_key(part: &str) -> String {
+    if let Some(rest) = part.strip_prefix("key").filter(|r| r.len() == 1 && r.chars().all(|c| c.is_ascii_lowercase())) {
+        return rest.to_string();
+    }
+    if let Some(rest) = part.strip_prefix("digit").filter(|r| r.len() == 1 && r.chars().all(|c| c.is_ascii_digit())) {
+        return rest.to_string();
+    }
+    if let Some(rest) = part.strip_prefix("arrow").filter(|r| matches!(*r, "up" | "down" | "left" | "right")) {
+        return rest.to_string();
+    }
+    let numpad = |rest: &str| match rest {
+        "plus" => Some("add".to_string()),
+        r if r.len() == 1 && r.chars().all(|c| c.is_ascii_digit()) => Some(r.to_string()),
+        "add" | "decimal" | "divide" | "enter" | "equal" | "multiply" | "subtract" => Some(rest.to_string()),
+        _ => None,
+    };
+    if let Some(rest) = part.strip_prefix("numpad").or_else(|| part.strip_prefix("num")).and_then(numpad) {
+        return format!("numpad{rest}");
+    }
+    let same = match part {
+        "`" => "backquote",
+        "\\" => "backslash",
+        "[" => "bracketleft",
+        "]" => "bracketright",
+        "," => "comma",
+        "=" => "equal",
+        "-" => "minus",
+        "." => "period",
+        "'" => "quote",
+        ";" => "semicolon",
+        "/" => "slash",
+        "pausebreak" => "pause",
+        "esc" => "escape",
+        "volumedown" => "audiovolumedown",
+        "volumeup" => "audiovolumeup",
+        "volumemute" => "audiovolumemute",
+        "mediatrackprev" => "mediatrackprevious",
+        other => other,
+    };
+    same.to_string()
+}
+
+/// One spelling per combo: lower case, `win`/`meta`/`cmd` as `super`, `CmdOrCtrl` as
+/// `ctrl`, every key in one spelling (`canonical_key`), modifiers in the order ctrl, alt,
+/// shift, super, then the key(s).
 pub fn normalize_combo(keys: &str) -> String {
     let mut mods = [false; 4];
     let mut rest = Vec::new();
     for part in keys.split('+').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()) {
         match modifier(&part) {
             Some(m) => mods[MODIFIERS.iter().position(|x| *x == m).unwrap_or(0)] = true,
-            None => rest.push(part),
+            None => rest.push(canonical_key(&part)),
         }
     }
     let mut out: Vec<String> = MODIFIERS.iter().zip(mods).filter(|(_, on)| *on).map(|(m, _)| m.to_string()).collect();
@@ -218,7 +266,7 @@ fn check_workspace(def: &WorkspaceDef, used: &mut Vec<String>) -> Result<(), Str
     if !one_word(&def.name) || def.aliases.iter().any(|a| !one_word(a)) {
         return Err("name must be one word".into());
     }
-    if def.name.contains(':') {
+    if std::iter::once(&def.name).chain(&def.aliases).any(|w| w.contains(':')) {
         return Err("name cannot contain :".into());
     }
     for word in std::iter::once(&def.name).chain(&def.aliases) {
@@ -1147,6 +1195,65 @@ item = { provider = \"apps\", id = \"C:/x/Term.lnk\", title = \"Term\" }
         assert_eq!(normalize_combo("Cmd+E"), "super+e");
         assert_eq!(normalize_combo("Control+Option+X"), normalize_combo("Ctrl+Alt+X"));
         assert_eq!(normalize_combo("Win+Shift+Alt+Ctrl+K"), "ctrl+alt+shift+super+k");
+    }
+
+    #[test]
+    fn normalize_combo_folds_every_spelling_of_a_key() {
+        let same = [
+            ("Win+N", "Super+N"),
+            ("Command+N", "Win+N"),
+            ("CmdOrCtrl+Alt+Space", "Ctrl+Alt+Space"),
+            ("CommandOrControl+Alt+X", "Ctrl+Alt+X"),
+            ("CmdOrControl+Alt+X", "Ctrl+Alt+X"),
+            ("CommandOrCtrl+Alt+X", "Ctrl+Alt+X"),
+            ("Ctrl+Alt+KeyT", "Ctrl+Alt+T"),
+            ("Ctrl+Alt+Digit1", "Ctrl+Alt+1"),
+            ("Ctrl+Alt+Esc", "Ctrl+Alt+Escape"),
+            ("Ctrl+Alt+Down", "Ctrl+Alt+ArrowDown"),
+            ("Ctrl+Alt+Up", "Ctrl+Alt+ArrowUp"),
+            ("Ctrl+Alt+Left", "Ctrl+Alt+ArrowLeft"),
+            ("Ctrl+Alt+Right", "Ctrl+Alt+ArrowRight"),
+            ("Ctrl+Alt+Num0", "Ctrl+Alt+Numpad0"),
+            ("Ctrl+Alt+NumPlus", "Ctrl+Alt+NumpadAdd"),
+            ("Ctrl+Alt+NumpadPlus", "Ctrl+Alt+NumAdd"),
+            ("Ctrl+Alt+NumEnter", "Ctrl+Alt+NumpadEnter"),
+            ("Ctrl+Alt+`", "Ctrl+Alt+Backquote"),
+            ("Ctrl+Alt+-", "Ctrl+Alt+Minus"),
+            ("Ctrl+Alt+\\", "Ctrl+Alt+Backslash"),
+            ("Ctrl+Alt+[", "Ctrl+Alt+BracketLeft"),
+            ("Ctrl+Alt+]", "Ctrl+Alt+BracketRight"),
+            ("Ctrl+Alt+,", "Ctrl+Alt+Comma"),
+            ("Ctrl+Alt+=", "Ctrl+Alt+Equal"),
+            ("Ctrl+Alt+.", "Ctrl+Alt+Period"),
+            ("Ctrl+Alt+'", "Ctrl+Alt+Quote"),
+            ("Ctrl+Alt+;", "Ctrl+Alt+Semicolon"),
+            ("Ctrl+Alt+/", "Ctrl+Alt+Slash"),
+            ("Ctrl+Alt+PauseBreak", "Ctrl+Alt+Pause"),
+            ("Ctrl+Alt+VolumeUp", "Ctrl+Alt+AudioVolumeUp"),
+            ("Ctrl+Alt+MediaTrackPrev", "Ctrl+Alt+MediaTrackPrevious"),
+        ];
+        for (a, b) in same {
+            assert_eq!(normalize_combo(a), normalize_combo(b), "{a} vs {b}");
+        }
+        // Different keys stay different.
+        assert_ne!(normalize_combo("Ctrl+Alt+NumLock"), normalize_combo("Ctrl+Alt+Numpad0"));
+        assert_ne!(normalize_combo("Ctrl+Alt+1"), normalize_combo("Ctrl+Alt+Num1"));
+        assert!(combo_allowed("CmdOrCtrl+Alt+Space"));
+    }
+
+    #[test]
+    fn same_key_in_another_spelling_is_a_duplicate() {
+        let c = Config { direct_hotkeys: vec![hk("Ctrl+Alt+T")], ..Default::default() };
+        assert_eq!(check_direct_hotkey_in(&c, None, &hk("Ctrl+Alt+KeyT")).unwrap_err(), DUPLICATE_COMBO);
+    }
+
+    #[test]
+    fn workspace_aliases_follow_the_name_rules() {
+        let none = Config::default();
+        let e = check_workspace_in(&none, None, &WorkspaceDef { aliases: vec!["a:b".into()], ..ws("w") }).unwrap_err();
+        assert_eq!(e, "name cannot contain :");
+        let e = check_workspace_in(&none, None, &WorkspaceDef { aliases: vec!["two words".into()], ..ws("w") }).unwrap_err();
+        assert_eq!(e, "name must be one word");
     }
 
     #[test]
