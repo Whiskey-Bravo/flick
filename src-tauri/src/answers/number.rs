@@ -60,8 +60,9 @@ pub fn parse_number(s: &str) -> Option<f64> {
     Some(if neg { -v } else { v })
 }
 
-/// Formats with up to 10 significant digits, no trailing zeros, thousands grouping
-/// and scientific notation for very large or very small magnitudes.
+/// Formats with up to 15 significant digits (exact for integers below 1e15, while
+/// binary float noise such as `0.1 + 0.2` stays hidden), no trailing zeros,
+/// thousands grouping and scientific notation for very large or very small magnitudes.
 pub fn format_number(x: f64, decimal: char, group: char) -> String {
     if !x.is_finite() {
         return x.to_string();
@@ -69,7 +70,7 @@ pub fn format_number(x: f64, decimal: char, group: char) -> String {
     if x == 0.0 {
         return "0".into();
     }
-    let sci = format!("{:.9e}", x.abs());
+    let sci = format!("{:.14e}", x.abs());
     let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
     let exp: i32 = exp.parse().unwrap_or(0);
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
@@ -277,10 +278,18 @@ mod tests {
         assert_eq!(format_number(38.5, ',', '.'), "38,5");
         assert_eq!(format_number(1234.5, ',', '.'), "1.234,5");
         assert_eq!(format_number(1234.5, '.', ','), "1,234.5");
-        assert_eq!(format_number(1.0 / 3.0, '.', ','), "0.3333333333");
         assert_eq!(format_number(84.0, ',', '.'), "84");
         assert_eq!(format_number(2e16, '.', ','), "2e16");
         assert_eq!(format_number(-0.0, '.', ','), "0");
+    }
+
+    #[test]
+    fn fifteen_significant_digits() {
+        assert_eq!(format_number(1099511627776.0, '.', ','), "1,099,511,627,776");
+        assert_eq!(format_number(12345678902.0, ',', '.'), "12.345.678.902");
+        assert_eq!(format_number(999999999999999.0, '.', ','), "999,999,999,999,999");
+        assert_eq!(format_number(0.1 + 0.2, ',', '.'), "0,3");
+        assert_eq!(format_number(1.0 / 3.0, '.', ','), "0.333333333333333");
     }
 
     #[test]

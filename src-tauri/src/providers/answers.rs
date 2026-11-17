@@ -621,6 +621,28 @@ mod tests {
     }
 
     #[test]
+    fn answers_are_exact_to_fifteen_digits() {
+        let r = rig(true, "", None);
+        assert_eq!(one(&r, "1 tib in bytes").title, "1.099.511.627.776 B");
+        let row = one(&r, "12345678901+1");
+        assert_eq!(row.title, "= 12.345.678.902");
+        assert_eq!(row.subtitle, "12.345.678.901 + 1");
+        r.answers.activate(&row.id, Modifier::None).unwrap();
+        assert_eq!(*r.clipboard.0.lock().unwrap(), ["12.345.678.902"]);
+        // Float noise stays hidden.
+        assert_eq!(titled(&r, "0,1+0,2"), ("= 0,3".into(), "0,1 + 0,2".into()));
+    }
+
+    #[test]
+    fn trig_rounding_noise_is_zero() {
+        let r = rig(true, "", None);
+        for text in ["sin(180)", "cos(90)", "tan(180)"] {
+            assert_eq!(one(&r, text).title, "= 0", "{text}");
+        }
+        assert_eq!(one(&r, "sin(30)").title, "= 0,5");
+    }
+
+    #[test]
     fn currency_rows_by_state() {
         // Fresh rates: no request.
         let r = rig(true, "", Some("2026-11-17"));

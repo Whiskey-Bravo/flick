@@ -262,6 +262,8 @@ impl State {
 struct Inner {
     path: PathBuf,
     fetch: Arc<dyn Fetch>,
+    /// Time for one whole attempt, geocode and forecast together.
+    budget: Duration,
     on_ready: Arc<dyn Fn() + Send + Sync>,
     state: Mutex<State>,
     /// Serialises writes of `weather.json`.
@@ -282,10 +284,21 @@ fn tidy(city: &str) -> String {
 impl WeatherStore {
     /// Cheap: no disk access. Call `load` once, off the query path.
     pub fn new(path: PathBuf, fetch: Arc<dyn Fetch>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Arc<Self> {
+        Self::with_budget(path, fetch, on_ready, crate::net::TIMEOUT)
+    }
+
+    /// Like `new`, with `budget` for each whole attempt instead of the usual 5 s.
+    fn with_budget(
+        path: PathBuf,
+        fetch: Arc<dyn Fetch>,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+        budget: Duration,
+    ) -> Arc<Self> {
         Arc::new(WeatherStore {
             inner: Arc::new(Inner {
                 path,
                 fetch,
+                budget,
                 on_ready,
                 state: Mutex::new(State::default()),
                 saving: Mutex::new(()),
@@ -469,18 +482,22 @@ enum Outcome {
     Got(Place, Forecast),
 }
 
-/// Geocode (unless the place is known), then the forecast. Blocking.
-fn run(fetch: &dyn Fetch, job: &Job) -> Outcome {
+/// Geocode (unless the place is known), then the forecast, both within `deadline`:
+/// a geocode that used up the time leaves no forecast request. Blocking.
+fn run(fetch: &dyn Fetch, job: &Job, deadline: Instant) -> Outcome {
     let place = match &job.place {
         Some(p) => p.clone(),
-        None => match fetch.get(&geocode_url(&job.city)).map_err(drop).and_then(|b| parse_geocode(&b)) {
+        None => match fetch.get_until(&geocode_url(&job.city), deadline).map_err(drop).and_then(|b| parse_geocode(&b)) {
             Err(()) => return Outcome::Failed(None),
             Ok(None) => return Outcome::Missing,
             Ok(Some(p)) => p,
         },
     };
+    if Instant::now() >= deadline {
+        return Outcome::Failed(Some(place));
+    }
     let forecast = fetch
-        .get(&forecast_url(place.lat, place.lon, job.key.1))
+        .get_until(&forecast_url(place.lat, place.lon, job.key.1), deadline)
         .ok()
         .and_then(|b| parse_forecast(&b, &place.name));
     match forecast {
@@ -497,7 +514,7 @@ fn spawn_fetch(inner: &Arc<Inner>, job: Job) -> bool {
     let thread_inner = inner.clone();
     let spawned = std::thread::Builder::new().name("flick-weather".into()).spawn(move || {
         let inner = thread_inner;
-        let outcome = run(inner.fetch.as_ref(), &job);
+        let outcome = run(inner.fetch.as_ref(), &job, Instant::now() + inner.budget);
         let save = {
             let mut st = inner.lock();
             let mine = st.in_flight.get(&job.key) == Some(&job.attempt);
@@ -565,14 +582,23 @@ mod tests {
     }
 
     fn store_with(dir: &tempfile::TempDir, fetch: Arc<FakeFetch>) -> (Arc<WeatherStore>, mpsc::Receiver<()>) {
+        store_with_budget(dir, fetch, crate::net::TIMEOUT)
+    }
+
+    fn store_with_budget(
+        dir: &tempfile::TempDir,
+        fetch: Arc<FakeFetch>,
+        budget: Duration,
+    ) -> (Arc<WeatherStore>, mpsc::Receiver<()>) {
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
-        let store = WeatherStore::new(
+        let store = WeatherStore::with_budget(
             dir.path().join("weather.json"),
             fetch,
             Arc::new(move || {
                 let _ = tx.lock().unwrap().send(());
             }),
+            budget,
         );
         (store, rx)
     }
@@ -625,6 +651,37 @@ mod tests {
         assert_eq!(store.lookup("london", later, true, true), WeatherState::Fetching("London".into()));
         wait(&rx);
         assert_eq!(fetch.urls()[3..], [london_forecast_url(true)]);
+    }
+
+    #[test]
+    fn geocode_and_forecast_share_one_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(london_fetch().with_delay(Duration::from_millis(50)));
+        let (store, rx) = store_with(&dir, fetch.clone());
+        let before = Instant::now();
+        store.lookup("London", before, true, false);
+        wait(&rx);
+        let done = Instant::now();
+        assert_eq!(fetch.urls(), vec![geocode_url("London"), london_forecast_url(false)]);
+        let d = fetch.deadlines();
+        assert_eq!(d[0], d[1], "the forecast gets only what the geocode left");
+        let budget = crate::net::TIMEOUT;
+        // Set when the attempt started: after the lookup, before the forecast came back.
+        assert!(d[0] >= before + budget && d[0] <= done + budget, "5 s for the whole attempt");
+    }
+
+    #[test]
+    fn a_slow_geocode_spends_the_budget_and_skips_the_forecast() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(london_fetch().with_delay(Duration::from_millis(300)));
+        let (store, rx) = store_with_budget(&dir, fetch.clone(), Duration::from_millis(200));
+        let now = Instant::now();
+        assert_eq!(store.lookup("London", now, true, false), WeatherState::Fetching("London".into()));
+        wait(&rx);
+        assert_eq!(fetch.urls(), vec![geocode_url("London")], "no forecast request after the deadline");
+        assert_eq!(store.lookup("London", now, true, false), WeatherState::Offline);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(fetch.urls().len(), 1, "settled: no retry while the bar re-queries");
     }
 
     #[test]
@@ -687,13 +744,13 @@ mod tests {
         let fetch = Arc::new(FakeFetch::new(Err(FetchError::Status(503))));
         let (store, rx) = store_with(&dir, fetch.clone());
         let now = Instant::now();
-        store.lookup("Vienna", now, true, false);
+        store.lookup("Paris", now, true, false);
         wait(&rx);
-        assert_eq!(store.lookup("Vienna", now, true, false), WeatherState::Offline);
+        assert_eq!(store.lookup("Paris", now, true, false), WeatherState::Offline);
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(fetch.urls().len(), 1, "no retry loop while the bar re-queries");
         // A while later it tries again.
-        assert_eq!(store.lookup("Vienna", now + Duration::from_secs(61), true, false), WeatherState::Fetching("Vienna".into()));
+        assert_eq!(store.lookup("Paris", now + Duration::from_secs(61), true, false), WeatherState::Fetching("Paris".into()));
         wait(&rx);
         assert_eq!(fetch.urls().len(), 2);
 
@@ -752,14 +809,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fetch = Arc::new(london_fetch());
         let (store, rx) = store_with(&dir, fetch.clone());
-        store.set_home("Vienna");
+        store.set_home("Paris");
         store.lookup("London", Instant::now(), true, false);
         wait(&rx);
         assert!(!dir.path().join("weather.json").exists());
         // Becoming home later saves the coordinates already known.
         store.set_home("London");
         let saved = std::fs::read_to_string(dir.path().join("weather.json")).unwrap();
-        assert!(saved.contains("\"london\"") && !saved.contains("vienna"), "{saved}");
+        assert!(saved.contains("\"london\"") && !saved.contains("paris"), "{saved}");
     }
 
     fn saved_places(dir: &tempfile::TempDir) -> serde_json::Value {
@@ -782,13 +839,13 @@ mod tests {
         assert_eq!(saved_places(&dir), serde_json::json!({}));
         // Nothing to change: no write (a missing file counts as no places).
         std::fs::remove_file(dir.path().join("weather.json")).unwrap();
-        store.set_home("Vienna");
+        store.set_home("Paris");
         assert!(!dir.path().join("weather.json").exists());
 
         // A new home whose coordinates are not known yet also removes the old one.
         store.set_home("London");
         assert_eq!(saved_places(&dir), serde_json::json!({"london":[51.51,-0.13,"London"]}));
-        store.set_home("Vienna");
+        store.set_home("Paris");
         assert_eq!(saved_places(&dir), serde_json::json!({}));
 
         // The stored entry for the home city itself stays, even before `load`.
@@ -880,12 +937,12 @@ mod tests {
             geocode_url("New York"),
             "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&name=New%20York"
         );
-        assert!(forecast_url(48.2082, 16.3738, false).contains("latitude=48.21&longitude=16.37"));
+        assert!(forecast_url(48.8566, 2.3522, false).contains("latitude=48.86&longitude=2.35"));
         assert_eq!(
-            forecast_url(48.2082, 16.3738, false),
-            "https://api.open-meteo.com/v1/forecast?latitude=48.21&longitude=16.37&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1"
+            forecast_url(48.8566, 2.3522, false),
+            "https://api.open-meteo.com/v1/forecast?latitude=48.86&longitude=2.35&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=1"
         );
-        assert!(forecast_url(48.2082, 16.3738, true).ends_with("&forecast_days=1&temperature_unit=fahrenheit"));
+        assert!(forecast_url(48.8566, 2.3522, true).ends_with("&forecast_days=1&temperature_unit=fahrenheit"));
         assert_eq!(geocode_url("Zürich&x=1"), "https://geocoding-api.open-meteo.com/v1/search?count=1&language=en&name=Z%C3%BCrich%26x%3D1");
     }
 

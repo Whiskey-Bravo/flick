@@ -24,7 +24,7 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | Part of a file or folder name | Opens it (searches your whole user folder by default) | `invoice` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
-| A sum, a unit or currency conversion, a time or date, or `weather` | Shows the answer on top; Enter copies it | `12*7`, `20 usd in eur`, `time tokyo` (see Quick answers) |
+| A sum, a unit or currency conversion, a time or date, or `weather` | Shows the answer on top; Enter copies it (on a weather answer, Enter opens a web search) | `12*7`, `20 usd in eur`, `time tokyo` (see Quick answers) |
 | `?`, `g`, `yt` or `gh`, then your search | Searches the web in your browser | `? rust lifetimes` |
 | The name of one of your shortcuts | Runs it | `search rust traits` (after adding the `search` shortcut shown below) |
 | `>` and a command | Runs the command in WSL | `> htop -d 10` |
@@ -94,7 +94,7 @@ Type `help` (in any case) to see one line for each kind of result, with an examp
 
 ## Quick answers
 
-Type a question and the answer appears as the first row, above apps. Enter copies the answer (the bar closes). Numbers are shown in your Windows number format, and you may type `,` or `.` as the decimal mark.
+Type a question and the answer appears as the first row, above apps. Enter copies the answer (the bar closes); on a weather answer, Enter opens a web search for the forecast instead. Numbers are shown in your Windows number format, and you may type `,` or `.` as the decimal mark.
 
 | You type | You get |
 |---|---|
@@ -102,14 +102,15 @@ Type a question and the answer appears as the first row, above apps. Enter copie
 | `5.5 km in m`, `70 f in c`, `3 cups in ml` | The conversion |
 | `20 usd in eur`, `$20 in gbp` | The conversion at the European Central Bank's latest rates |
 | `20 usd` | The same, into your home currency |
-| `time tokyo` | The time there, with the day if it differs |
+| `time` | The time and weekday here, with today's date |
+| `time tokyo` | The time and weekday there, and how far ahead or behind you it is |
 | `in 45 days`, `3 weeks ago`, `days until 24 dec` | The date, or the number of days |
 | `weather london` | The weather there now; Enter opens a web search for it |
 | `weather` | The weather in your `weather_city` |
 
-Only text that is clearly a question gets an answer: a bare number or an app name is never read as maths. The answer comes first, and your other matches follow below as usual.
+Only text that is clearly a question gets an answer: a bare number or an app name is never read as maths. The answer comes first, and your other matches follow below as usual. A bare `time`, `weather` or `20 usd` could also be an app's name, so its answer is ranked like one instead of always coming first.
 
-A currency or weather answer needs the internet. The row says `Getting rates...` or `Getting weather...` for a moment and turns into the answer by itself. If a city is not found, or you are offline, the row says so. Answers are never saved: not in past searches, not as recent launches, not as pins.
+A currency or weather answer needs the internet. The row says `Getting rates…` or `Getting weather for London…` for a moment and turns into the answer by itself. If a city is not found, or you are offline, the row says so. Answers are never saved: not in past searches, not as recent launches, not as pins.
 
 **Web search.** Four searches are built in. Type the name, a space, then what to search for; Enter opens it in your browser.
 

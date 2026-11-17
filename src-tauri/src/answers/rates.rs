@@ -497,7 +497,7 @@ mod tests {
     struct Sequence(Mutex<Vec<Vec<u8>>>);
 
     impl crate::net::Fetch for Sequence {
-        fn get(&self, _url: &str) -> Result<Vec<u8>, FetchError> {
+        fn get_until(&self, _url: &str, _deadline: std::time::Instant) -> Result<Vec<u8>, FetchError> {
             let mut left = self.0.lock().unwrap();
             if left.is_empty() { Err(FetchError::Offline) } else { Ok(left.remove(0)) }
         }

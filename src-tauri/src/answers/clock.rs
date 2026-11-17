@@ -351,13 +351,13 @@ mod tests {
         let p = place;
         assert_eq!(time_in(p("time tokyo"), now).unwrap().0.time(), jiff::civil::time(21, 0, 0, 0));
         assert_eq!(time_in(p("time london"), now).unwrap().0.time(), jiff::civil::time(13, 0, 0, 0)); // BST
-        assert_eq!(p("time wien").name, "Vienna");
+        assert_eq!(p("time france").name, "Paris");
     }
 
     #[test]
     fn offset_against_injected_local_zone() {
         let now: Timestamp = "2026-07-01T12:00:00Z".parse().unwrap();
-        let local = TimeZone::get("Europe/Vienna").unwrap();
+        let local = TimeZone::get("Europe/Paris").unwrap();
         let (dt, ahead) = time_in_from(place("time tokyo"), now, &local).unwrap();
         assert_eq!(dt.hour(), 21);
         assert_eq!(ahead, 7 * 60);

@@ -253,9 +253,9 @@ impl Parser<'_> {
                             "ceil" => f64::ceil,
                             "ln" => f64::ln,
                             "log" => f64::log10,
-                            "sin" => |x| x.to_radians().sin(),
-                            "cos" => |x| x.to_radians().cos(),
-                            "tan" => |x| x.to_radians().tan(),
+                            "sin" => |x| trig(x.to_radians().sin()),
+                            "cos" => |x| trig(x.to_radians().cos()),
+                            "tan" => |x| trig(x.to_radians().tan()),
                             _ => return None,
                         };
                         self.meaningful = true;
@@ -265,6 +265,15 @@ impl Parser<'_> {
             }
             _ => None,
         }
+    }
+}
+
+/// Trig results this close to 0 are rounding noise (`sin(180)` is 1.2e-16): show 0.
+fn trig(r: f64) -> f64 {
+    if r.abs() < 1e-12 {
+        0.0
+    } else {
+        r
     }
 }
 
@@ -351,6 +360,15 @@ mod tests {
         assert_eq!(v("3x4"), Some(12.0));
         assert_eq!(v("sqrt(16)"), Some(4.0));
         assert!((v("2pi").unwrap() - std::f64::consts::TAU).abs() < 1e-12);
+        assert!((v("sin(30)").unwrap() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn trig_noise_snaps_to_zero() {
+        let v = |s| evaluate(s).map(|c| c.value);
+        for s in ["sin(180)", "cos(90)", "tan(180)", "sin(360)"] {
+            assert_eq!(v(s), Some(0.0), "{s}");
+        }
         assert!((v("sin(30)").unwrap() - 0.5).abs() < 1e-12);
     }
 

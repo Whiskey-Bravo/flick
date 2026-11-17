@@ -1,5 +1,7 @@
 //! HTTPS GET for quick answers. The only place Flick talks to the network.
 
+use std::time::{Duration, Instant};
+
 /// Why a fetch did not produce a body.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FetchError {
@@ -11,19 +13,30 @@ pub enum FetchError {
     Other(String),
 }
 
+/// How long one fetch may take, all steps included. A job of several requests
+/// (weather: geocode, then forecast) shares one such budget.
+pub const TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Downloads a URL. Implementations block; callers run them on a background thread.
 pub trait Fetch: Send + Sync {
-    fn get(&self, url: &str) -> Result<Vec<u8>, FetchError>;
+    /// Downloads `url`, giving up (as offline) at `deadline`.
+    fn get_until(&self, url: &str, deadline: Instant) -> Result<Vec<u8>, FetchError>;
+
+    /// Downloads `url` within [`TIMEOUT`] from now.
+    fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+        self.get_until(url, Instant::now() + TIMEOUT)
+    }
 }
 
-/// HTTPS GET through Windows' own WinHTTP stack: system proxy settings, 5 s
-/// timeouts, User-Agent `Flick`, no cookies, no credentials, 200 only, body ≤ 2 MB.
+/// HTTPS GET through Windows' own WinHTTP stack: system proxy settings, every step
+/// capped by the deadline, User-Agent `Flick`, no cookies, no credentials, 200 only,
+/// body ≤ 2 MB.
 pub struct WinHttp;
 
 impl Fetch for WinHttp {
-    fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+    fn get_until(&self, url: &str, deadline: Instant) -> Result<Vec<u8>, FetchError> {
         let (host, port, path) = split_https(url)?;
-        winhttp::get(&host, port, &path)
+        winhttp::get(&host, port, &path, deadline)
     }
 }
 
@@ -51,16 +64,13 @@ fn split_https(url: &str) -> Result<(String, u16, String), FetchError> {
 
 mod winhttp {
     use std::ffi::c_void;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use windows::core::{w, Error, HSTRING, HRESULT, PCWSTR};
     use windows::Win32::Networking::WinHttp::*;
 
     use super::FetchError;
 
-    const TIMEOUT_MS: i32 = 5_000;
-    /// The whole fetch (resolve, connect, send, headers, body) must finish within this.
-    const TOTAL: Duration = Duration::from_millis(TIMEOUT_MS as u64);
     const MAX_BODY: usize = 2 * 1024 * 1024;
 
     /// A WinHTTP handle, closed on drop.
@@ -118,15 +128,16 @@ mod winhttp {
         unsafe { WinHttpSetOption(Some(handle.0), option, Some(&value.to_ne_bytes())) }.map_err(map)
     }
 
-    pub(super) fn get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError> {
-        let deadline = Instant::now() + TOTAL;
+    /// The whole fetch (resolve, connect, send, headers, body) must finish by `deadline`.
+    pub(super) fn get(host: &str, port: u16, path: &str, deadline: Instant) -> Result<Vec<u8>, FetchError> {
+        let ms = remaining_ms(deadline, Instant::now()).ok_or(FetchError::Offline)?;
         // Declared in this order so they drop request → connection → session.
         // SAFETY (all calls below): every handle passed is live and owned by a guard;
         // string arguments outlive the calls; out-pointers point at locals of the right size.
         let session = Handle::new(unsafe {
             WinHttpOpen(w!("Flick"), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, PCWSTR::null(), PCWSTR::null(), 0)
         })?;
-        unsafe { WinHttpSetTimeouts(session.0, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS, TIMEOUT_MS) }
+        unsafe { WinHttpSetTimeouts(session.0, ms, ms, ms, ms) }
             .map_err(map)?;
         let host = HSTRING::from(host);
         let connection = Handle::new(unsafe { WinHttpConnect(session.0, &host, port, 0) })?;
@@ -194,9 +205,10 @@ mod winhttp {
 #[cfg(test)]
 pub(crate) struct FakeFetch {
     urls: std::sync::Mutex<Vec<String>>,
+    deadlines: std::sync::Mutex<Vec<Instant>>,
     responses: std::collections::HashMap<String, Result<Vec<u8>, FetchError>>,
     default: Result<Vec<u8>, FetchError>,
-    delay: Option<std::time::Duration>,
+    delay: Option<Duration>,
 }
 
 #[cfg(test)]
@@ -205,6 +217,7 @@ impl FakeFetch {
     pub(crate) fn new(default: Result<Vec<u8>, FetchError>) -> Self {
         FakeFetch {
             urls: std::sync::Mutex::new(Vec::new()),
+            deadlines: std::sync::Mutex::new(Vec::new()),
             responses: std::collections::HashMap::new(),
             default,
             delay: None,
@@ -222,8 +235,9 @@ impl FakeFetch {
         self
     }
 
-    /// Sleeps this long before answering (after recording the URL).
-    pub(crate) fn with_delay(mut self, delay: std::time::Duration) -> Self {
+    /// Sleeps this long before answering (after recording the URL). The answer is
+    /// given even past the deadline, as from a server that replied just in time.
+    pub(crate) fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
         self
     }
@@ -232,12 +246,18 @@ impl FakeFetch {
     pub(crate) fn urls(&self) -> Vec<String> {
         self.urls.lock().unwrap().clone()
     }
+
+    /// The deadline of each request so far, in order.
+    pub(crate) fn deadlines(&self) -> Vec<Instant> {
+        self.deadlines.lock().unwrap().clone()
+    }
 }
 
 #[cfg(test)]
 impl Fetch for FakeFetch {
-    fn get(&self, url: &str) -> Result<Vec<u8>, FetchError> {
+    fn get_until(&self, url: &str, deadline: Instant) -> Result<Vec<u8>, FetchError> {
         self.urls.lock().unwrap().push(url.to_string());
+        self.deadlines.lock().unwrap().push(deadline);
         if let Some(d) = self.delay {
             std::thread::sleep(d);
         }
@@ -281,7 +301,6 @@ mod tests {
 
     #[test]
     fn deadline_counts_down_and_expires() {
-        use std::time::{Duration, Instant};
         let now = Instant::now();
         let deadline = now + Duration::from_millis(5_000);
         assert_eq!(winhttp::remaining_ms(deadline, now), Some(5_000));
@@ -296,6 +315,18 @@ mod tests {
         assert_eq!(f.get("https://a/"), Ok(b"hi".to_vec()));
         assert_eq!(f.get("https://b/"), Err(FetchError::Offline));
         assert_eq!(f.urls(), vec!["https://a/".to_string(), "https://b/".to_string()]);
+        let before = Instant::now();
+        let deadline = before + Duration::from_millis(300);
+        assert_eq!(f.get_until("https://a/", deadline), Ok(b"hi".to_vec()));
+        let d = f.deadlines();
+        assert_eq!(d[2], deadline);
+        assert!(d[0] > before && d[0] <= before + TIMEOUT, "plain get: TIMEOUT from the call");
+    }
+
+    #[test]
+    fn a_passed_deadline_is_offline_before_any_request() {
+        let past = Instant::now() - Duration::from_millis(1);
+        assert_eq!(WinHttp.get_until("https://no-such-host.invalid/", past), Err(FetchError::Offline));
     }
 
     /// Touches the network: run by hand with `cargo test --lib net -- --ignored`.
