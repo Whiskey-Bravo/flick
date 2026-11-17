@@ -418,7 +418,8 @@ fn row(e: &AppEntry, score: u32) -> ResultItem {
         title: e.name.clone(),
         subtitle: "App".into(),
         score,
-        icon: if shortcut { format!("file:{}", e.target) } else { "builtin:app".into() },
+        // Store apps too: `file:shell:AppsFolder\<AUMID>`, which the icon server resolves.
+        icon: format!("file:{}", e.target),
         pinnable: true,
         revealable: shortcut,
         elevatable: true,
@@ -545,7 +546,7 @@ mod tests {
         assert!(r.pinnable && r.revealable && r.elevatable);
         assert!(p.item("nope").is_none());
         let s = p.item(r"shell:AppsFolder\Microsoft.WindowsCalculator_x!App").unwrap();
-        assert_eq!(s.icon, "builtin:app");
+        assert_eq!(s.icon, r"file:shell:AppsFolder\Microsoft.WindowsCalculator_x!App");
         assert!(s.pinnable && !s.revealable && s.elevatable);
         assert_eq!(p.reveal(r"C:\b.lnk"), Ok(()));
         assert!(p.reveal(&s.id).is_err());
