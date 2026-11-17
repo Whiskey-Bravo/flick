@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { failureText, initial, menuActions, movedEnough, reduce, rowsFromWheel, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
+import { failureText, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
-  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "",
+  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "",
 });
 const run = (s: State, ...events: Event[]) => {
   let state = s;
@@ -895,5 +895,33 @@ describe("mouse and menu", () => {
     it("ready_ignored_before_any_query", () => {
       expect(run(initial, { type: "answersReady" }).effects).toEqual([]);
     });
+  });
+
+  it("panel_item_is_the_single_qr_row", () => {
+    const qr = { ...item("q"), panel: "<svg/>" };
+    expect(panelItem(withItems(qr))).toEqual(qr);
+    expect(panelItem(withItems(qr, item("b")))).toBeNull();
+    expect(panelItem(withItems(item("a")))).toBeNull();
+  });
+
+  it("enter_on_a_panel_row_activates_it", () => {
+    const qr = { ...item("q"), panel: "<svg/>" };
+    const r = run(withItems(qr), key("Enter"));
+    expect(r.effects).toEqual([{ type: "activate", item: qr, modifier: "none", text: "", scope: null }]);
+  });
+
+  it("copy_is_a_menu_action_that_acts", () => {
+    const c = { ...item("c"), actions: ["copy" as const] };
+    expect(menuActions(c)).toEqual(["copy"]);
+    const r = run(withItems(c), key("Tab"), { type: "menuPick", action: "copy" });
+    expect(r.effects).toEqual([{ type: "act", item: c, action: "copy" }]);
+    expect(r.state.pending).toBe(true);
+  });
+
+  it("ctrl_enter_copies_a_row_that_offers_copy", () => {
+    const c = { ...item("c"), actions: ["copy" as const] };
+    const r = run(withItems(c), key("Enter", true));
+    expect(r.effects).toEqual([{ type: "act", item: c, action: "copy" }]);
+    expect(r.state.pending).toBe(true);
   });
 });

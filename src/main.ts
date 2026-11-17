@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
-  type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  panelItem, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -42,7 +42,15 @@ const menuEl = document.createElement("div");
 menuEl.className = "menu";
 menuEl.setAttribute("role", "menu");
 menuEl.hidden = true;
-panel.append(row, errorLine, listWrap, menuEl);
+const qrHolder = document.createElement("div");
+qrHolder.className = "qr-svg";
+const qrCaption = document.createElement("div");
+qrCaption.className = "qr-caption";
+const qrPanel = document.createElement("div");
+qrPanel.className = "qr-panel";
+qrPanel.hidden = true;
+qrPanel.append(qrHolder, qrCaption);
+panel.append(row, errorLine, listWrap, qrPanel, menuEl);
 
 // Bundled SVGs by name (src/icons/<name>.svg), resolved to URLs by Vite.
 const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?url", import: "default" });
@@ -132,6 +140,7 @@ const MENU_LABELS: Record<MenuAction, string> = {
   uninstall: "Uninstall",
   close: "Close",
   close_window: "Close window",
+  copy: "Copy",
 };
 /// Where the right-click happened, in window coordinates.
 let menuAt: Point = { x: 0, y: 0 };
@@ -173,6 +182,24 @@ function renderMenu() {
   menuEl.style.top = `${Math.max(0, top)}px`;
 }
 
+// Only an <svg> built by Flick's backend is injected: anything else is dropped.
+let qrMarkup = "";
+function renderQr(item: Item) {
+  if (item.panel !== qrMarkup) {
+    qrMarkup = item.panel;
+    const doc = new DOMParser().parseFromString(item.panel, "image/svg+xml");
+    const svg = doc.documentElement;
+    const safe =
+      svg.nodeName === "svg" &&
+      !doc.querySelector("parsererror") &&
+      !svg.querySelector("script, foreignObject, image, a, style, use, iframe") &&
+      ![svg, ...svg.querySelectorAll("*")].some((el) => [...el.attributes].some((a) => /^on/i.test(a.name) || /^(javascript|data):/i.test(a.value.trim())));
+    if (safe) qrHolder.replaceChildren(document.importNode(svg, true));
+    else qrHolder.replaceChildren();
+  }
+  qrCaption.textContent = item.title;
+}
+
 function render() {
   if (input.value !== state.text) {
     input.value = state.text;
@@ -184,7 +211,10 @@ function render() {
   errorLine.hidden = !state.error;
   errorLine.textContent = state.error ?? "";
   const rows = visibleItems(state);
-  listWrap.hidden = rows.length === 0;
+  const qr = panelItem(state);
+  qrPanel.hidden = !qr;
+  if (qr) renderQr(qr);
+  listWrap.hidden = rows.length === 0 || !!qr;
   list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i)));
   const cap = capOf(state);
   const len = state.items.length;
@@ -325,6 +355,10 @@ document.addEventListener("click", (e) => {
   const entry = target?.closest<HTMLElement>(".menu-item");
   if (entry) {
     dispatch({ type: "menuPick", action: entry.dataset.action as MenuAction });
+    return;
+  }
+  if (target?.closest(".qr-panel") && panelItem(state)) {
+    dispatch({ type: "click", index: 0, ctrl: e.ctrlKey, shift: e.shiftKey });
     return;
   }
   const index = rowIndex(e);
