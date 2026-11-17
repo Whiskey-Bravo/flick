@@ -2260,6 +2260,23 @@ mod tests {
     }
 
     #[test]
+    fn a_wifi_name_is_claimed_and_never_a_past_search() {
+        let r = rig(vec![app("Notepad")], vec![]);
+        let res = r.engine.query("wifi home", None);
+        assert!(!res.is_empty() && res.iter().all(|i| i.provider == "devices"), "{:?}", providers_of(&res));
+        // Claimed text is never a past search (`Engine::searchable`).
+        let claimed = |text: &str| r.engine.providers().any(|p| p.claims(text));
+        assert!(claimed("wifi home"));
+        // The toggles keep their words, unclaimed.
+        for text in ["wifi on", "wifi off", "wifi"] {
+            assert!(!claimed(text), "{text}");
+        }
+        for text in ["wifi on", "wifi off"] {
+            assert!(r.engine.query(text, None).iter().any(|i| i.provider == "system"), "{text}");
+        }
+    }
+
+    #[test]
     fn typed_extras_are_never_recorded() {
         let r = rig(vec![], vec![]);
         let res = r.engine.query("timer 5m", None);
