@@ -7,15 +7,15 @@ use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, Once};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use windows::core::HRESULT;
+use windows::core::{HRESULT, HSTRING};
 use windows::ApplicationModel::DataTransfer::{
     Clipboard, ClipboardHistoryItem, ClipboardHistoryItemsResultStatus, SetHistoryItemAsContentStatus,
     StandardDataFormats,
 };
 use windows::Win32::Foundation::{E_NOINTERFACE, E_NOTIMPL, REGDB_E_CLASSNOTREG};
-use windows::Win32::System::Com::CoIncrementMTAUsage;
-
-use crate::launch;
+use windows::Win32::System::Com::{
+    CoIncrementMTAUsage, CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+};
 
 pub const MAX_ITEMS: usize = 50;
 
@@ -101,10 +101,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Held items outlive the `with_com` call that read them and may be released
-/// on any thread. If the last apartment in the process closed in between,
-/// COM would unload the WinRT server and that release would crash, so keep
-/// the MTA alive for the life of the process (once; never decremented).
+/// Held items outlive the call that read them and may be released on any
+/// thread. If the last apartment in the process closed in between, COM would
+/// unload the WinRT server and that release would crash, so keep the MTA
+/// alive for the life of the process (once; never decremented).
 fn keep_com_loaded() {
     static ONCE: Once = Once::new();
     // SAFETY: plain process-wide COM usage count; the cookie is deliberately
@@ -114,62 +114,148 @@ fn keep_com_loaded() {
     });
 }
 
+/// Run `f` in a fresh STA on a short-lived thread of its own. Every history
+/// call goes through here, so the result never depends on the caller's
+/// thread (a Loader thread, a Tauri command thread, an MTA or STA thread).
+/// It is an STA, not the MTA, because the `Clipboard` statics refuse the MTA
+/// (`RO_E_UNSUPPORTED_FROM_MTA`, 0x8000001D, seen by hand). The items it
+/// returns are agile (`Send + Sync`), so a later call on another such thread
+/// can use them after this one has exited; `keep_com_loaded` keeps the
+/// server loaded in between.
+fn in_sta<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            // SAFETY: plain COM init/uninit pair on this new thread.
+            let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            let out = f();
+            if com.is_ok() {
+                unsafe { CoUninitialize() };
+            }
+            out
+        })
+        .join()
+        .unwrap_or_else(|p| std::panic::resume_unwind(p))
+    })
+}
+
+/// Map raw items to clips, skipping any `to_clip` rejects (not text, or
+/// unreadable), then keep the newest `MAX_ITEMS` and hold only those, by id.
+fn gather<T>(
+    items: impl IntoIterator<Item = T>,
+    mut to_clip: impl FnMut(&T) -> Option<Clip>,
+) -> (Vec<Clip>, HashMap<String, T>) {
+    let mut clips = Vec::new();
+    let mut held = HashMap::new();
+    for item in items {
+        if let Some(clip) = to_clip(&item) {
+            held.insert(clip.id.clone(), item);
+            clips.push(clip);
+        }
+    }
+    let clips = newest_first(clips);
+    held.retain(|id, _| clips.iter().any(|c| &c.id == id));
+    (clips, held)
+}
+
+/// The items of the last read, by id, with a generation: every read `begin`s
+/// a new one and `forget` bumps it, so a late or abandoned read can neither
+/// bring back forgotten items nor overwrite a newer read's items.
+struct Held<T> {
+    state: Mutex<(u64, HashMap<String, T>)>,
+}
+
+impl<T: Clone> Held<T> {
+    fn new() -> Self {
+        Held { state: Mutex::new((0, HashMap::new())) }
+    }
+
+    fn begin(&self) -> u64 {
+        let mut state = lock(&self.state);
+        state.0 += 1;
+        state.0
+    }
+
+    /// Replace the held items if no read or forget came after `generation`.
+    /// Old (or refused) items are dropped after the lock is released.
+    fn store_if(&self, generation: u64, items: HashMap<String, T>) -> bool {
+        let (dropped, stored) = {
+            let mut state = lock(&self.state);
+            if state.0 == generation {
+                (std::mem::replace(&mut state.1, items), true)
+            } else {
+                (items, false)
+            }
+        };
+        drop(dropped);
+        stored
+    }
+
+    fn get(&self, id: &str) -> Option<T> {
+        lock(&self.state).1.get(id).cloned()
+    }
+
+    fn forget(&self) {
+        let dropped = {
+            let mut state = lock(&self.state);
+            state.0 += 1;
+            std::mem::take(&mut state.1)
+        };
+        drop(dropped);
+    }
+}
+
+/// One history item as a clip; `None` when it is not plain text or any part
+/// of it cannot be read.
+fn clip_of(item: &ClipboardHistoryItem, text: &HSTRING, files: &HSTRING) -> Option<Clip> {
+    let content = item.Content().ok()?;
+    if !is_text_item(content.Contains(text).ok()?, content.Contains(files).ok()?) {
+        return None;
+    }
+    let body = content.GetTextAsync().ok()?.get().ok()?;
+    Some(Clip {
+        id: item.Id().ok()?.to_string_lossy(),
+        text: body.to_string_lossy(),
+        copied: from_universal_time(item.Timestamp().ok()?.UniversalTime),
+        pinned: false,
+    })
+}
+
+type Read = Result<(History, HashMap<String, ClipboardHistoryItem>), HistoryError>;
+
+/// Must run in an STA (see `in_sta`).
+fn fetch() -> Read {
+    if !Clipboard::IsHistoryEnabled().map_err(winrt_error)? {
+        return Ok((History::Off, HashMap::new()));
+    }
+    let result = Clipboard::GetHistoryItemsAsync()
+        .map_err(winrt_error)?
+        .get()
+        .map_err(winrt_error)?;
+    let status = result.Status().map_err(winrt_error)?;
+    if status == ClipboardHistoryItemsResultStatus::ClipboardHistoryDisabled {
+        return Ok((History::Off, HashMap::new()));
+    }
+    if status != ClipboardHistoryItemsResultStatus::Success {
+        // AccessDenied, or a status this code does not know.
+        return Err(HistoryError::Failed);
+    }
+    let items = result.Items().map_err(winrt_error)?;
+    let text = StandardDataFormats::Text().map_err(winrt_error)?;
+    let files = StandardDataFormats::StorageItems().map_err(winrt_error)?;
+    let (clips, held) = gather(items, |item| clip_of(item, &text, &files));
+    Ok((History::Items(clips), held))
+}
+
 /// The real history over WinRT `Clipboard`. Holds the items of the last read
 /// by id, so `set_content` acts on exactly the item a row was built from.
 pub struct WinRtHistory {
-    held: Mutex<HashMap<String, ClipboardHistoryItem>>,
+    held: Held<ClipboardHistoryItem>,
 }
 
 impl WinRtHistory {
     pub fn new() -> Self {
         keep_com_loaded();
-        WinRtHistory { held: Mutex::new(HashMap::new()) }
-    }
-
-    fn read_items(&self) -> Result<History, HistoryError> {
-        if !Clipboard::IsHistoryEnabled().map_err(winrt_error)? {
-            self.forget();
-            return Ok(History::Off);
-        }
-        let result = Clipboard::GetHistoryItemsAsync()
-            .map_err(winrt_error)?
-            .get()
-            .map_err(winrt_error)?;
-        let status = result.Status().map_err(winrt_error)?;
-        if status == ClipboardHistoryItemsResultStatus::ClipboardHistoryDisabled {
-            self.forget();
-            return Ok(History::Off);
-        }
-        if status != ClipboardHistoryItemsResultStatus::Success {
-            // AccessDenied, or a status this code does not know.
-            return Err(HistoryError::Failed);
-        }
-        let text = StandardDataFormats::Text().map_err(winrt_error)?;
-        let files = StandardDataFormats::StorageItems().map_err(winrt_error)?;
-        let mut clips = Vec::new();
-        let mut held = HashMap::new();
-        for item in result.Items().map_err(winrt_error)? {
-            let content = item.Content().map_err(winrt_error)?;
-            let has_text = content.Contains(&text).map_err(winrt_error)?;
-            let has_files = content.Contains(&files).map_err(winrt_error)?;
-            if !is_text_item(has_text, has_files) {
-                continue;
-            }
-            let body = content.GetTextAsync().map_err(winrt_error)?.get().map_err(winrt_error)?;
-            let id = item.Id().map_err(winrt_error)?.to_string_lossy();
-            let copied = from_universal_time(item.Timestamp().map_err(winrt_error)?.UniversalTime);
-            clips.push(Clip {
-                id: id.clone(),
-                text: body.to_string_lossy(),
-                copied,
-                pinned: false,
-            });
-            held.insert(id, item);
-        }
-        let clips = newest_first(clips);
-        held.retain(|id, _| clips.iter().any(|c| &c.id == id));
-        *lock(&self.held) = held;
-        Ok(History::Items(clips))
+        WinRtHistory { held: Held::new() }
     }
 }
 
@@ -181,12 +267,22 @@ impl Default for WinRtHistory {
 
 impl ClipHistory for WinRtHistory {
     fn read(&self) -> Result<History, HistoryError> {
-        launch::with_com(|| self.read_items())
+        let generation = self.held.begin();
+        match in_sta(fetch) {
+            Ok((history, held)) => {
+                self.held.store_if(generation, held);
+                Ok(history)
+            }
+            Err(e) => {
+                self.held.store_if(generation, HashMap::new());
+                Err(e)
+            }
+        }
     }
 
     fn set_content(&self, id: &str) -> Result<(), SetError> {
-        let item = lock(&self.held).get(id).cloned().ok_or(SetError::Gone)?;
-        launch::with_com(|| match Clipboard::SetHistoryItemAsContent(&item) {
+        let item = self.held.get(id).ok_or(SetError::Gone)?;
+        in_sta(move || match Clipboard::SetHistoryItemAsContent(&item) {
             Ok(s) if s == SetHistoryItemAsContentStatus::Success => Ok(()),
             Ok(s) if s == SetHistoryItemAsContentStatus::ItemDeleted => Err(SetError::Gone),
             _ => Err(SetError::Failed),
@@ -194,7 +290,7 @@ impl ClipHistory for WinRtHistory {
     }
 
     fn forget(&self) {
-        lock(&self.held).clear();
+        self.held.forget();
     }
 }
 
@@ -388,6 +484,96 @@ mod tests {
         fake.forget();
         fake.forget();
         assert_eq!(fake.forgets(), 2);
+    }
+
+    #[test]
+    fn one_unreadable_item_is_skipped() {
+        // (clip, readable): "b" stands for an item whose text cannot be read.
+        let items = vec![(clip("a", 1), true), (clip("b", 3), false), (clip("c", 2), true)];
+        let (clips, held) = gather(items, |(c, readable)| readable.then(|| c.clone()));
+        let ids: Vec<&str> = clips.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["c", "a"]);
+        let mut held_ids: Vec<&String> = held.keys().collect();
+        held_ids.sort();
+        assert_eq!(held_ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn gather_holds_only_the_kept_items() {
+        let items: Vec<Clip> = (0..60u64).map(|i| clip(&i.to_string(), i)).collect();
+        let (clips, held) = gather(items, |c| Some(c.clone()));
+        assert_eq!(clips.len(), MAX_ITEMS);
+        assert_eq!(held.len(), MAX_ITEMS);
+        assert!(clips.iter().all(|c| held.contains_key(&c.id)));
+        assert!(!held.contains_key("0"), "the oldest are dropped");
+    }
+
+    fn map(ids: &[&str]) -> HashMap<String, String> {
+        ids.iter().map(|id| (id.to_string(), format!("item {id}"))).collect()
+    }
+
+    #[test]
+    fn a_late_read_never_restores_forgotten_items() {
+        let held = Held::new();
+        let generation = held.begin();
+        held.forget();
+        assert!(!held.store_if(generation, map(&["1"])));
+        assert_eq!(held.get("1"), None);
+    }
+
+    #[test]
+    fn an_older_read_never_overwrites_a_newer_one() {
+        let held = Held::new();
+        let older = held.begin();
+        let newer = held.begin();
+        assert!(held.store_if(newer, map(&["new"])));
+        assert!(!held.store_if(older, map(&["old"])));
+        assert_eq!(held.get("new"), Some("item new".to_string()));
+        assert_eq!(held.get("old"), None);
+    }
+
+    #[test]
+    fn a_failed_read_clears_the_held_items() {
+        let held = Held::new();
+        let first = held.begin();
+        held.store_if(first, map(&["1"]));
+        let second = held.begin();
+        assert_eq!(held.get("1"), Some("item 1".to_string()), "kept while a read runs");
+        assert!(held.store_if(second, HashMap::new()));
+        assert_eq!(held.get("1"), None);
+    }
+
+    /// Hand test: reads on one thread, lets it exit, then sets the newest
+    /// item (already the clipboard's content, so nothing visibly changes) from
+    /// another thread. Prints only result variants, never text. Skips when
+    /// the newest history item is not text. Run with
+    /// `cargo test --lib real_set_content_across_threads -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn real_set_content_across_threads() {
+        let history = Arc::new(WinRtHistory::new());
+        let reader = history.clone();
+        let read = std::thread::spawn(move || reader.read()).join().unwrap();
+        let clips = match read {
+            Ok(History::Items(clips)) if !clips.is_empty() => clips,
+            Ok(History::Items(_)) => return println!("Items(0): nothing to set"),
+            Ok(History::Off) => return println!("Off"),
+            Err(e) => return println!("{e:?}"),
+        };
+        let newest_any = in_sta(|| {
+            let result = Clipboard::GetHistoryItemsAsync().ok()?.get().ok()?;
+            let items = result.Items().ok()?;
+            items.into_iter().filter_map(|i| i.Timestamp().ok()).map(|t| t.UniversalTime).max()
+        });
+        if newest_any.map(from_universal_time) != Some(clips[0].copied) {
+            return println!("skipped: the newest history item is not text");
+        }
+        let id = clips[0].id.clone();
+        let setter = history.clone();
+        let got = std::thread::spawn(move || setter.set_content(&id)).join().unwrap();
+        println!("{got:?}");
+        assert_eq!(got, Ok(()));
+        history.forget();
     }
 
     /// Hand test: reads the real history and prints only its shape (never
