@@ -1,6 +1,5 @@
 mod answers;
 mod clipboard;
-#[allow(dead_code)] // wired up by the `v` provider
 mod cliphistory;
 mod commands;
 mod config;

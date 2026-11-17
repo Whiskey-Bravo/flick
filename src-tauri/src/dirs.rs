@@ -154,7 +154,6 @@ impl<T> Clone for Load<T> {
 /// A value is served without a new read for this long.
 pub const FRESH: Duration = Duration::from_secs(5);
 /// A `fresh` that never reads again: the value stays until [`Loader::clear`].
-#[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
 pub const NEVER_STALE: Duration = Duration::MAX;
 /// A first read taking longer than this shows as [`Load::Slow`].
 pub const SLOW: Duration = Duration::from_secs(3);
@@ -230,7 +229,6 @@ impl<T: Send + Sync + 'static> Loader<T> {
 
     /// Forgets every key. A read in flight finishes into nothing (its slot is
     /// gone) and still calls `on_ready`.
-    #[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
     pub fn clear(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.clear();
     }
@@ -295,7 +293,6 @@ fn evict_oldest<T>(slots: &mut HashMap<String, Slot<T>>) {
 /// `text` on one line: trimmed, line breaks (`\r\n`, `\n`, `\r`) as `⏎`,
 /// tabs as spaces, other control characters dropped, and cut to `max`
 /// characters plus `…` when longer.
-#[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
 pub fn one_line(text: &str, max: usize) -> String {
     let mut flat = String::with_capacity(text.len());
     let mut chars = text.trim().chars().peekable();

@@ -109,7 +109,6 @@ pub enum Outcome {
     /// Done, hide the bar.
     Hide,
     /// Done, hide the bar, then run `then` (the commands turn it into `Hide`).
-    #[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
     #[serde(rename = "hide")]
     HideThen {
         #[serde(skip_serializing)]
