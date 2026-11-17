@@ -8,7 +8,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-const DEFAULT_FILE: &str = "\
+pub(crate) const DEFAULT_FILE: &str = "\
 ## Flick configuration. Changes are picked up as soon as you save.
 ##
 ## hotkey: global shortcut that shows the launcher, e.g. \"Alt+Space\".
@@ -37,6 +37,9 @@ const DEFAULT_FILE: &str = "\
 ##
 ## search_engine: the web search behind `? text` and Enter on a weather answer; {arg} is the search text.
 # search_engine = \"https://duckduckgo.com/?q={arg}\"
+##
+## check_updates: ask GitHub about once a day whether a new version exists (false: never).
+# check_updates = true
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
@@ -71,7 +74,7 @@ const DEFAULT_FILE: &str = "\
 # terminal = true
 ";
 
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hotkey: String,
@@ -91,6 +94,8 @@ pub struct Config {
     pub temperature_unit: String,
     /// Web search URL with `{arg}`; empty means DuckDuckGo.
     pub search_engine: String,
+    /// Look for a new version in the background (also needs `online`).
+    pub check_updates: bool,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -108,13 +113,14 @@ impl Default for Config {
             currency: String::new(),
             temperature_unit: String::new(),
             search_engine: String::new(),
+            check_updates: true,
             shortcuts: Vec::new(),
         }
     }
 }
 
 /// One `[[shortcut]]` table.
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShortcutDef {
     pub name: String,
@@ -123,17 +129,22 @@ pub struct ShortcutDef {
     #[serde(default)]
     pub about: String,
     /// Windows command line.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     /// Command run in the WSL distro.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wsl: Option<String>,
     /// Path or URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub open: Option<String>,
     /// Keep a terminal open; default is true for `wsl`, false for `run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<bool>,
     /// Run elevated (`run`/`open` only).
     #[serde(default)]
     pub admin: bool,
     /// Folder whose sub-folders are the choices.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pick: Option<PathBuf>,
     #[serde(default)]
     pub choices: Vec<String>,
@@ -350,6 +361,12 @@ mod tests {
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn check_updates_defaults_on_and_parses_false() {
+        assert!(Config::default().check_updates);
+        assert!(parse("").unwrap().check_updates);
+        assert!(!parse("check_updates = false").unwrap().check_updates);
+    }
     #[test]
     fn config_history_defaults_on_and_parses_false() {
         assert!(Config::default().history);
