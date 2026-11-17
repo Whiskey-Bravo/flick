@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn hide_then_hides_and_runs_the_follow_up() {
         for m in [Modifier::None, Modifier::Ctrl, Modifier::CtrlShift] {
-            for then in [Then::Paste { before: 0 }, Then::ClipboardHistory, Then::Snip, Then::PickColor] {
+            for then in [Then::Paste { before: 0 }, Then::ClipboardHistory, Then::Snip, Then::PickColor, Then::StartMenu] {
                 assert_eq!(settle(Ok(Outcome::HideThen { then }), m), (Ok(Outcome::Hide), After::Then(then)));
             }
         }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::controls::{Audio, Controls, MediaKey, RadioKind};
 use crate::fuzzy;
 use crate::launch::Launcher;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
 use crate::providers::power::POWER_PENALTY;
 
 /// Score of rows built from typed numbers (`vol 30`).
@@ -41,6 +41,7 @@ const CMDS: &[Cmd] = &[
     Cmd { id: "radio:bt:on", title: "Turn Bluetooth on", keywords: &["bluetooth on"] },
     Cmd { id: "radio:bt:off", title: "Turn Bluetooth off", keywords: &["bluetooth off"] },
     Cmd { id: "nightlight", title: "Night light settings", keywords: &["night light"] },
+    Cmd { id: "startmenu", title: "Start menu", keywords: &["start", "start menu"] },
 ];
 
 pub struct SystemProvider {
@@ -103,6 +104,7 @@ impl SystemProvider {
                 },
                 "Sound".to_string(),
             ),
+            "startmenu" => (c.title.to_string(), "Ctrl+Esc also opens it".to_string()),
             _ => (c.title.to_string(), "System".to_string()),
         };
         self.row(c.id, title, subtitle, score, true)
@@ -242,6 +244,7 @@ impl Provider for SystemProvider {
                 return self.radio(RadioKind::Bluetooth, false, "Bluetooth", "ms-settings:bluetooth")
             }
             "nightlight" => self.launcher.open("ms-settings:nightlight")?,
+            "startmenu" => return Ok(Outcome::HideThen { then: Then::StartMenu }),
             _ => {
                 let n = id
                     .strip_prefix("vol:")
@@ -462,6 +465,25 @@ mod tests {
         assert_eq!(only(&p, "night light").id, "nightlight");
         assert_eq!(p.activate("nightlight", Modifier::None), Ok(Outcome::Hide));
         assert_eq!(l.calls(), vec!["open ms-settings:nightlight"]);
+    }
+
+    #[test]
+    fn start_menu_row_shows_for_start_words() {
+        let (p, _, _) = setup(Err("x".into()));
+        for text in ["start", "start menu", "start m"] {
+            let r = only(&p, text);
+            assert_eq!(r.id, "startmenu", "{text}");
+            assert_eq!(r.title, "Start menu");
+            assert_eq!(r.subtitle, "Ctrl+Esc also opens it");
+        }
+    }
+
+    #[test]
+    fn start_menu_hides_then_opens_start() {
+        let (p, c, l) = setup(Err("x".into()));
+        assert_eq!(p.activate("startmenu", Modifier::None), Ok(Outcome::HideThen { then: Then::StartMenu }));
+        assert!(c.calls().is_empty());
+        assert!(l.calls().is_empty());
     }
 
     #[test]

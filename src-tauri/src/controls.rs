@@ -53,6 +53,43 @@ pub(crate) fn key_input(
     }
 }
 
+/// Tag on the input Flick sends itself ("FLWK").
+pub(crate) const FLICK_INPUT_TAG: usize = 0x464C_574B;
+
+/// Opens the real Start menu: asks the taskbar to, and when it can't be
+/// reached sends Ctrl+Esc. Never called by tests.
+pub fn open_start_menu() -> Result<(), String> {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, VK_CONTROL, VK_ESCAPE};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_SYSCOMMAND};
+
+    const SC_TASKLIST: usize = 0xF490;
+    // SAFETY: the class name is a NUL-terminated literal.
+    if let Ok(tray) = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) } {
+        // SAFETY: a plain message post to a window handle just found.
+        if unsafe { PostMessageW(Some(tray), WM_SYSCOMMAND, WPARAM(SC_TASKLIST), LPARAM(0)) }.is_ok() {
+            return Ok(());
+        }
+    }
+    let mut inputs = [
+        key_input(VK_CONTROL, false),
+        key_input(VK_ESCAPE, false),
+        key_input(VK_ESCAPE, true),
+        key_input(VK_CONTROL, true),
+    ];
+    for i in &mut inputs {
+        i.Anonymous.ki.dwExtraInfo = FLICK_INPUT_TAG;
+    }
+    // SAFETY: a valid slice of fully initialised INPUTs.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == inputs.len() as u32 {
+        Ok(())
+    } else {
+        Err("couldn't open the Start menu".to_string())
+    }
+}
+
 mod real {
     use windows::core::{w, PCWSTR};
     use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioState};

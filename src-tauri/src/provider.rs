@@ -102,6 +102,8 @@ pub enum Then {
     ClipboardHistory,
     Snip,
     PickColor,
+    /// Opens the real Start menu.
+    StartMenu,
 }
 
 #[derive(Debug, PartialEq, serde::Serialize)]
@@ -267,5 +269,6 @@ mod tests {
     #[test]
     fn hide_then_serialises_as_hide() {
         assert_eq!(serde_json::to_value(Outcome::HideThen { then: Then::Paste { before: 0 } }).unwrap(), json!({"kind": "hide"}));
+        assert_eq!(serde_json::to_value(Outcome::HideThen { then: Then::StartMenu }).unwrap(), json!({"kind": "hide"}));
     }
 }
