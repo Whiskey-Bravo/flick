@@ -193,14 +193,21 @@ impl<T: Clone> Held<T> {
     fn get(&self, id: &str) -> Option<T> {
         lock(&self.state).1.get(id).cloned()
     }
+}
 
+impl<T: Send + 'static> Held<T> {
+    /// Forgets the items. They are released on a thread of their own: the
+    /// caller is the hiding bar's (UI) thread, and releasing a WinRT item
+    /// is a cross-apartment call that may block.
     fn forget(&self) {
         let dropped = {
             let mut state = lock(&self.state);
             state.0 += 1;
             std::mem::take(&mut state.1)
         };
-        drop(dropped);
+        if !dropped.is_empty() {
+            std::thread::spawn(move || drop(dropped));
+        }
     }
 }
 
@@ -530,6 +537,26 @@ mod tests {
         assert!(!held.store_if(older, map(&["old"])));
         assert_eq!(held.get("new"), Some("item new".to_string()));
         assert_eq!(held.get("old"), None);
+    }
+
+    #[test]
+    fn forgotten_items_are_released_off_the_calling_thread() {
+        /// Reports the thread it is dropped on.
+        #[derive(Clone)]
+        struct Item(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let held = Held::new();
+        let generation = held.begin();
+        held.store_if(generation, HashMap::from([("1".to_string(), Item(tx))]));
+        held.forget();
+        assert!(held.get("1").is_none());
+        let dropped_on = rx.recv_timeout(Duration::from_secs(1)).expect("the item is released");
+        assert_ne!(dropped_on, std::thread::current().id());
     }
 
     #[test]

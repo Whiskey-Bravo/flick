@@ -9,6 +9,7 @@ use crate::cliphistory::{ClipHistory, History, HistoryError, SetError};
 use crate::dirs::{ago, one_line, Clock, Load, Loader, NEVER_STALE, SLOW};
 use crate::fuzzy::{normalize, score_prenormalized};
 use crate::launch::Launcher;
+use crate::paste::Sequence;
 use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route, Then};
 
 pub const CLIPBOARD_SETTINGS: &str = "ms-settings:clipboard";
@@ -25,6 +26,8 @@ const OPEN_ID: &str = "open-history";
 const GONE: &str = "That item is gone from clipboard history";
 const COPY_FAILED: &str = "could not copy to the clipboard";
 const ICON: &str = "builtin:clipboard";
+/// Title of an item that is only white space.
+const BLANK: &str = "(blank)";
 
 /// One history item as read, with what every query needs worked out once.
 struct Entry {
@@ -51,8 +54,9 @@ fn prepare(read: Result<History, HistoryError>) -> Read {
                 .into_iter()
                 .map(|c| {
                     let head: String = c.text.chars().take(MATCH_CHARS).collect();
+                    let title = one_line(&c.text, MAX_TITLE);
                     Entry {
-                        title: one_line(&c.text, MAX_TITLE),
+                        title: if title.is_empty() { BLANK.to_string() } else { title },
                         matched: normalize(&head),
                         id: c.id,
                         copied: c.copied,
@@ -70,6 +74,9 @@ pub struct ClipsProvider {
     history: Arc<dyn ClipHistory>,
     launcher: Arc<dyn Launcher>,
     now: Clock,
+    /// The clipboard sequence number, read before an item is set so the
+    /// paste can tell that the clipboard took it.
+    sequence: Sequence,
 }
 
 impl ClipsProvider {
@@ -78,8 +85,9 @@ impl ClipsProvider {
         launcher: Arc<dyn Launcher>,
         now: Clock,
         on_ready: Arc<dyn Fn() + Send + Sync>,
+        sequence: Sequence,
     ) -> Self {
-        Self::build(history, launcher, now, on_ready, SLOW)
+        Self::build(history, launcher, now, on_ready, sequence, SLOW)
     }
 
     #[cfg(test)]
@@ -90,7 +98,7 @@ impl ClipsProvider {
         on_ready: Arc<dyn Fn() + Send + Sync>,
         slow: Duration,
     ) -> Self {
-        Self::build(history, launcher, now, on_ready, slow)
+        Self::build(history, launcher, now, on_ready, Arc::new(|| 0), slow)
     }
 
     fn build(
@@ -98,9 +106,10 @@ impl ClipsProvider {
         launcher: Arc<dyn Launcher>,
         now: Clock,
         on_ready: Arc<dyn Fn() + Send + Sync>,
+        sequence: Sequence,
         slow: Duration,
     ) -> Self {
-        Self { loader: Loader::new(on_ready, NEVER_STALE, slow), history, launcher, now }
+        Self { loader: Loader::new(on_ready, NEVER_STALE, slow), history, launcher, now, sequence }
     }
 
     /// Drops the items read and the history's held items (the bar hid).
@@ -181,10 +190,14 @@ impl Provider for ClipsProvider {
 
     fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
         if let Some(clip) = id.strip_prefix("clip:") {
+            // Read before the set: the paste waits for the clipboard to move on.
+            let before = (self.sequence)();
             self.copy(clip)?;
             return Ok(match modifier {
-                Modifier::Ctrl => Outcome::Hide,
-                Modifier::None | Modifier::CtrlShift => Outcome::HideThen { then: Then::Paste },
+                Modifier::None => Outcome::HideThen { then: Then::Paste { before } },
+                // Pasting while Ctrl (and Shift) are held would send the
+                // target more than Ctrl+V: only copy.
+                Modifier::Ctrl | Modifier::CtrlShift => Outcome::Hide,
             });
         }
         match id {
@@ -284,7 +297,10 @@ mod tests {
         fake.set(result);
         let launcher = Arc::new(RecordingLauncher::default());
         let (on_ready, rx) = signal();
-        let p = ClipsProvider::new(fake.clone(), launcher.clone(), clock(), on_ready);
+        // The fake clipboard's sequence number: 100 plus the items set so far.
+        let sets = fake.clone();
+        let sequence: Sequence = Arc::new(move || 100 + sets.set_calls().len() as u32);
+        let p = ClipsProvider::new(fake.clone(), launcher.clone(), clock(), on_ready, sequence);
         V { p, rx, fake, launcher }
     }
 
@@ -444,20 +460,38 @@ mod tests {
         let t = v(items(vec![clip("b", "bee", 10, false), clip("a", "ay", 20, false)]));
         let rows = ready(&t, "");
         t.fake.set(items(vec![clip("c", "sea", 1, false), clip("b", "bee", 10, false), clip("a", "ay", 20, false)]));
-        assert_eq!(t.p.activate(&rows[0].id, Modifier::None), Ok(Outcome::HideThen { then: Then::Paste }));
+        assert_eq!(t.p.activate(&rows[0].id, Modifier::None), Ok(Outcome::HideThen { then: Then::Paste { before: 100 } }));
         assert_eq!(t.fake.set_calls(), ["b"]);
-        assert_eq!(t.p.activate(&rows[1].id, Modifier::CtrlShift), Ok(Outcome::HideThen { then: Then::Paste }));
+        assert_eq!(t.p.activate(&rows[1].id, Modifier::None), Ok(Outcome::HideThen { then: Then::Paste { before: 101 } }));
         assert_eq!(t.fake.set_calls(), ["b", "a"]);
     }
 
     #[test]
-    fn ctrl_enter_and_copy_only_copy() {
+    fn the_paste_carries_the_number_read_before_the_set() {
+        let t = v(items(vec![clip("b", "bee", 10, false)]));
+        let rows = ready(&t, "");
+        t.fake.set_content("x").unwrap();
+        t.fake.set_content("y").unwrap();
+        // 102 is the number before this set; after it the fake reads 103.
+        assert_eq!(t.p.activate(&rows[0].id, Modifier::None), Ok(Outcome::HideThen { then: Then::Paste { before: 102 } }));
+    }
+
+    #[test]
+    fn ctrl_enter_ctrl_shift_enter_and_copy_only_copy() {
         let t = v(items(vec![clip("b", "bee", 10, false)]));
         let rows = ready(&t, "");
         assert_eq!(t.p.activate(&rows[0].id, Modifier::Ctrl), Ok(Outcome::Hide));
         assert_eq!(t.fake.set_calls(), ["b"]);
-        assert_eq!(t.p.act(&rows[0].id, Action::Copy), Ok(Outcome::Hide));
+        assert_eq!(t.p.activate(&rows[0].id, Modifier::CtrlShift), Ok(Outcome::Hide));
         assert_eq!(t.fake.set_calls(), ["b", "b"]);
+        assert_eq!(t.p.act(&rows[0].id, Action::Copy), Ok(Outcome::Hide));
+        assert_eq!(t.fake.set_calls(), ["b", "b", "b"]);
+    }
+
+    #[test]
+    fn a_blank_item_says_blank() {
+        let t = v(items(vec![clip("s", " \r\n\t ", 10, false), clip("t", "text", 20, false)]));
+        assert_eq!(titles(&ready(&t, "")), ["(blank)", "text"]);
     }
 
     #[test]
@@ -484,7 +518,7 @@ mod tests {
             fn forget(&self) {}
         }
         let (on_ready, _rx) = signal();
-        let p = ClipsProvider::new(Arc::new(Failing), Arc::new(RecordingLauncher::default()), clock(), on_ready);
+        let p = ClipsProvider::new(Arc::new(Failing), Arc::new(RecordingLauncher::default()), clock(), on_ready, Arc::new(|| 0));
         assert_eq!(p.activate("clip:b", Modifier::None), Err("could not copy to the clipboard".to_string()));
     }
 

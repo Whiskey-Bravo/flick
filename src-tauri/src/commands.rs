@@ -19,7 +19,9 @@ pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Vec
 /// colour picker). Looked up as managed state `Arc<dyn AfterHide>`; without
 /// it a follow-up is skipped.
 pub trait AfterHide: Send + Sync {
-    fn run(&self, then: Then);
+    /// `started` is the show count when the bar hid: a follow-up that is
+    /// still waiting when the bar is shown again gives up.
+    fn run(&self, then: Then, started: u64);
 }
 
 /// What to do with the bar once an activation has finished.
@@ -91,10 +93,11 @@ fn finish(app: &AppHandle, after: After) {
     match after {
         After::Hide => window::hide(app),
         After::Then(then) => {
+            let started = window::shows();
             window::hide(app);
             if let Some(follow) = app.try_state::<Arc<dyn AfterHide>>() {
                 let follow = Arc::clone(&follow);
-                std::thread::spawn(move || follow.run(then));
+                std::thread::spawn(move || follow.run(then, started));
             }
         }
         After::Reveal => window::reveal(app),
@@ -180,7 +183,7 @@ mod tests {
     #[test]
     fn hide_then_hides_and_runs_the_follow_up() {
         for m in [Modifier::None, Modifier::Ctrl, Modifier::CtrlShift] {
-            for then in [Then::Paste, Then::ClipboardHistory, Then::Snip, Then::PickColor] {
+            for then in [Then::Paste { before: 0 }, Then::ClipboardHistory, Then::Snip, Then::PickColor] {
                 assert_eq!(settle(Ok(Outcome::HideThen { then }), m), (Ok(Outcome::Hide), After::Then(then)));
             }
         }
@@ -188,8 +191,8 @@ mod tests {
 
     #[test]
     fn a_follow_up_is_dropped_when_the_bar_was_shown_again() {
-        assert_eq!(after_for(After::Then(Then::Paste), 3, 4), After::Leave);
-        assert_eq!(after_for(After::Then(Then::Paste), 3, 3), After::Then(Then::Paste));
+        assert_eq!(after_for(After::Then(Then::Paste { before: 0 }), 3, 4), After::Leave);
+        assert_eq!(after_for(After::Then(Then::Paste { before: 0 }), 3, 3), After::Then(Then::Paste { before: 0 }));
     }
 
     #[test]

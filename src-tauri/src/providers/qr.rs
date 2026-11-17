@@ -15,6 +15,7 @@ pub const MAX_PREVIEW: usize = 80;
 const READING: &str = "Reading clipboard\u{2026}";
 const TOO_LONG: &str = "Too long for a QR code";
 const NOTHING: &str = "Nothing to show \u{2014} copy some text first";
+const CANT_READ: &str = "Can't read the clipboard";
 
 /// Blank modules around the code.
 const QUIET: i32 = 4;
@@ -49,7 +50,16 @@ pub struct QrProvider {
 
 impl QrProvider {
     pub fn new(source: Arc<dyn ClipboardText>, clipboard: Arc<dyn Clipboard>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { loader: Loader::new(on_ready, NEVER_STALE, SLOW), source, clipboard }
+        Self::with_slow(source, clipboard, on_ready, SLOW)
+    }
+
+    fn with_slow(
+        source: Arc<dyn ClipboardText>,
+        clipboard: Arc<dyn Clipboard>,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+        slow: std::time::Duration,
+    ) -> Self {
+        Self { loader: Loader::new(on_ready, NEVER_STALE, slow), source, clipboard }
     }
 
     /// Drops the clipboard text read, so the next `qr` reads again (the bar hid).
@@ -101,7 +111,13 @@ impl Provider for QrProvider {
                 Some(t) if !t.trim().is_empty() => vec![code_row(t)],
                 _ => vec![inert(NOTHING)],
             },
-            Load::NotFound | Load::Denied | Load::Slow => vec![inert(NOTHING)],
+            // A busy clipboard: not kept, so the next query reads again.
+            Load::NotFound | Load::Denied => {
+                self.loader.clear();
+                vec![inert(CANT_READ)]
+            }
+            // Still reading: its answer replaces this once it comes.
+            Load::Slow => vec![inert(CANT_READ)],
         }
     }
 
@@ -241,6 +257,77 @@ mod tests {
             assert!(rows[0].panel.is_empty());
             assert_eq!(t.p.activate(&rows[0].id, Modifier::None), Ok(Outcome::Keep));
         }
+    }
+
+    /// Fails while `busy`; blocks while `gate` holds a receiver and nothing
+    /// was sent on it.
+    struct Flaky {
+        busy: std::sync::atomic::AtomicBool,
+        gate: Mutex<Option<Receiver<()>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ClipboardText for Flaky {
+        fn text(&self) -> Result<Option<String>, String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.calls.fetch_add(1, SeqCst);
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                let _ = gate.recv();
+            }
+            if self.busy.load(SeqCst) {
+                Err("busy".into())
+            } else {
+                Ok(Some("hello".into()))
+            }
+        }
+    }
+
+    fn flaky(busy: bool, gate: Option<Receiver<()>>, slow: Duration) -> (Arc<Flaky>, QrProvider, Receiver<()>) {
+        let source = Arc::new(Flaky {
+            busy: busy.into(),
+            gate: Mutex::new(gate),
+            calls: Default::default(),
+        });
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let p = QrProvider::with_slow(
+            source.clone(),
+            Arc::new(FakeClipboard::default()),
+            Arc::new(move || {
+                let _ = tx.lock().unwrap().send(());
+            }),
+            slow,
+        );
+        (source, p, rx)
+    }
+
+    #[test]
+    fn a_busy_clipboard_says_so_and_is_read_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (source, p, rx) = flaky(true, None, Duration::from_secs(3));
+        assert_eq!(p.query(&q(""))[0].title, READING);
+        rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+        let rows = p.query(&q(""));
+        assert_eq!(rows[0].title, "Can't read the clipboard");
+        assert_eq!(p.activate(&rows[0].id, Modifier::None), Ok(Outcome::Keep));
+        source.busy.store(false, SeqCst);
+        assert_eq!(p.query(&q(""))[0].title, READING, "the failure was not kept");
+        rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+        assert_eq!(p.query(&q(""))[0].title, "hello");
+        assert_eq!(source.calls.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn a_slow_clipboard_says_so_until_it_answers() {
+        let (open, gate) = mpsc::channel();
+        let (source, p, rx) = flaky(false, Some(gate), Duration::from_millis(30));
+        assert_eq!(p.query(&q(""))[0].title, READING);
+        rx.recv_timeout(Duration::from_secs(1)).expect("on_ready at slow");
+        assert_eq!(p.query(&q(""))[0].title, "Can't read the clipboard");
+        open.send(()).unwrap();
+        rx.recv_timeout(Duration::from_secs(1)).expect("on_ready when read");
+        assert_eq!(p.query(&q(""))[0].title, "hello");
+        assert_eq!(source.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

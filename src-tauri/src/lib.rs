@@ -285,6 +285,7 @@ impl Capture {
             launcher,
             Arc::new(std::time::SystemTime::now),
             on_ready,
+            Arc::new(paste::clipboard_sequence),
         )
     }
 
@@ -296,9 +297,10 @@ impl Capture {
         launcher: Arc<dyn Launcher>,
         now: dirs::Clock,
         on_ready: Arc<dyn Fn() + Send + Sync>,
+        sequence: paste::Sequence,
     ) -> Self {
         Capture {
-            clips: Arc::new(ClipsProvider::new(history, launcher, now, on_ready.clone())),
+            clips: Arc::new(ClipsProvider::new(history, launcher, now, on_ready.clone(), sequence)),
             qr: Arc::new(QrProvider::new(text, clipboard, on_ready)),
         }
     }
@@ -612,6 +614,7 @@ fn setup(app: &AppHandle) {
         previous: paste::previous,
         pick_color: Box::new(|| picker::start(Arc::new(picker::GdiScreen), Arc::new(WindowsClipboard))),
         settle: after_hide::settle,
+        shows: window::shows,
     }));
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);
@@ -1035,6 +1038,7 @@ mod tests {
             Arc::new(move || {
                 let _ = capture_tx.lock().unwrap().send(());
             }),
+            Arc::new(|| 7),
         );
         let providers = Providers {
             refresher: refresh_windows_and_audio(windows.clone(), system.clone(), Arc::new(|| {})),
@@ -1697,7 +1701,7 @@ mod tests {
         let row = query_capture(&r, "v").into_iter().find(|i| i.title == "meeting notes").unwrap();
         assert_eq!(
             r.engine.activate("clips", &row.id, provider::Modifier::None, "v", None),
-            Ok(Outcome::HideThen { then: provider::Then::Paste })
+            Ok(Outcome::HideThen { then: provider::Then::Paste { before: 7 } })
         );
         assert_eq!(r.clip_history.set_calls(), ["c"]);
         assert_eq!(r.ranking.boost("clips", &row.id), 0);

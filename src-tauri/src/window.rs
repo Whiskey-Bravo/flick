@@ -56,9 +56,18 @@ fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
 /// Centre horizontally, top edge at 25% of the monitor under the mouse cursor;
 /// show; focus; emit `bar:shown`, then `config:error` with the stored error (or null).
 pub fn show(app: &AppHandle) {
-    // Before the bar takes focus: `v`'s Enter pastes into this window.
-    crate::paste::remember_foreground();
+    // Every open starts fresh: a `v` or `qr` read that raced the last hide
+    // is dropped too.
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.providers.on_hide();
+    }
     let Some(w) = bar(app) else { return };
+    // Before the bar takes focus: `v`'s Enter pastes into this window. When
+    // the bar is already up (tray Open, a second launch) the foreground is
+    // the bar itself, so the window remembered when it opened stays.
+    if !w.is_visible().unwrap_or(false) {
+        crate::paste::remember_foreground();
+    }
     SHOWS.fetch_add(1, Ordering::SeqCst);
     set_weather_hidden(app, false);
     if let Some(pos) = placement(app, &w) {

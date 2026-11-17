@@ -420,7 +420,7 @@ Flick goes online when you ask a currency or weather question, when you type `ip
 - `ip` (also `my ip` and `ip address`) asks api.ipify.org for your public address, only while `online` is on, and only after the text has stayed exactly `ip` for a moment (so typing `ipconfig` sends nothing). api.ipify.org sees the request; nothing about you is sent. Without it you see just your local addresses.
 - Nothing else goes online. `online = false` stops all of the above. Web search only opens your browser; Flick itself sends nothing.
 
-`v` reads Windows' clipboard history only when you type it. Flick stores none of it and forgets it when the bar closes; copies that password managers ask Windows to leave out of the history stay out. `qr` codes are drawn on your PC and nothing is sent. `v`, `qr`, `snip` and `color` rows are never counted, kept as recent launches or saved as searches.
+`v` reads Windows' clipboard history only while `v` is typed in the bar (a search such as `vlc` passes through `v` on the way). Flick stores none of it and forgets it when the bar closes; copies that password managers ask Windows to leave out of the history stay out. `qr` codes are drawn on your PC and nothing is sent. `v`, `qr`, `snip` and `color` rows are never counted, kept as recent launches or saved as searches.
 
 Paths you type, and the `dl` and `recent` rows, are never counted, kept as recent launches or saved as searches. `recent` only reads the list Windows already keeps; Flick adds nothing to it. Uninstall reads the installed-programs list on this PC and sends nothing anywhere.
 

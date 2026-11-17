@@ -96,7 +96,9 @@ pub struct HelpLine {
 /// What runs after the bar has hidden.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Then {
-    Paste,
+    /// Paste what was just put on the clipboard; `before` is the clipboard
+    /// sequence number read before it was put there.
+    Paste { before: u32 },
     ClipboardHistory,
     Snip,
     PickColor,
@@ -264,6 +266,6 @@ mod tests {
 
     #[test]
     fn hide_then_serialises_as_hide() {
-        assert_eq!(serde_json::to_value(Outcome::HideThen { then: Then::Paste }).unwrap(), json!({"kind": "hide"}));
+        assert_eq!(serde_json::to_value(Outcome::HideThen { then: Then::Paste { before: 0 } }).unwrap(), json!({"kind": "hide"}));
     }
 }
