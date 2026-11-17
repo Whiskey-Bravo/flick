@@ -26,6 +26,7 @@ toml_edit = "0.25"
 notify = "8"
 png = "0.18"
 windows = { version = "0.61", features = [
+    "ApplicationModel_DataTransfer",
     "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
