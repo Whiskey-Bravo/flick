@@ -276,7 +276,8 @@ impl Engine {
         if let Some(key) = p.rank_key(id) {
             self.ranking.record(provider, &key);
             self.history.record_launch(provider, id);
-            if self.searchable(text, scope) {
+            // Rows built from typed text (shortcut arguments) cannot be rebuilt: never saved.
+            if self.searchable(text, scope) && p.item(id).is_some() {
                 self.history.record_search(text);
             }
         }
@@ -519,6 +520,16 @@ mod tests {
         e.activate("a", "x", Modifier::None, "blen", None).unwrap();
         assert_eq!(h.searches(), ["blen"]);
         assert_eq!(h.recents(), [pair("a", "x")]);
+    }
+
+    #[test]
+    fn typed_text_launch_records_no_search() {
+        let (e, _, h, _, _dir) = engine_stores(vec![Box::new(FakeProvider::new("a", vec![("x", "X", 1)]))]);
+        // "arg:a:typed" is not among the provider's items, so `item` cannot rebuild it.
+        e.activate("a", "arg:a:typed", Modifier::None, "a typed", None).unwrap();
+        assert!(h.searches().is_empty());
+        e.activate("a", "x", Modifier::None, "x", None).unwrap();
+        assert_eq!(h.searches(), ["x"]);
     }
 
     #[test]

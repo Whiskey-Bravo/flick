@@ -67,7 +67,7 @@ Pin the things you open every day. Select a row and press Ctrl+P (again to unpin
 
 ## Past searches
 
-Press Up on an empty bar to step back through what you searched for before (the last 50). Press Down to step forward again. Typing anything stops the recall.
+A search is saved when you open a result from it. Press Up on an empty bar to step back through those searches (the last 50). Press Down to step forward again. Typing anything stops the recall.
 
 Type `clear history` and press Enter twice to forget past searches and recent launches. Pins are kept.
 
@@ -288,7 +288,7 @@ Changes are picked up as soon as you save the file; changed `file_roots` are sea
 
 Flick counts only which result you picked (an app, a Settings page, a file, a shortcut, an entry of a shortcut's list). This is stored only on this PC in `%APPDATA%\Flick\picks.json` and never shown. Power actions are never counted.
 
-Past searches are saved on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`. Nothing is sent anywhere.
+The text of a search is saved when you open a result from it, on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`. Nothing is sent anywhere.
 
 Never saved: WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
 
