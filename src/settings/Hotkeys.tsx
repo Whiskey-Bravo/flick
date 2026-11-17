@@ -10,7 +10,7 @@ import {
   type SettingsState,
 } from "./api";
 import { DIRECT_HINT, WEAK_COMBO, directComboOk, hotkeyFromEvent, hotkeyKeys } from "./hotkey";
-import { emptyHkForm as empty, hkSync, isHkDirty, type HkForm } from "./hotkeyForm";
+import { emptyHkForm as empty, hkSync, isHkDirty, keepRemoveError, type HkForm, type RemoveError } from "./hotkeyForm";
 import { ItemPicker } from "./ItemPicker";
 import type { LeaveGuard } from "./Shortcuts";
 import "./shortcuts.css";
@@ -42,7 +42,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
   const [form, setForm] = useState<HkForm>(empty());
   const [saved, setSaved] = useState<HkForm | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
-  const [removeError, setRemoveError] = useState<string | null>(null);
+  const [removeError, setRemoveError] = useState<RemoveError | null>(null);
   const [changedNote, setChangedNote] = useState(false);
   const [asking, setAsking] = useState<((c: Choice) => void) | null>(null);
   const [capturing, setCapturing] = useState(false);
@@ -118,6 +118,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
   latest.current = { open, dirty, saved, original };
   useEffect(() => {
     const { open, dirty, saved, original } = latest.current;
+    setRemoveError((e) => keepRemoveError(e, defs));
     const act = hkSync(open, original, dirty, saved, defs);
     if (act.kind === "note") {
       setChangedNote(true);
@@ -140,6 +141,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
       setSaved(form);
       setOriginal(form.keys);
       setChangedNote(false);
+      setRemoveError(null);
       return true;
     } catch (e) {
       setSaveError(message(e));
@@ -193,7 +195,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
       }
       setSaveError(null);
     } catch (e) {
-      setRemoveError(message(e));
+      setRemoveError({ keys, text: message(e) });
     }
   };
 
@@ -228,7 +230,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
         {defs.length === 0 && <p class="sc-hint">No hotkeys yet.</p>}
         {removeError !== null && (
           <p class="sc-error" role="alert">
-            {removeError}
+            {removeError.text}
           </p>
         )}
       </div>

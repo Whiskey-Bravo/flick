@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { DirectHotkeyDef } from "./api";
-import { hkSync, isHkDirty, type HkForm } from "./hotkeyForm";
+import { hkSync, isHkDirty, keepRemoveError, type HkForm } from "./hotkeyForm";
 
 const item = { provider: "apps", id: "a", title: "A" };
 const def = (keys: string, i = item): DirectHotkeyDef => ({ keys, item: i });
@@ -40,5 +40,16 @@ describe("hkSync", () => {
     expect(isHkDirty(null, { keys: "", item: null })).toBe(false);
     expect(isHkDirty(null, form("Ctrl+Alt+A"))).toBe(true);
     expect(isHkDirty(form("Ctrl+Alt+A"), form("Ctrl+Alt+A"))).toBe(false);
+  });
+});
+
+describe("keepRemoveError", () => {
+  const err = { keys: "Ctrl+Alt+A", text: "Could not save." };
+  it("keeps the error while its row is in the file", () => {
+    expect(keepRemoveError(err, [def("Ctrl+Alt+A")])).toBe(err);
+  });
+  it("drops it when the row is gone, or there is none", () => {
+    expect(keepRemoveError(err, [def("Ctrl+Alt+B")])).toBeNull();
+    expect(keepRemoveError(null, [def("Ctrl+Alt+A")])).toBeNull();
   });
 });
