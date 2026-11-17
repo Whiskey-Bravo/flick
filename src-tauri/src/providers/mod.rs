@@ -10,6 +10,7 @@ pub mod path;
 pub mod power;
 pub mod qr;
 pub mod recent;
+pub mod screen;
 pub mod settings;
 pub mod shortcuts;
 pub mod status;

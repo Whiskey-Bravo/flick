@@ -15,6 +15,7 @@ mod launch;
 mod net;
 mod paste;
 mod pins;
+mod picker;
 mod provider;
 mod process;
 mod providers;
