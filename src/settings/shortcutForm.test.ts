@@ -46,6 +46,22 @@ describe("shortcutForm", () => {
       expect(disabledReasons({ ...f, target: `x ${p}` }, true).admin).toBe("can't be combined with placeholders");
   });
 
+  it("never disables a field that is set", () => {
+    const f = { ...emptyForm(), kind: "wsl" as const, target: "x {arg}", admin: true };
+    expect(disabledReasons(f, true).admin).toBeUndefined();
+    expect(disabledReasons({ ...f, admin: false }, true).admin).toBeDefined();
+    const p = { ...emptyForm(), target: "{arg}", listMode: "pick" as const };
+    expect(disabledReasons(p, true).pick).toBeUndefined();
+    expect(disabledReasons(p, true).choices).toBeDefined();
+    expect(disabledReasons({ ...p, listMode: "choices" }, true).choices).toBeUndefined();
+  });
+
+  it("drops terminal for open shortcuts", () => {
+    const f = { ...emptyForm(), name: "w", target: "x", terminal: true };
+    expect("terminal" in toDef(f)).toBe(false);
+    expect(toDef({ ...f, kind: "run" }).terminal).toBe(true);
+  });
+
   it("disables the wsl kind without WSL", () => {
     const f = emptyForm();
     expect(disabledReasons(f, false).wsl).toBe("WSL is not installed");

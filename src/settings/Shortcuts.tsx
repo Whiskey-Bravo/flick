@@ -161,6 +161,14 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
     ) : null;
   };
 
+  const moreRef = useRef<HTMLDetailsElement>(null);
+  const errField = saveError && typeof saveError === "object" ? saveError.field : check?.key === key ? check.error?.field : undefined;
+  useEffect(() => {
+    if (moreRef.current && errField && ["admin", "terminal", "pick", "choices"].includes(errField)) {
+      moreRef.current.open = true;
+    }
+  }, [errField, open]);
+
   const pickFolder = () => {
     settingsPickFolder().then(
       (p) => p && set("pick", p),
@@ -243,7 +251,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
             {shown("target")}
           </label>
 
-          <details class="sc-more">
+          <details class="sc-more" ref={moreRef}>
             <summary>More options</summary>
             <label class="sc-check">
               <input

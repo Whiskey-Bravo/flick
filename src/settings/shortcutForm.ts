@@ -57,7 +57,7 @@ export function toDef(f: Form): ShortcutDef {
     choices: f.listMode === "choices" ? f.choices.split(/\r?\n/).map((c) => c.trim()).filter((c) => c !== "") : [],
   };
   def[f.kind] = f.target.trim();
-  if (f.terminal !== null) def.terminal = f.terminal;
+  if (f.terminal !== null && f.kind !== "open") def.terminal = f.terminal;
   const pick = f.pick.trim();
   if (f.listMode === "pick" && pick !== "") def.pick = pick;
   return def;
@@ -70,12 +70,16 @@ export type DisabledField = "admin" | "terminal" | "pick" | "choices" | "wsl";
 /** Fields the rules forbid for this form, each with the reason shown beside it. */
 export function disabledReasons(f: Form, wsl: boolean): Partial<Record<DisabledField, string>> {
   const out: Partial<Record<DisabledField, string>> = {};
-  if (f.kind === "wsl") out.admin = "not available for WSL commands";
-  else if (PLACEHOLDER.test(f.target)) out.admin = "can't be combined with placeholders";
+  // A field that is already set stays enabled, so it can be cleared.
+  if (!f.admin) {
+    if (f.kind === "wsl") out.admin = "not available for WSL commands";
+    else if (PLACEHOLDER.test(f.target)) out.admin = "can't be combined with placeholders";
+  }
+  // Meaningless for `open`; toDef drops it.
   if (f.kind === "open") out.terminal = "only for commands";
   if (/\{arg\}/.test(f.target)) {
-    out.pick = "can't be combined with {arg}";
-    out.choices = "can't be combined with {arg}";
+    if (f.listMode !== "pick") out.pick = "can't be combined with {arg}";
+    if (f.listMode !== "choices") out.choices = "can't be combined with {arg}";
   }
   if (!wsl) out.wsl = "WSL is not installed";
   return out;
