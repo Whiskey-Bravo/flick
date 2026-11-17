@@ -211,7 +211,7 @@ impl Providers {
     pub(crate) fn on_hide(&self) {
         self.clips.forget();
         self.qr.forget();
-        self.words.forget_waiting();
+        self.words.hide();
     }
 }
 
