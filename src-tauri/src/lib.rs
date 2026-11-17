@@ -10,6 +10,7 @@ mod controls;
 mod dirs;
 mod engine;
 mod fuzzy;
+mod games;
 mod history;
 mod hotkey;
 mod icon;
