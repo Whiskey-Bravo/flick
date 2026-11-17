@@ -2527,6 +2527,26 @@ mod tests {
     }
 
     #[test]
+    fn the_start_menu_row_tops_startup_apps_and_taskbar() {
+        let r = rig(vec![], vec![]);
+        for text in ["start", "start m", "start menu"] {
+            let res = r.engine.query(text, None);
+            assert_eq!((res[0].provider, res[0].id.as_str()), ("system", "startmenu"), "{text}: {:?}", titles(&res));
+            assert!(res.iter().any(|i| i.provider == "settings" && i.title == "Taskbar"), "{text}: {:?}", titles(&res));
+        }
+        let res = r.engine.query("start", None);
+        assert!(res.iter().any(|i| i.title == "Startup apps"), "{:?}", titles(&res));
+        // Picking Taskbar often does not lift it above the exact words.
+        let taskbar = res.iter().find(|i| i.title == "Taskbar").unwrap().id.clone();
+        for _ in 0..30 {
+            r.ranking.record("settings", &taskbar);
+        }
+        assert_eq!(r.engine.query("start menu", None)[0].id, "startmenu");
+        // `startup` is still Startup apps.
+        assert_eq!(r.engine.query("startup", None)[0].title, "Startup apps");
+    }
+
+    #[test]
     fn hiding_the_bar_forgets_what_was_read() {
         let r = clip_rig();
         query_capture(&r, "v");

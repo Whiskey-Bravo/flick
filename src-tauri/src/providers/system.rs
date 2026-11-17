@@ -162,6 +162,13 @@ fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
+/// `start`, `start menu`, or anything between them (`start m`): the words
+/// that name the Start menu row, so it tops Settings pages such as Startup
+/// apps and Taskbar. `startup` is not one of them.
+fn names_start_menu(text: &str) -> bool {
+    text.len() >= "start".len() && "start menu".starts_with(text)
+}
+
 fn volume_rest(text: &str) -> Option<&str> {
     text.strip_prefix("volume ").or_else(|| text.strip_prefix("vol ")).map(str::trim)
 }
@@ -192,7 +199,9 @@ impl Provider for SystemProvider {
                     .iter()
                     .flat_map(|k| needles.iter().filter_map(move |n| fuzzy::score(n, k)))
                     .max()?;
-                Some(self.cmd_row(c, best.saturating_sub(POWER_PENALTY).max(1)))
+                let mut row = self.cmd_row(c, best.saturating_sub(POWER_PENALTY).max(1));
+                row.top = c.id == "startmenu" && names_start_menu(&text);
+                Some(row)
             })
             .collect();
         hits.sort_by(|a, b| b.score.cmp(&a.score));
@@ -475,7 +484,21 @@ mod tests {
             assert_eq!(r.id, "startmenu", "{text}");
             assert_eq!(r.title, "Start menu");
             assert_eq!(r.subtitle, "Ctrl+Esc also opens it");
+            assert!(r.top, "{text}");
         }
+    }
+
+    #[test]
+    fn only_the_start_words_put_the_start_menu_on_top() {
+        let (p, _, _) = setup(Err("x".into()));
+        let top = |t: &str| p.query(&q(t)).into_iter().find(|i| i.id == "startmenu").is_some_and(|i| i.top);
+        for t in ["start", "Start", "start ", "start m", "start me", "start men", "start menu", "START  MENU"] {
+            assert!(top(t), "{t}");
+        }
+        for t in ["sta", "star", "startup", "start menus", "start x"] {
+            assert!(!top(t), "{t}");
+        }
+        assert!(p.query(&q("mute")).iter().all(|i| !i.top));
     }
 
     #[test]
