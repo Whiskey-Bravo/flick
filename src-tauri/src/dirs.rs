@@ -153,6 +153,9 @@ impl<T> Clone for Load<T> {
 
 /// A value is served without a new read for this long.
 pub const FRESH: Duration = Duration::from_secs(5);
+/// A `fresh` that never reads again: the value stays until [`Loader::clear`].
+#[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
+pub const NEVER_STALE: Duration = Duration::MAX;
 /// A first read taking longer than this shows as [`Load::Slow`].
 pub const SLOW: Duration = Duration::from_secs(3);
 /// Keys kept; the least recently asked for goes first.
@@ -225,6 +228,13 @@ impl<T: Send + Sync + 'static> Loader<T> {
         out
     }
 
+    /// Forgets every key. A read in flight finishes into nothing (its slot is
+    /// gone) and still calls `on_ready`.
+    #[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
+    pub fn clear(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.clear();
+    }
+
     /// The last value read for `key`, however old.
     #[cfg(test)]
     pub fn peek(&self, key: &str) -> Option<Arc<T>> {
@@ -279,6 +289,35 @@ fn evict_oldest<T>(slots: &mut HashMap<String, Slot<T>>) {
     };
     if let Some(key) = oldest(true).or_else(|| oldest(false)) {
         slots.remove(&key);
+    }
+}
+
+/// `text` on one line: trimmed, line breaks (`\r\n`, `\n`, `\r`) as `⏎`,
+/// tabs as spaces, other control characters dropped, and cut to `max`
+/// characters plus `…` when longer.
+#[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
+pub fn one_line(text: &str, max: usize) -> String {
+    let mut flat = String::with_capacity(text.len());
+    let mut chars = text.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                flat.push('\u{23CE}');
+            }
+            '\n' => flat.push('\u{23CE}'),
+            '\t' => flat.push(' '),
+            c if c.is_control() => {}
+            c => flat.push(c),
+        }
+    }
+    match flat.char_indices().nth(max) {
+        Some((cut, _)) => {
+            flat.truncate(cut);
+            flat.push('\u{2026}');
+            flat
+        }
+        None => flat,
     }
 }
 
@@ -600,6 +639,69 @@ mod tests {
         assert!(l.peek("0").is_none());
         assert_eq!(l.peek("1").as_deref(), Some(&1));
         assert_eq!(l.peek("64").as_deref(), Some(&64));
+    }
+
+    #[test]
+    fn clear_forgets_values() {
+        let (l, rx) = loader(FRESH, SLOW);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job = |runs: &Arc<AtomicUsize>| {
+            let r = runs.clone();
+            move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            }
+        };
+        l.get("a", job(&runs));
+        wait(&rx);
+        assert_eq!(show(l.get("a", job(&runs))), "Ready(1)");
+        l.clear();
+        assert_eq!(show(l.get("a", job(&runs))), "Pending");
+        wait(&rx);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn clear_drops_a_read_in_flight() {
+        let (l, rx) = loader(FRESH, SLOW);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        l.get("a", move || {
+            let _ = gate_rx.recv();
+            Ok(1)
+        });
+        l.clear();
+        gate_tx.send(()).unwrap();
+        wait(&rx);
+        assert!(l.peek("a").is_none());
+    }
+
+    #[test]
+    fn never_stale_reads_once() {
+        let (l, rx) = loader(NEVER_STALE, SLOW);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let job = |runs: &Arc<AtomicUsize>| {
+            let r = runs.clone();
+            move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            }
+        };
+        l.get("a", job(&runs));
+        wait(&rx);
+        for _ in 0..3 {
+            assert_eq!(show(l.get("a", job(&runs))), "Ready(1)");
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no read, no on_ready");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn one_line_flattens_and_cuts() {
+        assert_eq!(one_line("a\r\nb\nc", 120), "a\u{23CE}b\u{23CE}c");
+        assert_eq!(one_line("  a\tb  ", 120), "a b");
+        assert_eq!(one_line(&"x".repeat(130), 120), format!("{}\u{2026}", "x".repeat(120)));
+        assert_eq!(one_line("ab", 2), "ab");
+        assert_eq!(one_line("a\rb\u{7}c", 120), "a\u{23CE}bc");
     }
 
     #[test]

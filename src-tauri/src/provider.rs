@@ -40,6 +40,8 @@ pub enum Action {
     Uninstall,
     Close,
     CloseWindow,
+    /// Copy the row's value to the clipboard.
+    Copy,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -64,6 +66,9 @@ pub struct ResultItem {
     pub actions: Vec<Action>,
     /// Text Tab puts in the bar ("" = none).
     pub complete: String,
+    /// SVG markup the bar shows in place of the list ("" = none). Built only
+    /// by Rust code (QR module positions), never from user text.
+    pub panel: String,
     /// A computed answer: in plain queries the engine puts it above every other row.
     #[serde(skip)]
     pub top: bool,
@@ -88,11 +93,28 @@ pub struct HelpLine {
     pub fill: String,
 }
 
+/// What runs after the bar has hidden.
+#[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Then {
+    Paste,
+    ClipboardHistory,
+    Snip,
+    PickColor,
+}
+
 #[derive(Debug, PartialEq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outcome {
     /// Done, hide the bar.
     Hide,
+    /// Done, hide the bar, then run `then` (the commands turn it into `Hide`).
+    #[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
+    #[serde(rename = "hide")]
+    HideThen {
+        #[serde(skip_serializing)]
+        then: Then,
+    },
     /// Done, bar stays.
     Keep,
     /// Show `prompt`; next queries carry `scope`.
@@ -228,5 +250,22 @@ mod tests {
         assert_eq!(v["actions"], json!(["reveal"]));
         assert_eq!(v["complete"], json!("x"));
         assert!(v.get("revealable").is_none() && v.get("elevatable").is_none(), "{v}");
+    }
+
+    #[test]
+    fn copy_action_serialises_as_copy() {
+        assert_eq!(serde_json::to_value(Action::Copy).unwrap(), json!("copy"));
+        assert_eq!(serde_json::from_value::<Action>(json!("copy")).unwrap(), Action::Copy);
+    }
+
+    #[test]
+    fn result_item_has_an_empty_panel_by_default() {
+        let v = serde_json::to_value(ResultItem::default()).unwrap();
+        assert_eq!(v["panel"], json!(""));
+    }
+
+    #[test]
+    fn hide_then_serialises_as_hide() {
+        assert_eq!(serde_json::to_value(Outcome::HideThen { then: Then::Paste }).unwrap(), json!({"kind": "hide"}));
     }
 }
