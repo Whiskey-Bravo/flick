@@ -16,8 +16,9 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
 /// Folders never walked (compared without case). Names starting with `.` are
 /// skipped everywhere.
-/// Package caches and build output, whose names would flood the results.
-const JUNK_DIRS: [&str; 14] = [
+/// Package caches, build output and Python distributions (whose `pkgs` and
+/// `envs` hold whole copies of Python), whose names would flood the results.
+const JUNK_DIRS: [&str; 18] = [
     "node_modules",
     "target",
     "dist",
@@ -32,6 +33,10 @@ const JUNK_DIRS: [&str; 14] = [
     "Pods",
     "bower_components",
     "obj",
+    "miniconda3",
+    "anaconda3",
+    "miniforge3",
+    "mambaforge",
 ];
 
 pub(super) fn skip_by_attributes(attrs: u32) -> bool {

@@ -117,6 +117,10 @@ const FILE_BELOW_FOLDER: u32 = 10;
 /// Points lost per level below the first, for at most `MAX_DEPTH_STEPS` levels.
 const DEPTH_STEP: u32 = 15;
 const MAX_DEPTH_STEPS: u32 = 4;
+/// Deeper than this below its root, only an exact name (or file stem) is
+/// found: the deep insides of SDKs and tool checkouts would otherwise fill
+/// the list for any short word. Path browsing still reaches them.
+const PARTIAL_MATCH_MAX_DEPTH: u8 = 6;
 
 /// Points an entry loses for sitting `depth` levels below its root (1 = directly in it).
 fn depth_penalty(depth: u8) -> u32 {
@@ -127,13 +131,14 @@ fn depth_penalty(depth: u8) -> u32 {
 /// `len` = needle chars), strict tiers only: exact name, or exact stem for a
 /// file (2+ chars); prefix, squashed prefix, word prefix or every typed word a
 /// word prefix (3+ chars); substring (4+ chars). Never acronyms, initials or
-/// typos. Minus [`depth_penalty`].
+/// typos. Below [`PARTIAL_MATCH_MAX_DEPTH`] levels, exact only. Minus
+/// [`depth_penalty`].
 fn file_score(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
     let f = fuzzy::score_prenormalized(needle, hay);
     let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
     let tier = if f == Some(1000) || stem_exact {
         EXACT
-    } else if len < 3 {
+    } else if len < 3 || depth > PARTIAL_MATCH_MAX_DEPTH {
         return None;
     } else {
         match f? {
@@ -699,6 +704,10 @@ mod tests {
             "Pods",
             "bower_components",
             "obj",
+            "miniconda3",
+            "Anaconda3",
+            "miniforge3",
+            "mambaforge",
         ] {
             touch(&root.join(junk).join("inside.txt"));
         }
@@ -845,6 +854,30 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!((out[0].id.as_str(), out[0].score), (r"C:\e\taxes", 640));
         assert_eq!(out[1].score, 630);
+    }
+
+    #[test]
+    fn deep_partial_matches_do_not_fill_the_list() {
+        let (p, _) = provider(vec![
+            entry(r"C:\r\sdk\dev\tests\gallery\demo\calculator", true).at_depth(7),
+            entry(r"C:\r\sdk\dev\tests\gallery\demo\calculator\calculator_demo.dart", false).at_depth(8),
+            entry(r"C:\r\sdk\engine\src\shell\common\cache_calculator.cc", false).at_depth(7),
+            entry(r"C:\r\Project\app\src\answers\calc.rs", false).at_depth(5),
+            entry(r"C:\r\Project\app\src\answers\calc_tools", true).at_depth(6),
+            entry(r"C:\r\Exercises\Calculator", true).at_depth(2),
+        ]);
+        let ids = |text: &str| p.query(&q(text)).into_iter().map(|r| r.id).collect::<Vec<_>>();
+        // Partial matches six levels down or less still show; deeper ones do not.
+        assert_eq!(
+            ids("calc"),
+            [r"C:\r\Exercises\Calculator", r"C:\r\Project\app\src\answers\calc.rs", r"C:\r\Project\app\src\answers\calc_tools"]
+        );
+        // The exact name is still found at any depth.
+        assert_eq!(ids("calculator"), [r"C:\r\Exercises\Calculator", r"C:\r\sdk\dev\tests\gallery\demo\calculator"]);
+        assert_eq!(ids("calculator_demo"), [r"C:\r\sdk\dev\tests\gallery\demo\calculator\calculator_demo.dart"]);
+        assert_eq!(fs("calc", "Calculator", true, 6), Some(540));
+        assert_eq!(fs("calc", "Calculator", true, 7), None);
+        assert_eq!(fs("calculator", "Calculator", true, 9), Some(580));
     }
 
     #[test]
