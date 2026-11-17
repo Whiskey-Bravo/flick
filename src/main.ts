@@ -1,6 +1,8 @@
+/// <reference types="vite/client" />
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { builtinName, fallbackName, serverUrl } from "./icons";
 import { capOf, failureText, initial, reduce, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
 
 type Outcome = Extract<Event, { type: "outcome" }>["outcome"];
@@ -34,11 +36,39 @@ track.append(thumb);
 listWrap.append(list, track);
 panel.append(row, errorLine, listWrap);
 
+// Bundled SVGs by name (src/icons/<name>.svg), resolved to URLs by Vite.
+const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?url", import: "default" });
+const svgUrl = (name: string): string => svgs[`./icons/${name}.svg`] ?? svgs["./icons/file.svg"];
+
 let state: State = initial;
 let querySeq = 0;
 /// Bumped on every `bar:shown`: an activation answered after the bar was
 /// shown again belongs to an old session and is dropped.
 let shows = 0;
+
+// A fixed 24x24 box, so a late image never moves the row. Server icons fade in
+// once loaded; a 404 swaps in the bundled SVG for the kind of thing.
+function renderIcon(item: Item): HTMLSpanElement {
+  const box = document.createElement("span");
+  box.className = "icon";
+  const img = document.createElement("img");
+  img.alt = "";
+  img.draggable = false;
+  const name = builtinName(item.icon);
+  if (name !== null) {
+    img.src = svgUrl(name);
+    img.className = "loaded";
+  } else {
+    img.onload = () => img.classList.add("loaded");
+    img.onerror = () => {
+      img.onerror = null;
+      img.src = svgUrl(fallbackName(item));
+    };
+    img.src = serverUrl(item.icon, window.devicePixelRatio || 1);
+  }
+  box.append(img);
+  return box;
+}
 
 function renderItem(item: Item, index: number): HTMLLIElement {
   const li = document.createElement("li");
@@ -52,7 +82,14 @@ function renderItem(item: Item, index: number): HTMLLIElement {
   const sub = document.createElement("span");
   sub.className = "subtitle";
   sub.textContent = armed ? "Press Enter again to confirm" : item.subtitle;
-  li.append(title, sub);
+  li.append(renderIcon(item), title, sub);
+  if (item.pinned) {
+    const star = document.createElement("img");
+    star.className = "star";
+    star.alt = "Pinned";
+    star.src = svgUrl("star");
+    li.append(star);
+  }
   return li;
 }
 
@@ -104,6 +141,8 @@ function run(effect: Effect) {
         provider: effect.item.provider,
         id: effect.item.id,
         modifier: effect.modifier,
+        text: effect.text,
+        scope: effect.scope,
       })
         .then((outcome) => {
           if (at === shows) dispatch({ type: "outcome", outcome });
@@ -113,6 +152,16 @@ function run(effect: Effect) {
         });
       break;
     }
+    case "loadPast":
+      invoke<string[]>("past_searches")
+        .then((items) => dispatch({ type: "past", items }))
+        .catch(() => {});
+      break;
+    case "togglePin":
+      invoke<boolean>("toggle_pin", { provider: effect.item.provider, id: effect.item.id })
+        .then((pinned) => dispatch({ type: "pinned", provider: effect.item.provider, id: effect.item.id, pinned }))
+        .catch((err) => dispatch({ type: "failed", message: failureText(effect.item, err) }));
+      break;
     case "hide":
       invoke("hide").catch(() => {});
       break;
@@ -121,7 +170,7 @@ function run(effect: Effect) {
 
 input.addEventListener("input", () => dispatch({ type: "input", text: input.value }));
 
-const KEYS = ["ArrowUp", "ArrowDown", "Enter", "Escape", "F1"] as const;
+const KEYS = ["ArrowUp", "ArrowDown", "Enter", "Escape", "F1", "p"] as const;
 // Browser defaults that make no sense in a launcher: focus change, help, reload, print, find.
 const SWALLOWED = ["Tab", "F1", "F5"];
 const SWALLOWED_CTRL = ["p", "f", "r"];
@@ -132,11 +181,12 @@ document.addEventListener("contextmenu", (e) => e.preventDefault());
 window.addEventListener("blur", () => dispatch({ type: "blurred" }));
 
 input.addEventListener("keydown", (e) => {
-  const key = KEYS.find((k) => k === e.key);
+  const key = KEYS.find((k) => k === (e.key.length === 1 ? e.key.toLowerCase() : e.key));
   if (!key || e.isComposing) return;
+  if (key === "p" && !e.ctrlKey) return; // plain p is text
   e.preventDefault();
   // Held Enter/Escape must not repeat: it would skip the two-step confirm.
-  if (e.repeat && (key === "Enter" || key === "Escape" || key === "F1")) return;
+  if (e.repeat && (key === "Enter" || key === "Escape" || key === "F1" || key === "p")) return;
   dispatch({ type: "key", key, ctrl: e.ctrlKey, shift: e.shiftKey });
 });
 

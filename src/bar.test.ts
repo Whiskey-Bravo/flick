@@ -11,7 +11,7 @@ const run = (s: State, ...events: Event[]) => {
   for (const e of events) ({ state, effects } = reduce(state, e));
   return { state, effects };
 };
-const key = (k: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1", ctrl = false, shift = false): Event =>
+const key = (k: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p", ctrl = false, shift = false): Event =>
   ({ type: "key", key: k, ctrl, shift });
 const withItems = (...items: Item[]) => run(initial, { type: "results", items }).state;
 
@@ -26,7 +26,7 @@ describe("bar", () => {
 
   it("queries the empty text when shown", () => {
     const { effects } = reduce(initial, { type: "shown" });
-    expect(effects).toEqual([{ type: "query", text: "", scope: null }]);
+    expect(effects).toEqual([{ type: "query", text: "", scope: null }, { type: "loadPast" }]);
   });
 
   it("input emits scoped query", () => {
@@ -53,9 +53,9 @@ describe("bar", () => {
   it("enter activates with modifier", () => {
     const s = withItems(item("a"));
     const mod = (ctrl: boolean, shift: boolean) => run(s, key("Enter", ctrl, shift)).effects;
-    expect(mod(false, false)).toEqual([{ type: "activate", item: item("a"), modifier: "none" }]);
-    expect(mod(true, false)).toEqual([{ type: "activate", item: item("a"), modifier: "ctrl" }]);
-    expect(mod(true, true)).toEqual([{ type: "activate", item: item("a"), modifier: "ctrl_shift" }]);
+    expect(mod(false, false)).toEqual([{ type: "activate", item: item("a"), modifier: "none", text: "", scope: null }]);
+    expect(mod(true, false)).toEqual([{ type: "activate", item: item("a"), modifier: "ctrl", text: "", scope: null }]);
+    expect(mod(true, true)).toEqual([{ type: "activate", item: item("a"), modifier: "ctrl_shift", text: "", scope: null }]);
   });
 
   it("confirm items need a second enter", () => {
@@ -64,7 +64,7 @@ describe("bar", () => {
     expect(first.effects).toEqual([]);
     expect(first.state.armed).toBe("a");
     expect(run(first.state, key("Enter")).effects).toEqual([
-      { type: "activate", item: item("a", true), modifier: "none" },
+      { type: "activate", item: item("a", true), modifier: "none", text: "", scope: null },
     ]);
   });
 
@@ -304,7 +304,7 @@ describe("bar", () => {
     const typed = run(scoped, { type: "input", text: "be" }, key("Enter"));
     expect(typed.state.queued).toBe("none");
     const r = run(typed.state, { type: "results", items: [item("beta")] });
-    expect(r.effects).toEqual([{ type: "activate", item: item("beta"), modifier: "none" }]);
+    expect(r.effects).toEqual([{ type: "activate", item: item("beta"), modifier: "none", text: "be", scope: "shortcut:proj" }]);
   });
 
   it("blur disarms and drops a queued enter", () => {
@@ -323,7 +323,7 @@ describe("bar", () => {
     const many = Array.from({ length: 12 }, (_, i) => item(String(i)));
     const s = run(withItems(...many), ...Array(9).fill(key("ArrowDown"))).state;
     expect(s.selected).toBe(9);
-    expect(run(s, key("Enter")).effects).toEqual([{ type: "activate", item: item("9"), modifier: "none" }]);
+    expect(run(s, key("Enter")).effects).toEqual([{ type: "activate", item: item("9"), modifier: "none", text: "", scope: null }]);
   });
 
   it("enter before results arrive activates the new top item", () => {
@@ -333,7 +333,7 @@ describe("bar", () => {
     expect(early.effects).toEqual([]);
     expect(early.state.queued).toBe("ctrl");
     const r = run(early.state, { type: "results", items: [item("chrome"), item("other")] });
-    expect(r.effects).toEqual([{ type: "activate", item: item("chrome"), modifier: "ctrl" }]);
+    expect(r.effects).toEqual([{ type: "activate", item: item("chrome"), modifier: "ctrl", text: "chrome", scope: null }]);
     expect(r.state.queued).toBeNull();
     expect(r.state.awaiting).toBe(false);
     expect(r.state.pending).toBe(true);
@@ -342,7 +342,7 @@ describe("bar", () => {
   it("enter right after show waits for the first results", () => {
     const s = run(initial, { type: "shown" }, { type: "input", text: "c" }, key("Enter")).state;
     const r = run(s, { type: "results", items: [item("calc")] });
-    expect(r.effects).toEqual([{ type: "activate", item: item("calc"), modifier: "none" }]);
+    expect(r.effects).toEqual([{ type: "activate", item: item("calc"), modifier: "none", text: "c", scope: null }]);
   });
 
   it("queued enter on a confirm item only arms it", () => {
@@ -393,5 +393,106 @@ describe("bar", () => {
   it("activation errors name the item", () => {
     expect(failureText(item("Blender"), "file not found")).toBe("Blender: file not found");
     expect(failureText(item("Blender"), new Error("boom"))).toBe("Blender: Error: boom");
+  });
+  describe("icons, pins and recents", () => {
+    const row = (id: string, o: Partial<Item> = {}): Item => ({ ...item(id), ...o });
+    const shownWith = (...items: Item[]) =>
+      run(initial, { type: "shown" }, { type: "results", items }).state;
+    const withPast = (...past: string[]) => run(initial, { type: "past", items: past }).state;
+    const queryOf = (text: string): Effect => ({ type: "query", text, scope: null });
+
+    it("shown also loads past searches", () => {
+      expect(reduce(initial, { type: "shown" }).effects).toContainEqual({ type: "loadPast" });
+    });
+
+    it("empty bar selects the latest recent launch", () => {
+      const s = shownWith(row("pin", { origin: "pin" }), row("r1", { origin: "recent" }), row("r2", { origin: "recent" }));
+      expect(s.selected).toBe(1);
+    });
+
+    it("welcome rows keep the selection on top", () => {
+      const s = shownWith(row("w", { provider: "welcome" }), row("r", { origin: "recent" }));
+      expect(s.selected).toBe(0);
+    });
+
+    it("typed text does not use the recent rule", () => {
+      const s = run(initial, { type: "input", text: "x" }, { type: "results", items: [row("a"), row("r", { origin: "recent" })] }).state;
+      expect(s.selected).toBe(0);
+    });
+
+    it("Up on an empty bar recalls past searches", () => {
+      const s = withPast("b", "a");
+      const up1 = run(s, key("ArrowUp"));
+      expect(up1.state.text).toBe("b");
+      expect(up1.effects).toEqual([queryOf("b")]);
+      const up2 = run(up1.state, key("ArrowUp"));
+      expect(up2.state.text).toBe("a");
+      expect(up2.effects).toEqual([queryOf("a")]);
+      const up3 = run(up2.state, key("ArrowUp"));
+      expect(up3.state.text).toBe("a");
+      const down1 = run(up3.state, key("ArrowDown"));
+      expect(down1.state.text).toBe("b");
+      expect(down1.effects).toEqual([queryOf("b")]);
+      const down2 = run(down1.state, key("ArrowDown"));
+      expect(down2.state.text).toBe("");
+      expect(down2.state.recall).toBe(-1);
+      expect(down2.effects).toEqual([queryOf("")]);
+    });
+
+    it("Up recalls even when the empty bar has rows", () => {
+      const s = run(withPast("b"), { type: "results", items: [row("a"), row("c")] }, key("ArrowDown")).state;
+      expect(run(s, key("ArrowUp")).state.text).toBe("b");
+    });
+
+    it("Up does nothing without past searches", () => {
+      const s = run(initial, { type: "results", items: [row("a"), row("b")] }).state;
+      const r = run(s, key("ArrowUp"));
+      expect(r.state.text).toBe("");
+      expect(r.state.selected).toBe(1);
+      expect(r.effects).toEqual([]);
+    });
+
+    it("Down on an empty bar not recalling moves rows", () => {
+      const s = run(withPast("b"), { type: "results", items: [row("a"), row("c")] }).state;
+      const r = run(s, key("ArrowDown"));
+      expect(r.state.selected).toBe(1);
+      expect(r.state.text).toBe("");
+      expect(r.effects).toEqual([]);
+    });
+
+    it("Up with typed text moves the selection as before", () => {
+      const s = run(withPast("b"), { type: "input", text: "x" }, { type: "results", items: [row("a"), row("c")] }).state;
+      const r = run(s, key("ArrowUp"));
+      expect(r.state.text).toBe("x");
+      expect(r.state.selected).toBe(1);
+    });
+
+    it("typing ends recall", () => {
+      const recalled = run(withPast("b", "a"), key("ArrowUp")).state;
+      expect(recalled.recall).toBe(0);
+      const typed = run(recalled, { type: "input", text: "bx" }, { type: "results", items: [row("a"), row("c")] }).state;
+      expect(typed.recall).toBe(-1);
+      expect(run(typed, key("ArrowUp")).state.selected).toBe(1);
+    });
+
+    it("Ctrl+P pins only pinnable rows", () => {
+      const p = row("p", { pinnable: true });
+      const s = withItems(p, row("n"));
+      expect(run(s, key("p", true)).effects).toEqual([{ type: "togglePin", item: p }]);
+      expect(run(s, key("p", false)).effects).toEqual([]);
+      const second = run(s, key("ArrowDown"), key("p", true));
+      expect(second.effects).toEqual([]);
+      const pinned = run(s, { type: "pinned", provider: "apps", id: "p", pinned: true }).state;
+      expect(pinned.items[0].pinned).toBe(true);
+      expect(pinned.items[1].pinned).toBe(false);
+    });
+
+    it("activate effect carries text and scope", () => {
+      const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } }).state;
+      const s = run(scoped, { type: "input", text: "cats" }, { type: "results", items: [item("a")] }).state;
+      expect(run(s, key("Enter")).effects).toEqual([
+        { type: "activate", item: item("a"), modifier: "none", text: "cats", scope: "web" },
+      ]);
+    });
   });
 });

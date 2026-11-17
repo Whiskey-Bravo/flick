@@ -26,17 +26,23 @@ export type State = {
   awaiting: boolean; // a query is in flight; `items` belong to older text
   queued: Modifier | null; // Enter pressed while awaiting, run on the next results
   top: number; // index of the first visible row
+  past: string[]; // past searches, newest first
+  recall: number; // index into `past` being shown, -1 = not recalling
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null }
-  | { type: "activate"; item: Item; modifier: Modifier }
+  | { type: "activate"; item: Item; modifier: Modifier; text: string; scope: string | null }
+  | { type: "loadPast" }
+  | { type: "togglePin"; item: Item }
   | { type: "hide" };
 export type Event =
   | { type: "shown" }
   | { type: "blurred" }
   | { type: "input"; text: string }
   | { type: "results"; items: Item[] }
-  | { type: "key"; key: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1"; ctrl: boolean; shift: boolean }
+  | { type: "past"; items: string[] }
+  | { type: "pinned"; provider: string; id: string; pinned: boolean }
+  | { type: "key"; key: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p"; ctrl: boolean; shift: boolean }
   | {
       type: "outcome";
       outcome:
@@ -62,6 +68,8 @@ export const initial: State = {
   awaiting: false,
   queued: null,
   top: 0,
+  past: [],
+  recall: -1,
 };
 
 // Text for a failed activation: the item's title, then the back end's message.
@@ -94,8 +102,9 @@ export function reduce(s: State, e: Event): Result {
       // The empty text is queried so providers can offer rows for an empty bar
       // (the first-start welcome). `awaiting` stays false: an Enter on the empty
       // bar is not queued, and typing right away supersedes this query.
-      return done({ ...initial, configError: s.configError, error: s.configError }, [
+      return done({ ...initial, past: s.past, configError: s.configError, error: s.configError }, [
         { type: "query", text: "", scope: null },
+        { type: "loadPast" },
       ]);
     case "blurred":
       return done({ ...s, armed: null, queued: null });
@@ -106,6 +115,7 @@ export function reduce(s: State, e: Event): Result {
         fit({
           ...s,
           text: e.text,
+          recall: -1,
           selected: 0,
           top: 0,
           armed: null,
@@ -117,10 +127,23 @@ export function reduce(s: State, e: Event): Result {
         [{ type: "query", text: e.text, scope: s.scope?.name ?? null }],
       );
     case "results": {
-      const next: State = { ...s, items: e.items, selected: 0, top: 0, awaiting: false, queued: null };
+      // The empty unscoped bar opens on the latest recent launch, unless a
+      // welcome row is shown: that stays on top.
+      let selected = 0;
+      if (s.text === "" && !s.scope && !e.items.some((i) => i.provider === "welcome")) {
+        selected = Math.max(0, e.items.findIndex((i) => i.origin === "recent"));
+      }
+      const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null });
       // An Enter pressed before these results arrived acts on them now.
       return s.queued ? enter(next, s.queued) : done(next);
     }
+    case "past":
+      return done({ ...s, past: e.items });
+    case "pinned":
+      return done({
+        ...s,
+        items: s.items.map((i) => (i.provider === e.provider && i.id === e.id ? { ...i, pinned: e.pinned } : i)),
+      });
     case "failed":
       return done(fit({ ...s, armed: null, pending: false, failure: e.message, error: e.message }));
     case "queryFailed":
@@ -155,10 +178,18 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
   switch (e.key) {
     case "ArrowUp":
     case "ArrowDown": {
+      if (s.past.length > 0 && !s.scope && (s.text === "" || s.recall >= 0) && (e.key === "ArrowUp" || s.recall >= 0)) {
+        return recallStep(s, e.key === "ArrowUp" ? 1 : -1);
+      }
       const n = s.items.length;
       if (n === 0) return done({ ...s, armed: null });
       const step = e.key === "ArrowDown" ? 1 : n - 1;
       return done(fit({ ...s, selected: (s.selected + step) % n, armed: null }));
+    }
+    case "p": {
+      const item = s.items[s.selected];
+      if (!e.ctrl || !item || !item.pinnable) return done(s);
+      return done(s, [{ type: "togglePin", item }]);
     }
     case "F1": {
       // Unlike the fill outcome, this is not an activation finishing: `pending` stays.
@@ -188,11 +219,34 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
   }
 }
 
+// Up/Down through past searches: the recalled text is queried like typed text.
+function recallStep(s: State, by: 1 | -1): Result {
+  const recall = Math.min(s.recall + by, s.past.length - 1);
+  if (recall === s.recall) return done(s);
+  const text = recall < 0 ? "" : s.past[recall];
+  return done(
+    fit({
+      ...s,
+      text,
+      recall,
+      selected: 0,
+      top: 0,
+      armed: null,
+      failure: null,
+      error: s.configError,
+      awaiting: true,
+      queued: null,
+    }),
+    [{ type: "query", text, scope: null }],
+  );
+}
+
 // Put `text` in the bar as if typed: nothing armed, queued or pending survives.
 function fill(s: State, text: string): Result {
   const next: State = {
     ...s,
     text,
+    recall: -1,
     items: [],
     selected: 0,
     top: 0,
@@ -211,5 +265,5 @@ function enter(s: State, modifier: Modifier): Result {
   const item = s.items[s.selected];
   if (!item || s.pending) return done(s);
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
-  return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier }]);
+  return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);
 }

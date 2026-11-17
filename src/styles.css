@@ -105,8 +105,7 @@ input {
 .result {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
   height: 44px;
   padding: 0 14px;
   border-radius: 8px;
@@ -116,7 +115,33 @@ input {
   background: #2a2a31;
 }
 
+.icon {
+  flex: none;
+  width: 24px;
+  height: 24px;
+}
+
+.icon img {
+  display: block;
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+
+.icon img.loaded {
+  opacity: 1;
+}
+
+.star {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+
 .title {
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   font-size: 15px;
