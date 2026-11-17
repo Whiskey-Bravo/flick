@@ -118,8 +118,10 @@ export function reduce(s: State, e: Event): Result {
     case "shown":
       // The empty text is queried so providers can offer rows for an empty bar
       // (the first-start welcome). `awaiting` stays false: an Enter on the empty
-      // bar is not queued, and typing right away supersedes this query.
-      return done({ ...initial, past: s.past, configError: s.configError, error: s.configError }, [
+      // bar is not queued, and typing right away supersedes this query. Past
+      // searches are reloaded: none are recalled until they arrive (history may
+      // have been switched off or cleared since the last show).
+      return done({ ...initial, configError: s.configError, error: s.configError }, [
         { type: "query", text: "", scope: null },
         { type: "loadPast" },
       ]);
@@ -134,7 +136,10 @@ export function reduce(s: State, e: Event): Result {
       if (s.menu) return done({ ...s, menu: null });
       if (!s.items[e.index]) return done(s);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
-      return onKey(sel, { type: "key", key: "Enter", ctrl: e.ctrl, shift: e.shift });
+      // A click is an explicit choice: it opens the clicked row now, never a
+      // queued pick from results still on their way.
+      const modifier: Modifier = e.ctrl && e.shift ? "ctrl_shift" : e.ctrl ? "ctrl" : "none";
+      return enter({ ...sel, queued: null }, modifier);
     }
     case "menu": {
       const item = s.items[e.index];
@@ -194,11 +199,15 @@ export function reduce(s: State, e: Event): Result {
     }
     case "past":
       return done({ ...s, past: e.items });
-    case "pinned":
-      return done({
+    case "pinned": {
+      const next = {
         ...s,
         items: s.items.map((i) => (i.provider === e.provider && i.id === e.id ? { ...i, pinned: e.pinned } : i)),
-      });
+      };
+      // The empty bar is laid out by pins: ask for it again.
+      const relayout = s.text === "" && !s.scope;
+      return done(next, relayout ? [{ type: "query", text: "", scope: null }] : []);
+    }
     case "failed":
       return done(fit({ ...s, armed: null, pending: false, failure: e.message, error: e.message }));
     case "queryFailed":

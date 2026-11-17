@@ -405,6 +405,16 @@ describe("bar", () => {
       expect(reduce(initial, { type: "shown" }).effects).toContainEqual({ type: "loadPast" });
     });
 
+    it("shown forgets past searches until they are loaded again", () => {
+      const reopened = run(withPast("old"), { type: "shown" }).state;
+      expect(reopened.past).toEqual([]);
+      // Up before the list arrives recalls nothing.
+      const up = run(reopened, key("ArrowUp"));
+      expect(up.state.text).toBe("");
+      expect(up.effects).toEqual([]);
+      expect(run(reopened, { type: "past", items: ["new"] }, key("ArrowUp")).state.text).toBe("new");
+    });
+
     it("empty bar selects the latest recent launch", () => {
       const s = shownWith(row("pin", { origin: "pin" }), row("r1", { origin: "recent" }), row("r2", { origin: "recent" }));
       expect(s.selected).toBe(1);
@@ -487,6 +497,16 @@ describe("bar", () => {
       expect(pinned.items[1].pinned).toBe(false);
     });
 
+    it("pinning on the empty bar lays it out again", () => {
+      const p = row("p", { pinnable: true, origin: "recent" });
+      const s = shownWith(p);
+      expect(run(s, { type: "pinned", provider: "apps", id: "p", pinned: true }).effects).toEqual([queryOf("")]);
+      const typed = run(s, { type: "input", text: "p" }, { type: "results", items: [p] }).state;
+      expect(run(typed, { type: "pinned", provider: "apps", id: "p", pinned: true }).effects).toEqual([]);
+      const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } }).state;
+      expect(run(scoped, { type: "pinned", provider: "apps", id: "p", pinned: true }).effects).toEqual([]);
+    });
+
     it("leaving a scope after recalling resets recall", () => {
       const recalled = run(withPast("b", "a"), key("ArrowUp"), key("ArrowUp")).state;
       const out = run(
@@ -543,6 +563,16 @@ describe("mouse and menu", () => {
     expect(first.state.armed).toBe("p");
     const second = run(first.state, click(1));
     expect(second.effects).toEqual([{ type: "activate", item: item("p", true), modifier: "none", text: "", scope: null }]);
+  });
+
+  it("click opens the clicked row even while a query is in flight", () => {
+    const s = run(withItems(item("a"), item("b")), { type: "input", text: "chr" }).state;
+    expect(s.awaiting).toBe(true);
+    const r = run(s, click(1));
+    expect(r.effects).toEqual([{ type: "activate", item: item("b"), modifier: "none", text: "chr", scope: null }]);
+    expect(r.state.queued).toBeNull();
+    // The new results do not open anything else.
+    expect(run(r.state, { type: "results", items: [item("c")] }).effects).toEqual([]);
   });
 
   it("ctrl+shift click runs as admin", () => {
