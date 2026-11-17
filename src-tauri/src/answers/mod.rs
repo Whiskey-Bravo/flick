@@ -9,3 +9,6 @@ pub mod calc;
 
 #[allow(dead_code)]
 pub mod units;
+
+#[allow(dead_code)]
+pub mod clock;
