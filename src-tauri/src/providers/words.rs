@@ -230,14 +230,16 @@ fn definitions_of(word: &str, fetch: &dyn Fetch) -> Result<Vec<Sense>, LookupErr
 /// the first page has no page, no senses, or senses in only one of German and
 /// English. A language missing from the first page is taken from the second,
 /// German first; when the second fails or has nothing, the first page's answer stands.
-fn define_job(word: &str, fetch: &dyn Fetch) -> Result<Vec<Sense>, LookupError> {
+/// The second request is sent only while `wanted()` (the word is still the text
+/// asked last, and online answers are on); else the first page's answer stands.
+fn define_job(word: &str, fetch: &dyn Fetch, wanted: &dyn Fn() -> bool) -> Result<Vec<Sense>, LookupError> {
     let first = definitions_of(word, fetch);
     let has = |senses: &[Sense], lang: Lang| senses.iter().any(|s| s.lang == lang);
     let wants_more = match &first {
         Ok(senses) => !(has(senses, Lang::German) && has(senses, Lang::English)),
         Err(e) => *e == LookupError::NotFound,
     };
-    let Some(other) = flip_first(word).filter(|_| wants_more) else {
+    let Some(other) = flip_first(word).filter(|_| wants_more && wanted()) else {
         return first;
     };
     let second = definitions_of(&other, fetch);
@@ -354,7 +356,7 @@ impl WordsProvider {
             return vec![online_off(TRANSLATE_ICON)];
         }
         let owned = text.to_string();
-        match self.translations.ask(text, move |f| translate_job(&owned, f)) {
+        match self.translations.ask(text, move |f, _| translate_job(&owned, f)) {
             Lookup::Waiting => vec![inert("Translating…", TRANSLATE_ICON)],
             Lookup::Ready(t) => {
                 let from = source_language(text);
@@ -382,7 +384,7 @@ impl WordsProvider {
             return vec![online_off(DEFINE_ICON)];
         }
         let owned = word.to_string();
-        match self.definitions.ask(word, move |f| define_job(&owned, f)) {
+        match self.definitions.ask(word, move |f, wanted| define_job(&owned, f, wanted)) {
             Lookup::Waiting => vec![inert("Looking up…", DEFINE_ICON)],
             Lookup::Ready(senses) => senses
                 .iter()
@@ -824,6 +826,37 @@ mod tests {
     const WIKTIONARY_GIFT_UPPER: &str = r#"{"de":[{"partOfSpeech":"Noun","language":"German","definitions":[{"definition":"<a rel=\"mw:WikiLink\" href=\"/wiki/poison\" title=\"poison\">poison</a>, <a rel=\"mw:WikiLink\" href=\"/wiki/toxin\" title=\"toxin\">toxin</a>"},{"definition":"<span class=\"gloss-brac\">(</span>figuratively<span class=\"gloss-brac\">)</span> venom, spite"}]}]}"#;
     const DEF_GIFT: &str = "https://en.wiktionary.org/api/rest_v1/page/definition/gift";
     const DEF_GIFT_UPPER: &str = "https://en.wiktionary.org/api/rest_v1/page/definition/Gift";
+
+    #[test]
+    fn no_second_def_request_once_the_text_moved_on() {
+        // The first request is in flight (100 ms to 400 ms) when something else happens at 200 ms.
+        let moves: [(&str, fn(&WordsProvider)); 4] = [
+            ("def gifts", |p| {
+                p.query(&q("def gifts"));
+            }),
+            ("tr hallo", |p| {
+                p.query(&q("tr hallo"));
+            }),
+            ("online off", |p| p.set_online(false)),
+            ("bar hidden", |p| p.forget_waiting()),
+        ];
+        for (what, step) in moves {
+            let r = rig(
+                FakeFetch::offline()
+                    .respond(DEF_GIFT, Ok(WIKTIONARY_GIFT.as_bytes().to_vec()))
+                    .respond(DEF_GIFT_UPPER, Ok(WIKTIONARY_GIFT_UPPER.as_bytes().to_vec()))
+                    .with_delay(Duration::from_millis(300)),
+            );
+            r.p.query(&q("def gift"));
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(r.fetch.urls(), [DEF_GIFT], "{what}: first in flight");
+            step(&r.p);
+            std::thread::sleep(Duration::from_millis(900));
+            let urls = r.fetch.urls();
+            assert_eq!(urls[0], DEF_GIFT, "{what}");
+            assert!(!urls.iter().any(|u| u == DEF_GIFT_UPPER), "{what}: {urls:?}");
+        }
+    }
 
     #[test]
     fn a_word_in_both_languages_shows_both_german_first() {
