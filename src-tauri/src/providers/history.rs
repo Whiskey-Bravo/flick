@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::fuzzy;
 use crate::history::History;
-use crate::provider::{Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 const ID: &str = "clear";
 const KEYWORD: &str = "clear history";
@@ -51,6 +51,14 @@ impl Provider for HistoryProvider {
         }
         self.history.clear();
         Ok(Outcome::Hide)
+    }
+
+    fn help(&self) -> Vec<HelpLine> {
+        vec![HelpLine {
+            example: KEYWORD.into(),
+            about: "forget recent searches and launches".into(),
+            fill: KEYWORD.into(),
+        }]
     }
 
     /// Never learned or recalled as a recent launch.

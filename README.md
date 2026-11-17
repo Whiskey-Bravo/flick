@@ -4,7 +4,7 @@ A small keyboard launcher for Windows 11. Press Alt+Space (or your own hotkey), 
 
 <!-- screenshot: added with result icons -->
 
-Flick finds apps, files, folders and Settings pages, runs power actions, runs commands in WSL, and runs your own shortcuts. It is built for personal use with Tauri 2 (a Rust core and a plain TypeScript front end).
+Flick finds apps, files, folders and Settings pages, runs power actions, runs commands in WSL, and runs your own shortcuts. Each result has its icon, and you can use the mouse as well as the keyboard. It is built for personal use with Tauri 2 (a Rust core and a plain TypeScript front end).
 
 ## Install
 
@@ -26,6 +26,7 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
 | The name of one of your shortcuts | Runs it | `search rust traits` (after adding the `search` shortcut shown below) |
 | `>` and a command | Runs the command in WSL | `> htop -d 10` |
+| `clear history` | Forgets recent searches and launches (press Enter twice) | `clear history` |
 | `help`, or press F1 | Lists everything Flick can do | `help file` |
 | `flick config` | Opens the config file | `flick config` |
 
@@ -41,12 +42,47 @@ If you press Enter while results for what you just typed are still on their way,
 | Ctrl+Shift+Enter | Run the selected app as administrator |
 | Enter again | Confirm restart, shut down or sign out |
 | Up / Down | Move the selection |
+| Up (empty bar) | Recall your past searches, newest first |
+| Ctrl+P | Pin or unpin the selected row |
 | F1 | Show the help list |
 | Esc | Leave a shortcut's list; otherwise close the bar |
+
+On an empty bar, Enter opens the most recent launch again.
 
 The hotkey does nothing while an exclusive full-screen app (such as a game) is in front.
 
 Ctrl+Shift+Enter works for apps only, both Start-menu shortcuts and Store apps. Your own shortcuts with `admin = true` always run as administrator. A Store app that cannot be elevated says "this app cannot be run as administrator" instead of opening normally. Cancelling the UAC prompt just closes the bar.
+
+## Icons and the mouse
+
+Each result shows the icon of its app, file or folder. Icons load in the background, so the text always appears first.
+
+- Moving the mouse over a row selects it.
+- A click opens it.
+- A right click opens a small menu: Pin or Unpin, Open file location, Run as administrator. Entries that do not apply to that row are left out.
+
+## Pins and recent launches
+
+Pin the things you open every day. Select a row and press Ctrl+P (again to unpin), or use the right-click menu. With an empty bar, Flick shows your pins first, each with a star, and under them your last 5 launches. Pins stay until you unpin them.
+
+## Past searches
+
+Press Up on an empty bar to step back through what you searched for before (the last 50). Press Down to step forward again. Typing anything stops the recall.
+
+Type `clear history` and press Enter twice to forget past searches and recent launches. Pins are kept.
+
+To stop all of this, add `history = false` to the config. Flick then records nothing and deletes `history.json`. Pins are not affected.
+
+<details>
+<summary>What is never saved as a past search</summary>
+
+- Text after `>` (WSL commands).
+- Text you type into a shortcut, or into one of its lists.
+- `help`.
+
+Power actions (lock, sleep, restart and so on) are never saved as recent launches either.
+
+</details>
 
 ## Help
 
@@ -228,6 +264,7 @@ The config file is `%APPDATA%\Flick\config.toml`. It is created with commented d
 hotkey = "Alt+Space"
 wsl_distro = "Ubuntu"
 file_roots = ["C:/Users/you/Desktop", "C:/Users/you/Documents", "C:/Users/you/Downloads"]
+history = true
 
 [[shortcut]]
 name = "docs"
@@ -237,6 +274,7 @@ open = "https://docs.rs"
 - `hotkey`: the global shortcut that shows the bar.
 - `wsl_distro`: the WSL distro for `>` commands and `wsl` shortcuts. Leave it out to use WSL's default distro.
 - `file_roots`: the folders searched for files. Leave it out to search your whole user folder.
+- `history`: set to `false` to stop saving past searches and recent launches (see Past searches). The default is `true`.
 - `[[shortcut]]`: see Shortcuts.
 
 <details>
@@ -250,7 +288,11 @@ Changes are picked up as soon as you save the file; changed `file_roots` are sea
 
 Flick counts only which result you picked (an app, a Settings page, a file, a shortcut, an entry of a shortcut's list). This is stored only on this PC in `%APPDATA%\Flick\picks.json` and never shown. Power actions are never counted.
 
-Nothing you type is saved: not WSL commands, not the text you give a shortcut.
+Past searches are saved on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`. Nothing is sent anywhere.
+
+Never saved: WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
+
+To switch it off, set `history = false` in the config: Flick stops recording and deletes `history.json`. `clear history` empties it at any time.
 
 ## Tray menu
 

@@ -571,8 +571,11 @@ mod tests {
                 "bluetooth",
                 "lock / sleep / restart / shut down / sign out",
                 "flick config",
+                "clear history",
                 "help",
                 "Esc",
+                "Ctrl+P",
+                "Up",
             ]
         );
         let flick = &help[6];
@@ -583,7 +586,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 9);
+        assert_eq!(r.engine.query("Help", None).len(), 12);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));

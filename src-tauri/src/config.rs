@@ -20,7 +20,7 @@ const DEFAULT_FILE: &str = "\
 ## file_roots: folders searched for files. Leave unset to search your whole user folder.
 # file_roots = [\"C:/Users/you/Desktop\", \"C:/Users/you/Documents\", \"C:/Users/you/Downloads\"]
 ##
-## history: remember recent searches and launches (false: forget and stop). 
+## history: remember recent searches and launches (false: forget and stop).
 # history = true
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
