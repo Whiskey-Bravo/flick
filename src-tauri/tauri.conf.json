@@ -42,7 +42,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "REPLACE_WITH_FLICK_UPDATER_PUBLIC_KEY",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZCQzUxRTZBQjIwQ0EwQjYKUldTMm9BeXlhaDdGKzJ0TWF0T3RKaFNJZGlPZnQremhKdXIza09vQ2QyU0ltcXNLd0tUbmlWNlgK",
       "endpoints": ["https://github.com/Whiskey-Bravo/flick/releases/latest/download/latest.json"],
       "windows": { "installMode": "passive" }
     }
