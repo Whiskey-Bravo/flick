@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! System controls behind a trait: audio, media keys, dark mode and radios.
 //! The real implementation talks to Windows; tests use fakes and never
 //! construct `SystemControls`.

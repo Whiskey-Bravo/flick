@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! System provider: volume, mute, media keys, dark and light mode, Wi-Fi,
 //! Bluetooth and night light. Typing only builds rows from the cached audio
 //! state; everything happens on Enter.
@@ -14,6 +13,8 @@ use crate::providers::power::POWER_PENALTY;
 /// Score of rows built from typed numbers (`vol 30`).
 const PARSED_SCORE: u32 = 800;
 const STEP: u8 = 10;
+/// The "out of range" hint must never crowd out real results.
+const WAIT_SCORE: u32 = 100;
 const WAIT_TITLE: &str = "Volume goes from 0 to 100";
 
 struct Cmd {
@@ -119,7 +120,7 @@ impl SystemProvider {
                     PARSED_SCORE,
                     false,
                 ),
-                None => self.row("wait", WAIT_TITLE.into(), "Sound".into(), PARSED_SCORE, false),
+                None => self.row("wait", WAIT_TITLE.into(), "Sound".into(), WAIT_SCORE, false),
             },
         }
     }
@@ -143,6 +144,17 @@ fn parse_percent(s: &str) -> Option<u8> {
     s.parse::<u8>().ok().filter(|n| *n <= 100)
 }
 
+/// Optional sign, digits, optional decimal part, optional `%`: a number the
+/// user is still working on, as opposed to a word like `mixer`.
+fn looks_numeric(s: &str) -> bool {
+    let s = s.strip_suffix('%').unwrap_or(s);
+    let s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    let (int, frac) = s.split_once('.').map_or((s, ""), |(i, f)| (i, f));
+    !int.is_empty()
+        && int.bytes().all(|b| b.is_ascii_digit())
+        && frac.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Lowercase with single spaces.
 fn normalize(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
@@ -162,13 +174,22 @@ impl Provider for SystemProvider {
         if text.is_empty() {
             return Vec::new();
         }
+        let mut needles = vec![text.as_str()];
         if let Some(rest) = volume_rest(&text) {
-            return vec![self.volume_row(rest)];
+            if matches!(rest, "up" | "down") || looks_numeric(rest) {
+                return vec![self.volume_row(rest)];
+            }
+            // `volume mute`: the word after it is matched on its own too.
+            needles.push(rest);
         }
         let mut hits: Vec<ResultItem> = CMDS
             .iter()
             .filter_map(|c| {
-                let best = c.keywords.iter().filter_map(|k| fuzzy::score(&text, k)).max()?;
+                let best = c
+                    .keywords
+                    .iter()
+                    .flat_map(|k| needles.iter().filter_map(move |n| fuzzy::score(n, k)))
+                    .max()?;
                 Some(self.cmd_row(c, best.saturating_sub(POWER_PENALTY).max(1)))
             })
             .collect();
@@ -304,7 +325,7 @@ mod tests {
         let (p, c, l) = setup(Ok(Audio { volume: 40, muted: false }));
         for t in [
             "mute", "sound off", "unmute", "sound on", "vol", "volume", "vol 30", "volume 5", "vol up",
-            "vol down", "vol abc", "next song", "next track", "previous song", "prev song", "play",
+            "vol down", "vol 3.5", "volume mute", "next song", "next track", "previous song", "prev song", "play",
             "pause", "play pause", "dark mode", "light mode", "wifi on", "wi-fi off", "bluetooth on",
             "bluetooth off", "night light",
         ] {
@@ -328,13 +349,24 @@ mod tests {
     #[test]
     fn volume_out_of_range_does_nothing() {
         let (p, c, _) = setup(Err("x".into()));
-        for t in ["vol 300", "vol -5", "vol abc"] {
+        for t in ["vol 300", "vol -5", "vol 3.5", "vol 120%"] {
             let r = p.query(&q(t));
             assert_eq!(r.len(), 1, "{t}");
             assert_eq!((r[0].id.as_str(), r[0].title.as_str()), ("wait", "Volume goes from 0 to 100"));
+            assert_eq!(r[0].score, WAIT_SCORE);
             assert_eq!(p.activate(&r[0].id, Modifier::None), Ok(Outcome::Keep));
         }
         assert!(c.calls().is_empty());
+    }
+
+    #[test]
+    fn words_after_vol_get_no_wait_row() {
+        let (p, _, _) = setup(Err("x".into()));
+        for t in ["vol abc", "volume mixer", "vol report"] {
+            assert!(p.query(&q(t)).iter().all(|r| r.id != "wait"), "{t}");
+        }
+        let r = p.query(&q("volume mute"));
+        assert!(r.iter().any(|r| r.id == "mute"), "volume mute offers Mute");
     }
 
     #[test]
