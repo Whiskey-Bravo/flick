@@ -12,3 +12,6 @@ pub mod units;
 
 #[allow(dead_code)]
 pub mod clock;
+
+#[allow(dead_code)]
+pub mod rates;

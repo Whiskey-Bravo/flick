@@ -7,6 +7,9 @@ mod history;
 mod hotkey;
 mod icon;
 mod launch;
+// Used by answers (rates now, weather later); wired into the app in a later task.
+#[allow(dead_code)]
+mod net;
 mod pins;
 mod provider;
 mod process;
