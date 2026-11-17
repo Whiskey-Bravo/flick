@@ -948,6 +948,27 @@ describe("mouse and menu", () => {
     expect(run(after, { type: "input", text: "wor" }).state.error).toBeNull();
   });
 
+  it("reopen_without_an_error_only_fills_the_text", () => {
+    const r = reduce(run(initial, { type: "hidden" }).state, { type: "reopen", text: "search ", error: "" });
+    expect(r.state.text).toBe("search ");
+    expect(r.state.error).toBeNull();
+    expect(r.state.failure).toBeNull();
+    expect(r.state.hidden).toBe(false);
+    expect(r.effects).toEqual([{ type: "query", text: "search ", scope: null }, { type: "loadPast" }]);
+  });
+
+  it("scoped_event_opens_the_pick_list", () => {
+    const dirty = run(initial, { type: "input", text: "x" }, { type: "hidden" }).state;
+    const r = reduce(dirty, { type: "scoped", prompt: "proj", scope: "shortcut:proj" });
+    expect(r.state.scope).toEqual({ name: "shortcut:proj", prompt: "proj" });
+    expect(r.state.text).toBe("");
+    expect(r.state.hidden).toBe(false);
+    expect(r.effects).toEqual([{ type: "query", text: "", scope: "shortcut:proj" }, { type: "loadPast" }]);
+    const listed = run(r.state, { type: "results", items: [item("a")] }).state;
+    const e = reduce(listed, key("Enter"));
+    expect(e.effects).toEqual([{ type: "activate", item: item("a"), modifier: "none", text: "", scope: "shortcut:proj" }]);
+  });
+
   it("armed_row_survives_answers_ready", () => {
     const it = item("w", true);
     const armed = run(initial, { type: "armed", item: it }).state;

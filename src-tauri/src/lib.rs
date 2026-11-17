@@ -1002,12 +1002,24 @@ impl PressTarget for AppPress {
         self.app.state::<AppState>().engine.item(provider, id)
     }
 
+    fn ready(&self, provider: &str) -> bool {
+        self.app.state::<AppState>().engine.ready(provider)
+    }
+
     fn open(&self, provider: &str, id: &str) -> Result<Outcome, String> {
         self.app.state::<AppState>().engine.open_item(provider, id)
     }
 
     fn show_armed(&self, item: ResultItem) {
         window::show_armed(&self.app, &item);
+    }
+
+    fn show_filled(&self, text: &str) {
+        window::reopen(&self.app, text, "");
+    }
+
+    fn show_step(&self, prompt: &str, scope: &str) {
+        window::show_step(&self.app, prompt, scope);
     }
 
     fn follow_up(&self, then: Then) {
