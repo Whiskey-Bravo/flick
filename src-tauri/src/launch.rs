@@ -321,10 +321,20 @@ unsafe fn shortcut_target_missing(file: &[u16]) -> bool {
 /// stores no file-system path (advertised installs, shell items).
 /// Call inside [`with_com`] when reading many links: the nested init here is
 /// then only a reference count, not a COM load and unload per link.
+#[cfg_attr(not(test), allow(dead_code))] // the apps scan reads `shortcut_details`
 pub fn shortcut_target(lnk: &str) -> Option<String> {
     let file = wide(lnk);
     // SAFETY: `with_com` initialises COM on this thread for the read.
     with_com(|| unsafe { stored_link_target(&file) })
+}
+
+/// The stored target of `lnk` and whether the link passes command-line
+/// arguments (web apps, Office and other launchers do). Same rules and COM
+/// advice as [`shortcut_target`]; unreadable arguments count as present.
+pub fn shortcut_details(lnk: &str) -> Option<(String, bool)> {
+    let file = wide(lnk);
+    // SAFETY: `with_com` initialises COM on this thread for the read.
+    with_com(|| unsafe { stored_link(&file) })
 }
 
 /// Run `f` with COM initialised on this thread, balanced only when that init
@@ -342,6 +352,12 @@ pub fn with_com<R>(f: impl FnOnce() -> R) -> R {
 /// # Safety
 /// COM must be initialised on this thread; `file` is NUL-terminated.
 unsafe fn stored_link_target(file: &[u16]) -> Option<String> {
+    unsafe { stored_link(file) }.map(|(target, _)| target)
+}
+
+/// # Safety
+/// COM must be initialised on this thread; `file` is NUL-terminated.
+unsafe fn stored_link(file: &[u16]) -> Option<(String, bool)> {
     let path = String::from_utf16_lossy(&file[..file.len() - 1]);
     let is_lnk = Path::new(&path)
         .extension()
@@ -356,7 +372,10 @@ unsafe fn stored_link_target(file: &[u16]) -> Option<String> {
         let mut buf = [0u16; 1024];
         link.GetPath(&mut buf, std::ptr::null_mut(), 0).ok()?;
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-        (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
+        let target = (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))?;
+        let mut args = [0u16; 2048];
+        let has_args = link.GetArguments(&mut args).map_or(true, |_| args[0] != 0);
+        Some((target, has_args))
     }
 }
 
