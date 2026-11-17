@@ -29,6 +29,8 @@
   border: none; background: transparent; color: var(--text); text-align: left; cursor: pointer;
 }
 .hk-remove { flex: none; margin-right: 6px; }
+/* Long combos wrap inside the row instead of running under Remove. */
+.hk-main .sc-name { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 0; }
 .hk-status { color: var(--error); font-size: 12px; }
 .hk-chosen { padding: 4px 0; }
 .hk-capture { align-self: flex-start; }
