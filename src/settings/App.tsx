@@ -1,10 +1,20 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { onSettingsChanged, settingsOpenFile, settingsState, type SettingsState } from "./api";
+import { Shortcuts, type LeaveGuard } from "./Shortcuts";
 import { TABS, TAB_LABELS, nextTab, type Tab } from "./tabs";
 
 export function App() {
   const [state, setState] = useState<SettingsState | null>(null);
   const [tab, setTab] = useState<Tab>("general");
+  // The Shortcuts editor sets this while it is open; it asks Save / Discard / Stay.
+  const shortcutsGuard: LeaveGuard = useRef(null);
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  const goTo = async (next: Tab) => {
+    if (next === tabRef.current) return;
+    if (tabRef.current === "shortcuts" && shortcutsGuard.current && !(await shortcutsGuard.current())) return;
+    setTab(next);
+  };
 
   useEffect(() => {
     const load = () => {
@@ -21,7 +31,7 @@ export function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.key === "Tab") {
         e.preventDefault();
-        setTab((t) => nextTab(t, e.shiftKey ? -1 : 1));
+        void goTo(nextTab(tabRef.current, e.shiftKey ? -1 : 1));
       }
     };
     window.addEventListener("keydown", onKey);
@@ -39,7 +49,7 @@ export function App() {
             role="tab"
             class={t === tab ? "tab active" : "tab"}
             aria-selected={t === tab}
-            onClick={() => setTab(t)}
+            onClick={() => void goTo(t)}
           >
             {TAB_LABELS[t]}
           </button>
@@ -54,7 +64,11 @@ export function App() {
       {/* While the file is broken every input inside is disabled. */}
       <fieldset class="page" disabled={broken}>
         <h1>{TAB_LABELS[tab]}</h1>
-        <p class="placeholder">Coming soon.</p>
+        {tab === "shortcuts" && state ? (
+          <Shortcuts state={state} guard={shortcutsGuard} />
+        ) : (
+          <p class="placeholder">Coming soon.</p>
+        )}
       </fieldset>
     </div>
   );
