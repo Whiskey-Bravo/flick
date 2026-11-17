@@ -367,11 +367,24 @@ impl WordsProvider {
     }
 
     /// Follows the `online` config key: off means nothing is ever fetched.
+    /// Turning it off waits for a query already past its checks (it holds
+    /// `copies`), so nothing that query asked for is sent.
     pub fn set_online(&self, on: bool) {
-        self.online.store(on, Ordering::Relaxed);
-        if !on {
-            self.forget_waiting();
+        if on {
+            self.online.store(true, Ordering::Relaxed);
+            return;
         }
+        let _turn = self.copies.lock().unwrap();
+        self.online.store(false, Ordering::Relaxed);
+        self.forget_waiting();
+    }
+
+    /// The bar hid: drops the waiting text, after any query already past its
+    /// checks (it holds `copies`) has asked. Not inside `forget_waiting`, which
+    /// runs while `copies` is held.
+    pub fn hide(&self) {
+        let _turn = self.copies.lock().unwrap();
+        self.forget_waiting();
     }
 
     /// Drops the text waiting for the pause (the bar hid): nothing is sent for it.
@@ -825,22 +838,35 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_skip_or_clear_waits_for_a_query_already_past_its_check() {
+    fn a_skip_clear_hide_or_online_off_waits_for_a_query_already_past_its_check() {
         type Step = fn(&WordsProvider);
-        let steps: [(&str, Step); 2] = [("skipped", |p| p.skipped()), ("empty_query", |p| {
-            p.empty_query();
-        })];
+        let steps: [(&str, Step); 4] = [
+            ("skipped", |p| p.skipped()),
+            ("empty_query", |p| {
+                p.empty_query();
+            }),
+            ("hide", |p| p.hide()),
+            ("online off", |p| p.set_online(false)),
+        ];
         for (what, step) in steps {
             let r = rig(FakeFetch::new(Ok(MYMEMORY_GUTEN_MORGEN.as_bytes().to_vec())));
             let p = &r.p;
+            let (started_tx, started) = mpsc::channel();
+            let (done_tx, done) = mpsc::channel();
             std::thread::scope(|s| {
-                // Query 5 holds `copies` and has passed its newest-query check ...
+                // Query 5 holds `copies` and has passed its checks ...
                 let mut copies = p.copies.lock().unwrap();
                 assert!(crate::engine::as_query(5, || p.is_newest()));
-                // ... when query 6 (the bar cleared, or text sent elsewhere) arrives.
-                let newer = s.spawn(move || crate::engine::as_query(6, || step(p)));
-                std::thread::sleep(Duration::from_millis(50));
-                // Query 5 goes on to ask; then query 6 must still forget it.
+                // ... when query 6 (a clear, text sent elsewhere, a hide, online off) arrives.
+                let newer = s.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    crate::engine::as_query(6, || step(p));
+                    done_tx.send(()).unwrap();
+                });
+                started.recv_timeout(WAIT).expect("the step started");
+                // It must wait for query 5; without the lock it is done long before this.
+                assert!(done.recv_timeout(Duration::from_millis(200)).is_err(), "{what}: did not wait for the query");
+                // Query 5 goes on to ask; then the step must still forget it.
                 crate::engine::as_query(5, || p.answer("tr hallo", &mut copies));
                 drop(copies);
                 newer.join().unwrap();
