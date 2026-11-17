@@ -41,7 +41,24 @@ fn tokenize(text: &str) -> Option<Vec<Tok>> {
                 i += 1;
             }
             let s: String = chars[start..i].iter().collect();
-            toks.push(Tok::Num(parse_number(&s)?));
+            let mut v = parse_number(&s)?;
+            // Scientific notation: `2e3`, `1,5e-3` (no spaces) is one number literal.
+            if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+                let mut j = i + 1;
+                if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+                    j += 1;
+                }
+                let digits = j;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > digits {
+                    let exp: String = chars[i + 1..j].iter().collect();
+                    v *= 10f64.powi(exp.parse::<i32>().ok()?);
+                    i = j;
+                }
+            }
+            toks.push(Tok::Num(v));
         } else if c.is_alphabetic() {
             let start = i;
             while i < chars.len() && chars[i].is_alphabetic() {
@@ -90,6 +107,11 @@ struct Parser<'a> {
     meaningful: bool,
 }
 
+/// Rejects a non-finite intermediate result (`1/(10^400)` must not become 0).
+fn chk(v: Val) -> Option<Val> {
+    v.v.is_finite().then_some(v)
+}
+
 impl Parser<'_> {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
@@ -107,7 +129,7 @@ impl Parser<'_> {
             let rhs = self.term()?;
             self.meaningful = true;
             let r = if rhs.pct { lhs.v * rhs.v } else { rhs.v };
-            lhs = Val { v: if op == Tok::Plus { lhs.v + r } else { lhs.v - r }, pct: false };
+            lhs = chk(Val { v: if op == Tok::Plus { lhs.v + r } else { lhs.v - r }, pct: false })?;
         }
         Some(lhs)
     }
@@ -121,7 +143,7 @@ impl Parser<'_> {
                     self.pos += 1;
                     let rhs = self.unary()?;
                     self.meaningful = true;
-                    lhs = Val { v: if mul { lhs.v * rhs.v } else { lhs.v / rhs.v }, pct: false };
+                    lhs = chk(Val { v: if mul { lhs.v * rhs.v } else { lhs.v / rhs.v }, pct: false })?;
                 }
                 Some(Tok::Of) => {
                     if !lhs.pct {
@@ -130,16 +152,19 @@ impl Parser<'_> {
                     self.pos += 1;
                     let rhs = self.unary()?;
                     self.meaningful = true;
-                    lhs = Val { v: lhs.v * rhs.v, pct: false };
+                    lhs = chk(Val { v: lhs.v * rhs.v, pct: false })?;
                 }
                 Some(Tok::Num(_)) | Some(Tok::Ident(_)) | Some(Tok::LParen) => {
-                    let after_num = self.pos > 0 && matches!(self.toks[self.pos - 1], Tok::Num(_));
-                    if lhs.pct || (after_num && matches!(self.peek(), Some(Tok::Num(_)))) {
+                    // Implicit multiplication: a number or `)` directly followed by a name or `(`.
+                    let left_ok = self.pos > 0
+                        && matches!(self.toks[self.pos - 1], Tok::Num(_) | Tok::RParen);
+                    let right_ok = matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::LParen));
+                    if lhs.pct || !left_ok || !right_ok {
                         return None;
                     }
                     let rhs = self.unary()?;
                     self.meaningful = true;
-                    lhs = Val { v: lhs.v * rhs.v, pct: false };
+                    lhs = chk(Val { v: lhs.v * rhs.v, pct: false })?;
                 }
                 _ => return Some(lhs),
             }
@@ -169,7 +194,7 @@ impl Parser<'_> {
             let exp = self.unary();
             self.depth -= 1;
             self.meaningful = true;
-            return Some(Val { v: base.v.powf(exp?.v), pct: false });
+            return chk(Val { v: base.v.powf(exp?.v), pct: false });
         }
         Some(base)
     }
@@ -229,7 +254,7 @@ impl Parser<'_> {
                             _ => return None,
                         };
                         self.meaningful = true;
-                        plain(f(self.paren()?))
+                        chk(Val { v: f(self.paren()?), pct: false })
                     }
                 }
             }
@@ -331,6 +356,20 @@ mod tests {
         assert_eq!(v("floor(2.7)+ceil(2.1)+round(2.5)"), Some(8.0));
         assert_eq!(v("log(1000)"), Some(3.0));
         assert!((v("pi*2").unwrap() - std::f64::consts::TAU).abs() < 1e-12);
+    }
+
+    #[test]
+    fn constants_and_scientific_notation() {
+        let v = |s| evaluate(s).map(|c| c.value);
+        for s in ["e2", "pi 2", "pi2", "2e3", "1/(10^400)"] {
+            assert!(evaluate(s).is_none(), "{s}");
+        }
+        assert_eq!(v("2e3*2"), Some(4000.0));
+        assert_eq!(v("1,5e3 + 0"), Some(1500.0));
+        assert_eq!(v("2e-3*1000"), Some(2.0));
+        assert!((v("2pi").unwrap() - std::f64::consts::TAU).abs() < 1e-12);
+        assert_eq!(v("2(3+1)"), Some(8.0));
+        assert_eq!(v("(1+1)(2)"), Some(4.0));
     }
 
     #[test]
