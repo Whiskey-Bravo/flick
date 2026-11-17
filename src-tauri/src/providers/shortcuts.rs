@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::config::ShortcutDef;
@@ -241,6 +241,19 @@ struct State {
     builtin: HashSet<String>,
     /// How many shortcuts the config itself defines.
     own: usize,
+    /// The [`Staged::ticket`] these definitions came with (0: none yet).
+    ticket: u64,
+}
+
+/// New definitions, taken in order by [`ShortcutsProvider::stage`] but not
+/// read from disk yet: [`ShortcutsProvider::apply`] reads their pick folders.
+pub struct Staged {
+    defs: Vec<ShortcutDef>,
+    distro: String,
+    builtin: HashSet<String>,
+    own: usize,
+    /// Order of staging: a set staged later always wins.
+    ticket: u64,
 }
 
 /// Sub-folders of `dir`, sorted case-insensitively. Reads the disk.
@@ -258,8 +271,22 @@ fn read_folders(dir: &Path) -> Result<Vec<Entry>, String> {
     Ok(out)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Calls of `load_entries` on this thread (tests).
+    static LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How often this thread has read the pick folders (tests).
+#[cfg(test)]
+pub(crate) fn pick_loads() -> usize {
+    LOADS.with(|n| n.get())
+}
+
 /// The entries of every pick shortcut in `defs`. Reads the disk.
 fn load_entries(defs: &[ShortcutDef]) -> Entries {
+    #[cfg(test)]
+    LOADS.with(|n| n.set(n.get() + 1));
     defs.iter()
         .filter(|d| kind(d) == Kind::Pick)
         .map(|d| {
@@ -296,6 +323,8 @@ pub struct ShortcutsProvider {
     state: Arc<RwLock<State>>,
     /// A background refresh is running (at most one at a time).
     refreshing: Arc<AtomicBool>,
+    /// The last [`Staged::ticket`] handed out.
+    tickets: AtomicU64,
 }
 
 /// Clears the in-flight flag when the background refresh ends, even by panic.
@@ -310,20 +339,40 @@ impl Drop for InFlight {
 impl ShortcutsProvider {
     pub fn new(launcher: Arc<dyn Launcher>, distro: &str) -> Arc<Self> {
         let state = State { distro: distro.to_string(), ..Default::default() };
-        Arc::new(Self { launcher, state: Arc::new(RwLock::new(state)), refreshing: Arc::default() })
+        Arc::new(Self { launcher, state: Arc::new(RwLock::new(state)), refreshing: Arc::default(), tickets: AtomicU64::new(0) })
     }
 
     /// New definitions from the config (reload thread), with the built-in web
     /// searches added under them (`search_engine` is the config's, "" = the
     /// default). Reads the pick folders before swapping, so queries never see
-    /// a half-built list.
+    /// a half-built list. The app stages and applies in two steps (tests).
+    #[cfg(test)]
     pub fn set(&self, defs: Vec<ShortcutDef>, distro: &str, search_engine: &str) {
+        self.apply(self.stage(defs, distro, search_engine));
+    }
+
+    /// The first half of [`set`](Self::set), with no disk access: takes the
+    /// definitions in order. Stage under the lock that orders the configs,
+    /// then [`apply`](Self::apply) with that lock released.
+    pub fn stage(&self, defs: Vec<ShortcutDef>, distro: &str, search_engine: &str) -> Staged {
         let own = defs.len();
         let (defs, builtin) = with_builtins(defs, search_engine);
-        let entries = load_entries(&defs);
+        let ticket = self.tickets.fetch_add(1, Ordering::SeqCst) + 1;
+        Staged { defs, distro: distro.to_string(), builtin, own, ticket }
+    }
+
+    /// The second half of [`set`](Self::set): reads the pick folders (no lock
+    /// held), then swaps the definitions in, unless a set staged later was
+    /// applied meanwhile (the last staged wins, whichever applies first).
+    pub fn apply(&self, staged: Staged) {
+        let entries = load_entries(&staged.defs);
         let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
-        st.generation += 1;
-        *st = State { defs, distro: distro.to_string(), entries, generation: st.generation, builtin, own };
+        if staged.ticket < st.ticket {
+            return;
+        }
+        let Staged { defs, distro, builtin, own, ticket } = staged;
+        let generation = st.generation + 1;
+        *st = State { defs, distro, entries, generation, builtin, own, ticket };
     }
 
     /// Re-read the pick folders (timer, and after a pick shortcut is chosen).
@@ -1104,6 +1153,34 @@ mod tests {
         assert_eq!(p.query(&scoped("shortcut:proj", "")).len(), 3);
         p.refresh();
         assert_eq!(p.query(&scoped("shortcut:proj", "")).len(), 4);
+    }
+
+    #[test]
+    fn stage_reads_nothing_and_apply_reads_the_folders_once() {
+        let dir = projects();
+        let (p, _) = setup(vec![]);
+        let before = pick_loads();
+        let staged = p.stage(vec![picker(run("proj", "code {path}"), dir.path())], "Debian", "");
+        assert_eq!(pick_loads(), before);
+        // Read at apply time: a folder made after staging is listed.
+        std::fs::create_dir(dir.path().join("delta")).unwrap();
+        p.apply(staged);
+        assert_eq!(pick_loads(), before + 1);
+        assert_eq!(p.query(&scoped("shortcut:proj", "")).len(), 4);
+    }
+
+    #[test]
+    fn a_later_staged_set_wins_even_when_applied_first() {
+        let (p, _) = setup(vec![]);
+        let older = p.stage(vec![run("old", "notepad")], "Debian", "");
+        let newer = p.stage(vec![run("new", "notepad")], "Debian", "");
+        p.apply(newer);
+        p.apply(older);
+        assert!(p.query(&q("old")).is_empty());
+        assert_eq!(ids(&p.query(&q("new"))), vec!["run:new"]);
+        // A refresh keeps them.
+        p.refresh();
+        assert_eq!(ids(&p.query(&q("new"))), vec!["run:new"]);
     }
 
     // ---- wsl / open ------------------------------------------------------
