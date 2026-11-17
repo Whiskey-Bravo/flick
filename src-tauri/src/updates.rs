@@ -20,7 +20,8 @@ pub struct Available {
 pub trait UpdateSource: Send + Sync {
     /// `Ok(None)`: this is the latest version.
     fn check(&self) -> Result<Option<Available>, String>;
-    /// Downloads and installs what the last `check` found, then restarts Flick.
+    /// Downloads and installs what the last `check` found. On Windows the plugin
+    /// exits the process and the NSIS update run relaunches Flick.
     fn install(&self) -> Result<(), String>;
 }
 
@@ -78,7 +79,7 @@ impl Updates {
     }
 
     /// Installs what was found (also retries after a failure). Blocks until the
-    /// source is done; on success the source restarts Flick.
+    /// source is done; on success the process ends.
     pub fn install(&self) {
         let version = {
             let mut inner = self.lock();
@@ -166,6 +167,7 @@ impl UpdateSource for PluginSource {
         };
         tauri::async_runtime::block_on(update.download_and_install(|_, _| {}, || {}))
             .map_err(|e| e.to_string())?;
+        // Only a fallback: on Windows the plugin has already exited the process.
         self.app.restart()
     }
 }
@@ -173,7 +175,7 @@ impl UpdateSource for PluginSource {
 /// Wires the in-memory state to the bar, the Settings window and the tray.
 pub fn on_change(app: AppHandle) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || {
-        let _ = app.emit_to(window::LABEL, "answers:ready", ());
+        let _ = app.emit_to(window::LABEL, "update:changed", ());
         let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
         if let Some(state) = app.try_state::<AppState>() {
             let label = match state.updates.visible_state() {
@@ -351,7 +353,7 @@ pub(crate) mod tests {
         u.install();
         assert_eq!(u.state(), UpdateState::Failed { version: "0.4.0".into(), reason: "bad signature".into() });
         u.install();
-        // The source restarts Flick on success, so the state stays Downloading.
+        // On success the install ends the process, so the state stays Downloading.
         assert_eq!(u.state(), UpdateState::Downloading { version: "0.4.0".into() });
     }
 

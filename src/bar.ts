@@ -47,6 +47,7 @@ export type Event =
   | { type: "blurred" }
   | { type: "hidden" }
   | { type: "answersReady" }
+  | { type: "updateChanged" }
   | { type: "input"; text: string }
   | { type: "results"; items: Item[] }
   | { type: "past"; items: string[] }
@@ -159,6 +160,13 @@ function step(s: State, e: Event): Result {
       // While typed text is still waiting for its answer, the rows are for older text.
       const keep = sel && !s.awaiting ? { provider: sel.provider, id: sel.id } : null;
       return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }]);
+    }
+    case "updateChanged": {
+      // The update row (found, downloading, failed) lives in the empty bar only.
+      if (s.hidden || s.text.trim() !== "" || s.scope) return done(s);
+      const sel = s.items[s.selected];
+      const keep = sel ? { provider: sel.provider, id: sel.id } : null;
+      return done({ ...s, keep }, [{ type: "query", text: "", scope: null, keepSelection: true }]);
     }
     case "menuClose":
       return done({ ...s, menu: null });
