@@ -21,6 +21,7 @@ mod settings_window;
 mod updates;
 mod tray;
 mod window;
+mod winlist;
 mod wsl_detect;
 
 use std::path::PathBuf;

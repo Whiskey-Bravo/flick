@@ -10,4 +10,5 @@ pub mod settings;
 pub mod shortcuts;
 pub mod update;
 pub mod welcome;
+pub mod windows;
 pub mod wsl;
