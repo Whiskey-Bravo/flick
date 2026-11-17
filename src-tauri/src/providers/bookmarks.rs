@@ -127,14 +127,31 @@ impl BookmarksProvider {
     /// again while a forced read was asked for meanwhile.
     fn spawn_reads(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        std::thread::spawn(move || loop {
-            this.refresh();
-            let mut state = this.state();
-            if !std::mem::take(&mut state.again) {
-                state.running = false;
-                return;
+        std::thread::spawn(move || {
+            let _done = Done(Arc::clone(&this));
+            loop {
+                this.refresh();
+                let mut state = this.state();
+                if !std::mem::take(&mut state.again) {
+                    state.running = false;
+                    return;
+                }
             }
         });
+    }
+}
+
+/// Clears `running` (and a pending forced read) when a read panics, so the
+/// next refresh can start one; a normal end clears it under the lock itself.
+struct Done(Arc<BookmarksProvider>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut state = self.0.state();
+            state.running = false;
+            state.again = false;
+        }
     }
 }
 
@@ -372,6 +389,31 @@ mod tests {
         p.refresh_now();
         wait_idle(&p);
         assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// The first read panics; later ones answer.
+    struct PanicsOnce(AtomicUsize);
+
+    impl BookmarkSource for PanicsOnce {
+        fn read(&self) -> Result<Vec<Bookmark>, String> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the reader broke");
+            }
+            Ok(books())
+        }
+    }
+
+    #[test]
+    fn a_panicking_read_does_not_stop_later_reads() {
+        let source = Arc::new(PanicsOnce(AtomicUsize::new(0)));
+        let p = BookmarksProvider::new(source.clone(), Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()));
+        p.refresh_now();
+        wait_idle(&p);
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
+        p.refresh_now();
+        wait_idle(&p);
+        assert_eq!(source.0.load(Ordering::SeqCst), 2, "a new read started");
+        assert_eq!(p.query(&q("rust")).len(), 1);
     }
 
     #[test]
