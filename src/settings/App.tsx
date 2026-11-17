@@ -4,6 +4,7 @@ import { Answers } from "./Answers";
 import { General } from "./General";
 import { Search } from "./Search";
 import { Shortcuts, type LeaveGuard } from "./Shortcuts";
+import { Updates } from "./Updates";
 import { TABS, TAB_LABELS, nextTab, type Tab } from "./tabs";
 
 export function App() {
@@ -92,7 +93,7 @@ export function App() {
         {state !== null && tab === "search" && <Search state={state} />}
         {state !== null && tab === "answers" && <Answers state={state} />}
         {state !== null && tab === "shortcuts" && <Shortcuts state={state} guard={shortcutsGuard} />}
-        {tab === "updates" && <p class="placeholder">Coming soon.</p>}
+        {tab === "updates" && <Updates />}
       </fieldset>
     </div>
   );

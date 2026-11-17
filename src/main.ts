@@ -314,6 +314,7 @@ const shownListener = listen("bar:shown", () => {
 shownListener.catch(listenFailed);
 // A rate or forecast arrived: the bar asks again if the text is still the same.
 listen("answers:ready", () => dispatch({ type: "answersReady" })).catch(listenFailed);
+listen("update:changed", () => dispatch({ type: "updateChanged" })).catch(listenFailed);
 // The back end hid the bar (Esc, focus loss, an activation): no live updates until it is shown again.
 listen("bar:hidden", () => dispatch({ type: "hidden" })).catch(listenFailed);
 listen<string | null>("config:error", (e) => dispatch({ type: "configError", message: e.payload })).catch(listenFailed);

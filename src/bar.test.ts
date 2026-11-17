@@ -621,6 +621,18 @@ describe("mouse and menu", () => {
     expect(viaEnter.state.menu).toBeNull();
   });
 
+  describe("update changed", () => {
+    it("requeries the empty bar only", () => {
+      const empty = run(initial, { type: "shown" }, { type: "results", items: [item("u")] });
+      expect(run(empty.state, { type: "updateChanged" }).effects).toEqual([
+        { type: "query", text: "", scope: null, keepSelection: true },
+      ]);
+      const typed = run(initial, { type: "shown" }, { type: "input", text: "a" }, { type: "results", items: [item("a")] });
+      expect(run(typed.state, { type: "updateChanged" }).effects).toEqual([]);
+      expect(run(empty.state, { type: "hidden" }, { type: "updateChanged" }).effects).toEqual([]);
+    });
+  });
+
   describe("answers ready", () => {
     const typed = (text: string, ...items: Item[]) =>
       run(initial, { type: "shown" }, { type: "input", text }, { type: "results", items }).state;
