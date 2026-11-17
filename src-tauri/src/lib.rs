@@ -8,6 +8,7 @@ mod config;
 mod config_edit;
 mod controls;
 mod dirs;
+mod direct_keys;
 mod engine;
 mod fuzzy;
 mod games;
