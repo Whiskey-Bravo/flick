@@ -130,9 +130,26 @@ impl Press {
     }
 }
 
+impl Default for Press {
+    fn default() -> Press {
+        Press::new()
+    }
+}
+
 /// Whether a lone press opens Flick (and is swallowed) or is left to Windows.
 pub fn take_lone(setting_on: bool, paused: bool, bar_ready: bool, full_screen: bool) -> bool {
     setting_on && !paused && bar_ready && !full_screen
+}
+
+/// A Win-up older than this when the hook sees it is left to Windows.
+const LATE_MS: u32 = 150;
+
+/// Whether an event stamped `event_ms` (the hook's `time`, `GetTickCount`
+/// clock) is too late to take at `now_ms`: Windows may already have timed the
+/// hook out and passed it on. The 32-bit clock wraps every 49.7 days; a stamp
+/// a little ahead of `now_ms` is not late.
+pub fn is_late(now_ms: u32, event_ms: u32) -> bool {
+    now_ms.wrapping_sub(event_ms) as i32 > LATE_MS as i32
 }
 
 /// How long the hook may lag behind raw keyboard input before it's reinstalled.
@@ -164,6 +181,12 @@ impl Watchdog {
         }
         self.last_reinstall_ms = Some(now_ms);
         true
+    }
+}
+
+impl Default for Watchdog {
+    fn default() -> Watchdog {
+        Watchdog::new()
     }
 }
 
@@ -367,7 +390,26 @@ mod tests {
                 }
             }
         }
-        assert!(take_lone(true, false, true, false));
+    }
+
+    #[test]
+    fn defaults_are_new() {
+        assert_eq!(format!("{:?}", Press::default()), format!("{:?}", Press::new()));
+        assert_eq!(format!("{:?}", Watchdog::default()), format!("{:?}", Watchdog::new()));
+    }
+
+    #[test]
+    fn a_win_up_over_150_ms_old_is_late() {
+        assert!(!is_late(1_000, 1_000));
+        assert!(!is_late(1_150, 1_000));
+        assert!(is_late(1_151, 1_000));
+        assert!(is_late(60_000, 1_000));
+        // Across the 32-bit wrap.
+        assert!(!is_late(50, u32::MAX - 50));
+        assert!(is_late(150, u32::MAX - 50));
+        // A stamp just ahead of the clock is not late.
+        assert!(!is_late(1_000, 1_005));
+        assert!(!is_late(u32::MAX - 5, 10));
     }
 
     #[test]
