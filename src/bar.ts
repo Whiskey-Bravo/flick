@@ -216,7 +216,8 @@ function step(s: State, e: Event): Result {
     case "menuPick": {
       const m = s.menu;
       const item = m && s.items[m.index];
-      const closed = { ...s, menu: null };
+      // Only picking Uninstall keeps (or sets) the arm: any other pick must never fire it.
+      const closed = { ...s, menu: null, ...(e.action === "uninstall" ? {} : { armed: null, armedAction: null }) };
       if (!m || !item || !m.actions.includes(e.action)) return done(closed);
       switch (e.action) {
         case "pin":
@@ -227,12 +228,14 @@ function step(s: State, e: Event): Result {
         case "uninstall":
           return done({ ...closed, selected: m.index, armed: item.id, armedAction: "uninstall" });
         default:
+          if (s.pending) return done(closed);
           return done({ ...closed, pending: true }, [{ type: "act", item, action: e.action }]);
       }
     }
     case "wheel": {
+      // A row-anchored menu would be left in the wrong place, so it closes.
       const top = Math.min(Math.max(0, s.top + e.rows), Math.max(0, s.items.length - capOf(s)));
-      return top === s.top ? done(s) : done({ ...s, top });
+      return top === s.top ? done({ ...s, menu: null }) : done({ ...s, top, menu: null });
     }
     case "configError":
       return done(fit({ ...s, configError: e.message, error: s.failure ?? e.message }));

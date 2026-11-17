@@ -172,7 +172,7 @@ Type part of a file or folder name. Search is by name only, not by content. Two 
 
 ### Browsing by path
 
-Type a path to look inside a folder: a drive (`C:\`), your user folder (`~\`, as in `~\Documents\`) or a network share (`\server\share\`). Folders come first, then files; hidden and system entries are skipped. Typing more after the last `\` narrows the list, and Tab completes the selected name. While a folder is being read the list says `Reading…`; a folder that does not exist says `Folder not found` and one that cannot be read says `Can't open this folder`.
+Type a path to look inside a folder: a drive (`C:\`), your user folder (`~\`, as in `~\Documents\`) or a network share (`\\server\share\`). Folders come first, then files; hidden and system entries are skipped. Typing more after the last `\` narrows the list, and Tab completes the selected name. While a folder is being read the list says `Reading…`; a folder that does not exist says `Folder not found` and one that cannot be read says `Can't open this folder`.
 
 `dl` lists the 20 newest files in your Downloads folder, and `recent` lists what Windows' own Recent list holds. Add text after either to filter it (`dl invoice`).
 

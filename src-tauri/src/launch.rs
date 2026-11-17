@@ -321,7 +321,6 @@ unsafe fn shortcut_target_missing(file: &[u16]) -> bool {
 /// stores no file-system path (advertised installs, shell items).
 /// Call inside [`with_com`] when reading many links: the nested init here is
 /// then only a reference count, not a COM load and unload per link.
-#[cfg_attr(not(test), allow(dead_code))] // the apps scan reads `shortcut_details`
 pub fn shortcut_target(lnk: &str) -> Option<String> {
     let file = wide(lnk);
     // SAFETY: `with_com` initialises COM on this thread for the read.

@@ -665,6 +665,13 @@ describe("mouse and menu", () => {
       expect(r.effects).toEqual([{ type: "query", text: "C:\\Games\\", scope: null }]);
     });
 
+    it("tab_complete_keeps_pending", () => {
+      const p = rich("C:\Games", { provider: "path", complete: "C:\Games\\", actions: ["open_folder"] });
+      const r = run({ ...withItems(p), pending: true }, key("Tab"));
+      expect(r.state.text).toBe("C:\Games\\");
+      expect(r.state.pending).toBe(true);
+    });
+
     it("tab_on_an_inert_path_row_does_nothing", () => {
       const p = rich("C:\\x", { provider: "path", complete: "" });
       const s = withItems(p, fileItem("f"));
@@ -703,6 +710,32 @@ describe("mouse and menu", () => {
       expect(second.state.armedAction).toBeNull();
     });
 
+    it("a_non_uninstall_pick_never_fires_an_armed_uninstall", () => {
+      const m = rich("m", { actions: ["admin", "copy_path", "uninstall"] });
+      const typed = run(initial, { type: "shown" }, { type: "input", text: "x" }, { type: "results", items: [m] }).state;
+      const armed = run(typed, key("Tab"), { type: "menuPick", action: "uninstall" }).state;
+      expect(armed.armedAction).toBe("uninstall");
+      const viaAdmin = run(armed, key("Tab"), { type: "menuPick", action: "admin" });
+      expect(viaAdmin.effects).toEqual([{ type: "activate", item: m, modifier: "ctrl_shift", text: "x", scope: null }]);
+      const viaCopy = run(armed, key("Tab"), { type: "menuPick", action: "copy_path" });
+      expect(viaCopy.effects).toEqual([{ type: "act", item: m, action: "copy_path" }]);
+      expect([viaCopy.state.armed, viaCopy.state.armedAction]).toEqual([null, null]);
+    });
+
+    it("a_menu_act_pick_is_ignored_while_pending", () => {
+      const a = rich("a", { actions: ["copy_path"] });
+      const open = run(withItems(a), { type: "menu", index: 0 }).state;
+      const r = run({ ...open, pending: true }, { type: "menuPick", action: "copy_path" });
+      expect(r.effects).toEqual([]);
+      expect(r.state.menu).toBeNull();
+    });
+
+    it("an_armed_uninstall_acts_for_enter_with_any_modifier", () => {
+      for (const k of [key("Enter", true), key("Enter", true, true)]) {
+        expect(run(armedState().state, k).effects).toEqual([{ type: "act", item: u, action: "uninstall" }]);
+      }
+    });
+
     it("moving_or_typing_disarms_an_uninstall", () => {
       const s = run(withItems(u, item("b")), key("Tab"), { type: "menuPick", action: "uninstall" }).state;
       expect(s.armedAction).toBe("uninstall");
@@ -736,6 +769,14 @@ describe("mouse and menu", () => {
       expect(run(a, { type: "wheel", rows: -100 }).state.top).toBe(0);
       const b = run(s, { type: "wheel", rows: 5 }, key("ArrowDown")).state;
       expect([b.selected, b.top]).toEqual([1, 1]);
+    });
+
+    it("wheel_closes_an_open_menu", () => {
+      const s = withItems(rich("r0", { actions: ["copy_path"] }), ...Array.from({ length: 19 }, (_, i) => item(`r${i + 1}`)));
+      const open = run(s, { type: "menu", index: 0 }).state;
+      expect(open.menu).not.toBeNull();
+      expect(run(open, { type: "wheel", rows: 3 }).state.menu).toBeNull();
+      expect(run(open, { type: "wheel", rows: 0 }).state.menu).toBeNull();
     });
 
     it("ready_after_scrolling_keeps_selection_and_window", () => {
