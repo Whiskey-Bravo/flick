@@ -18,14 +18,14 @@ use windows::core::{w, BOOL};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject,
-    DrawTextW, EndPaint, EnumDisplayMonitors, FillRect, FrameRect, GdiFlush, GetDC, GetMonitorInfoW, InvalidateRect,
-    ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+    DrawTextW, EndPaint, EnumDisplayMonitors, ExcludeClipRect, FillRect, FrameRect, GdiFlush, GetDC, GetMonitorInfoW, InvalidateRect,
+    ReleaseDC, SelectClipRgn, SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DIB_RGB_COLORS, DT_CENTER, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, FW_SEMIBOLD, HBITMAP, HDC, HFONT, HGDIOBJ, HMONITOR, MONITORINFO, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
     SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
-use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW,
     IsWindow, KillTimer, LoadCursorW, PostQuitMessage, RegisterClassW, SetCursor, SetForegroundWindow, SetTimer,
@@ -375,11 +375,15 @@ struct Picker {
     size: (u32, u32),
     /// Mouse position in client coordinates (= frame pixels).
     cursor: Option<(i32, i32)>,
-    /// The frozen frame, ready to blit.
+    /// The frozen frame, ready to blit. The session's `Frame` keeps the
+    /// pixels for sampling; the copy only lives as long as this DIB.
     picture: Canvas,
-    /// Frame plus loupe, drawn here first so the loupe never flickers.
+    /// The loupe, drawn here first so it never flickers (loupe-sized).
     back: Canvas,
     font: HFONT,
+    /// The left button went down in this window: only then does its
+    /// release pick (a stray release from before the picker opened never does).
+    pressed: bool,
 }
 
 impl Drop for Picker {
@@ -424,9 +428,10 @@ fn feed(hwnd: HWND, input: Input) {
     });
     match step {
         Some((Step::Ignore, _)) => {}
+        // Close first, so a slow clipboard never keeps the frozen window up.
         Some((Step::Copy(hex), clipboard)) => {
-            let _ = clipboard.set_text(&hex);
             destroy(hwnd);
+            let _ = clipboard.set_text(&hex);
         }
         // Close, or no usable state: close.
         _ => destroy(hwnd),
@@ -480,16 +485,18 @@ unsafe fn outline(dc: HDC, r: &RECT, color: COLORREF) {
     }
 }
 
-/// Draws the loupe for `cursor` on `p.back`.
-fn draw_loupe(p: &Picker, cursor: (i32, i32)) {
+/// Draws the loupe for `cursor` on `p.back`, at its top-left. Returns where
+/// it goes in the window, or `None` when there is nothing to draw.
+fn draw_loupe(p: &Picker, cursor: (i32, i32)) -> Option<RECT> {
     if cursor.0 < 0 || cursor.1 < 0 {
-        return;
+        return None;
     }
     let center = (cursor.0 as u32, cursor.1 as u32);
     let frame = p.session.frame();
-    let Some(picked) = frame.pixel(center.0, center.1) else { return };
+    let picked = frame.pixel(center.0, center.1)?;
     let dc = p.back.dc;
-    let area = loupe_rect(cursor, p.size);
+    let target = loupe_rect(cursor, p.size);
+    let area = RECT { left: 0, top: 0, right: LOUPE_SIZE.0 as i32, bottom: LOUPE_SIZE.1 as i32 };
     let cells = loupe(frame, center);
     let zoom = LOUPE_ZOOM as i32;
     let x0 = area.left + LOUPE_BORDER;
@@ -525,6 +532,7 @@ fn draw_loupe(p: &Picker, cursor: (i32, i32)) {
         DrawTextW(dc, &mut text, &mut label, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, old_font);
     }
+    Some(target)
 }
 
 fn paint(hwnd: HWND) {
@@ -538,11 +546,17 @@ fn paint(hwnd: HWND) {
             let Some(p) = s.as_ref() else { return };
             let r = ps.rcPaint;
             let (w, h) = (r.right - r.left, r.bottom - r.top);
-            let _ = BitBlt(p.back.dc, r.left, r.top, w, h, Some(p.picture.dc), r.left, r.top, SRCCOPY);
-            if let Some(c) = p.cursor {
-                draw_loupe(p, c);
+            let loupe = p.cursor.and_then(|c| draw_loupe(p, c));
+            // The frame everywhere but under the loupe, then the loupe: no
+            // pixel is drawn twice, so nothing flickers.
+            if let Some(l) = loupe {
+                ExcludeClipRect(hdc, l.left, l.top, l.right, l.bottom);
             }
-            let _ = BitBlt(hdc, r.left, r.top, w, h, Some(p.back.dc), r.left, r.top, SRCCOPY);
+            let _ = BitBlt(hdc, r.left, r.top, w, h, Some(p.picture.dc), r.left, r.top, SRCCOPY);
+            if let Some(l) = loupe {
+                SelectClipRgn(hdc, None);
+                let _ = BitBlt(hdc, l.left, l.top, l.right - l.left, l.bottom - l.top, Some(p.back.dc), 0, 0, SRCCOPY);
+            }
         });
         let _ = EndPaint(hwnd, &ps);
     }
@@ -552,8 +566,20 @@ fn on_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LR
     match msg {
         // Buttons act on release, so the release never lands on the window
         // underneath (a right-button release there opens its menu).
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN => {}
-        WM_LBUTTONUP => feed(hwnd, Input::Click(client_point(lparam))),
+        WM_RBUTTONDOWN => {}
+        WM_LBUTTONDOWN => {
+            let _ = PICKER.with(|s| s.try_borrow_mut().ok()?.as_mut().map(|p| p.pressed = true));
+            // SAFETY: our own window, on its thread.
+            unsafe { SetCapture(hwnd) };
+        }
+        WM_LBUTTONUP => {
+            let pressed = PICKER.with(|s| s.try_borrow_mut().ok()?.as_mut().map(|p| std::mem::take(&mut p.pressed)));
+            // SAFETY: releases only this thread's capture.
+            let _ = unsafe { ReleaseCapture() };
+            if pressed == Some(true) {
+                feed(hwnd, Input::Click(client_point(lparam)));
+            }
+        }
         WM_RBUTTONUP => feed(hwnd, Input::RightClick),
         WM_KEYDOWN if wparam.0 == usize::from(VK_ESCAPE.0) => feed(hwnd, Input::Escape),
         // Alt+F4 and the like.
@@ -592,8 +618,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         Ok(Some(r)) => r,
         // SAFETY: the arguments are the ones Windows passed in.
         Ok(None) => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        // Any panic closes the picker.
         Err(_) => {
-            feed(hwnd, Input::Error);
             destroy(hwnd);
             LRESULT(0)
         }
@@ -618,7 +644,7 @@ fn run(screen: &dyn Screen, clipboard: Arc<dyn Clipboard>) -> Result<(), String>
     let picture = Canvas::new(width, height)?;
     // SAFETY: `prepare` checked the frame holds exactly `picture.len()` bytes.
     unsafe { std::ptr::copy_nonoverlapping(frame.bgra.as_ptr(), picture.bits, picture.len()) };
-    let back = Canvas::new(width, height)?;
+    let back = Canvas::new(LOUPE_SIZE.0 as i32, LOUPE_SIZE.1 as i32)?;
     // SAFETY: a plain font; freed by `Picker`'s drop.
     let font = unsafe {
         CreateFontW(
@@ -640,7 +666,16 @@ fn run(screen: &dyn Screen, clipboard: Arc<dyn Clipboard>) -> Result<(), String>
     };
     let size = (rect.width, rect.height);
     PICKER.with(|p| {
-        *p.borrow_mut() = Some(Picker { session: Session::new(frame), clipboard, size, cursor, picture, back, font })
+        *p.borrow_mut() = Some(Picker {
+            session: Session::new(frame),
+            clipboard,
+            size,
+            cursor,
+            picture,
+            back,
+            font,
+            pressed: false,
+        })
     });
     // Dropped last: after the window is gone.
     let _state = Defer(|| drop(PICKER.with(|p| p.borrow_mut().take())));
@@ -683,9 +718,18 @@ fn run(screen: &dyn Screen, clipboard: Arc<dyn Clipboard>) -> Result<(), String>
         let _ = SetForegroundWindow(hwnd);
         let mut msg = MSG::default();
         // 0 is WM_QUIT (posted on WM_DESTROY), -1 an error: both end it.
-        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        loop {
+            match GetMessageW(&mut msg, None, 0, 0).0 {
+                0 => break,
+                -1 => {
+                    feed(hwnd, Input::Error);
+                    break;
+                }
+                _ => {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
         }
     }
     Ok(())
@@ -704,7 +748,12 @@ pub fn start(screen: Arc<dyn Screen>, clipboard: Arc<dyn Clipboard>) {
     let spawned = std::thread::Builder::new().name("colour picker".into()).spawn(move || {
         let _open = Defer(|| OPEN.store(false, Ordering::SeqCst));
         // SAFETY: affects this thread only, before any other call on it.
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        // Without per-monitor awareness the coordinates are scaled and the
+        // picked pixel could be the wrong one: then no picker at all.
+        if previous.0.is_null() {
+            return;
+        }
         let _ = catch_unwind(AssertUnwindSafe(|| run(screen.as_ref(), clipboard)));
     });
     if spawned.is_err() {
@@ -876,19 +925,6 @@ mod tests {
     fn screen(cursor: Option<(i32, i32)>, size: Option<(u32, u32)>) -> FakeScreen {
         let small = |r: Rect| Rect { width: r.width / 64, height: r.height / 64, ..r };
         FakeScreen { monitors: vec![small(LEFT), small(MAIN)], cursor, size, captures: Mutex::new(Vec::new()) }
-    }
-
-    /// Opens the real picker on the monitor under the mouse and prints what
-    /// it copied (to a fake clipboard). By hand only:
-    /// `cargo test picker::tests::hand_pick -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn hand_pick() {
-        let clipboard = Arc::new(crate::clipboard::FakeClipboard::default());
-        // SAFETY: this test thread only.
-        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
-        let result = run(&GdiScreen, clipboard.clone());
-        println!("{result:?} {:?}", clipboard.0.lock().unwrap());
     }
 
     #[test]
