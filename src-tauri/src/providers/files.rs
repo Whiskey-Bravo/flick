@@ -467,7 +467,7 @@ impl FilesProvider {
 }
 
 /// The icon key of a file: `ext:.pdf`, or `builtin:file` when it has none.
-fn file_icon(name: &str, is_dir: bool) -> String {
+pub(crate) fn file_icon(name: &str, is_dir: bool) -> String {
     if is_dir {
         return "folder".into();
     }
