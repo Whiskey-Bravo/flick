@@ -5,9 +5,6 @@
 //! caller only copies. Every decision lives in `target_of` and `paste_into`;
 //! the Win32 part is thin.
 
-// Not called until the window-show wiring lands (Part 9, Task 8), which removes this.
-#![allow(dead_code)]
-
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

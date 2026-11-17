@@ -288,10 +288,8 @@ impl Drop for Canvas {
 
 /// The real screen, read with GDI. Coordinates are physical pixels only on a
 /// thread set to per-monitor DPI awareness, as [`start`]'s thread is.
-#[allow(dead_code)] // until Task 8 runs the picker after the bar hides
 pub struct GdiScreen;
 
-#[allow(dead_code)] // until Task 8 runs the picker after the bar hides
 unsafe extern "system" fn add_monitor(monitor: HMONITOR, _dc: HDC, _clip: *mut RECT, data: LPARAM) -> BOOL {
     // SAFETY: `data` is the `&mut Vec<Rect>` passed by `monitors` for the
     // duration of the enumeration.
@@ -740,7 +738,6 @@ static OPEN: AtomicBool = AtomicBool::new(false);
 
 /// Opens the colour picker on the monitor under the mouse, on its own
 /// thread; returns at once. Does nothing while a picker is already open.
-#[allow(dead_code)] // until Task 8 runs it after the bar hides
 pub fn start(screen: Arc<dyn Screen>, clipboard: Arc<dyn Clipboard>) {
     if OPEN.swap(true, Ordering::SeqCst) {
         return;

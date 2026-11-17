@@ -4,11 +4,9 @@
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
 
 /// Opens the Windows snipping overlay; the snip lands on the clipboard.
-#[allow(dead_code)] // until Task 8 runs the snip after the bar hides
 pub const SNIP_URI: &str = "ms-screenclip:";
 
 /// One fixed row for the exact words, or nothing.
-#[allow(dead_code)] // until Task 8 registers the providers
 fn row(text: &str, words: &[&str], provider: &'static str, title: &str, subtitle: &str, icon: &str) -> Vec<ResultItem> {
     let text = text.trim();
     if !words.iter().any(|w| w.eq_ignore_ascii_case(text)) {
@@ -27,7 +25,6 @@ fn row(text: &str, words: &[&str], provider: &'static str, title: &str, subtitle
 }
 
 /// `snip` / `screenshot`.
-#[allow(dead_code)] // until Task 8 registers it
 pub struct SnipProvider;
 
 impl Provider for SnipProvider {
@@ -57,7 +54,6 @@ impl Provider for SnipProvider {
 }
 
 /// `color` / `colour` / `picker`.
-#[allow(dead_code)] // until Task 8 registers it
 pub struct ColorProvider;
 
 impl Provider for ColorProvider {

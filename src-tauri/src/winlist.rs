@@ -408,7 +408,6 @@ mod sys {
 }
 
 /// True when the process token cannot be read from here or reports elevation.
-#[allow(dead_code)] // Used by paste.rs until Task 8 wires it in.
 pub(crate) fn process_elevated(pid: u32) -> bool {
     sys::is_elevated(pid)
 }

@@ -1,6 +1,5 @@
 //! `qr`: the clipboard (or the typed text) as a QR code the bar draws as a panel.
 //! The clipboard is read on a [`Loader`] thread; nothing is stored or logged.
-#![cfg_attr(not(test), allow(dead_code))] // until the provider is registered (Task 8)
 
 use std::sync::Arc;
 

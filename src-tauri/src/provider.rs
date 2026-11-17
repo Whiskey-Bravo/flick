@@ -94,7 +94,6 @@ pub struct HelpLine {
 }
 
 /// What runs after the bar has hidden.
-#[cfg_attr(not(test), allow(dead_code))] // until the Part 9 providers use it
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Then {
     Paste,
