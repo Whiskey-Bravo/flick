@@ -5,6 +5,7 @@ pub mod clips;
 pub mod files;
 mod files_scan;
 pub mod flick;
+pub mod games;
 pub mod history;
 pub mod path;
 pub mod power;
