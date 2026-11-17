@@ -50,8 +50,13 @@ impl Engine {
         Self { providers, ranking, history, pins }
     }
 
-    /// Pins or unpins an item; returns the new pinned state.
+    /// Pins or unpins an item; returns the new pinned state. Unpinning always
+    /// works; pinning only an item its provider can rebuild and marks
+    /// `pinnable`, so typed text (shortcut arguments) never reaches disk.
     pub fn toggle_pin(&self, provider: &str, id: &str) -> bool {
+        if !self.pins.is_pinned(provider, id) && !self.item(provider, id).is_some_and(|i| i.pinnable) {
+            return false;
+        }
         self.pins.toggle(provider, id)
     }
 
@@ -244,9 +249,11 @@ impl Engine {
     }
 
     /// `text` and `scope` are what the bar held when the row was picked. A launch
-    /// that is learned (`rank_key`) is recorded as a recent launch, and the text
-    /// as a past search when it is searchable. A failed launch records nothing;
-    /// when it no longer resolves, it is also dropped from the recents.
+    /// that is learned (`rank_key`) is ranked; when its provider can also rebuild
+    /// the row (`item`) it is recorded as a recent launch (unless it asks for a
+    /// confirm), and the text as a past search when it is searchable. A failed
+    /// launch records nothing; when it no longer resolves, it is also dropped
+    /// from the recents.
     pub fn activate(
         &self,
         provider: &str,
@@ -275,10 +282,15 @@ impl Engine {
         };
         if let Some(key) = p.rank_key(id) {
             self.ranking.record(provider, &key);
-            self.history.record_launch(provider, id);
             // Rows built from typed text (shortcut arguments) cannot be rebuilt: never saved.
-            if self.searchable(text, scope) && p.item(id).is_some() {
-                self.history.record_search(text);
+            if let Some(item) = p.item(id) {
+                // A confirm row in the empty bar would arm on a habitual Enter.
+                if !item.confirm {
+                    self.history.record_launch(provider, id);
+                }
+                if self.searchable(text, scope) {
+                    self.history.record_search(text);
+                }
             }
         }
         Ok(outcome)
@@ -306,6 +318,9 @@ mod tests {
         share: usize,
         /// `ready()` result.
         ready: bool,
+        /// Every item's `confirm` and `pinnable`.
+        confirm: bool,
+        pinnable: bool,
         /// `Query.text` of every query this provider received.
         seen: std::sync::Mutex<Vec<String>>,
     }
@@ -323,6 +338,8 @@ mod tests {
                 help: vec![],
                 share: usize::MAX,
                 ready: true,
+                confirm: false,
+                pinnable: true,
                 seen: Default::default(),
             }
         }
@@ -352,6 +369,8 @@ mod tests {
                 id: id.to_string(),
                 provider: self.name,
                 title: title.to_string(),
+                confirm: self.confirm,
+                pinnable: self.pinnable,
                 ..Default::default()
             })
         }
@@ -530,6 +549,73 @@ mod tests {
         assert!(h.searches().is_empty());
         e.activate("a", "x", Modifier::None, "x", None).unwrap();
         assert_eq!(h.searches(), ["x"]);
+    }
+
+    #[test]
+    fn typed_text_launch_records_no_recent() {
+        let (e, ranking, h, _, _dir) = engine_stores(vec![Box::new(FakeProvider::new("a", vec![("x", "X", 1)]))]);
+        // Has a rank_key but no `item`: learned for ranking, never kept as a recent or a search.
+        e.activate("a", "arg:a:typed", Modifier::None, "a typed", None).unwrap();
+        assert!(h.recents().is_empty());
+        assert!(h.searches().is_empty());
+        assert!(ranking.boost("a", "arg:a:typed") > 0);
+    }
+
+    #[test]
+    fn shortcut_arguments_never_reach_history_file() {
+        use crate::config::ShortcutDef;
+        use crate::launch::testing::RecordingLauncher;
+        use crate::providers::shortcuts::ShortcutsProvider;
+        let def = |name: &str, run: &str| ShortcutDef {
+            name: name.into(),
+            aliases: vec![],
+            about: String::new(),
+            run: Some(run.into()),
+            wsl: None,
+            open: None,
+            terminal: None,
+            admin: false,
+            pick: None,
+            choices: vec![],
+        };
+        let sc = ShortcutsProvider::new(Arc::new(RecordingLauncher::default()), "");
+        sc.set(vec![def("search", "x {arg}"), def("hello", "notepad")], "");
+        let (e, _, h, _, dir) = engine_stores(vec![Box::new(sc)]);
+        e.activate("shortcuts", "arg:search:secret words", Modifier::None, "search secret words", None).unwrap();
+        e.activate("shortcuts", "run:hello", Modifier::None, "hello", None).unwrap();
+        assert_eq!(h.recents(), [pair("shortcuts", "run:hello")]);
+        let saved = std::fs::read_to_string(dir.path().join("history.json")).unwrap();
+        assert!(!saved.contains("secret"), "{saved}");
+    }
+
+    #[test]
+    fn confirm_launch_records_no_recent() {
+        let mut a = FakeProvider::new("a", vec![("off", "Shut down", 1)]);
+        a.confirm = true;
+        let (e, _, h, _, _dir) = engine_stores(vec![Box::new(a)]);
+        e.activate("a", "off", Modifier::None, "shut", None).unwrap();
+        assert!(h.recents().is_empty());
+    }
+
+    #[test]
+    fn toggle_pin_refuses_unbuildable_or_unpinnable_items() {
+        let (e, _, _, pins, _dir) = engine_stores(vec![Box::new(FakeProvider::new("a", vec![("x", "X", 1)]))]);
+        assert!(!e.toggle_pin("a", "arg:a:typed"));
+        assert!(!e.toggle_pin("nowhere", "x"));
+        assert!(pins.list().is_empty());
+        assert!(e.toggle_pin("a", "x"));
+        assert!(!e.toggle_pin("a", "x"));
+        assert!(pins.list().is_empty());
+
+        let mut a = FakeProvider::new("a", vec![("x", "X", 1)]);
+        a.pinnable = false;
+        let (e, _, _, pins, _dir) = engine_stores(vec![Box::new(a)]);
+        assert!(!e.toggle_pin("a", "x"));
+        assert!(pins.list().is_empty());
+        // A pin made earlier (or by hand) can still be removed.
+        pins.toggle("a", "gone");
+        assert!(!e.toggle_pin("a", "gone"));
+        assert!(pins.list().is_empty());
     }
 
     #[test]
