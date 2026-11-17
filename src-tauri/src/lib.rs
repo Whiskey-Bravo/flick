@@ -1,5 +1,6 @@
 mod after_hide;
 mod answers;
+mod bookmarks;
 mod clipboard;
 mod cliphistory;
 mod commands;
