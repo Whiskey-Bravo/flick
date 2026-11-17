@@ -8,6 +8,7 @@ pub mod history;
 pub mod path;
 pub mod power;
 pub mod recent;
+pub mod screen;
 pub mod settings;
 pub mod shortcuts;
 pub mod status;
