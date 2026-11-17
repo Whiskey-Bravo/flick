@@ -67,6 +67,8 @@ export type Effect =
   | { type: "hide" };
 export type Event =
   | { type: "shown" }
+  | { type: "armed"; item: Item }
+  | { type: "reopen"; text: string; error: string }
   | { type: "blurred" }
   | { type: "hidden" }
   | { type: "answersReady" }
@@ -157,7 +159,7 @@ export function reduce(s: State, e: Event): Result {
     : stepped;
   const q = [...r.effects].reverse().find((f): f is Extract<Effect, { type: "query" }> => f.type === "query");
   const hide = r.effects.some((f) => f.type === "hide");
-  const hidden = e.type === "shown" || e.type === "input" ? false : r.state.hidden || e.type === "hidden" || hide;
+  const hidden = e.type === "shown" || e.type === "armed" || e.type === "reopen" || e.type === "input" ? false : r.state.hidden || e.type === "hidden" || hide;
   if (!q) return hidden === r.state.hidden ? r : done({ ...r.state, hidden }, r.effects);
   const keep = q.keepSelection ? r.state.keep : null;
   return done({ ...r.state, hidden, keep, queried: { text: q.text, scope: q.scope } }, r.effects);
@@ -173,6 +175,19 @@ function step(s: State, e: Event): Result {
       // have been switched off or cleared since the last show).
       return done({ ...initial, configError: s.configError, error: s.configError }, [
         { type: "query", text: "", scope: null },
+        { type: "loadPast" },
+      ]);
+    case "armed":
+      // A direct hotkey pointed at an item that needs a second Enter: it is the
+      // only row, armed. No query, so nothing replaces it.
+      return done({ ...initial, configError: s.configError, error: s.configError, items: [e.item], selected: 0, armed: e.item.id }, [
+        { type: "loadPast" },
+      ]);
+    case "reopen":
+      // A workspace run had failures: the bar comes back with its text and the
+      // error, which stays through the results and goes at the next input.
+      return done({ ...initial, configError: s.configError, text: e.text, failure: e.error, error: e.error }, [
+        { type: "query", text: e.text, scope: null },
         { type: "loadPast" },
       ]);
     case "hidden":
