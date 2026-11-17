@@ -21,6 +21,8 @@ use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 const MAX_ENTRIES: usize = 50;
 /// Shortcuts beat an equal match from another provider.
 const BONUS: u32 = 50;
+/// Highest score of a built-in search's name row: below any app prefix match.
+const BUILTIN_MAX: u32 = 100;
 const GONE: &str = "shortcut no longer exists";
 const CHOICE_GONE: &str = "choice no longer exists";
 
@@ -49,11 +51,14 @@ pub fn builtin_shortcuts(search_engine: &str) -> Vec<ShortcutDef> {
 }
 
 /// `defs` plus the built-in searches whose name no definition uses as a name or alias.
-fn with_builtins(mut defs: Vec<ShortcutDef>, search_engine: &str) -> Vec<ShortcutDef> {
+fn with_builtins(mut defs: Vec<ShortcutDef>, search_engine: &str) -> (Vec<ShortcutDef>, HashSet<String>) {
     let taken: HashSet<String> =
         defs.iter().flat_map(|d| std::iter::once(&d.name).chain(&d.aliases)).map(|w| w.to_lowercase()).collect();
-    defs.extend(builtin_shortcuts(search_engine).into_iter().filter(|b| !taken.contains(&b.name.to_lowercase())));
-    defs
+    let added: Vec<ShortcutDef> =
+        builtin_shortcuts(search_engine).into_iter().filter(|b| !taken.contains(&b.name.to_lowercase())).collect();
+    let names = added.iter().map(|b| b.name.to_lowercase()).collect();
+    defs.extend(added);
+    (defs, names)
 }
 
 /// Values for a shortcut's placeholders.
@@ -232,6 +237,10 @@ struct State {
     entries: Entries,
     /// Bumped by `set`, so a refresh that read older definitions is dropped.
     generation: u64,
+    /// Names of the built-in searches in `defs` (lowercase), as opposed to the config's own.
+    builtin: HashSet<String>,
+    /// How many shortcuts the config itself defines.
+    own: usize,
 }
 
 /// Sub-folders of `dir`, sorted case-insensitively. Reads the disk.
@@ -309,11 +318,12 @@ impl ShortcutsProvider {
     /// default). Reads the pick folders before swapping, so queries never see
     /// a half-built list.
     pub fn set(&self, defs: Vec<ShortcutDef>, distro: &str, search_engine: &str) {
-        let defs = with_builtins(defs, search_engine);
+        let own = defs.len();
+        let (defs, builtin) = with_builtins(defs, search_engine);
         let entries = load_entries(&defs);
         let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
         st.generation += 1;
-        *st = State { defs, distro: distro.to_string(), entries, generation: st.generation };
+        *st = State { defs, distro: distro.to_string(), entries, generation: st.generation, builtin, own };
     }
 
     /// Re-read the pick folders (timer, and after a pick shortcut is chosen).
@@ -433,15 +443,6 @@ impl Provider for ShortcutsProvider {
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let st = self.state.read().unwrap_or_else(|e| e.into_inner());
         let text = q.text.trim();
-        // `?rust` is `? rust`: the one name that needs no space.
-        let spaced;
-        let text = match text.strip_prefix('?') {
-            Some(rest) if !rest.is_empty() && !rest.starts_with(char::is_whitespace) => {
-                spaced = format!("? {rest}");
-                spaced.as_str()
-            }
-            _ => text,
-        };
 
         if let Some(scope) = &q.scope {
             let Some(def) = scope.strip_prefix("shortcut:").and_then(|n| find(&st.defs, n, Kind::Pick)) else {
@@ -463,6 +464,15 @@ impl Provider for ShortcutsProvider {
         if text.is_empty() {
             return Vec::new();
         }
+        // `?rust` is `? rust`: the one name that needs no space.
+        let spaced;
+        let text = match text.strip_prefix('?') {
+            Some(rest) if !rest.is_empty() && !rest.starts_with(char::is_whitespace) => {
+                spaced = format!("? {rest}");
+                spaced.as_str()
+            }
+            _ => text,
+        };
         let (first, rest) = match text.split_once(char::is_whitespace) {
             Some((first, rest)) => (first, rest.trim()),
             None => (text, ""),
@@ -485,7 +495,9 @@ impl Provider for ShortcutsProvider {
 
             if let Some(score) = words().filter_map(|w| fuzzy::score(text, w)).max() {
                 let (id, subtitle) = head(def, &st.distro);
-                push(item(def, id, n.clone(), subtitle, score + BONUS));
+                // A built-in search never outranks an app on a short prefix (`g` is Gimp, not Google).
+                let score = if st.builtin.contains(&n.to_lowercase()) { score.min(BUILTIN_MAX) } else { score + BONUS };
+                push(item(def, id, n.clone(), subtitle, score));
             }
 
             if rest.is_empty() || !words().any(|w| w.to_lowercase() == first) {
@@ -609,16 +621,16 @@ impl Provider for ShortcutsProvider {
 
     fn help(&self) -> Vec<HelpLine> {
         let st = self.state.read().unwrap_or_else(|e| e.into_inner());
-        if st.defs.is_empty() {
-            return vec![HelpLine {
-                example: "your shortcuts".into(),
-                about: "define your own commands in the config (type: flick config)".into(),
-                fill: "flick config".into(),
-            }];
-        }
-        st.defs
-            .iter()
-            .map(|def| {
+        let own_line = HelpLine {
+            example: "your shortcuts".into(),
+            about: "define your own commands in the config (type: flick config)".into(),
+            fill: "flick config".into(),
+        };
+        // The line stays until the config defines a shortcut of its own.
+        (st.own == 0)
+            .then_some(own_line)
+            .into_iter()
+            .chain(st.defs.iter().map(|def| {
                 let n = &def.name;
                 let example = match kind(def) {
                     Kind::Plain => n.clone(),
@@ -626,7 +638,7 @@ impl Provider for ShortcutsProvider {
                     Kind::Pick => format!("{n} …"),
                 };
                 HelpLine { example, about: describe(def), fill: format!("{n} ") }
-            })
+            }))
             .collect()
     }
 }
@@ -1361,5 +1373,38 @@ mod tests {
         p.activate(&open_row(&p, "? x").id, Modifier::None).unwrap();
         let calls = opened(&rec).join("\n");
         assert!(calls.contains("https://www.startpage.com/do/search?q=x"), "{calls}");
+    }
+
+    #[test]
+    fn builtin_names_rank_below_an_app_prefix_match() {
+        let (p, _) = setup(vec![run("gx", "x")]);
+        let app = fuzzy::score("g", "Gimp").unwrap();
+        for text in ["g", "gh", "yt", "?"] {
+            let rows = p.query(&q(text));
+            let row = rows.iter().find(|r| r.title == text).unwrap();
+            assert!(row.score < fuzzy::score(text, "Gimp").unwrap_or(app), "{text}: {}", row.score);
+        }
+        // Argument rows keep the bonus; a user's own shortcut name row too.
+        assert!(open_row(&p, "g cats").score >= 1000);
+        assert_eq!(p.query(&q("gx"))[0].score, fuzzy::score("gx", "gx").unwrap() + BONUS);
+    }
+
+    #[test]
+    fn question_mark_rewrite_is_not_applied_inside_a_scope() {
+        let def = ShortcutDef { choices: vec!["?x".into()], ..run("pk", "p {name}") };
+        let (p, _) = setup(vec![def]);
+        let rows = p.query(&scoped("shortcut:pk", "?x"));
+        assert_eq!(titles(&rows), vec!["?x".to_string()]);
+        assert_eq!(rows[0].score, fuzzy::score("?x", "?x").unwrap());
+    }
+
+    #[test]
+    fn help_keeps_the_your_shortcuts_line_until_the_config_has_one() {
+        let (p, _) = setup(vec![]);
+        let h = p.help();
+        assert_eq!(h[0].example, "your shortcuts");
+        assert_eq!(h.len(), 1 + builtin_shortcuts("").len());
+        p.set(vec![run("hello", "x")], "Debian", "");
+        assert!(p.help().iter().all(|l| l.example != "your shortcuts"));
     }
 }

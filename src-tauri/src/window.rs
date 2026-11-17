@@ -58,6 +58,7 @@ fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
 pub fn show(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
     SHOWS.fetch_add(1, Ordering::SeqCst);
+    set_weather_hidden(app, false);
     if let Some(pos) = placement(app, &w) {
         let _ = w.set_position(pos);
     }
@@ -72,6 +73,7 @@ pub fn show(app: &AppHandle) {
 /// Show and focus where it was, without `bar:shown`, so the page keeps its
 /// state (used to bring back a failed activation's error).
 pub fn reveal(app: &AppHandle) {
+    set_weather_hidden(app, false);
     if let Some(w) = bar(app) {
         reveal_window(&w);
     }
@@ -83,12 +85,18 @@ fn reveal_window(w: &WebviewWindow) {
     let _ = w.set_focus();
 }
 
+/// Tells the weather store whether the bar is hidden (memory only).
+fn set_weather_hidden(app: &AppHandle, hidden: bool) {
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.providers.weather.set_hidden(hidden);
+    }
+}
+
 pub fn hide(app: &AppHandle) {
     // A weather city still waiting for the typing pause is forgotten, so a
     // hidden bar never sends a request.
-    if let Some(state) = app.try_state::<crate::AppState>() {
-        crate::provider::Provider::skipped(&*state.providers.answers);
-    }
+    set_weather_hidden(app, true);
+    let _ = app.emit_to(LABEL, "bar:hidden", ());
     if let Some(w) = bar(app) {
         let _ = w.hide();
     }

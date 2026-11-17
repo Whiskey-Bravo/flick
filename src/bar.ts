@@ -45,6 +45,7 @@ export type Effect =
 export type Event =
   | { type: "shown" }
   | { type: "blurred" }
+  | { type: "hidden" }
   | { type: "answersReady" }
   | { type: "input"; text: string }
   | { type: "results"; items: Item[] }
@@ -126,7 +127,7 @@ export function reduce(s: State, e: Event): Result {
   const r = step(s, e);
   const q = [...r.effects].reverse().find((f): f is Extract<Effect, { type: "query" }> => f.type === "query");
   const hide = r.effects.some((f) => f.type === "hide");
-  const hidden = e.type === "shown" || e.type === "input" ? false : r.state.hidden || e.type === "blurred" || hide;
+  const hidden = e.type === "shown" || e.type === "input" ? false : r.state.hidden || e.type === "hidden" || hide;
   if (!q) return hidden === r.state.hidden ? r : done({ ...r.state, hidden }, r.effects);
   const keep = q.keepSelection ? r.state.keep : null;
   return done({ ...r.state, hidden, keep, queried: { text: q.text, scope: q.scope } }, r.effects);
@@ -144,6 +145,8 @@ function step(s: State, e: Event): Result {
         { type: "query", text: "", scope: null },
         { type: "loadPast" },
       ]);
+    case "hidden":
+      return done({ ...s, hidden: true });
     case "blurred":
       return done({ ...s, armed: null, queued: null, menu: null });
     case "answersReady": {
@@ -153,7 +156,8 @@ function step(s: State, e: Event): Result {
       if (s.hidden || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s);
       if (s.text.trim() === "" && !s.scope) return done(s);
       const sel = s.items[s.selected];
-      const keep = sel ? { provider: sel.provider, id: sel.id } : null;
+      // While typed text is still waiting for its answer, the rows are for older text.
+      const keep = sel && !s.awaiting ? { provider: sel.provider, id: sel.id } : null;
       return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }]);
     }
     case "menuClose":
@@ -219,17 +223,18 @@ function step(s: State, e: Event): Result {
       // The empty unscoped bar opens on the latest recent launch, unless a
       // welcome row is shown: that stays on top.
       let selected = 0;
-      if (s.keep) {
-        // The answers' re-query: stay on the row the user was on, if it is still there.
+      if (s.keep && !s.queued) {
+        // The answers' re-query: stay on the row the user was on, if it is still there,
+        // and keep the window where it was.
         const k = s.keep;
-        selected = Math.max(0, e.items.findIndex((i) => i.provider === k.provider && i.id === k.id));
-        const armed = s.armed !== null && e.items.some((i) => i.id === s.armed) ? s.armed : null;
-        return done(fit({ ...s, items: e.items, selected, top: 0, armed, awaiting: false, menu: null, keep: null }));
+        const at = e.items.findIndex((i) => i.provider === k.provider && i.id === k.id);
+        const armed = at >= 0 && s.armed === k.id ? s.armed : null;
+        return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu: null, keep: null }));
       }
       if (s.text === "" && !s.scope && !e.items.some((i) => i.provider === "welcome")) {
         selected = Math.max(0, e.items.findIndex((i) => i.origin === "recent"));
       }
-      const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null, menu: null });
+      const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null, menu: null, keep: null });
       // An Enter pressed before these results arrived acts on them now.
       return s.queued ? enter(next, s.queued) : done(next);
     }
@@ -245,7 +250,8 @@ function step(s: State, e: Event): Result {
       return done(next, relayout ? [{ type: "query", text: "", scope: null }] : []);
     }
     case "failed":
-      return done(fit({ ...s, armed: null, pending: false, failure: e.message, error: e.message }));
+      // A failed activation brings the bar back.
+      return done(fit({ ...s, armed: null, pending: false, hidden: false, failure: e.message, error: e.message }));
     case "queryFailed":
       // Leaves `pending` alone: an activation may still be in flight.
       return done(fit({ ...s, armed: null, awaiting: false, queued: null, failure: e.message, error: e.message }));

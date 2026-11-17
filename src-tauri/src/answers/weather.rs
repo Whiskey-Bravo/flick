@@ -228,6 +228,8 @@ struct State {
     /// A timer thread is running for `pending`.
     timer: bool,
     attempts: u64,
+    /// The bar is hidden: a query still in flight must not arm a city again.
+    hidden: bool,
 }
 
 impl State {
@@ -318,6 +320,16 @@ impl WeatherStore {
         self.inner.save_home();
     }
 
+    /// The bar was hidden (true) or is back (false). Hiding forgets the waiting
+    /// city, and until the bar returns no city waits for the pause.
+    pub fn set_hidden(&self, hidden: bool) {
+        let mut st = self.inner.lock();
+        st.hidden = hidden;
+        if hidden {
+            st.pending = None;
+        }
+    }
+
     /// Forgets the city waiting for the pause (the text is no longer a weather question).
     pub fn cancel_pending(&self) {
         self.inner.lock().pending = None;
@@ -364,6 +376,9 @@ impl WeatherStore {
             let job = st.begin(key, city, now);
             drop(st);
             return if spawn_fetch(&self.inner, job) { WeatherState::Fetching(shown) } else { WeatherState::Offline };
+        }
+        if st.hidden {
+            return WeatherState::Fetching(shown);
         }
         if st.pending.as_ref().is_none_or(|p| p.key != key) {
             st.pending = Some(Pending { key: key.clone(), city, at: now, since: Instant::now() });
@@ -820,6 +835,25 @@ mod tests {
         assert_eq!(store.lookup("xyz", Instant::now(), true, false), WeatherState::NotFound("xyz".into()));
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(fetch.urls(), vec![geocode_url("xyz")]);
+    }
+
+    #[test]
+    fn a_hidden_bar_drops_and_does_not_rearm_the_waiting_city() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(london_fetch());
+        let (store, _rx) = store_with(&dir, fetch.clone());
+        let now = Instant::now();
+        store.lookup("Londo", now, true, false);
+        store.set_hidden(true);
+        // A query still in flight when the bar hid asks again: nothing is armed.
+        store.lookup("Londo", now, true, false);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(fetch.urls().is_empty(), "{:?}", fetch.urls());
+        // Shown again: typing waits for the pause and fetches as before.
+        store.set_hidden(false);
+        store.lookup("London", now, true, false);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(fetch.urls().first(), Some(&geocode_url("London")));
     }
 
     #[test]

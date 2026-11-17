@@ -661,7 +661,9 @@ describe("mouse and menu", () => {
 
     it("ready_ignored_when_hidden", () => {
       const s = typed("20 usd", item("a"));
-      expect(run(s, { type: "blurred" }, { type: "answersReady" }).effects).toEqual([]);
+      expect(run(s, { type: "hidden" }, { type: "answersReady" }).effects).toEqual([]);
+      // A focus loss alone does not stop live updates: the back end says when the bar is hidden.
+      expect(run(s, { type: "blurred" }, { type: "answersReady" }).effects).toHaveLength(1);
       const esc = run(s, key("Escape"));
       expect(esc.effects).toEqual([{ type: "hide" }]);
       expect(run(esc.state, { type: "answersReady" }).effects).toEqual([]);
@@ -669,6 +671,38 @@ describe("mouse and menu", () => {
       expect(run(esc.state, { type: "shown" }, { type: "input", text: "a" }, { type: "answersReady" }).effects).toEqual([
         { type: "query", text: "a", scope: null, keepSelection: true },
       ]);
+    });
+
+    it("ready_keeps_a_queued_enter", () => {
+      const waiting = run(typed("20 usd", item("old")), { type: "input", text: "20 usd in eur" }, key("Enter")).state;
+      expect(waiting.queued).toBe("none");
+      const r = run(waiting, { type: "answersReady" }, { type: "results", items: [item("a"), item("b")] });
+      expect(r.effects).toEqual([{ type: "activate", item: item("a"), modifier: "none", text: "20 usd in eur", scope: null }]);
+      expect(r.state.queued).toBeNull();
+    });
+
+    it("ready_keeps_top_and_armed_by_provider_and_id", () => {
+      const many = Array.from({ length: 12 }, (_, i) => item(`r${i}`));
+      let s = typed("t", ...many);
+      for (let i = 0; i < 9; i++) s = run(s, key("ArrowDown")).state;
+      expect([s.selected, s.top]).toEqual([9, 2]);
+      s = { ...s, armed: "r9" };
+      const r = run(s, { type: "answersReady" });
+      // One row was added on top: the selected row moves down, the window does not jump to the top.
+      const got = run(r.state, { type: "results", items: [item("new"), ...many] }).state;
+      expect([got.selected, got.top, got.armed]).toEqual([10, 3, "r9"]);
+      // The same id under another provider is another row: back to the first, nothing armed.
+      const other = many.map((i) => (i.id === "r9" ? { ...i, provider: "files" } : i));
+      const lost = run(r.state, { type: "results", items: other }).state;
+      expect([lost.selected, lost.top, lost.armed]).toEqual([0, 0, null]);
+    });
+
+    it("hidden_event_hides_and_shown_clears", () => {
+      const s = typed("t", item("a"));
+      const h = run(s, { type: "hidden" }).state;
+      expect(h.hidden).toBe(true);
+      expect(run(h, { type: "shown" }).state.hidden).toBe(false);
+      expect(run(h, { type: "input", text: "u" }).state.hidden).toBe(false);
     });
 
     it("ready_ignored_before_any_query", () => {

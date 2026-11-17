@@ -345,7 +345,7 @@ The text of a search is saved when you open a result from it, on this PC in `%AP
 Flick goes online only when you ask a currency or weather question, and only while `online` is not `false`:
 
 - Currency: when the saved rates are older than the latest publication, Flick downloads the European Central Bank's daily rates file (at most once an hour) and keeps it in `%APPDATA%\Flick\rates.json`. Nothing about you is sent beyond the request itself.
-- Weather: Flick sends the city name you asked for (or your `weather_city`) to Open-Meteo's place search, then that place's coordinates to Open-Meteo's forecast. Never your own position, and nothing is looked up from your IP address. The places it found are kept in `%APPDATA%\Flick\weather.json`.
+- Weather: Flick sends the city name you asked for (or your `weather_city`) to Open-Meteo's place search, then that place's coordinates to Open-Meteo's forecast. Never your own position, and nothing is looked up from your IP address. Only your `weather_city` and its coordinates are kept, in `%APPDATA%\Flick\weather.json`; any other place is remembered only until Flick quits.
 - Nothing else goes online. `online = false` stops both. Web search only opens your browser; Flick itself sends nothing.
 
 Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.

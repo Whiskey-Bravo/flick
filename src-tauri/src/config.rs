@@ -213,6 +213,10 @@ pub fn validate(c: &Config) -> Result<(), String> {
         if n.contains(':') {
             return fail("name cannot contain :");
         }
+        // `?x` is read as `? x`: only the one-character name `?` can be typed.
+        if std::iter::once(n).chain(&s.aliases).any(|w| w.starts_with('?') && w.chars().count() > 1) {
+            return fail("name cannot start with ?");
+        }
         // `>` routes to WSL commands: such a name could never be reached.
         if std::iter::once(n).chain(&s.aliases).any(|w| w.starts_with('>')) {
             return fail("name cannot start with >");
@@ -611,6 +615,16 @@ admin = true")).is_ok());
     fn question_mark_is_a_valid_name() {
         // The built-in web search is named `?`; a config shortcut may replace it.
         assert!(parse(&sc("?", "open = \"https://example.com/?q={arg}\"")).is_ok());
+    }
+
+    #[test]
+    fn names_starting_with_question_mark_other_than_it_are_rejected() {
+        assert_eq!(err(&sc("?docs", "open = \"x\"")), "shortcut \"?docs\": name cannot start with ?");
+        assert_eq!(
+            err(&sc("x", "aliases = [\"?y\"]\nopen = \"x\"")),
+            "shortcut \"x\": name cannot start with ?"
+        );
+        assert!(parse(&sc("?", "open = \"x\"")).is_ok());
     }
 
     #[test]
