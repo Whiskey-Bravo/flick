@@ -1,0 +1,46 @@
+.updates {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  align-items: flex-start;
+}
+
+.updates .muted {
+  color: var(--muted);
+}
+
+.updates .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.updates button {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.updates button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #10131f;
+}
+
+.updates button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.updates .error {
+  color: var(--error);
+}
+
+.updates .notes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+}

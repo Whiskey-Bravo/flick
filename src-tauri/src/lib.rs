@@ -2,6 +2,7 @@ mod answers;
 mod clipboard;
 mod commands;
 mod config;
+mod config_edit;
 mod engine;
 mod fuzzy;
 mod history;
@@ -15,6 +16,9 @@ mod process;
 mod providers;
 mod quote;
 mod ranking;
+mod settings;
+mod settings_window;
+mod updates;
 mod tray;
 mod window;
 mod wsl_detect;
@@ -42,7 +46,9 @@ use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
 use providers::settings::SettingsProvider;
 use providers::shortcuts::ShortcutsProvider;
+use providers::update::UpdateProvider;
 use providers::welcome::WelcomeProvider;
+use updates::{PluginSource, Updates};
 use providers::wsl::WslProvider;
 use history::History;
 use pins::Pins;
@@ -67,11 +73,19 @@ struct Providers {
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
+    update: Arc<UpdateProvider>,
 }
 
 impl Providers {
     /// Cheap: no disk access. File roots and shortcuts arrive with the config.
-    fn new(answers: Answers, apps: Arc<AppsProvider>, launcher: Arc<dyn Launcher>, distro: &str) -> Self {
+    fn new(
+        answers: Answers,
+        apps: Arc<AppsProvider>,
+        launcher: Arc<dyn Launcher>,
+        distro: &str,
+        open_settings: Opener,
+        updates: Arc<Updates>,
+    ) -> Self {
         Self {
             answers: answers.provider,
             weather: answers.weather,
@@ -81,7 +95,8 @@ impl Providers {
             files: FilesProvider::new(launcher.clone()),
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
-            welcome: WelcomeProvider::new(Box::new(window::shows)),
+            welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
+            update: UpdateProvider::new(updates),
         }
     }
 }
@@ -143,17 +158,19 @@ fn answers_config(c: &Config, formats: &dyn Formats) -> AnswersConfig {
 pub(crate) struct AppState {
     pub(crate) engine: Arc<Engine>,
     /// Shared with the engine; the config's `history` switch is applied to it.
-    history: Arc<History>,
+    pub(crate) history: Arc<History>,
     providers: Providers,
+    /// What the last update check found; in memory only.
+    pub(crate) updates: Arc<Updates>,
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
-    config: Mutex<Config>,
+    pub(crate) config: Mutex<Config>,
     /// Result of the last successful WSL detection; `Unknown` until one
     /// succeeds. Lock order: `config`, then this.
-    detected: Mutex<WslState>,
+    pub(crate) detected: Mutex<WslState>,
     /// Configured accelerator last applied successfully; `None` when the last
     /// `hotkey::apply` failed (the previous hotkey may then still be active).
-    hotkey: Mutex<Option<String>>,
+    pub(crate) hotkey: Mutex<Option<String>>,
     /// Keeps the config watcher alive for the life of the app.
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Latest config/hotkey error text, re-sent on every show so an error from
@@ -173,11 +190,14 @@ fn build_engine(
     p: &Providers,
     power: Box<dyn PowerRunner>,
     open_config: Opener,
+    open_settings: Opener,
     ranking: Arc<Ranking>,
     history: Arc<History>,
     pins: Arc<Pins>,
 ) -> Engine {
     let providers: Vec<Box<dyn Provider>> = vec![
+        // First, so its row tops the empty bar. It has no help line.
+        Box::new(p.update.clone()),
         Box::new(p.answers.clone()),
         Box::new(p.apps.clone()),
         Box::new(p.files.clone()),
@@ -185,7 +205,7 @@ fn build_engine(
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
         Box::new(PowerProvider::new(power)),
-        Box::new(FlickProvider::new(open_config)),
+        Box::new(FlickProvider::new(open_config, open_settings)),
         Box::new(HistoryProvider::new(history.clone())),
         // Last: it has no help line, so the help list is unchanged.
         Box::new(p.welcome.clone()),
@@ -193,22 +213,31 @@ fn build_engine(
     Engine::new(providers, ranking, history, pins)
 }
 
+/// Opens the Settings window; builds it off the calling thread.
+fn settings_opener(app: &AppHandle) -> Opener {
+    let app = app.clone();
+    Box::new(move || {
+        settings_window::open_soon(&app);
+        Ok(())
+    })
+}
+
 /// What detection has said about WSL so far.
 #[derive(Clone, Debug, PartialEq)]
-enum WslState {
+pub(crate) enum WslState {
     /// No detection has succeeded yet (not run, or it timed out).
     Unknown,
     /// Detection found no usable WSL.
     NoWsl,
-    /// Detection found this default distro.
-    Distro(String),
+    /// Detection found these distros; `default` is the one to use.
+    Present { default: String, distros: Vec<String> },
 }
 
 impl WslState {
     /// `None` for a failed detection: the caller keeps its previous state.
     fn from_detection(detection: wsl_detect::Detection) -> Option<WslState> {
         match detection {
-            wsl_detect::Detection::Found(Some(d)) => Some(WslState::Distro(d)),
+            wsl_detect::Detection::Found(Some(f)) => Some(WslState::Present { default: f.default, distros: f.distros }),
             wsl_detect::Detection::Found(None) => Some(WslState::NoWsl),
             wsl_detect::Detection::Failed => None,
         }
@@ -221,7 +250,7 @@ fn effective_distro(configured: &str, detected: &WslState) -> String {
     match detected {
         WslState::NoWsl => String::new(),
         _ if !configured.is_empty() => configured.to_string(),
-        WslState::Distro(d) => d.clone(),
+        WslState::Present { default, .. } => default.clone(),
         WslState::Unknown => String::new(),
     }
 }
@@ -301,13 +330,32 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::query,
             commands::activate,
             commands::hide,
             commands::toggle_pin,
             commands::past_searches,
-            commands::reveal
+            commands::reveal,
+            settings::settings_state,
+            settings::settings_set,
+            settings::settings_save_shortcut,
+            settings::settings_check_shortcut,
+            settings::settings_delete_shortcut,
+            settings::settings_set_start_at_login,
+            settings::settings_clear_history,
+            settings::settings_pick_folder,
+            settings::settings_pins,
+            settings::settings_move_pin,
+            settings::settings_check_city,
+            settings::settings_open_file,
+            settings::settings_currencies,
+            settings::settings_pause_hotkey,
+            updates::settings_update_status,
+            updates::settings_check_now,
+            updates::settings_install_update
         ])
         // Result-row icons. Answered on the icon workers, never on this thread.
         .register_asynchronous_uri_scheme_protocol(icon::SCHEME, move |_ctx, request, responder| {
@@ -339,7 +387,13 @@ fn setup(app: &AppHandle) {
     let answers = Answers::new(launcher.clone(), Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
     }));
-    let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
+    let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
+    updates.set_enabled(loaded.config.check_updates);
+    let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher,
+        &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
+        settings_opener(app),
+        updates.clone(),
+    );
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
@@ -350,6 +404,7 @@ fn setup(app: &AppHandle) {
         &providers,
         Box::new(SystemPower),
         Box::new(launch::open_config),
+        settings_opener(app),
         ranking,
         history.clone(),
         pins,
@@ -358,6 +413,7 @@ fn setup(app: &AppHandle) {
         engine: Arc::new(engine),
         history,
         providers: providers.clone(),
+        updates,
         config: Mutex::new(loaded.config.clone()),
         detected: Mutex::new(WslState::Unknown),
         hotkey: Mutex::new(None),
@@ -366,6 +422,7 @@ fn setup(app: &AppHandle) {
     });
 
     start_index_threads(app, providers);
+    updates::start_scheduler(app);
 
     window::install_handlers(app);
 
@@ -484,7 +541,7 @@ fn load_answer_stores(app: &AppHandle, p: &Providers) {
 
 /// Registers `accelerator`, records the result and updates the tray tooltip.
 /// Returns the user-facing error text on failure.
-fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
+pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
     let result = hotkey::apply(app, accelerator);
     let state = app.state::<AppState>();
     *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then(|| accelerator.to_string());
@@ -505,7 +562,7 @@ fn tooltip(error: Option<&str>) -> String {
 /// providers (rescanning files in the background when their folders changed);
 /// re-apply the hotkey if it changed (or the last attempt failed); emit
 /// `config:error`. Never call on the main thread.
-fn reload_config(app: &AppHandle) {
+pub(crate) fn reload_config(app: &AppHandle) {
     let state = app.state::<AppState>();
     let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     let loaded = config::load(&config::config_path(), Some(&config));
@@ -527,6 +584,9 @@ fn reload_config(app: &AppHandle) {
         p.weather.set_home(loaded.config.weather_city.trim());
     }
     *config = loaded.config;
+    if loaded.error.is_none() {
+        state.updates.set_enabled(config.check_updates);
+    }
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let hotkey_error = if hotkey_needs_apply(applied.as_deref(), &config.hotkey) {
         apply_hotkey(app, &config.hotkey)
@@ -534,6 +594,7 @@ fn reload_config(app: &AppHandle) {
         None
     };
     emit_config_error(app, join_errors(loaded.error, hotkey_error));
+    let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
 }
 
 /// `applied` is the configured hotkey that last registered successfully (`None`
@@ -588,6 +649,7 @@ mod tests {
         power: Arc<Mutex<Vec<PowerAction>>>,
         opened: Arc<AtomicUsize>,
         dir: tempfile::TempDir,
+        ranking: Arc<Ranking>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
@@ -616,7 +678,11 @@ mod tests {
             files: FilesProvider::with_entries(launcher.clone(), files),
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
-            welcome: WelcomeProvider::new(Box::new(|| 0)),
+            welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
+            update: UpdateProvider::new(Arc::new(Updates::new(
+                Arc::new(updates::tests::FakeSource::default()),
+                Arc::new(|| {}),
+            ))),
         };
         let power = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
@@ -628,11 +694,12 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
-            ranking,
+            Box::new(|| Ok(())),
+            ranking.clone(),
             Arc::new(History::load(dir.path().join("history.json"), true)),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
         );
-        Rig { engine, providers, launcher, power, opened, dir }
+        Rig { engine, providers, launcher, power, opened, dir, ranking }
     }
 
     fn app(name: &str) -> AppEntry {
@@ -769,6 +836,7 @@ mod tests {
                 "bluetooth",
                 "lock / sleep / restart / shut down / sign out",
                 "flick config",
+                "settings",
                 "clear history",
                 "help",
                 "Esc",
@@ -784,7 +852,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 18);
+        assert_eq!(r.engine.query("Help", None).len(), 19);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
@@ -863,12 +931,31 @@ mod tests {
         let r = rig(vec![], vec![]);
         for text in ["flick config", "edit config", "flick", "config"] {
             let res = r.engine.query(text, None);
-            assert_eq!((res[0].provider, res[0].title.as_str()), ("flick", "Flick: edit config"), "{text}");
+            let row = res.iter().find(|i| i.id == "config").unwrap_or_else(|| panic!("{text}"));
+            assert_eq!((row.provider, row.title.as_str()), ("flick", "Flick: edit config"), "{text}");
+        }
+        for text in ["flick config", "edit config"] {
+            assert_eq!(r.engine.query(text, None)[0].id, "config", "{text}");
         }
         let id = r.engine.query("flick config", None)[0].id.clone();
         assert_eq!(r.engine.activate("flick", &id, provider::Modifier::None, "", None), Ok(Outcome::Hide));
         assert_eq!(r.opened.load(Ordering::SeqCst), 1);
         assert!(r.launcher.calls().is_empty());
+    }
+
+    #[test]
+    fn typing_settings_ranks_flick_settings_above_the_windows_app() {
+        let r = rig(vec![app("Settings")], vec![]);
+        let res = r.engine.query("settings", None);
+        assert_eq!((res[0].provider, res[0].id.as_str()), ("flick", "settings"), "{:?}", res.iter().map(|i| &i.title).collect::<Vec<_>>());
+        assert!(res.iter().any(|i| i.provider == "apps" && i.title == "Settings"));
+        // Even after Windows Settings was launched from the bar many times.
+        let app_id = res.iter().find(|i| i.provider == "apps").unwrap().id.clone();
+        for _ in 0..30 {
+            r.ranking.record("apps", &app_id);
+        }
+        let res = r.engine.query("settings", None);
+        assert_eq!((res[0].provider, res[0].id.as_str()), ("flick", "settings"));
     }
 
     #[test]
@@ -888,9 +975,13 @@ mod tests {
         assert!(r.launcher.calls().is_empty());
     }
 
+    fn ubuntu() -> WslState {
+        WslState::Present { default: "Ubuntu".into(), distros: vec!["Ubuntu".into(), "Debian".into()] }
+    }
+
     #[test]
     fn config_distro_wins_over_detected() {
-        let ubuntu = WslState::Distro("Ubuntu".into());
+        let ubuntu = ubuntu();
         assert_eq!(effective_distro("Debian", &ubuntu), "Debian");
         assert_eq!(effective_distro("", &ubuntu), "Ubuntu");
         assert_eq!(effective_distro("", &WslState::Unknown), "");
@@ -906,7 +997,8 @@ mod tests {
     #[test]
     fn detection_maps_to_state_and_failure_keeps_the_old_one() {
         use wsl_detect::Detection::{Failed, Found};
-        assert_eq!(WslState::from_detection(Found(Some("Ubuntu".into()))), Some(WslState::Distro("Ubuntu".into())));
+        let found = wsl_detect::Found { default: "Ubuntu".into(), distros: vec!["Ubuntu".into(), "Debian".into()] };
+        assert_eq!(WslState::from_detection(Found(Some(found))), Some(ubuntu()));
         assert_eq!(WslState::from_detection(Found(None)), Some(WslState::NoWsl));
         assert_eq!(WslState::from_detection(Failed), None);
     }
@@ -917,10 +1009,10 @@ mod tests {
         let old = Config::default();
         assert!(!push_config(&r.providers, &old, &old, &WslState::Unknown));
         assert!(r.engine.query("> ls", None).is_empty(), "no WSL: nothing offered");
-        assert!(!push_config(&r.providers, &old, &old, &WslState::Distro("Ubuntu".into())));
+        assert!(!push_config(&r.providers, &old, &old, &ubuntu()));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         let set = Config { wsl_distro: "Debian".into(), ..Config::default() };
-        push_config(&r.providers, &old, &set, &WslState::Distro("Ubuntu".into()));
+        push_config(&r.providers, &old, &set, &ubuntu());
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Debian");
     }
 
@@ -928,7 +1020,7 @@ mod tests {
     fn push_distro_applies_the_effective_distro_to_wsl_and_shortcuts() {
         let r = rig(vec![], vec![]);
         let config = Config { shortcuts: vec![shortcut("hello", "notepad")], ..Config::default() };
-        push_distro(&r.providers, &config, &WslState::Distro("Ubuntu".into()));
+        push_distro(&r.providers, &config, &ubuntu());
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
         push_distro(&r.providers, &config, &WslState::NoWsl);

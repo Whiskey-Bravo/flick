@@ -30,6 +30,7 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | `>` and a command | Runs the command in WSL | `> htop -d 10` |
 | `clear history` | Forgets recent searches and launches (press Enter twice) | `clear history` |
 | `help`, or press F1 | Lists everything Flick can do | `help file` |
+| `settings` | Opens the Settings window | `settings` |
 | `flick config` | Opens the config file | `flick config` |
 
 If you press Enter while results for what you just typed are still on their way, Flick waits for them and opens the new top result.
@@ -308,9 +309,29 @@ In `run` and `wsl` shortcuts, what you type is never pasted into the command. Fl
 
 </details>
 
+## Settings
+
+Open the Settings window from the tray menu (Settings), by typing `settings` in the bar, or with the Open Settings row on the first-run welcome. Every setting is there, so you never have to open the config file. Changes in General, Search, Quick answers and Updates apply at once; a shortcut is saved when you press Save.
+
+- **General**: the hotkey (click the box and press the keys), Start at login, remembering past searches and launches (with a Clear history button), and the WSL distro.
+- **Search**: the folders to search (add or remove them) and your pins, which you can reorder or unpin.
+- **Quick answers**: going online, your home city, currency and temperature unit, and the search engine.
+- **Shortcuts**: your list of shortcuts, with an editor that checks each one as you type.
+- **Updates**: the installed version, Check automatically, Check now, and the update waiting for you, if any.
+
+The config file still works and stays the one source of truth. Edit it by hand if you like; the window follows your changes. Changes made in the window keep your comments, the order of the file and the shortcuts you did not touch. If the file has an error, the window shows it and stays read-only until you fix it.
+
+## Updates
+
+Flick looks for a new version 10 seconds after it starts and then once a day. When one is found, the first row of the empty bar reads "Update to x.y" with "Enter to install and restart" under it, and the tray menu gets an Update to x.y item. Enter downloads it, installs it and restarts Flick; nothing installs unless you say so. Start at login and your settings are kept. If it fails, the bar says "Update failed" with the reason and the current version keeps running. Only updates signed with the project's key are installed.
+
+Set `check_updates = false` to stop the automatic checks (`online = false` stops them too). Check now in Settings, Updates still works.
+
+Versions 0.3.0 and older have no updater, so 0.4.0 has to be installed by hand once, as in Install.
+
 ## Config
 
-The config file is `%APPDATA%\Flick\config.toml`. It is created with commented defaults on first start. Type `flick config` in the bar (or use the tray menu) to open it.
+The config file is `%APPDATA%\Flick\config.toml`. It is created with commented defaults on first start. Most people can use the Settings window instead (see Settings). Type `flick config` in the bar (or use the tray menu) to open the file.
 
 ```toml
 hotkey = "Alt+Space"
@@ -328,6 +349,7 @@ open = "https://docs.rs"
 - `file_roots`: the folders searched for files. Leave it out to search your whole user folder.
 - `history`: set to `false` to stop saving past searches and recent launches (see Past searches). The default is `true`.
 - `online`, `weather_city`, `currency`, `temperature_unit`, `search_engine`: see Quick answers.
+- `check_updates`: set to `false` to stop Flick looking for new versions (see Updates). The default is `true`.
 - `[[shortcut]]`: see Shortcuts.
 
 <details>
@@ -343,11 +365,12 @@ Flick counts only which result you picked (an app, a Settings page, a file, a sh
 
 The text of a search is saved when you open a result from it, on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`.
 
-Flick goes online only when you ask a currency or weather question, and only while `online` is not `false`:
+Flick goes online when you ask a currency or weather question, and to look for updates, and only while `online` is not `false`:
 
 - Currency: when the saved rates are older than the latest publication, Flick downloads the European Central Bank's daily rates file (at most once an hour) and keeps it in `%APPDATA%\Flick\rates.json`. Nothing about you is sent beyond the request itself.
 - Weather: Flick sends the city name you asked for (or your `weather_city`) to Open-Meteo's place search, then that place's coordinates to Open-Meteo's forecast. Never your own position, and nothing is looked up from your IP address. Only your `weather_city` and its coordinates are kept, in `%APPDATA%\Flick\weather.json`; any other place is remembered only until Flick quits.
-- Nothing else goes online. `online = false` stops both. Web search only opens your browser; Flick itself sends nothing.
+- Flick asks GitHub once a day whether a new version exists (GitHub sees the request; nothing about you is sent). `check_updates = false` or `online = false` stops it.
+- Nothing else goes online. `online = false` stops all of the above. Web search only opens your browser; Flick itself sends nothing.
 
 Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
 
@@ -356,6 +379,7 @@ To switch it off, set `history = false` in the config: Flick stops recording and
 ## Tray menu
 
 - Open
+- Settings
 - Edit config (opens the file in its associated editor, or in Notepad if `.toml` has none)
 - Reload (reads the config again and refreshes apps, files and shortcut lists)
 - Start at login (switched on the first time a release build starts)

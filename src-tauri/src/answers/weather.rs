@@ -112,6 +112,8 @@ struct GeoHit {
     name: String,
     latitude: f64,
     longitude: f64,
+    #[serde(default)]
+    country: Option<String>,
 }
 
 /// The first hit of a place search: `Ok(None)` when nothing was found,
@@ -122,6 +124,18 @@ pub fn parse_geocode(body: &[u8]) -> Result<Option<Place>, ()> {
         None => Ok(None),
         Some(hit) => valid_place(&hit.name, hit.latitude, hit.longitude).map(Some).ok_or(()),
     }
+}
+
+/// `"<name>, <country>"` of the first hit of a place search (just the name
+/// when the country is missing); same results as [`parse_geocode`].
+pub fn geocode_label(body: &[u8]) -> Result<Option<String>, ()> {
+    let body: GeoBody = serde_json::from_slice(body).map_err(drop)?;
+    let Some(hit) = body.results.unwrap_or_default().into_iter().next() else {
+        return Ok(None);
+    };
+    let place = valid_place(&hit.name, hit.latitude, hit.longitude).ok_or(())?;
+    let country: String = hit.country.unwrap_or_default().trim().chars().filter(|c| !c.is_control()).collect();
+    Ok(Some(if country.is_empty() { place.name } else { format!("{}, {country}", place.name) }))
 }
 
 #[derive(Deserialize)]
@@ -609,6 +623,13 @@ mod tests {
 
     fn london() -> Forecast {
         Forecast { place: "London".into(), temp: 12.3, code: 61, low: 8.0, high: 14.0 }
+    }
+
+    #[test]
+    fn geocode_label_names_city_and_country() {
+        assert_eq!(geocode_label(LONDON_GEO), Ok(Some("London, United Kingdom".to_string())));
+        assert_eq!(geocode_label(NO_RESULTS), Ok(None));
+        assert_eq!(geocode_label(b"<html>"), Err(()));
     }
 
     #[test]

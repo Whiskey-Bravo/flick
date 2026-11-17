@@ -30,6 +30,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
     "windows": {
@@ -37,6 +38,13 @@
         "installMode": "currentUser",
         "installerHooks": "nsis-hooks.nsh"
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEZCQzUxRTZBQjIwQ0EwQjYKUldTMm9BeXlhaDdGKzJ0TWF0T3RKaFNJZGlPZnQremhKdXIza09vQ2QyU0ltcXNLd0tUbmlWNlgK",
+      "endpoints": ["https://github.com/Whiskey-Bravo/flick/releases/latest/download/latest.json"],
+      "windows": { "installMode": "passive" }
     }
   }
 }

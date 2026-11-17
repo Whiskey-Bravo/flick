@@ -8,7 +8,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
-const DEFAULT_FILE: &str = "\
+pub(crate) const DEFAULT_FILE: &str = "\
 ## Flick configuration. Changes are picked up as soon as you save.
 ##
 ## hotkey: global shortcut that shows the launcher, e.g. \"Alt+Space\".
@@ -37,6 +37,9 @@ const DEFAULT_FILE: &str = "\
 ##
 ## search_engine: the web search behind `? text` and Enter on a weather answer; {arg} is the search text.
 # search_engine = \"https://duckduckgo.com/?q={arg}\"
+##
+## check_updates: ask GitHub about once a day whether a new version exists (false: never).
+# check_updates = true
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
@@ -71,7 +74,7 @@ const DEFAULT_FILE: &str = "\
 # terminal = true
 ";
 
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hotkey: String,
@@ -91,6 +94,8 @@ pub struct Config {
     pub temperature_unit: String,
     /// Web search URL with `{arg}`; empty means DuckDuckGo.
     pub search_engine: String,
+    /// Look for a new version in the background (also needs `online`).
+    pub check_updates: bool,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -108,13 +113,14 @@ impl Default for Config {
             currency: String::new(),
             temperature_unit: String::new(),
             search_engine: String::new(),
+            check_updates: true,
             shortcuts: Vec::new(),
         }
     }
 }
 
 /// One `[[shortcut]]` table.
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShortcutDef {
     pub name: String,
@@ -123,17 +129,22 @@ pub struct ShortcutDef {
     #[serde(default)]
     pub about: String,
     /// Windows command line.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
     /// Command run in the WSL distro.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub wsl: Option<String>,
     /// Path or URL.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub open: Option<String>,
     /// Keep a terminal open; default is true for `wsl`, false for `run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal: Option<bool>,
     /// Run elevated (`run`/`open` only).
     #[serde(default)]
     pub admin: bool,
     /// Folder whose sub-folders are the choices.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pick: Option<PathBuf>,
     #[serde(default)]
     pub choices: Vec<String>,
@@ -203,81 +214,128 @@ pub fn validate(c: &Config) -> Result<(), String> {
     }
     let mut used: Vec<String> = vec!["help".to_string()];
     for s in &c.shortcuts {
-        let n = &s.name;
-        let fail = |msg: &str| Err(format!("shortcut \"{n}\": {msg}"));
+        check_shortcut(s, &mut used)
+            .map_err(|e| format!("shortcut \"{}\": {}", s.name, e.message))?;
+    }
+    Ok(())
+}
 
-        if !one_word(n) || s.aliases.iter().any(|a| !one_word(a)) {
-            return fail("name must be one word");
-        }
-        // Result ids are `kind:<name>:<value>`; aliases never appear in them.
-        if n.contains(':') {
-            return fail("name cannot contain :");
-        }
-        // `?x` is read as `? x`: only the one-character name `?` can be typed.
-        if std::iter::once(n).chain(&s.aliases).any(|w| w.starts_with('?') && w.chars().count() > 1) {
-            return fail("name cannot start with ?");
-        }
-        // `>` routes to WSL commands: such a name could never be reached.
-        if std::iter::once(n).chain(&s.aliases).any(|w| w.starts_with('>')) {
-            return fail("name cannot start with >");
-        }
-        for word in std::iter::once(n).chain(&s.aliases) {
-            let lower = word.to_lowercase();
-            if used.contains(&lower) {
-                return fail("name is already used");
-            }
-            used.push(lower);
-        }
+/// The field of a shortcut a problem is about (`Target` is whichever of run/wsl/open is set).
+#[derive(serde::Serialize, Debug, PartialEq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum Field {
+    Name,
+    Aliases,
+    Target,
+    /// No rule reports it yet; kept so the Settings form has a name for the field.
+    #[allow(dead_code)]
+    Terminal,
+    Admin,
+    Pick,
+    Choices,
+}
 
-        let actions = [s.run.as_ref(), s.wsl.as_ref(), s.open.as_ref()];
-        if actions.iter().filter(|a| a.is_some()).count() != 1 {
-            return fail("needs exactly one of run, wsl, open");
-        }
-        let picks = s.pick.is_some() || !s.choices.is_empty();
-        if s.pick.is_some() && !s.choices.is_empty() {
-            return fail("use pick or choices, not both");
-        }
+#[derive(serde::Serialize, Debug, PartialEq)]
+pub struct FieldError {
+    pub field: Field,
+    pub message: String,
+}
 
-        let command = actions.iter().flatten().next().map_or("", |a| a.as_str());
-        let found = placeholders(command);
-        if picks && found.contains(&"arg") {
-            return fail("{arg} cannot be combined with pick or choices");
-        }
-        let uses_entry = found.iter().any(|p| matches!(*p, "name" | "path"));
-        if !picks && uses_entry {
-            return fail("{name} and {path} need pick or choices");
-        }
-        if picks && !uses_entry {
-            return fail("pick or choices need {name} or {path}");
-        }
-        if s.pick.is_none() && found.contains(&"path") {
-            return fail("{path} needs pick");
-        }
-        if let Some(p) = found.iter().find(|p| !matches!(**p, "arg" | "name" | "path")) {
-            return fail(&format!("unknown placeholder {{{p}}}"));
-        }
-        if s.admin && s.wsl.is_some() {
-            return fail("admin is not available for wsl");
-        }
+/// Checks one shortcut; `used` holds the lowercase names and aliases taken so far and
+/// grows with this shortcut's own. The first broken rule is reported.
+pub fn check_shortcut(s: &ShortcutDef, used: &mut Vec<String>) -> Result<(), FieldError> {
+    let n = &s.name;
+    let fail = |field: Field, msg: &str| Err(FieldError { field, message: msg.to_string() });
+    // Which field a rule about the name and aliases concerns.
+    let word_field = |bad: &dyn Fn(&str) -> bool| if bad(n) { Field::Name } else { Field::Aliases };
 
-        // Report a template that cannot bind its values now, not when it is used.
-        let names: Vec<&str> = ["arg", "name", "path"].into_iter().filter(|n| found.contains(n)).collect();
-        if s.admin && !names.is_empty() {
-            return fail("admin cannot be combined with placeholders");
+    if !one_word(n) {
+        return fail(Field::Name, "name must be one word");
+    }
+    if s.aliases.iter().any(|a| !one_word(a)) {
+        return fail(Field::Aliases, "name must be one word");
+    }
+    // Result ids are `kind:<name>:<value>`; aliases never appear in them.
+    if n.contains(':') {
+        return fail(Field::Name, "name cannot contain :");
+    }
+    // `?x` is read as `? x`: only the one-character name `?` can be typed.
+    let bad_q = |w: &str| w.starts_with('?') && w.chars().count() > 1;
+    if std::iter::once(n).chain(&s.aliases).any(|w| bad_q(w)) {
+        return fail(word_field(&bad_q), "name cannot start with ?");
+    }
+    // `>` routes to WSL commands: such a name could never be reached.
+    let bad_gt = |w: &str| w.starts_with('>');
+    if std::iter::once(n).chain(&s.aliases).any(|w| bad_gt(w)) {
+        return fail(word_field(&bad_gt), "name cannot start with >");
+    }
+    for (i, word) in std::iter::once(n).chain(&s.aliases).enumerate() {
+        let lower = word.to_lowercase();
+        if used.contains(&lower) {
+            return fail(if i == 0 { Field::Name } else { Field::Aliases }, "name is already used");
         }
-        if let Some(run) = &s.run {
-            if let Err(e) = crate::launch::bind_windows(run, &names) {
-                return fail(&e);
-            }
+        used.push(lower);
+    }
+
+    let actions = [s.run.as_ref(), s.wsl.as_ref(), s.open.as_ref()];
+    if actions.iter().filter(|a| a.is_some()).count() != 1 {
+        return fail(Field::Target, "needs exactly one of run, wsl, open");
+    }
+    let picks = s.pick.is_some() || !s.choices.is_empty();
+    if s.pick.is_some() && !s.choices.is_empty() {
+        return fail(Field::Choices, "use pick or choices, not both");
+    }
+
+    let command = actions.iter().flatten().next().map_or("", |a| a.as_str());
+    let found = placeholders(command);
+    if picks && found.contains(&"arg") {
+        return fail(Field::Target, "{arg} cannot be combined with pick or choices");
+    }
+    let uses_entry = found.iter().any(|p| matches!(*p, "name" | "path"));
+    if !picks && uses_entry {
+        return fail(Field::Target, "{name} and {path} need pick or choices");
+    }
+    if picks && !uses_entry {
+        let field = if s.pick.is_some() { Field::Pick } else { Field::Choices };
+        return fail(field, "pick or choices need {name} or {path}");
+    }
+    if s.pick.is_none() && found.contains(&"path") {
+        return fail(Field::Target, "{path} needs pick");
+    }
+    if let Some(p) = found.iter().find(|p| !matches!(**p, "arg" | "name" | "path")) {
+        return fail(Field::Target, &format!("unknown placeholder {{{p}}}"));
+    }
+    if s.admin && s.wsl.is_some() {
+        return fail(Field::Admin, "admin is not available for wsl");
+    }
+
+    // Report a template that cannot bind its values now, not when it is used.
+    let names: Vec<&str> = ["arg", "name", "path"].into_iter().filter(|n| found.contains(n)).collect();
+    if s.admin && !names.is_empty() {
+        return fail(Field::Admin, "admin cannot be combined with placeholders");
+    }
+    if let Some(run) = &s.run {
+        if let Err(e) = crate::launch::bind_windows(run, &names) {
+            return fail(Field::Target, &e);
         }
-        if let Some(wsl) = &s.wsl {
-            let dummy: Vec<(&str, &str)> = names.iter().map(|n| (*n, "x")).collect();
-            if let Err(e) = crate::launch::bind_bash(wsl, &dummy) {
-                return fail(&e);
-            }
+    }
+    if let Some(wsl) = &s.wsl {
+        let dummy: Vec<(&str, &str)> = names.iter().map(|n| (*n, "x")).collect();
+        if let Err(e) = crate::launch::bind_bash(wsl, &dummy) {
+            return fail(Field::Target, &e);
         }
     }
     Ok(())
+}
+
+/// Checks `def` against the other shortcuts of `config` (the one named `original` is
+/// left out, as it is being replaced) and the built-in `help`.
+pub fn check_shortcut_in(config: &Config, original: Option<&str>, def: &ShortcutDef) -> Result<(), FieldError> {
+    let mut used: Vec<String> = vec!["help".to_string()];
+    for s in config.shortcuts.iter().filter(|s| Some(s.name.as_str()) != original) {
+        used.extend(std::iter::once(&s.name).chain(&s.aliases).map(|w| w.to_lowercase()));
+    }
+    check_shortcut(def, &mut used)
 }
 
 /// Reads the file. On error keeps `last_good` (or `Config::default()`) and returns the message.
@@ -342,6 +400,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn check_shortcut_in_rejects_the_builtin_help_name() {
+        let def: ShortcutDef = toml::from_str("name = \"Help\"
+run = \"notepad\"").unwrap();
+        let err = check_shortcut_in(&Config::default(), None, &def).unwrap_err();
+        assert_eq!(err.field, Field::Name);
+        assert_eq!(err.message, "name is already used");
+    }
+
+    #[test]
     fn defaults() {
         let c = Config::default();
         assert_eq!(c.hotkey, "Alt+Space");
@@ -350,6 +417,12 @@ mod tests {
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn check_updates_defaults_on_and_parses_false() {
+        assert!(Config::default().check_updates);
+        assert!(parse("").unwrap().check_updates);
+        assert!(!parse("check_updates = false").unwrap().check_updates);
+    }
     #[test]
     fn config_history_defaults_on_and_parses_false() {
         assert!(Config::default().history);
@@ -722,6 +795,61 @@ search_engine = \"https://www.google.com/search?q={arg}\"").unwrap();
         assert!(err("temperature_unit = \"k\"").contains("temperature_unit"));
         assert!(err("search_engine = \"https://example.com/?q=\"").contains("search_engine"));
         assert!(err("search_engine = \"http://example.com/?q={arg}\"").contains("search_engine"));
+    }
+
+    fn def(name: &str) -> ShortcutDef {
+        ShortcutDef {
+            name: name.into(), aliases: vec![], about: String::new(), run: None, wsl: None,
+            open: Some("x".into()), terminal: None, admin: false, pick: None, choices: vec![],
+        }
+    }
+
+    #[test]
+    fn field_for_each_rule() {
+        let cases: Vec<(ShortcutDef, Field, &str)> = vec![
+            (def(""), Field::Name, "name must be one word"),
+            (ShortcutDef { aliases: vec!["b c".into()], ..def("a") }, Field::Aliases, "name must be one word"),
+            (ShortcutDef { run: Some("y".into()), ..def("a") }, Field::Target, "needs exactly one of run, wsl, open"),
+            (
+                ShortcutDef { open: Some("x {name}".into()), pick: Some("C:/p".into()), choices: vec!["q".into()], ..def("a") },
+                Field::Choices,
+                "use pick or choices, not both",
+            ),
+            (ShortcutDef { open: Some("x {path}".into()), ..def("a") }, Field::Target, "{name} and {path} need pick or choices"),
+            (
+                ShortcutDef { open: Some("x {arg} {name}".into()), choices: vec!["q".into()], ..def("a") },
+                Field::Target,
+                "{arg} cannot be combined with pick or choices",
+            ),
+            (
+                ShortcutDef { open: None, wsl: Some("x".into()), admin: true, ..def("a") },
+                Field::Admin,
+                "admin is not available for wsl",
+            ),
+            (
+                ShortcutDef { open: Some("x {arg}".into()), admin: true, ..def("a") },
+                Field::Admin,
+                "admin cannot be combined with placeholders",
+            ),
+            (def("help"), Field::Name, "name is already used"),
+        ];
+        for (d, field, message) in cases {
+            let e = check_shortcut(&d, &mut vec!["help".to_string()]).unwrap_err();
+            assert_eq!((e.field, e.message.as_str()), (field, message), "{d:?}");
+        }
+    }
+
+    #[test]
+    fn check_in_excludes_the_original() {
+        let c = Config { shortcuts: vec![def("s1"), def("s2")], ..Default::default() };
+        assert!(check_shortcut_in(&c, Some("s1"), &def("s1")).is_ok());
+        assert!(check_shortcut_in(&c, None, &def("s3")).is_ok());
+        let e = check_shortcut_in(&c, Some("s2"), &def("s1")).unwrap_err();
+        assert_eq!(e.field, Field::Name);
+        assert_eq!(e.message, "name is already used");
+        let c = Config { shortcuts: vec![ShortcutDef { aliases: vec!["z".into()], ..def("s1") }], ..Default::default() };
+        let e = check_shortcut_in(&c, None, &def("z")).unwrap_err();
+        assert_eq!(e.field, Field::Name);
     }
 
     #[test]

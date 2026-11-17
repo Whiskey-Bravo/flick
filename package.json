@@ -17,6 +17,8 @@
     "vitest": "^2.1.8"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2"
+    "@preact/preset-vite": "^2.10.6",
+    "@tauri-apps/api": "^2",
+    "preact": "^11.2.0"
   }
 }

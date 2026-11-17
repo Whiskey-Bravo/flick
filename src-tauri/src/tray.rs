@@ -1,11 +1,22 @@
-//! Tray icon and its menu: Open, Edit config, Reload, Start at login, Quit.
+//! Tray icon and its menu: Open, Settings, Edit config, Reload, Start at login, Quit.
+
+use std::sync::Mutex;
 
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
-use crate::{launch, window};
+use crate::{launch, settings_window, window};
+
+/// The "Start at login" menu item, in managed state.
+struct LoginItem(CheckMenuItem<tauri::Wry>);
+
+/// The tray menu and the "Update to x.y" item in it while one is shown.
+struct UpdateItem {
+    menu: Menu<tauri::Wry>,
+    item: Mutex<Option<MenuItem<tauri::Wry>>>,
+}
 
 const TRAY_ID: &str = "flick";
 pub const DEFAULT_TOOLTIP: &str = "Flick";
@@ -19,19 +30,25 @@ pub fn build(
 ) -> tauri::Result<()> {
     let start_at_login = app.autolaunch().is_enabled().unwrap_or(false);
     let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let edit = MenuItem::with_id(app, "edit_config", "Edit config", true, None::<&str>)?;
     let reload = MenuItem::with_id(app, "reload", "Reload", true, None::<&str>)?;
     let login =
         CheckMenuItem::with_id(app, "start_at_login", "Start at login", true, start_at_login, None::<&str>)?;
+    // Kept so the Settings window can move the check mark.
+    app.manage(LoginItem(login.clone()));
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&open, &edit, &reload, &login, &separator, &quit])?;
+    let menu = Menu::with_items(app, &[&open, &settings, &edit, &reload, &login, &separator, &quit])?;
+
+    app.manage(UpdateItem { menu: menu.clone(), item: Mutex::new(None) });
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .tooltip(tooltip)
         .on_menu_event(move |app, event| match event.id().as_ref() {
             "open" => window::show(app),
+            "settings" => settings_window::open_soon(app),
             "edit_config" => {
                 // ShellExecute can block (it waits for the shell); keep it off the main thread.
                 std::thread::spawn(|| {
@@ -39,6 +56,11 @@ pub fn build(
                 });
             }
             "reload" => on_reload(app),
+            "update" => {
+                // Installing blocks for as long as the download takes.
+                let app = app.clone();
+                std::thread::spawn(move || app.state::<crate::AppState>().updates.install());
+            }
             "start_at_login" => set_start_at_login(app, &login),
             "quit" => app.exit(0),
             _ => {}
@@ -60,11 +82,43 @@ fn set_start_at_login(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     if actual != wanted {
         let _ = item.set_checked(actual);
     }
+    let _ = app.emit_to(crate::settings::WINDOW, "settings:changed", ());
+}
+
+/// Puts the tray's "Start at login" check mark on `on`. No-op until the tray exists.
+pub fn set_login_checked(app: &AppHandle, on: bool) {
+    if let Some(item) = app.try_state::<LoginItem>() {
+        let _ = item.0.set_checked(on);
+    }
 }
 
 /// No-op until the tray exists.
 pub fn set_tooltip(app: &AppHandle, tooltip: &str) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         let _ = tray.set_tooltip(Some(tooltip));
+    }
+}
+
+/// Puts "Update to <version>" at the top of the menu, or takes it out on `None`.
+/// No-op until the tray exists.
+pub fn set_update(app: &AppHandle, version: Option<&str>) {
+    let Some(holder) = app.try_state::<UpdateItem>() else { return };
+    let mut current = holder.item.lock().unwrap_or_else(|e| e.into_inner());
+    match version {
+        Some(v) => {
+            let text = format!("Update to {v}");
+            if let Some(item) = current.as_ref() {
+                let _ = item.set_text(text);
+            } else if let Ok(item) = MenuItem::with_id(app, "update", text, true, None::<&str>) {
+                if holder.menu.insert(&item, 0).is_ok() {
+                    *current = Some(item);
+                }
+            }
+        }
+        None => {
+            if let Some(item) = current.take() {
+                let _ = holder.menu.remove(&item);
+            }
+        }
     }
 }

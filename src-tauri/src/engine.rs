@@ -244,6 +244,16 @@ impl Engine {
         self.providers.iter().find(|p| p.name() == name).map(|p| p.as_ref())
     }
 
+    /// `(provider, id)` of every pin, in pin order.
+    pub fn pin_list(&self) -> Vec<(String, String)> {
+        self.pins.list()
+    }
+
+    /// Moves a pin one place up or down.
+    pub fn move_pin(&self, provider: &str, id: &str, up: bool) {
+        self.pins.move_pin(provider, id, up);
+    }
+
     /// The row `provider` would return for `id`, if it can be rebuilt.
     pub fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
         self.provider(provider)?.item(id)
