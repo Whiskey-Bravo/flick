@@ -8,6 +8,7 @@ pub mod history;
 pub mod power;
 pub mod settings;
 pub mod shortcuts;
+pub mod status;
 pub mod update;
 pub mod welcome;
 pub mod wsl;

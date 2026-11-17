@@ -18,6 +18,7 @@ mod quote;
 mod ranking;
 mod settings;
 mod settings_window;
+mod status;
 mod updates;
 mod tray;
 mod window;
