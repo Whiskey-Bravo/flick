@@ -215,24 +215,45 @@ fn translate_job(text: &str, fetch: &dyn Fetch) -> Result<String, LookupError> {
     }
 }
 
-/// The word as typed; when Wiktionary has no page (or no German/English
-/// senses) for it, once more with the first letter's case flipped.
-fn define_job(word: &str, fetch: &dyn Fetch) -> Result<Vec<Sense>, LookupError> {
-    let first = match fetch.get(&definition_url(word)) {
-        Ok(body) => parse_definitions(&body),
-        Err(FetchError::Status(404)) => Err(LookupError::NotFound),
-        Err(FetchError::Offline) => return Err(LookupError::Offline),
-        Err(_) => return Err(LookupError::Bad),
-    };
-    let Some(other) = first.as_ref().err().filter(|e| **e == LookupError::NotFound).and(flip_first(word)) else {
-        return first;
-    };
-    match fetch.get(&definition_url(&other)) {
+/// The senses on Wiktionary's page for `word`; no page is `NotFound`.
+fn definitions_of(word: &str, fetch: &dyn Fetch) -> Result<Vec<Sense>, LookupError> {
+    match fetch.get(&definition_url(word)) {
         Ok(body) => parse_definitions(&body),
         Err(FetchError::Status(404)) => Err(LookupError::NotFound),
         Err(FetchError::Offline) => Err(LookupError::Offline),
         Err(_) => Err(LookupError::Bad),
     }
+}
+
+/// The word as typed, then (Wiktionary titles being case-sensitive: `gift` is
+/// English, `Gift` German) once more with the first letter's case flipped when
+/// the first page has no page, no senses, or senses in only one of German and
+/// English. A language missing from the first page is taken from the second,
+/// German first; when the second fails or has nothing, the first page's answer stands.
+fn define_job(word: &str, fetch: &dyn Fetch) -> Result<Vec<Sense>, LookupError> {
+    let first = definitions_of(word, fetch);
+    let has = |senses: &[Sense], lang: Lang| senses.iter().any(|s| s.lang == lang);
+    let wants_more = match &first {
+        Ok(senses) => !(has(senses, Lang::German) && has(senses, Lang::English)),
+        Err(e) => *e == LookupError::NotFound,
+    };
+    let Some(other) = flip_first(word).filter(|_| wants_more) else {
+        return first;
+    };
+    let second = definitions_of(&other, fetch);
+    let first = match first {
+        Ok(senses) => senses,
+        Err(_) => return second,
+    };
+    let Ok(second) = second else {
+        return Ok(first);
+    };
+    let mut merged = Vec::new();
+    for lang in [Lang::German, Lang::English] {
+        let source = if has(&first, lang) { &first } else { &second };
+        merged.extend(source.iter().filter(|s| s.lang == lang).cloned());
+    }
+    Ok(merged)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -264,6 +285,8 @@ pub struct WordsProvider {
     /// Copy text of the answer rows of the latest query, by the `<n>` of their id.
     copies: Mutex<Vec<String>>,
     /// This provider answered the latest query (the engine then calls `skipped` on every provider).
+    /// Assumes the engine runs `query` and the `skipped` calls of one bar query back to back,
+    /// with no other query in between (one query at a time, as the engine does today).
     answered: AtomicBool,
 }
 
@@ -423,6 +446,14 @@ impl Provider for WordsProvider {
         if !self.answered.swap(false, Ordering::Relaxed) {
             self.forget_waiting();
         }
+    }
+
+    /// The bar was cleared (the engine calls neither `query` nor `skipped` then):
+    /// what was waiting is not sent. Memory only.
+    fn empty_query(&self) -> Vec<ResultItem> {
+        self.answered.store(false, Ordering::Relaxed);
+        self.forget_waiting();
+        vec![]
     }
 
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
@@ -659,10 +690,24 @@ mod tests {
 
     #[test]
     fn hiding_drops_the_waiting_text() {
+        // Each store on its own: the text waiting last is the one dropped.
+        for texts in [["def Haus", "tr hallo"], ["tr hallo", "def Haus"]] {
+            let r = rig(FakeFetch::new(Ok(MYMEMORY_GUTEN_MORGEN.as_bytes().to_vec())));
+            for t in texts {
+                r.p.query(&q(t));
+            }
+            r.p.forget_waiting();
+            std::thread::sleep(P * 3);
+            assert!(r.fetch.urls().is_empty(), "{texts:?}");
+        }
+    }
+
+    #[test]
+    fn clearing_the_bar_drops_the_waiting_text() {
         let r = rig(FakeFetch::new(Ok(MYMEMORY_GUTEN_MORGEN.as_bytes().to_vec())));
         r.p.query(&q("tr hallo"));
-        r.p.query(&q("def Haus"));
-        r.p.forget_waiting();
+        r.p.skipped();
+        assert!(r.p.empty_query().is_empty());
         std::thread::sleep(P * 3);
         assert!(r.fetch.urls().is_empty());
     }
@@ -771,6 +816,56 @@ mod tests {
         r.wait();
         assert_eq!(r.fetch.urls(), vec![DEF_HAUS_LOWER.to_string(), DEF_HAUS.to_string()]);
         assert_eq!(r.p.query(&q("def haus")).len(), 5);
+    }
+
+    /// `rest_v1/page/definition/gift`: English only (plus a Danish entry never shown).
+    const WIKTIONARY_GIFT: &str = r#"{"en":[{"partOfSpeech":"Noun","language":"English","definitions":[{"definition":"Something given to another <a rel=\"mw:WikiLink\" href=\"/wiki/voluntarily\" title=\"voluntarily\">voluntarily</a>, without charge.","examples":["She gave me a lovely <b>gift</b>."]},{"definition":"A talent or natural ability."}]},{"partOfSpeech":"Verb","language":"English","definitions":[{"definition":"To give as a gift."}]}],"da":[{"partOfSpeech":"Noun","language":"Danish","definitions":[{"definition":"poison"}]}]}"#;
+    /// `rest_v1/page/definition/Gift`: German only.
+    const WIKTIONARY_GIFT_UPPER: &str = r#"{"de":[{"partOfSpeech":"Noun","language":"German","definitions":[{"definition":"<a rel=\"mw:WikiLink\" href=\"/wiki/poison\" title=\"poison\">poison</a>, <a rel=\"mw:WikiLink\" href=\"/wiki/toxin\" title=\"toxin\">toxin</a>"},{"definition":"<span class=\"gloss-brac\">(</span>figuratively<span class=\"gloss-brac\">)</span> venom, spite"}]}]}"#;
+    const DEF_GIFT: &str = "https://en.wiktionary.org/api/rest_v1/page/definition/gift";
+    const DEF_GIFT_UPPER: &str = "https://en.wiktionary.org/api/rest_v1/page/definition/Gift";
+
+    #[test]
+    fn a_word_in_both_languages_shows_both_german_first() {
+        let fetch = || {
+            FakeFetch::offline()
+                .respond(DEF_GIFT, Ok(WIKTIONARY_GIFT.as_bytes().to_vec()))
+                .respond(DEF_GIFT_UPPER, Ok(WIKTIONARY_GIFT_UPPER.as_bytes().to_vec()))
+        };
+        for (typed, urls) in [("gift", [DEF_GIFT, DEF_GIFT_UPPER]), ("Gift", [DEF_GIFT_UPPER, DEF_GIFT])] {
+            let r = rig(fetch());
+            r.p.query(&q(&format!("def {typed}")));
+            r.wait();
+            assert_eq!(r.fetch.urls(), urls.map(String::from).to_vec(), "{typed}");
+            let rows = r.p.query(&q(&format!("def {typed}")));
+            let subtitles: Vec<&str> = rows.iter().map(|r| r.subtitle.as_str()).collect();
+            assert_eq!(
+                subtitles,
+                ["German · noun", "German · noun", "English · noun", "English · noun", "English · verb"],
+                "{typed}"
+            );
+            assert_eq!(rows[0].title, "poison, toxin");
+            assert_eq!(rows[2].title, "Something given to another voluntarily, without charge.");
+            std::thread::sleep(P * 3);
+            assert_eq!(r.fetch.urls().len(), 2, "both kept under the typed word");
+        }
+    }
+
+    #[test]
+    fn the_first_page_stands_when_the_other_case_has_nothing() {
+        for second in [Err(FetchError::Status(404)), Err(FetchError::Offline), Ok(WIKTIONARY_404.as_bytes().to_vec())] {
+            let r = rig(FakeFetch::offline().respond(DEF_GIFT, Ok(WIKTIONARY_GIFT.as_bytes().to_vec())).respond(DEF_GIFT_UPPER, second.clone()));
+            r.p.query(&q("def gift"));
+            r.wait();
+            let rows = r.p.query(&q("def gift"));
+            assert_eq!(rows.len(), 3, "{second:?}");
+            assert!(rows.iter().all(|r| r.subtitle.starts_with("English")), "{second:?}");
+        }
+        // A word without case is asked once.
+        let r = rig(FakeFetch::new(Ok(WIKTIONARY_GIFT.as_bytes().to_vec())));
+        r.p.query(&q("def 42"));
+        r.wait();
+        assert_eq!(r.fetch.urls().len(), 1);
     }
 
     #[test]

@@ -82,15 +82,19 @@ impl<T: Send + Sync + 'static> Lookups<T> {
         job: impl FnOnce(&dyn Fetch) -> Result<T, LookupError> + Send + 'static,
     ) -> Lookup<T> {
         let mut st = self.state.lock().unwrap();
-        if let Some((_, answer)) = st.cache.iter().find(|(k, _)| k == key) {
-            return match answer {
-                Ok(v) => Lookup::Ready(v.clone()),
-                Err(e) => Lookup::Failed(*e),
-            };
-        }
-        match st.failed.take() {
-            Some((k, e)) if k == key => return Lookup::Failed(e),
-            _ => {}
+        // Any answer for `key` means `key` is the latest text: nothing else may stay waiting.
+        let known = st.cache.iter().find(|(k, _)| k == key).map(|(_, answer)| match answer {
+            Ok(v) => Lookup::Ready(v.clone()),
+            Err(e) => Lookup::Failed(*e),
+        });
+        let known = known.or_else(|| match st.failed.take() {
+            Some((k, e)) if k == key => Some(Lookup::Failed(e)),
+            _ => None,
+        });
+        if let Some(answer) = known {
+            st.waiting = None;
+            self.wake.notify_all();
+            return answer;
         }
         if st.running.as_deref() == Some(key) {
             st.waiting = None;
@@ -239,6 +243,35 @@ mod tests {
         rx.recv_timeout(WAIT).unwrap();
         std::thread::sleep(PAUSE_TEST * 2);
         assert_eq!(fetch.urls(), vec!["https://x/abc".to_string()]);
+    }
+
+    #[test]
+    fn going_back_to_a_known_key_drops_the_waiting_one() {
+        let fetch = Arc::new(FakeFetch::new(Ok(b"yes".to_vec())).respond("https://x/gone", Err(FetchError::Status(404))));
+        let (s, rx) = store(fetch.clone(), PAUSE_TEST);
+        for known in ["a", "gone"] {
+            assert!(matches!(ask(&s, known), Lookup::Waiting));
+            rx.recv_timeout(WAIT).unwrap();
+            assert!(matches!(ask(&s, &format!("{known}b")), Lookup::Waiting));
+            assert!(!matches!(ask(&s, known), Lookup::Waiting), "{known} is kept");
+        }
+        std::thread::sleep(PAUSE_TEST * 3);
+        assert_eq!(fetch.urls(), vec!["https://x/a".to_string(), "https://x/gone".to_string()]);
+
+        // A failure told once drops the waiting key too: `ab` is typed while
+        // `a` runs, then the text goes back to `a`, whose failure is shown.
+        let pause = Duration::from_millis(300);
+        let fetch = Arc::new(FakeFetch::offline().with_delay(Duration::from_millis(600)));
+        let (s, rx) = store(fetch.clone(), pause);
+        assert!(matches!(ask(&s, "a"), Lookup::Waiting));
+        // `a` runs from 300 ms to 900 ms; `ab` asked at 800 ms is due at 1100 ms.
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(fetch.urls().len(), 1, "a is running");
+        assert!(matches!(ask(&s, "ab"), Lookup::Waiting));
+        rx.recv_timeout(WAIT).unwrap();
+        assert!(matches!(ask(&s, "a"), Lookup::Failed(LookupError::Offline)));
+        std::thread::sleep(pause * 3);
+        assert_eq!(fetch.urls(), vec!["https://x/a".to_string()]);
     }
 
     #[test]
