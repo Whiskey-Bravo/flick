@@ -138,14 +138,14 @@ pub fn take_lone(setting_on: bool, paused: bool, bar_ready: bool, full_screen: b
     setting_on && !paused && bar_ready && !full_screen
 }
 
-/// How long the hook may lag behind real input before it's reinstalled.
+/// How long the hook may lag behind raw keyboard input before it's reinstalled.
 const STALE_MS: u64 = 2_000;
 /// The least time between two reinstalls.
 const REINSTALL_GAP_MS: u64 = 10_000;
 
-/// Reinstalls the hook quietly when Windows has seen input the hook hasn't.
-/// `GetLastInputInfo` also counts input the hook can't see (lock screen,
-/// elevated windows), so this is only a hint and is rate-limited.
+/// Reinstalls the hook quietly when raw keyboard input has arrived that the
+/// hook hasn't seen (Windows drops a slow hook without saying so). It is
+/// still only a hint, so it is rate-limited.
 #[derive(Debug)]
 pub struct Watchdog {
     last_reinstall_ms: Option<u64>,
@@ -156,8 +156,8 @@ impl Watchdog {
         Watchdog { last_reinstall_ms: None }
     }
 
-    pub fn should_reinstall(&mut self, now_ms: u64, last_hook_event_ms: u64, last_input_ms: u64) -> bool {
-        if last_input_ms <= last_hook_event_ms.saturating_add(STALE_MS) {
+    pub fn should_reinstall(&mut self, now_ms: u64, last_hook_event_ms: u64, last_raw_key_ms: u64) -> bool {
+        if last_raw_key_ms <= last_hook_event_ms.saturating_add(STALE_MS) {
             return false;
         }
         if let Some(last) = self.last_reinstall_ms {
