@@ -5,9 +5,6 @@
 //! so missed key-ups (Win+L, Ctrl+Alt+Del, elevated windows) can't wedge it;
 //! tracking only spans one press, from Win down to Win up.
 
-// used by winkey.rs (Task 4)
-#![allow(dead_code)]
-
 /// Keys and buttons already down when Win went down, read from Windows
 /// (`GetAsyncKeyState`) by the caller. `Default` is "nothing held".
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

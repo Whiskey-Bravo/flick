@@ -552,6 +552,20 @@ mod tests {
         assert!(check_city(true, &fetch, "  ").is_err());
         assert!(fetch.urls().is_empty());
     }
+
+    #[test]
+    fn status_text_names_the_bar_hotkey() {
+        assert_eq!(win_key_status(false, false, "Alt+Space"), None, "off");
+        assert_eq!(win_key_status(true, true, "Alt+Space"), None, "healthy");
+        assert_eq!(
+            win_key_status(true, false, "Alt+Space"),
+            Some("The Win key isn't available right now; Alt+Space still works.".to_string())
+        );
+        assert_eq!(
+            win_key_status(true, false, "Ctrl+Alt+K").as_deref(),
+            Some("The Win key isn't available right now; Ctrl+Alt+K still works.")
+        );
+    }
 }
 
 /// Opens config.toml like the tray's "Edit config" (the file-error banner's button).
@@ -568,8 +582,29 @@ pub fn settings_currencies() -> Vec<String> {
 
 /// Releases the global hotkeys (the bar's and the direct ones) while a keys box
 /// captures keys, then restores them, the bar's first.
+/// The Win key is left to Windows for the same time.
 #[tauri::command(async)]
 pub fn settings_pause_hotkey(paused: bool, app: AppHandle, keys: State<Arc<DirectKeys>>) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.win_key.flags.set_paused(paused);
+    }
     crate::hotkey::set_paused(&app, paused);
     keys.pause(paused);
+}
+
+/// The line under "Win key opens Flick": `None` when the setting is off or
+/// the hook works, else what still opens the bar.
+#[tauri::command(async)]
+pub fn settings_win_key_status(app: AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    let (on, configured) = {
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        (config.win_key, config.hotkey.clone())
+    };
+    win_key_status(on, state.win_key.healthy(), &crate::registered_bar(&app, &configured))
+}
+
+/// See [`settings_win_key_status`]; `bar_hotkey` is the registered bar hotkey.
+fn win_key_status(on: bool, healthy: bool, bar_hotkey: &str) -> Option<String> {
+    (on && !healthy).then(|| format!("The Win key isn't available right now; {bar_hotkey} still works."))
 }
