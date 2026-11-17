@@ -21,6 +21,7 @@ pub mod status;
 pub mod system;
 pub mod timers;
 pub mod update;
+pub mod words;
 pub mod welcome;
 pub mod windows;
 pub mod workspaces;
