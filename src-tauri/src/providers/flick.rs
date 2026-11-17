@@ -72,10 +72,12 @@ impl Provider for FlickProvider {
             rows.push(row(score));
         }
         if let Some(score) = best(text, &SETTINGS_KEYWORDS) {
-            // Exactly one of its keywords: edge out an app of the same name
-            // (Windows Settings) so the advertised `settings` opens this window.
-            let exact = SETTINGS_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(text));
-            rows.push(settings_row(if exact { score.saturating_add(1) } else { score }));
+            // Exactly one of its keywords: always first, above an app of the same
+            // name (Windows Settings) however often that was picked, so the
+            // advertised `settings` opens this window.
+            let mut item = settings_row(score);
+            item.top = SETTINGS_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(text));
+            rows.push(item);
         }
         rows
     }
@@ -158,12 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_keyword_scores_one_above_a_plain_match() {
+    fn only_an_exact_keyword_puts_settings_on_top() {
         let (p, _) = provider(Ok(()));
-        let score = |t: &str| p.query(&q(t)).into_iter().find(|i| i.id == "settings").unwrap().score;
-        assert_eq!(score("settings"), fuzzy::score("settings", "settings").unwrap() + 1);
-        assert_eq!(score("Settings"), fuzzy::score("Settings", "settings").unwrap() + 1);
-        assert_eq!(score("setting"), fuzzy::score("setting", "settings").unwrap());
+        let top = |t: &str| p.query(&q(t)).into_iter().find(|i| i.id == "settings").unwrap().top;
+        assert!(top("settings") && top("Settings") && top("options"));
+        assert!(!top("setting"));
     }
 
     #[test]

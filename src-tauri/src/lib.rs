@@ -649,6 +649,7 @@ mod tests {
         power: Arc<Mutex<Vec<PowerAction>>>,
         opened: Arc<AtomicUsize>,
         dir: tempfile::TempDir,
+        ranking: Arc<Ranking>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
@@ -694,11 +695,11 @@ mod tests {
                 Ok(())
             }),
             Box::new(|| Ok(())),
-            ranking,
+            ranking.clone(),
             Arc::new(History::load(dir.path().join("history.json"), true)),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
         );
-        Rig { engine, providers, launcher, power, opened, dir }
+        Rig { engine, providers, launcher, power, opened, dir, ranking }
     }
 
     fn app(name: &str) -> AppEntry {
@@ -948,6 +949,13 @@ mod tests {
         let res = r.engine.query("settings", None);
         assert_eq!((res[0].provider, res[0].id.as_str()), ("flick", "settings"), "{:?}", res.iter().map(|i| &i.title).collect::<Vec<_>>());
         assert!(res.iter().any(|i| i.provider == "apps" && i.title == "Settings"));
+        // Even after Windows Settings was launched from the bar many times.
+        let app_id = res.iter().find(|i| i.provider == "apps").unwrap().id.clone();
+        for _ in 0..30 {
+            r.ranking.record("apps", &app_id);
+        }
+        let res = r.engine.query("settings", None);
+        assert_eq!((res[0].provider, res[0].id.as_str()), ("flick", "settings"));
     }
 
     #[test]
