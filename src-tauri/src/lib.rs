@@ -4,6 +4,7 @@ mod commands;
 mod config;
 mod config_edit;
 mod controls;
+mod dirs;
 mod engine;
 mod fuzzy;
 mod history;
