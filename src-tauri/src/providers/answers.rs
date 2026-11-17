@@ -634,6 +634,8 @@ mod tests {
         assert_eq!(titled(&r, "1,1-1"), ("= 0,1".into(), "1,1 - 1".into()));
         assert_eq!(titled(&r, "0,3-0,1"), ("= 0,2".into(), "0,3 - 0,1".into()));
         assert_eq!(titled(&r, "10,1-10"), ("= 0,1".into(), "10,1 - 10".into()));
+        assert_eq!(titled(&r, "100,1-100"), ("= 0,1".into(), "100,1 - 100".into()));
+        assert_eq!(one(&r, "1000,1-1000").title, "= 0,1");
         assert_eq!(one(&r, "10000000000001*1").title, "= 10.000.000.000.001");
     }
 

@@ -117,6 +117,23 @@ fn chk(v: Val) -> Option<Val> {
     v.v.is_finite().then_some(v)
 }
 
+/// Rounds `sum` of `a` and `b` to 15 significant digits of the larger operand, so
+/// cancellation noise goes (`100.1 - 100` is 0.09999999999999432, shown as 0.1).
+/// Operands from 1e14 up already round to whole numbers or more: left as is, as are
+/// zero operands and non-finite sums (which `chk` rejects).
+fn sum_digits(sum: f64, a: f64, b: f64) -> f64 {
+    let largest = a.abs().max(b.abs());
+    if !sum.is_finite() || !largest.is_finite() || largest == 0.0 {
+        return sum;
+    }
+    let exp = largest.log10().floor() as i32 - 14;
+    if exp >= 0 {
+        return sum;
+    }
+    // Decimal rounding through text: exact, unlike scaling by a power of ten.
+    format!("{:.*}", (-exp) as usize, sum).parse().unwrap_or(sum)
+}
+
 impl Parser<'_> {
     fn peek(&self) -> Option<&Tok> {
         self.toks.get(self.pos)
@@ -134,7 +151,8 @@ impl Parser<'_> {
             let rhs = self.term()?;
             self.meaningful = true;
             let r = if rhs.pct { lhs.v * rhs.v } else { rhs.v };
-            lhs = chk(Val { v: if op == Tok::Plus { lhs.v + r } else { lhs.v - r }, pct: false })?;
+            let sum = if op == Tok::Plus { lhs.v + r } else { lhs.v - r };
+            lhs = chk(Val { v: sum_digits(sum, lhs.v, r), pct: false })?;
         }
         Some(lhs)
     }
@@ -370,6 +388,23 @@ mod tests {
             assert_eq!(v(s), Some(0.0), "{s}");
         }
         assert!((v("sin(30)").unwrap() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sums_drop_cancellation_noise() {
+        let v = |s| evaluate(s).map(|c| c.value);
+        assert_eq!(v("100,1-100"), Some(0.1));
+        assert_eq!(v("1000,1-1000"), Some(0.1));
+        assert_eq!(v("10,1-10"), Some(0.1));
+        assert_eq!(v("0,1+0,2"), Some(0.3));
+        assert_eq!(v("1e-20+1e-20"), Some(2e-20));
+        assert_eq!(v("1e-300-3e-301"), Some(7e-301));
+        assert_eq!(v("12345678901+1"), Some(12345678902.0));
+        assert_eq!(v("999999999999990+9"), Some(999999999999999.0));
+        assert_eq!(v("0+0"), Some(0.0));
+        assert_eq!(v("1e300+1e300"), Some(2e300));
+        assert_eq!(v("80 + 15%"), Some(92.0));
+        assert!(evaluate("1e308+1e308").is_none(), "overflow still rejected");
     }
 
     #[test]
