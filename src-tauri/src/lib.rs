@@ -607,6 +607,12 @@ impl WinKey {
     fn running(&self) -> bool {
         self.hook.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
+
+    /// The worker thread couldn't be started, so no hook ever will be: say so
+    /// in Settings when the setting is on.
+    fn no_worker(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Starts and stops the Win-key hook as [`WinKey::want`] asks. While the hook
@@ -1053,7 +1059,10 @@ fn setup(app: &AppHandle) {
             .name("flick-winkey-control".into())
             .spawn(move || win_key_worker(worker, win_key_rx))
             .map(drop)
-            .unwrap_or_else(|e| eprintln!("could not start the Win key worker: {e}"));
+            .unwrap_or_else(|e| {
+                eprintln!("could not start the Win key worker: {e}");
+                state.win_key.no_worker();
+            });
         if loaded.config.win_key {
             state.win_key.want(true);
         }
@@ -2953,5 +2962,14 @@ mod tests {
         assert!(flags.may_take());
         flags.set_on(false);
         assert!(!flags.may_take(), "switched off before the hook has stopped");
+    }
+
+    #[test]
+    fn a_missing_worker_shows_as_unhealthy() {
+        let (tx, _rx) = mpsc::channel();
+        let win = WinKey::new(tx);
+        assert!(win.healthy(), "nothing asked yet");
+        win.no_worker();
+        assert!(!win.healthy(), "the status line must show");
     }
 }
