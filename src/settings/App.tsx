@@ -4,21 +4,35 @@ import { onSettingsChanged, settingsOpenFile, settingsState, type SettingsState 
 import { Answers } from "./Answers";
 import { General } from "./General";
 import { Search } from "./Search";
+import { Hotkeys } from "./Hotkeys";
 import { Shortcuts, type LeaveGuard } from "./Shortcuts";
 import { Updates } from "./Updates";
+import { Workspaces } from "./Workspaces";
 import { TABS, TAB_LABELS, nextTab, type Tab } from "./tabs";
 
 export function App() {
   const [state, setState] = useState<SettingsState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("general");
-  // The Shortcuts editor sets this while it is open; it asks Save / Discard / Stay.
+  // Each editing tab sets its guard while it is open; it asks Save / Discard / Stay.
   const shortcutsGuard: LeaveGuard = useRef(null);
+  const workspacesGuard: LeaveGuard = useRef(null);
+  const hotkeysGuard: LeaveGuard = useRef(null);
+  const guards: Partial<Record<Tab, LeaveGuard>> = {
+    shortcuts: shortcutsGuard,
+    workspaces: workspacesGuard,
+    hotkeys: hotkeysGuard,
+  };
+  /** True when the open editor (if any) lets us leave. */
+  const mayLeaveTab = async (): Promise<boolean> => {
+    const g = guards[tabRef.current]?.current;
+    return !g || (await g());
+  };
   const tabRef = useRef(tab);
   tabRef.current = tab;
   const goTo = async (next: Tab) => {
     if (next === tabRef.current) return;
-    if (tabRef.current === "shortcuts" && shortcutsGuard.current && !(await shortcutsGuard.current())) return;
+    if (!(await mayLeaveTab())) return;
     setTab(next);
   };
 
@@ -54,7 +68,7 @@ export function App() {
     let gone = false;
     getCurrentWindow()
       .onCloseRequested(async (e) => {
-        if (shortcutsGuard.current && !(await shortcutsGuard.current())) e.preventDefault();
+        if (!(await mayLeaveTab())) e.preventDefault();
       })
       .then((f) => (gone ? f() : (off = f)))
       .catch(() => {});
@@ -110,6 +124,8 @@ export function App() {
         {state !== null && tab === "search" && <Search state={state} />}
         {state !== null && tab === "answers" && <Answers state={state} />}
         {state !== null && tab === "shortcuts" && <Shortcuts state={state} guard={shortcutsGuard} />}
+        {state !== null && tab === "workspaces" && <Workspaces state={state} guard={workspacesGuard} />}
+        {state !== null && tab === "hotkeys" && <Hotkeys state={state} guard={hotkeysGuard} />}
         {tab === "updates" && <Updates />}
       </fieldset>
     </div>
