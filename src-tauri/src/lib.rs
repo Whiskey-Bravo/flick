@@ -44,7 +44,8 @@ mod winlist;
 mod wsl_detect;
 
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
@@ -513,12 +514,180 @@ pub(crate) struct AppState {
     /// Latest config/hotkey error text, re-sent on every show so an error from
     /// startup (emitted before the page listened) still reaches the bar.
     config_error: Mutex<Option<String>>,
+    /// The Win-key hook (the `win_key` setting) and what it reads.
+    pub(crate) win_key: WinKey,
 }
 
 impl AppState {
     pub(crate) fn config_error(&self) -> Option<String> {
         self.config_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+}
+
+/// How often the full-screen state (and the hook's health) is read while the
+/// Win-key hook runs.
+const WIN_KEY_POLL: Duration = Duration::from_millis(500);
+
+/// What decides whether a lone Win press opens Flick. Read inside the hook
+/// callback on every lone press, so atomics only; each is set elsewhere.
+#[derive(Default)]
+pub(crate) struct WinKeyFlags {
+    /// The `win_key` setting.
+    on: AtomicBool,
+    /// Settings is capturing keys for a hotkey box.
+    paused: AtomicBool,
+    /// The bar window exists.
+    bar_ready: AtomicBool,
+    /// An exclusive full-screen app is running; read every [`WIN_KEY_POLL`]
+    /// off the hook thread, since the hook callback must not call the shell.
+    full_screen: AtomicBool,
+}
+
+impl WinKeyFlags {
+    fn may_take(&self) -> bool {
+        winkey_logic::take_lone(
+            self.on.load(Ordering::SeqCst),
+            self.paused.load(Ordering::SeqCst),
+            self.bar_ready.load(Ordering::SeqCst),
+            self.full_screen.load(Ordering::SeqCst),
+        )
+    }
+
+    fn set_on(&self, on: bool) {
+        self.on.store(on, Ordering::SeqCst);
+    }
+
+    pub(crate) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    fn set_bar_ready(&self, ready: bool) {
+        self.bar_ready.store(ready, Ordering::SeqCst);
+    }
+
+    /// Records the shell's notification state: only exclusive full-screen
+    /// (the state that stops the bar hotkey) leaves Win to Windows.
+    fn note_screen(&self, state: Option<windows::Win32::UI::Shell::QUERY_USER_NOTIFICATION_STATE>) {
+        self.full_screen.store(!window::hotkey_may_show(state), Ordering::SeqCst);
+    }
+}
+
+/// The Win-key hook as the app runs it. One worker thread ([`win_key_worker`])
+/// starts and stops the hook, in order, with the last wanted state winning:
+/// starting can block for seconds, so it never runs on the main thread.
+pub(crate) struct WinKey {
+    pub(crate) flags: Arc<WinKeyFlags>,
+    hook: Mutex<Option<winkey::WinKeyHook>>,
+    /// The last start failed, so there is no hook to ask.
+    failed: AtomicBool,
+    wanted: mpsc::Sender<bool>,
+}
+
+impl WinKey {
+    fn new(wanted: mpsc::Sender<bool>) -> WinKey {
+        WinKey { flags: Arc::default(), hook: Mutex::new(None), failed: AtomicBool::new(false), wanted }
+    }
+
+    /// Asks for the hook on or off. Turning it off takes effect for the next
+    /// press at once, before the hook has stopped.
+    fn want(&self, on: bool) {
+        self.flags.set_on(on);
+        let _ = self.wanted.send(on);
+    }
+
+    /// False when a start failed, or the running hook couldn't be reinstalled.
+    /// True while nothing has been asked yet or a start is under way.
+    pub(crate) fn healthy(&self) -> bool {
+        match &*self.hook.lock().unwrap_or_else(|e| e.into_inner()) {
+            Some(hook) => hook.healthy(),
+            None => !self.failed.load(Ordering::SeqCst),
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.hook.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+}
+
+/// Starts and stops the Win-key hook as [`WinKey::want`] asks. While the hook
+/// runs it also reads the full-screen state and tells Settings when the
+/// hook's health changes.
+fn win_key_worker(app: AppHandle, wanted: mpsc::Receiver<bool>) {
+    let state = app.state::<AppState>();
+    let win = &state.win_key;
+    let mut told_healthy = true;
+    loop {
+        let next = if win.running() {
+            match wanted.recv_timeout(WIN_KEY_POLL) {
+                Ok(on) => Some(on),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        } else {
+            match wanted.recv() {
+                Ok(on) => Some(on),
+                Err(_) => return,
+            }
+        };
+        let mut tell = false;
+        if let Some(on) = next {
+            let mut want = on;
+            // Only the last of a burst counts.
+            while let Ok(on) = wanted.try_recv() {
+                want = on;
+            }
+            tell = win_key_apply(&app, win, want);
+        }
+        if win.running() {
+            win.flags.note_screen(window::notification_state());
+        }
+        let healthy = win.healthy();
+        if healthy != told_healthy {
+            told_healthy = healthy;
+            tell = true;
+        }
+        // After the start or stop has finished, so the status Settings reads is current.
+        if tell {
+            let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
+        }
+    }
+}
+
+/// Starts or stops the hook to match `want`. True when something changed.
+fn win_key_apply(app: &AppHandle, win: &WinKey, want: bool) -> bool {
+    if !want {
+        let old = win.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let was_failed = win.failed.swap(false, Ordering::SeqCst);
+        let changed = old.is_some() || was_failed;
+        if let Some(hook) = old {
+            hook.stop();
+        }
+        return changed;
+    }
+    if win.running() {
+        return false;
+    }
+    // Read before the first press, not 500 ms after it.
+    win.flags.note_screen(window::notification_state());
+    let flags = win.flags.clone();
+    let may_take: Box<dyn Fn() -> bool + Send + Sync> = Box::new(move || flags.may_take());
+    let handle = app.clone();
+    // Runs on the hook's worker thread: hand off to the main thread and return.
+    let on_lone: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+        let app = handle.clone();
+        let _ = handle.run_on_main_thread(move || window::toggle_from_win_key(&app));
+    });
+    match winkey::WinKeyHook::start(may_take, on_lone) {
+        Ok(hook) => {
+            *win.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+            win.failed.store(false, Ordering::SeqCst);
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            win.failed.store(true, Ordering::SeqCst);
+        }
+    }
+    true
 }
 
 /// The one place providers are put together: used by `run()` and by the tests.
@@ -753,6 +922,7 @@ pub fn run() {
             item_search::settings_search_items,
             item_search::settings_items_found,
             direct_keys::settings_hotkey_status,
+            settings::settings_win_key_status,
             updates::settings_update_status,
             updates::settings_check_now,
             updates::settings_install_update
@@ -845,6 +1015,7 @@ fn setup(app: &AppHandle) {
     ));
     let runner: std::sync::Weak<dyn ItemRunner> = Arc::<Engine>::downgrade(&engine);
     providers.workspaces.set_runner(runner);
+    let (win_key_tx, win_key_rx) = mpsc::channel();
     app.manage(AppState {
         engine,
         history,
@@ -856,6 +1027,7 @@ fn setup(app: &AppHandle) {
         bar_hotkey: Mutex::new(None),
         watcher: Mutex::new(None),
         config_error: Mutex::new(None),
+        win_key: WinKey::new(win_key_tx),
     });
     // Once: reads reminders.json, rings what was missed while Flick was not
     // running, then each one when it falls due. `AppState` keeps it alive.
@@ -871,6 +1043,21 @@ fn setup(app: &AppHandle) {
     let hotkey_error = apply_hotkey(app, &loaded.config.hotkey);
     // After the bar hotkey, against the one that registered: it always wins.
     keys.apply(&registered_bar(app, &loaded.config.hotkey), &loaded.config.direct_hotkeys);
+
+    // The Win key: its worker starts the hook when the setting is on.
+    {
+        let state = app.state::<AppState>();
+        state.win_key.flags.set_bar_ready(app.get_webview_window(window::LABEL).is_some());
+        let worker = app.clone();
+        std::thread::Builder::new()
+            .name("flick-winkey-control".into())
+            .spawn(move || win_key_worker(worker, win_key_rx))
+            .map(drop)
+            .unwrap_or_else(|e| eprintln!("could not start the Win key worker: {e}"));
+        if loaded.config.win_key {
+            state.win_key.want(true);
+        }
+    }
     if first_run {
         // Armed before the show: the empty query that `bar:shown` triggers must find it ready.
         let state = app.state::<AppState>();
@@ -1074,7 +1261,17 @@ impl PressTarget for AppPress {
 /// starts the installer and ends the process without that event (it runs this
 /// as its `on_before_exit`). Safe to run more than once.
 pub(crate) fn on_exit(app: &AppHandle) {
-    quit_cleanup(app.try_state::<AppState>().as_ref().map(|s| s.providers.reminders.as_ref()));
+    let state = app.try_state::<AppState>();
+    quit_cleanup(state.as_ref().map(|s| s.providers.reminders.as_ref()));
+    // Unhooks and gives the keyboard's raw input back. Quick: stopping only
+    // waits for the hook threads, never for this one.
+    if let Some(state) = state {
+        state.win_key.flags.set_on(false);
+        let hook = state.win_key.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(hook) = hook {
+            hook.stop();
+        }
+    }
 }
 
 /// A reminder change whose save failed is written now (or it would ring again
@@ -1143,6 +1340,10 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     if loaded.error.is_none() {
         state.updates.set_enabled(config.check_updates);
     }
+    // Under the config lock, so the worker gets the switches in config order.
+    // Its own thread starts or stops the hook (and retries a failed start)
+    // and emits `settings:changed` when that is done.
+    state.win_key.want(config.win_key);
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     // Under the config lock, so two reloads never apply hotkeys interleaved.
     let keys = app.state::<Arc<DirectKeys>>();
@@ -2688,5 +2889,49 @@ mod tests {
         let mut held = registry.held.lock().unwrap().clone();
         held.sort();
         assert_eq!(held, [config::normalize_combo("Ctrl+Alt+T"), config::normalize_combo("Ctrl+Shift+K")]);
+    }
+
+    /// The flags as the running app has them: setting on, bar up, no capture.
+    fn win_flags_ready() -> WinKeyFlags {
+        let flags = WinKeyFlags::default();
+        flags.set_on(true);
+        flags.set_bar_ready(true);
+        flags
+    }
+
+    #[test]
+    fn full_screen_leaves_win_to_windows() {
+        use windows::Win32::UI::Shell::{QUNS_ACCEPTS_NOTIFICATIONS, QUNS_BUSY, QUNS_RUNNING_D3D_FULL_SCREEN};
+        let flags = win_flags_ready();
+        flags.note_screen(Some(QUNS_ACCEPTS_NOTIFICATIONS));
+        assert!(flags.may_take());
+        flags.note_screen(Some(QUNS_RUNNING_D3D_FULL_SCREEN));
+        assert!(!flags.may_take(), "an exclusive full-screen game keeps Start");
+        // Borderless full-screen is not exclusive: Win still opens Flick.
+        flags.note_screen(Some(QUNS_BUSY));
+        assert!(flags.may_take());
+        flags.note_screen(None);
+        assert!(flags.may_take(), "an unreadable state never blocks");
+    }
+
+    #[test]
+    fn capture_pauses_the_win_key() {
+        let flags = win_flags_ready();
+        flags.set_paused(true);
+        assert!(!flags.may_take(), "Settings is capturing keys: Win is left to Windows");
+        flags.set_paused(false);
+        assert!(flags.may_take(), "after capture Win opens the bar again");
+    }
+
+    #[test]
+    fn win_key_waits_for_the_setting_and_the_bar() {
+        let flags = WinKeyFlags::default();
+        assert!(!flags.may_take(), "off by default");
+        flags.set_on(true);
+        assert!(!flags.may_take(), "the bar isn't there yet");
+        flags.set_bar_ready(true);
+        assert!(flags.may_take());
+        flags.set_on(false);
+        assert!(!flags.may_take(), "switched off before the hook has stopped");
     }
 }

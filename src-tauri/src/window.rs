@@ -5,6 +5,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::WindowsAndMessaging::{
+    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+};
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
@@ -43,15 +49,62 @@ pub fn toggle(app: &AppHandle) {
     }
 }
 
+/// Win-key path ([`toggle`] for a lone Win press). The hook has just sent
+/// Flick's own input (the mask batch), which lets this process take the
+/// foreground; if Windows still keeps another window in front, the bar's
+/// thread joins that window's input queue for a moment and takes it from there.
+/// Main thread only (the bar's window thread, for `SetFocus`).
+pub fn toggle_from_win_key(app: &AppHandle) {
+    let Some(w) = bar(app) else { return };
+    if w.is_visible().unwrap_or(false) {
+        hide(app);
+        return;
+    }
+    if !hotkey_may_show(notification_state()) {
+        return;
+    }
+    show(app);
+    if let Ok(h) = w.hwnd() {
+        take_foreground(HWND(h.0 as _));
+    }
+}
+
+/// Makes `hwnd` (a window of this thread) the foreground window with focus.
+fn take_foreground(hwnd: HWND) {
+    // SAFETY: plain calls on window handles and thread ids; every result is
+    // checked, and the input queues are detached again before returning.
+    unsafe {
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        let _ = SetForegroundWindow(hwnd);
+        let front = GetForegroundWindow();
+        if front == hwnd {
+            return;
+        }
+        let front_thread = GetWindowThreadProcessId(front, None);
+        let me = GetCurrentThreadId();
+        if front_thread == 0 || front_thread == me {
+            return;
+        }
+        if AttachThreadInput(me, front_thread, true).as_bool() {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+            let _ = AttachThreadInput(me, front_thread, false);
+        }
+    }
+}
+
 /// `None` when the state cannot be read; that never blocks showing.
-fn notification_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
+pub(crate) fn notification_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
     // SAFETY: no pointers or preconditions; the wrapper owns the out-parameter.
     unsafe { SHQueryUserNotificationState() }.ok()
 }
 
 /// Only exclusive full-screen blocks the hotkey. Borderless full-screen and
 /// presentation mode (`QUNS_BUSY`, `QUNS_PRESENTATION_MODE`) do not.
-fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
+pub(crate) fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
     state != Some(QUNS_RUNNING_D3D_FULL_SCREEN)
 }
 

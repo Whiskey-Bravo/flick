@@ -20,9 +20,6 @@
 //!
 //! Never started by tests: they cover only the pure helpers.
 
-// started by lib.rs when the setting is on (Task 5)
-#![allow(dead_code)]
-
 use std::cell::{Cell, OnceCell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};

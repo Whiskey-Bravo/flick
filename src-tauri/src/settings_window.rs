@@ -29,6 +29,9 @@ pub fn open(app: &AppHandle) {
             w.on_window_event(move |event| {
                 if matches!(event, tauri::WindowEvent::Destroyed) {
                     let app = handle.clone();
+                    if let Some(state) = app.try_state::<crate::AppState>() {
+                        state.win_key.flags.set_paused(false);
+                    }
                     std::thread::spawn(move || {
                         crate::hotkey::set_paused(&app, false);
                         // A crashed page never sends the resume itself.
