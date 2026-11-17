@@ -10,6 +10,7 @@ mod config_edit;
 mod controls;
 mod devices;
 mod dirs;
+mod direct_keys;
 mod engine;
 mod fuzzy;
 mod games;
