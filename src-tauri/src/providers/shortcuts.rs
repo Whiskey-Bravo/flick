@@ -75,7 +75,7 @@ fn insert_plain(template: &str, values: &[(&str, String)]) -> String {
 
 /// Percent-encode `v` (its UTF-8 bytes) for a URL: only the unreserved
 /// characters `A-Z a-z 0-9 - . _ ~` stay as they are; a space is `%20`.
-fn encode_url_component(v: &str) -> String {
+pub(crate) fn encode_url_component(v: &str) -> String {
     let mut out = String::with_capacity(v.len());
     for b in v.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
