@@ -943,6 +943,14 @@ mod tests {
     }
 
     #[test]
+    fn typing_settings_ranks_flick_settings_above_the_windows_app() {
+        let r = rig(vec![app("Settings")], vec![]);
+        let res = r.engine.query("settings", None);
+        assert_eq!((res[0].provider, res[0].id.as_str()), ("flick", "settings"), "{:?}", res.iter().map(|i| &i.title).collect::<Vec<_>>());
+        assert!(res.iter().any(|i| i.provider == "apps" && i.title == "Settings"));
+    }
+
+    #[test]
     fn push_config_updates_every_provider() {
         let r = rig(vec![], vec![]);
         let old = Config::default();

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "settings",
-  "description": "Settings window: event listening only. Its commands need no core permission; dialogs are driven from Rust.",
+  "description": "Settings window: event listening and destroying itself once a close is allowed. Its commands need no core permission; dialogs are driven from Rust.",
   "windows": ["settings"],
-  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten", "core:window:allow-destroy"]
 }

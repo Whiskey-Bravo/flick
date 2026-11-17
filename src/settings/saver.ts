@@ -1,13 +1,19 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { settingsSet, type Setting, type SettingsState } from "./api";
+import { sameConfig } from "./sameConfig";
 
 /**
  * Applies one setting at once. A failure is kept under the control's `field`
- * until the next `settings:changed` (a new `state`) brings the saved value back.
+ * until a `settings:changed` brings a different config. A reload that leaves the config
+ * as it was (a failed hotkey restores the old one) keeps the message.
  */
 export function useSaver(state: SettingsState) {
   const [errors, setErrors] = useState<Record<string, string>>({});
-  useEffect(() => setErrors({}), [state]);
+  const last = useRef(state.config);
+  useEffect(() => {
+    if (!sameConfig(last.current, state.config)) setErrors({});
+    last.current = state.config;
+  }, [state]);
   const save = async (field: string, setting: Setting) => {
     try {
       await settingsSet(setting);

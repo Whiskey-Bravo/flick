@@ -1,3 +1,4 @@
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { onSettingsChanged, settingsOpenFile, settingsState, type SettingsState } from "./api";
 import { Answers } from "./Answers";
@@ -44,6 +45,22 @@ export function App() {
     );
     return () => {
       unlisten.then((f) => f());
+    };
+  }, []);
+
+  // Closing the window leaves the editor too: ask first, as a tab switch does.
+  useEffect(() => {
+    let off = () => {};
+    let gone = false;
+    getCurrentWindow()
+      .onCloseRequested(async (e) => {
+        if (shortcutsGuard.current && !(await shortcutsGuard.current())) e.preventDefault();
+      })
+      .then((f) => (gone ? f() : (off = f)))
+      .catch(() => {});
+    return () => {
+      gone = true;
+      off();
     };
   }, []);
 

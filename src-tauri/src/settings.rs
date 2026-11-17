@@ -83,6 +83,8 @@ pub fn set_hotkey(
 /// Adds a shortcut (`original` is `None`) or replaces the one named `original`.
 pub fn save_shortcut(path: &Path, original: Option<&str>, def: &ShortcutDef) -> Result<(), SaveError> {
     let (text, config) = read_config(path).map_err(SaveError::File)?;
+    // The original was removed from the file meanwhile: keep the edit and add it as a new one.
+    let original = original.filter(|name| config.shortcuts.iter().any(|s| s.name == *name));
     config::check_shortcut_in(&config, original, def).map_err(SaveError::Field)?;
     let edited = config_edit::upsert_shortcut(&text, original, def).map_err(SaveError::File)?;
     write(path, &edited).map_err(SaveError::File)
@@ -340,6 +342,15 @@ mod tests {
         // A new shortcut may not take the built-in `help`.
         assert!(matches!(save_shortcut(&path, None, &def("HELP")), Err(SaveError::Field(_))));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), FILE);
+    }
+
+    #[test]
+    fn saving_a_shortcut_whose_original_vanished_adds_it() {
+        let (_d, path) = file(FILE);
+        save_shortcut(&path, Some("gone"), &def("gone2")).unwrap();
+        let config = config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let names: Vec<_> = config.shortcuts.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "gone2"]);
     }
 
     #[test]
