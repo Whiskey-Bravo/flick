@@ -1,0 +1,34 @@
+.sc { display: flex; gap: 20px; height: 100%; min-height: 0; }
+.sc-list { flex: none; width: 220px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+.sc-add, .sc-row, .sc-actions button, .sc-pick button, .sc-ask button {
+  padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
+}
+.sc-add { color: var(--accent); margin-bottom: 6px; }
+.sc-row { display: flex; flex-direction: column; gap: 2px; background: transparent; border-color: transparent; }
+.sc-row:hover { background: var(--panel); }
+.sc-row.active { background: var(--panel); border-color: var(--accent); }
+.sc-name { font-weight: 600; }
+.sc-about { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sc-hint, .sc-empty { color: var(--muted); }
+.sc-editor { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; padding-right: 4px; }
+.sc-field { display: flex; flex-direction: column; gap: 4px; }
+.sc-field > span { font-weight: 600; }
+.sc-field small, .sc-check small, .sc-radio small { color: var(--muted); }
+.sc input:not([type]), .sc input[type="text"], .sc textarea, .sc select {
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); font: inherit;
+}
+.sc-radio, .sc-check { display: flex; align-items: center; gap: 6px; font-weight: 400; }
+.sc-pick { display: flex; gap: 8px; }
+.sc-pick input { flex: 1; }
+.sc-more { display: flex; flex-direction: column; gap: 10px; }
+.sc-more > summary { cursor: pointer; color: var(--muted); margin-bottom: 10px; }
+.sc-error { margin: 0; color: var(--error); }
+.sc-note { margin: 0; color: var(--muted); }
+.sc-ask { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--accent); border-radius: 8px; }
+.sc-ask span { flex: 1; }
+.sc-actions { display: flex; align-items: center; gap: 8px; }
+.sc-actions .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.sc-actions .danger { color: var(--error); border-color: var(--error); }
+.sc button:disabled { opacity: 0.45; cursor: default; }
