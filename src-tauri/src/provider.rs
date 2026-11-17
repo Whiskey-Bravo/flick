@@ -110,6 +110,9 @@ pub trait Provider: Send + Sync {
     fn plain_share(&self) -> usize {
         usize::MAX
     }
+    /// Called by the engine for a query that did not reach this provider
+    /// (routed, scoped, help or blank text). Memory only. Default: nothing.
+    fn skipped(&self) {}
     /// Rows shown when the bar is opened with no text (welcome, later
     /// favourites and history). Default: none.
     fn empty_query(&self) -> Vec<ResultItem> {
@@ -155,6 +158,9 @@ impl<P: Provider + ?Sized> Provider for Arc<P> {
     }
     fn plain_share(&self) -> usize {
         (**self).plain_share()
+    }
+    fn skipped(&self) {
+        (**self).skipped()
     }
     fn empty_query(&self) -> Vec<ResultItem> {
         (**self).empty_query()

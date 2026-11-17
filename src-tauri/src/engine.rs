@@ -73,39 +73,46 @@ impl Engine {
     /// (or the built-in `help` route) goes to that provider alone, with the
     /// prefix removed; providers that own a route never see plain text.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
-        let mut rows = self.query_rows(text, scope);
+        let (mut rows, plain) = self.query_rows(text, scope);
+        if !plain {
+            for p in &self.providers {
+                p.skipped();
+            }
+        }
         for row in &mut rows {
             row.pinned = self.pins.is_pinned(row.provider, &row.id);
         }
         rows
     }
 
-    fn query_rows(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
+    /// The rows, and whether the plain providers were asked (a plain query or
+    /// the truly empty bar); when not, the engine tells them with `skipped`.
+    fn query_rows(&self, text: &str, scope: Option<&str>) -> (Vec<ResultItem>, bool) {
         let untrimmed_empty = text.is_empty();
         let text = text.trim();
         if let Some(scope) = scope {
             let q = Query { text: text.to_string(), scope: Some(scope.to_string()) };
             let owners = self.providers.iter().filter(|p| p.owns_scope(scope));
-            return self.rank(owners, &q, ROUTED_MAX_RESULTS, false);
+            return (self.rank(owners, &q, ROUTED_MAX_RESULTS, false), false);
         }
         if text.is_empty() {
             // Only the unscoped, truly empty bar (not whitespace) shows rows.
             if untrimmed_empty {
-                return self.empty_bar();
+                return (self.empty_bar(), true);
             }
-            return vec![];
+            return (vec![], false);
         }
         if let Some(rest) = strip_route(text, &HELP_ROUTE) {
-            return self.help_items(rest);
+            return (self.help_items(rest), false);
         }
         for p in &self.providers {
             if let Some(rest) = p.route().and_then(|r| strip_route(text, &r)) {
                 let q = Query { text: rest.to_string(), scope: None };
-                return self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false);
+                return (self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false), false);
             }
         }
         let q = Query { text: text.to_string(), scope: None };
-        self.rank(self.providers.iter().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true)
+        (self.rank(self.providers.iter().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true), true)
     }
 
     /// The truly empty bar: the providers' own rows (welcome) in registration

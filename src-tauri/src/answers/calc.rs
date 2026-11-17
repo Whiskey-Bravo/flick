@@ -268,14 +268,14 @@ impl Parser<'_> {
     }
 }
 
-fn shown(toks: &[Tok]) -> String {
+fn shown(toks: &[Tok], number: &dyn Fn(f64) -> String) -> String {
     let mut out = String::new();
     for (i, t) in toks.iter().enumerate() {
         let binary =
             i > 0 && matches!(toks[i - 1], Tok::Num(_) | Tok::RParen | Tok::Percent | Tok::Ident(_));
         let op = match t {
             Tok::Num(n) => {
-                out.push_str(&n.to_string());
+                out.push_str(&number(*n));
                 continue;
             }
             Tok::Ident(s) => {
@@ -314,7 +314,14 @@ fn shown(toks: &[Tok]) -> String {
 }
 
 /// Evaluates `text` when the whole of it is a calculation (not a bare number or word).
+/// `shown` writes numbers with Rust's `Display`; see [`evaluate_with`].
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn evaluate(text: &str) -> Option<Calc> {
+    evaluate_with(text, &|n| n.to_string())
+}
+
+/// Like [`evaluate`], writing each number of `shown` with `number` (the locale format).
+pub fn evaluate_with(text: &str, number: &dyn Fn(f64) -> String) -> Option<Calc> {
     let toks = tokenize(text)?;
     if toks.is_empty() {
         return None;
@@ -324,7 +331,7 @@ pub fn evaluate(text: &str) -> Option<Calc> {
     if p.pos != toks.len() || !p.meaningful || !v.v.is_finite() {
         return None;
     }
-    Some(Calc { value: v.v, shown: shown(&toks) })
+    Some(Calc { value: v.v, shown: shown(&toks, number) })
 }
 
 #[cfg(test)]

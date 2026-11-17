@@ -181,8 +181,8 @@ fn offset_text(minutes: i64) -> String {
     format!("{amount} {}", if minutes > 0 { "ahead" } else { "behind" })
 }
 
-/// `in 45 days`, `2 days ago`, `in 1 week`.
-fn span_words(amount: i64, unit: Span) -> String {
+/// `in 45 days`, `2 days ago`, `in 1 week`; `number` writes the amount in the locale format.
+fn span_words(amount: i64, unit: Span, number: &dyn Fn(f64) -> String) -> String {
     let word = match unit {
         Span::Days => "day",
         Span::Weeks => "week",
@@ -191,6 +191,7 @@ fn span_words(amount: i64, unit: Span) -> String {
     };
     let n = amount.unsigned_abs();
     let s = if n == 1 { "" } else { "s" };
+    let n = number(n as f64);
     if amount < 0 {
         format!("{n} {word}{s} ago")
     } else {
@@ -257,7 +258,7 @@ impl AnswersProvider {
     }
 
     fn calc_row(&self, text: &str) -> Option<ResultItem> {
-        let c = calc::evaluate(text)?;
+        let c = calc::evaluate_with(text, &|n| self.formats.number(n))?;
         let shown = self.number(c.value)?;
         Some(copy_row(&shown, format!("= {shown}"), c.shown, Icon::Calc, true))
     }
@@ -279,7 +280,7 @@ impl AnswersProvider {
             }
             ClockAsk::Shift { amount, unit } => {
                 let date = self.formats.date(clock::shift(today, amount, unit)?, true);
-                Some(copy_row(&date, date.clone(), span_words(amount, unit), Icon::Time, true))
+                Some(copy_row(&date, date.clone(), span_words(amount, unit, &|n| self.formats.number(n)), Icon::Time, true))
             }
             ClockAsk::DaysUntil(date) => {
                 let days = today.until(date).ok()?.get_days();
@@ -302,9 +303,11 @@ impl AnswersProvider {
             }
             Ask::Money { amount, from, to } => {
                 // A bare `20 usd` could be an app's name: it ranks like one.
-                let top = to.is_some() || has_symbol(text);
+                let explicit = to.is_some();
+                let top = explicit || has_symbol(text);
                 let to = to.unwrap_or_else(|| cfg.currency.clone());
-                if !top && from == to {
+                // `20 eur` or `€20` at home: nothing to convert (and no fetch).
+                if !explicit && from == to {
                     return None;
                 }
                 let question = format!("{} {from} → {to}", self.number(amount)?);
@@ -404,6 +407,11 @@ impl Provider for AnswersProvider {
     fn empty_query(&self) -> Vec<ResultItem> {
         self.weather.cancel_pending();
         vec![]
+    }
+
+    /// The text went to a route, a scope or was blank: no weather question any more.
+    fn skipped(&self) {
+        self.weather.cancel_pending();
     }
 
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
@@ -590,7 +598,10 @@ mod tests {
     fn german_formatting_in_rows() {
         let r = rig(true, "", None);
         assert_eq!(titled(&r, "5 miles in km"), ("8,05 km".into(), "5 miles → km".into()));
-        assert_eq!(one(&r, "1234,5*1").title, "= 1.234,5");
+        assert_eq!(titled(&r, "1234,5*1"), ("= 1.234,5".into(), "1.234,5 * 1".into()));
+        assert_eq!(titled(&r, "0,1+0,2"), ("= 0,3".into(), "0,1 + 0,2".into()));
+        assert_eq!(one(&r, "in 1500 days").subtitle, "in 1.500 days");
+        assert_eq!(one(&r, "1500 days ago").subtitle, "1.500 days ago");
         assert_eq!(one(&r, "1 mile in km").subtitle, "1 mile → km");
         assert_eq!(one(&r, "5 miles in km").icon, "builtin:calc");
         let row = one(&r, "5 miles in km");
@@ -654,8 +665,58 @@ mod tests {
         assert!(!row.top);
         assert_eq!(row.score, 900);
         assert!(one(&r, "$20").top);
-        // Home currency to itself is not a question.
+        // Home currency to itself is not a question, with or without a symbol.
         assert!(ask(&r, "20 eur").is_empty());
+        assert!(ask(&r, "€20").is_empty());
+        assert!(ask(&r, "20€").is_empty());
+        // An explicit target still answers.
+        assert_eq!(one(&r, "20 eur in eur").title, "20 EUR");
+        let r = rig(true, "", None);
+        assert!(ask(&r, "€20").is_empty());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(r.fetch.urls().is_empty(), "no ECB download for the home currency alone");
+    }
+
+    /// A provider that owns the `>` route and the `proj` scope.
+    struct Routed;
+
+    impl Provider for Routed {
+        fn name(&self) -> &'static str {
+            "sh"
+        }
+        fn route(&self) -> Option<crate::provider::Route> {
+            Some(crate::provider::Route { prefix: ">", needs_space: false })
+        }
+        fn owns_scope(&self, scope: &str) -> bool {
+            scope == "proj"
+        }
+        fn query(&self, _q: &Query) -> Vec<ResultItem> {
+            vec![]
+        }
+        fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+            Ok(Outcome::Hide)
+        }
+    }
+
+    #[test]
+    fn leaving_weather_by_route_scope_or_blank_drops_the_waiting_city() {
+        let r = rig(true, "", None);
+        let dir = tempfile::tempdir().unwrap();
+        let ranking = Arc::new(Ranking::load(dir.path().join("picks.json")));
+        let history = Arc::new(History::load(dir.path().join("history.json"), true));
+        let pins = Arc::new(Pins::load(dir.path().join("pins.json")));
+        let e = Engine::new(vec![Box::new(r.answers.clone()), Box::new(Routed)], ranking, history, pins);
+        let leave: [(&str, Option<&str>); 4] = [("> htop", None), ("help", None), ("   ", None), ("x", Some("proj"))];
+        for (text, scope) in leave {
+            assert_eq!(e.query("weather lo", None)[0].title, "Getting weather for lo…");
+            e.query(text, scope);
+            std::thread::sleep(Duration::from_millis(700));
+            assert!(r.fetch.urls().is_empty(), "{text:?} {scope:?}: {:?}", r.fetch.urls());
+        }
+        // Staying on the question still fetches after the pause.
+        e.query("weather lo", None);
+        r.ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(r.fetch.urls().len(), 1);
     }
 
     #[test]
