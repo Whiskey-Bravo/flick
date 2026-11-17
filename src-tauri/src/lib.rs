@@ -93,7 +93,7 @@ use providers::windows::WindowsProvider;
 use status::{StatusStore, SystemStatus};
 use winlist::{SystemWindows, WindowList};
 use controls::SystemControls;
-use providers::shortcuts::ShortcutsProvider;
+use providers::shortcuts::{ShortcutsProvider, Staged};
 use providers::update::UpdateProvider;
 use providers::welcome::WelcomeProvider;
 use updates::{PluginSource, Updates};
@@ -211,7 +211,7 @@ impl Providers {
     pub(crate) fn on_hide(&self) {
         self.clips.forget();
         self.qr.forget();
-        self.words.forget_waiting();
+        self.words.hide();
     }
 }
 
@@ -614,42 +614,73 @@ fn record_detection(state: &AppState, detection: wsl_detect::Detection) {
     }
 }
 
-/// Puts `config`'s shortcuts and the effective distro into the providers.
-/// `detected` decides whether the configured or detected distro is used.
-/// `shortcuts.set` reads the pick folders: never call on the main thread.
-fn push_distro(p: &Providers, config: &Config, detected: &WslState) {
+/// Puts the effective distro into the providers and stages `config`'s
+/// shortcuts with it. `detected` decides whether the configured or detected
+/// distro is used. No disk access, so it runs under the config lock (which
+/// orders the stagings); apply the result once that lock is released, never
+/// on the main thread (it reads the pick folders).
+#[must_use]
+fn push_distro(p: &Providers, config: &Config, detected: &WslState) -> Staged {
     let distro = effective_distro(&config.wsl_distro, detected);
-    p.shortcuts.set(config.shortcuts.clone(), &distro, &config.search_engine);
     p.wsl.set_distro(&distro);
+    p.shortcuts.stage(config.shortcuts.clone(), &distro, &config.search_engine)
 }
 
 /// Stores a detection and pushes the resulting distro with the last good
 /// config, whether or not the config file currently parses. Takes the config
 /// lock (then `detected`); call with no lock held, after `wsl.exe` has run.
+/// The pick folders are read after the config lock is released.
 fn apply_detection(state: &AppState, detection: wsl_detect::Detection) {
-    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-    record_detection(state, detection);
-    let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    push_distro(&state.providers, &config, &detected);
+    let staged = {
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        record_detection(state, detection);
+        let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        push_distro(&state.providers, &config, &detected)
+    };
+    state.providers.shortcuts.apply(staged);
+}
+
+/// What [`push_config`] leaves to its caller.
+struct Pushed {
+    /// The file roots changed: the caller rescans the files in the background
+    /// (the watcher has already moved to the new roots).
+    roots_changed: bool,
+    /// The new shortcuts, to apply once the config lock is released.
+    shortcuts: Staged,
 }
 
 /// Push a newly loaded `new` config (replacing `old`) into the providers;
 /// `detected` decides whether the configured or detected distro is used.
-/// `shortcuts.set` reads the pick folders: never call on the main thread.
-/// Returns true when the file roots changed; the caller then rescans the
-/// files in the background (the watcher has already moved to the new roots).
-fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -> bool {
-    push_distro(p, new, detected);
+/// No disk access: the shortcuts come back staged (see [`push_distro`]).
+#[must_use]
+fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -> Pushed {
+    let shortcuts = push_distro(p, new, detected);
     p.status.set_online(new.online);
     p.words.set_online(new.online);
     p.workspaces.set(new.workspaces.clone());
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
-    let changed = old.file_roots != new.file_roots;
-    if changed {
+    let roots_changed = old.file_roots != new.file_roots;
+    if roots_changed {
         p.files.set_roots(new.file_roots.clone());
     }
-    changed
+    Pushed { roots_changed, shortcuts }
+}
+
+/// What a reload pushes, under the config lock: the newly `loaded` config when
+/// it parsed; else, after a fresh WSL detection (`redetected`), the last good
+/// `current` one with the new distro; else nothing (it is in already).
+/// Returns whether the file roots changed and the shortcuts to apply once the
+/// lock is released: at most one read of the pick folders per reload.
+fn push_reload(p: &Providers, current: &Config, loaded: &config::Loaded, detected: &WslState, redetected: bool) -> (bool, Option<Staged>) {
+    if loaded.error.is_none() {
+        let pushed = push_config(p, current, &loaded.config, detected);
+        (pushed.roots_changed, Some(pushed.shortcuts))
+    } else if redetected {
+        (false, Some(push_distro(p, current, detected)))
+    } else {
+        (false, None)
+    }
 }
 
 fn picks_path() -> PathBuf {
@@ -855,14 +886,13 @@ fn setup(app: &AppHandle) {
         // Off the main thread: all of these can block. Config first, so a
         // slow PowerShell or file scan never delays it.
         std::thread::spawn(move || {
-            // No lock held while `wsl.exe` runs. Pushed even when the config
-            // has an error, which makes the reload skip its own push.
+            // No lock held while `wsl.exe` runs. The reload pushes the new
+            // distro even when the config has an error, and reads the pick
+            // folders once either way.
             let detection = wsl_detect::detect();
-            apply_detection(&app.state::<AppState>(), detection);
-            reload_config(&app);
+            reload_config_after_detection(&app, detection);
             let state = app.state::<AppState>();
             let p = &state.providers;
-            p.shortcuts.refresh();
             p.apps.refresh();
             p.games.refresh();
             p.bookmarks.refresh_now();
@@ -902,14 +932,15 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
     let shortcuts = p.shortcuts;
     std::thread::spawn(move || {
         let state = handle.state::<AppState>();
-        {
-            // Right away, with no detection yet. Under the config lock, so
-            // this never replaces the definitions of a reload that ran first
-            // with older ones.
+        let staged = {
+            // Right away, with no detection yet. Staged under the config lock,
+            // so this never replaces the definitions of a reload that ran
+            // first with older ones; the pick folders are read after it.
             let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
             let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            push_distro(&state.providers, &config, &detected);
-        }
+            push_distro(&state.providers, &config, &detected)
+        };
+        state.providers.shortcuts.apply(staged);
         // `wsl.exe` can take seconds: run it with no lock held.
         apply_detection(&state, wsl_detect::detect());
         loop {
@@ -1066,14 +1097,32 @@ fn tooltip(error: Option<&str>) -> String {
 /// Reload with last-good fallback; push a successfully loaded config into the
 /// providers (rescanning files in the background when their folders changed);
 /// re-apply the hotkey if it changed (or the last attempt failed); emit
-/// `config:error`. Never call on the main thread.
+/// `config:error`. The pick folders are read after the config lock is
+/// released. Never call on the main thread.
 pub(crate) fn reload_config(app: &AppHandle) {
+    reload_with(app, None);
+}
+
+/// [`reload_config`] after a fresh WSL `detection` (tray Reload): the
+/// detection is stored under the config lock and its distro pushed even when
+/// the config has an error, with one read of the pick folders either way.
+fn reload_config_after_detection(app: &AppHandle, detection: wsl_detect::Detection) {
+    reload_with(app, Some(detection));
+}
+
+fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     let state = app.state::<AppState>();
     let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    let redetected = detection.is_some();
+    if let Some(detection) = detection {
+        record_detection(&state, detection);
+    }
     let loaded = config::load(&config::config_path(), Some(&config));
-    // On error `loaded.config` is the last good one, already pushed.
     let detected = state.detected.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if loaded.error.is_none() && push_config(&state.providers, &config, &loaded.config, &detected) {
+    // On error `loaded.config` is the last good one, already pushed (only
+    // its distro may be new).
+    let (roots_changed, staged) = push_reload(&state.providers, &config, &loaded, &detected, redetected);
+    if roots_changed {
         let files = state.providers.files.clone();
         std::thread::spawn(move || files.refresh());
     }
@@ -1103,8 +1152,16 @@ pub(crate) fn reload_config(app: &AppHandle) {
         |accelerator| apply_hotkey(app, accelerator),
         || registered_bar(app, &config.hotkey),
     );
+    // Under the config lock, so concurrent reloads report in order.
     emit_config_error(app, join_errors(loaded.error, hotkey_error));
-    // After the direct keys were applied, so the Hotkeys status read on this is fresh.
+    // Disk I/O, with the config lock released. Staged under it, so the last
+    // reload's shortcuts win even if an earlier one finishes reading later.
+    drop(config);
+    if let Some(staged) = staged {
+        state.providers.shortcuts.apply(staged);
+    }
+    // After the direct keys and the shortcuts are in, so the Hotkeys status
+    // read on this is fresh. It carries nothing, so its order needs no lock.
     let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
 }
 
@@ -1990,12 +2047,76 @@ mod tests {
             shortcuts: vec![shortcut("hello", "notepad")],
             ..Config::default()
         };
-        assert!(!push_config(&r.providers, &old, &new, &WslState::Unknown), "same roots: no rescan");
+        assert!(!push_config_now(&r.providers, &old, &new, &WslState::Unknown), "same roots: no rescan");
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         let moved = Config { file_roots: vec![PathBuf::from(r"C:\definitely\missing")], ..new.clone() };
-        assert!(push_config(&r.providers, &new, &moved, &WslState::Unknown), "roots changed: rescan");
+        assert!(push_config_now(&r.providers, &new, &moved, &WslState::Unknown), "roots changed: rescan");
         assert!(r.launcher.calls().is_empty());
+    }
+
+    /// `push_config` with its shortcuts applied at once; whether the roots changed.
+    fn push_config_now(p: &Providers, old: &Config, new: &Config, detected: &WslState) -> bool {
+        let pushed = push_config(p, old, new, detected);
+        p.shortcuts.apply(pushed.shortcuts);
+        pushed.roots_changed
+    }
+
+    fn push_distro_now(p: &Providers, config: &Config, detected: &WslState) {
+        let staged = push_distro(p, config, detected);
+        p.shortcuts.apply(staged);
+    }
+
+    /// A pick shortcut named `name` over `dir`.
+    fn picker(name: &str, dir: &std::path::Path) -> config::ShortcutDef {
+        config::ShortcutDef { pick: Some(dir.to_path_buf()), ..shortcut(name, "code {path}") }
+    }
+
+    #[test]
+    fn a_reload_reads_the_pick_folders_once_and_never_under_the_lock() {
+        let r = rig(vec![], vec![]);
+        let picks = tempfile::tempdir().unwrap();
+        std::fs::create_dir(picks.path().join("alpha")).unwrap();
+        let good = Config { shortcuts: vec![picker("proj", picks.path())], ..Config::default() };
+        let parsed = config::Loaded { config: good.clone(), error: None };
+        let broken = config::Loaded { config: good.clone(), error: Some("config.toml: bad".into()) };
+        let loads = providers::shortcuts::pick_loads;
+
+        // Tray Reload, config parses: the new config with the new distro.
+        let before = loads();
+        let (roots_changed, staged) = push_reload(&r.providers, &Config::default(), &parsed, &ubuntu(), true);
+        assert!(!roots_changed);
+        assert_eq!(loads(), before, "nothing read while the config lock is held");
+        r.providers.shortcuts.apply(staged.expect("pushed"));
+        assert_eq!(loads(), before + 1, "read once");
+        assert_eq!(r.engine.query("proj", None)[0].provider, "shortcuts");
+        assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
+
+        // Tray Reload, config broken: the last good one with the new distro, read once too.
+        let before = loads();
+        let (_, staged) = push_reload(&r.providers, &good, &broken, &WslState::NoWsl, true);
+        r.providers.shortcuts.apply(staged.expect("pushed"));
+        assert_eq!(loads(), before + 1);
+        assert!(r.engine.query("> ls", None).is_empty(), "the new distro is in");
+
+        // A file-change reload of a broken config pushes nothing.
+        let before = loads();
+        let (_, staged) = push_reload(&r.providers, &good, &broken, &WslState::NoWsl, false);
+        assert!(staged.is_none());
+        assert_eq!(loads(), before);
+    }
+
+    #[test]
+    fn the_last_staged_reload_wins_whichever_applies_first() {
+        let r = rig(vec![], vec![]);
+        let first = Config { shortcuts: vec![shortcut("first", "notepad")], ..Config::default() };
+        let second = Config { shortcuts: vec![shortcut("second", "notepad")], ..Config::default() };
+        let older = push_config(&r.providers, &Config::default(), &first, &WslState::Unknown);
+        let newer = push_config(&r.providers, &first, &second, &WslState::Unknown);
+        r.providers.shortcuts.apply(newer.shortcuts);
+        r.providers.shortcuts.apply(older.shortcuts);
+        assert!(r.engine.query("first", None).iter().all(|i| i.provider != "shortcuts"));
+        assert_eq!(r.engine.query("second", None)[0].provider, "shortcuts");
     }
 
     fn ubuntu() -> WslState {
@@ -2030,12 +2151,12 @@ mod tests {
     fn push_config_uses_the_detected_distro_when_none_is_configured() {
         let r = rig(vec![], vec![]);
         let old = Config::default();
-        assert!(!push_config(&r.providers, &old, &old, &WslState::Unknown));
+        assert!(!push_config_now(&r.providers, &old, &old, &WslState::Unknown));
         assert!(r.engine.query("> ls", None).is_empty(), "no WSL: nothing offered");
-        assert!(!push_config(&r.providers, &old, &old, &ubuntu()));
+        assert!(!push_config_now(&r.providers, &old, &old, &ubuntu()));
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         let set = Config { wsl_distro: "Debian".into(), ..Config::default() };
-        push_config(&r.providers, &old, &set, &ubuntu());
+        push_config_now(&r.providers, &old, &set, &ubuntu());
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Debian");
     }
 
@@ -2043,10 +2164,10 @@ mod tests {
     fn push_distro_applies_the_effective_distro_to_wsl_and_shortcuts() {
         let r = rig(vec![], vec![]);
         let config = Config { shortcuts: vec![shortcut("hello", "notepad")], ..Config::default() };
-        push_distro(&r.providers, &config, &ubuntu());
+        push_distro_now(&r.providers, &config, &ubuntu());
         assert_eq!(r.engine.query("> ls", None)[0].subtitle, "run in Ubuntu");
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
-        push_distro(&r.providers, &config, &WslState::NoWsl);
+        push_distro_now(&r.providers, &config, &WslState::NoWsl);
         assert!(r.engine.query("> ls", None).is_empty());
     }
 
@@ -2317,7 +2438,7 @@ mod tests {
         };
         let old = Config::default();
         let new = Config { workspaces: vec![work], ..Config::default() };
-        push_config(&r.providers, &old, &new, &WslState::Unknown);
+        push_config_now(&r.providers, &old, &new, &WslState::Unknown);
         let row = r.engine.query("work", None).into_iter().find(|i| i.provider == "workspaces").unwrap();
         assert_eq!((row.title.as_str(), row.subtitle.as_str()), ("Open workspace work", "3 items"));
         assert_eq!(r.engine.activate("workspaces", "work", provider::Modifier::None, "work", None), Ok(Outcome::Hide));
@@ -2350,7 +2471,7 @@ mod tests {
     fn online_off_reaches_tr_and_def() {
         let r = rig(vec![], vec![]);
         let off = Config { online: false, ..Config::default() };
-        push_config(&r.providers, &Config::default(), &off, &WslState::Unknown);
+        push_config_now(&r.providers, &Config::default(), &off, &WslState::Unknown);
         assert_eq!(titles(&r.engine.query("tr hallo", None)), ["Online answers are off"]);
         assert_eq!(titles(&r.engine.query("def Haus", None)), ["Online answers are off"]);
         std::thread::sleep(Duration::from_millis(600));

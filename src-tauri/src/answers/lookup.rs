@@ -50,8 +50,9 @@ struct State<T> {
     waiting: Option<Waiting<T>>,
     /// The key whose job is running.
     running: Option<String>,
-    /// The latest failure that is not kept (`Offline`/`Bad`), told once.
-    failed: Option<(String, LookupError)>,
+    /// The latest answer that is not kept (`Offline`/`Bad`, or one `keep`
+    /// turned down), told once: the next ask looks it up again.
+    once: Option<(String, Result<Arc<T>, LookupError>)>,
     /// A worker thread is alive.
     worker: bool,
     /// The key asked last; `None` once forgotten.
@@ -62,17 +63,31 @@ pub struct Lookups<T> {
     fetch: Arc<dyn Fetch>,
     on_ready: Arc<dyn Fn() + Send + Sync>,
     pause: Duration,
+    /// Whether an answer is kept; one that is not is told once.
+    keep: fn(&T) -> bool,
     state: Mutex<State<T>>,
     wake: Condvar,
 }
 
 impl<T: Send + Sync + 'static> Lookups<T> {
     pub fn new(fetch: Arc<dyn Fetch>, on_ready: Arc<dyn Fn() + Send + Sync>, pause: Duration) -> Arc<Self> {
+        Self::keeping(fetch, on_ready, pause, |_| true)
+    }
+
+    /// Like [`Lookups::new`], but an answer `keep` turns down (a partial one)
+    /// is told once, like a failure, and looked up again at the next ask.
+    pub fn keeping(
+        fetch: Arc<dyn Fetch>,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+        pause: Duration,
+        keep: fn(&T) -> bool,
+    ) -> Arc<Self> {
         Arc::new(Lookups {
             fetch,
             on_ready,
             pause,
-            state: Mutex::new(State { cache: VecDeque::new(), waiting: None, running: None, failed: None, worker: false, latest: None }),
+            keep,
+            state: Mutex::new(State { cache: VecDeque::new(), waiting: None, running: None, once: None, worker: false, latest: None }),
             wake: Condvar::new(),
         })
     }
@@ -93,8 +108,11 @@ impl<T: Send + Sync + 'static> Lookups<T> {
             Err(e) => Lookup::Failed(*e),
         });
         let known = known.or_else(|| {
-            let mine = st.failed.as_ref().is_some_and(|(k, _)| k == key);
-            mine.then(|| st.failed.take()).flatten().map(|(_, e)| Lookup::Failed(e))
+            let mine = st.once.as_ref().is_some_and(|(k, _)| k == key);
+            mine.then(|| st.once.take()).flatten().map(|(_, answer)| match answer {
+                Ok(v) => Lookup::Ready(v),
+                Err(e) => Lookup::Failed(e),
+            })
         });
         if let Some(answer) = known {
             st.waiting = None;
@@ -153,9 +171,10 @@ impl<T: Send + Sync + 'static> Lookups<T> {
             st = self.state.lock().unwrap();
             st.running = None;
             match out {
-                Ok(v) => st.cache.push_back((key, Ok(Arc::new(v)))),
+                Ok(v) if (self.keep)(&v) => st.cache.push_back((key, Ok(Arc::new(v)))),
+                Ok(v) => st.once = Some((key, Ok(Arc::new(v)))),
                 Err(LookupError::NotFound) => st.cache.push_back((key, Err(LookupError::NotFound))),
-                Err(e) => st.failed = Some((key, e)),
+                Err(e) => st.once = Some((key, Err(e))),
             }
             while st.cache.len() > CACHE_MAX {
                 st.cache.pop_front();
@@ -229,6 +248,32 @@ mod tests {
         assert!(matches!(ask(&s, "a"), Lookup::Waiting), "asking again fetches again");
         rx.recv_timeout(WAIT).unwrap();
         assert_eq!(fetch.urls().len(), 2);
+    }
+
+    #[test]
+    fn an_answer_not_kept_is_told_once_then_looked_up_again() {
+        let fetch = Arc::new(FakeFetch::new(Ok(b"partial".to_vec())).respond("https://x/b", Ok(b"whole".to_vec())));
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let on_ready: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        });
+        let s: Arc<Lookups<String>> = Lookups::keeping(fetch.clone(), on_ready, PAUSE_TEST, |v| v != "partial");
+        assert!(matches!(ask(&s, "a"), Lookup::Waiting));
+        rx.recv_timeout(WAIT).unwrap();
+        match ask(&s, "a") {
+            Lookup::Ready(v) => assert_eq!(*v, "partial"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(ask(&s, "a"), Lookup::Waiting), "not kept: asked again");
+        rx.recv_timeout(WAIT).unwrap();
+        assert_eq!(fetch.urls().len(), 2);
+        // A kept answer needs no new request.
+        assert!(matches!(ask(&s, "b"), Lookup::Waiting));
+        rx.recv_timeout(WAIT).unwrap();
+        assert!(matches!(ask(&s, "b"), Lookup::Ready(_)));
+        assert!(matches!(ask(&s, "b"), Lookup::Ready(_)));
+        assert_eq!(fetch.urls().len(), 3);
     }
 
     #[test]

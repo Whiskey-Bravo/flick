@@ -92,16 +92,17 @@ impl BookmarksProvider {
     }
 
     /// Starts one background read when the last attempt is older than
-    /// [`STALE`] and none is running.
+    /// [`STALE`] (or a forced read is still owed) and none is running.
     pub fn refresh_if_stale(self: &Arc<Self>) {
         {
             let mut state = self.state();
             let now = (self.now)();
             let fresh = state.last_attempt.is_some_and(|at| now.saturating_duration_since(at) < STALE);
-            if state.running || fresh {
+            if state.running || (fresh && !state.again) {
                 return;
             }
             state.running = true;
+            state.again = false;
             state.last_attempt = Some(now);
         }
         self.spawn_reads();
@@ -119,6 +120,7 @@ impl BookmarksProvider {
                 return;
             }
             state.running = true;
+            state.again = false;
         }
         self.spawn_reads();
     }
@@ -127,14 +129,35 @@ impl BookmarksProvider {
     /// again while a forced read was asked for meanwhile.
     fn spawn_reads(self: &Arc<Self>) {
         let this = Arc::clone(self);
-        std::thread::spawn(move || loop {
-            this.refresh();
-            let mut state = this.state();
-            if !std::mem::take(&mut state.again) {
-                state.running = false;
-                return;
+        std::thread::spawn(move || {
+            let _done = Done(Arc::clone(&this));
+            loop {
+                this.refresh();
+                let mut state = this.state();
+                if !std::mem::take(&mut state.again) {
+                    state.running = false;
+                    return;
+                }
             }
         });
+    }
+}
+
+/// When a read panics: clears `running` so a later refresh can start one,
+/// and counts the attempt, so a reader that always panics waits [`STALE`]
+/// like one that fails. A forced read asked for meanwhile stays owed: the
+/// next `refresh_if_stale` starts it. A normal end clears `running` under the
+/// lock itself.
+struct Done(Arc<BookmarksProvider>);
+
+impl Drop for Done {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let now = (self.0.now)();
+            let mut state = self.0.state();
+            state.running = false;
+            state.last_attempt = Some(now);
+        }
     }
 }
 
@@ -372,6 +395,95 @@ mod tests {
         p.refresh_now();
         wait_idle(&p);
         assert_eq!(source.reads.load(Ordering::SeqCst), 3);
+    }
+
+    /// The first read panics; later ones answer.
+    struct PanicsOnce(AtomicUsize);
+
+    impl BookmarkSource for PanicsOnce {
+        fn read(&self) -> Result<Vec<Bookmark>, String> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the reader broke");
+            }
+            Ok(books())
+        }
+    }
+
+    #[test]
+    fn a_panicking_read_does_not_stop_later_reads() {
+        let source = Arc::new(PanicsOnce(AtomicUsize::new(0)));
+        let p = BookmarksProvider::new(source.clone(), Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()));
+        p.refresh_now();
+        wait_idle(&p);
+        assert_eq!(source.0.load(Ordering::SeqCst), 1);
+        p.refresh_now();
+        wait_idle(&p);
+        assert_eq!(source.0.load(Ordering::SeqCst), 2, "a new read started");
+        assert_eq!(p.query(&q("rust")).len(), 1);
+    }
+
+    /// Every read waits for the gate (while `gated`), then panics.
+    #[derive(Default)]
+    struct AlwaysPanics {
+        reads: AtomicUsize,
+        gated: Mutex<bool>,
+        opened: std::sync::Condvar,
+    }
+
+    impl BookmarkSource for AlwaysPanics {
+        fn read(&self) -> Result<Vec<Bookmark>, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let mut gated = self.gated.lock().unwrap_or_else(|e| e.into_inner());
+            while *gated {
+                gated = self.opened.wait(gated).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(gated);
+            panic!("the reader broke");
+        }
+    }
+
+    #[test]
+    fn a_reader_that_always_panics_waits_like_a_failing_one_and_a_forced_read_stays_owed() {
+        let base = Instant::now();
+        let offset = Arc::new(Mutex::new(Duration::ZERO));
+        let clock_offset = offset.clone();
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || base + *clock_offset.lock().unwrap());
+        let source = Arc::new(AlwaysPanics::default());
+        let p = BookmarksProvider::with_clock(
+            source.clone(),
+            Arc::new(RecordingLauncher::default()),
+            Arc::new(FakeClipboard::default()),
+            clock,
+        );
+        let reads = || source.reads.load(Ordering::SeqCst);
+        // A Reload: the attempt is counted only by the panic.
+        p.refresh_now();
+        wait_idle(&p);
+        assert_eq!(reads(), 1);
+        // Every show asks: no new read until STALE has passed.
+        *offset.lock().unwrap() = Duration::from_secs(60);
+        p.refresh_if_stale();
+        wait_idle(&p);
+        assert_eq!(reads(), 1, "a panic counts as an attempt");
+        *offset.lock().unwrap() = Duration::from_secs(301);
+        // A Reload during that read is owed after its panic.
+        *source.gated.lock().unwrap() = true;
+        p.refresh_if_stale();
+        let end = Instant::now() + Duration::from_secs(2);
+        while reads() < 2 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        p.refresh_now();
+        *source.gated.lock().unwrap() = false;
+        source.opened.notify_all();
+        wait_idle(&p);
+        assert_eq!(reads(), 2);
+        p.refresh_if_stale();
+        wait_idle(&p);
+        assert_eq!(reads(), 3, "the owed forced read ran at the next show");
+        p.refresh_if_stale();
+        wait_idle(&p);
+        assert_eq!(reads(), 3, "and only once");
     }
 
     #[test]

@@ -117,6 +117,10 @@ const FILE_BELOW_FOLDER: u32 = 10;
 /// Points lost per level below the first, for at most `MAX_DEPTH_STEPS` levels.
 const DEPTH_STEP: u32 = 15;
 const MAX_DEPTH_STEPS: u32 = 4;
+/// Deeper than this below its root, only an exact name (or file stem) is
+/// found: the deep insides of SDKs and tool checkouts would otherwise fill
+/// the list for any short word. Path browsing still reaches them.
+const PARTIAL_MATCH_MAX_DEPTH: u8 = 6;
 
 /// Points an entry loses for sitting `depth` levels below its root (1 = directly in it).
 fn depth_penalty(depth: u8) -> u32 {
@@ -127,13 +131,14 @@ fn depth_penalty(depth: u8) -> u32 {
 /// `len` = needle chars), strict tiers only: exact name, or exact stem for a
 /// file (2+ chars); prefix, squashed prefix, word prefix or every typed word a
 /// word prefix (3+ chars); substring (4+ chars). Never acronyms, initials or
-/// typos. Minus [`depth_penalty`].
+/// typos. Below [`PARTIAL_MATCH_MAX_DEPTH`] levels, exact only. Minus
+/// [`depth_penalty`].
 fn file_score(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
     let f = fuzzy::score_prenormalized(needle, hay);
     let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
     let tier = if f == Some(1000) || stem_exact {
         EXACT
-    } else if len < 3 {
+    } else if len < 3 || depth > PARTIAL_MATCH_MAX_DEPTH {
         return None;
     } else {
         match f? {
@@ -190,6 +195,31 @@ fn last_scan_so_far(last: Option<(Instant, Option<Duration>)>, now: Instant) -> 
 /// `MAX_WAIT` after the first.
 fn rescan_deadline(first: Instant, last: Instant) -> Instant {
     (last + QUIET).min(first + MAX_WAIT)
+}
+
+/// Waits out a burst of changes whose first came at `first`: until changes
+/// have been quiet for `QUIET`, but never past `first + MAX_WAIT`, even while
+/// changes keep arriving (a queued change is not read once the deadline has
+/// passed). `recv` waits up to the given time for the next change and says
+/// whether it is relevant; `now` is the clock. False when the channel closed.
+fn wait_out_burst(
+    first: Instant,
+    mut recv: impl FnMut(Duration) -> Result<bool, RecvTimeoutError>,
+    now: impl Fn() -> Instant,
+) -> bool {
+    let mut deadline = rescan_deadline(first, first);
+    loop {
+        let left = deadline.saturating_duration_since(now());
+        if left.is_zero() {
+            return true;
+        }
+        match recv(left) {
+            Ok(true) => deadline = rescan_deadline(first, now()),
+            Ok(false) => {}
+            Err(RecvTimeoutError::Timeout) => return true,
+            Err(RecvTimeoutError::Disconnected) => return false,
+        }
+    }
 }
 
 /// Whether `path` lies inside a folder the scan skips: some part of it below
@@ -426,18 +456,13 @@ impl FilesProvider {
                 if !change_is_relevant(&paths, &roots) {
                     continue;
                 }
-                let first = Instant::now();
-                let mut deadline = rescan_deadline(first, first);
-                loop {
-                    let left = deadline.saturating_duration_since(Instant::now());
-                    match rx.recv_timeout(left) {
-                        Ok(paths) if change_is_relevant(&paths, &roots) => {
-                            deadline = rescan_deadline(first, Instant::now());
-                        }
-                        Ok(_) => {}
-                        Err(RecvTimeoutError::Timeout) => break,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
+                let burst = wait_out_burst(
+                    Instant::now(),
+                    |left| rx.recv_timeout(left).map(|paths| change_is_relevant(&paths, &roots)),
+                    Instant::now,
+                );
+                if !burst {
+                    return;
                 }
                 // Too soon after the last scan, or one is running: wait,
                 // swallowing further events (they collapse into the one rescan
@@ -699,6 +724,10 @@ mod tests {
             "Pods",
             "bower_components",
             "obj",
+            "miniconda3",
+            "Anaconda3",
+            "miniforge3",
+            "mambaforge",
         ] {
             touch(&root.join(junk).join("inside.txt"));
         }
@@ -845,6 +874,30 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!((out[0].id.as_str(), out[0].score), (r"C:\e\taxes", 640));
         assert_eq!(out[1].score, 630);
+    }
+
+    #[test]
+    fn deep_partial_matches_do_not_fill_the_list() {
+        let (p, _) = provider(vec![
+            entry(r"C:\r\sdk\dev\tests\gallery\demo\calculator", true).at_depth(7),
+            entry(r"C:\r\sdk\dev\tests\gallery\demo\calculator\calculator_demo.dart", false).at_depth(8),
+            entry(r"C:\r\sdk\engine\src\shell\common\cache_calculator.cc", false).at_depth(7),
+            entry(r"C:\r\Project\app\src\answers\calc.rs", false).at_depth(5),
+            entry(r"C:\r\Project\app\src\answers\calc_tools", true).at_depth(6),
+            entry(r"C:\r\Exercises\Calculator", true).at_depth(2),
+        ]);
+        let ids = |text: &str| p.query(&q(text)).into_iter().map(|r| r.id).collect::<Vec<_>>();
+        // Partial matches six levels down or less still show; deeper ones do not.
+        assert_eq!(
+            ids("calc"),
+            [r"C:\r\Exercises\Calculator", r"C:\r\Project\app\src\answers\calc.rs", r"C:\r\Project\app\src\answers\calc_tools"]
+        );
+        // The exact name is still found at any depth.
+        assert_eq!(ids("calculator"), [r"C:\r\Exercises\Calculator", r"C:\r\sdk\dev\tests\gallery\demo\calculator"]);
+        assert_eq!(ids("calculator_demo"), [r"C:\r\sdk\dev\tests\gallery\demo\calculator\calculator_demo.dart"]);
+        assert_eq!(fs("calc", "Calculator", true, 6), Some(540));
+        assert_eq!(fs("calc", "Calculator", true, 7), None);
+        assert_eq!(fs("calculator", "Calculator", true, 9), Some(580));
     }
 
     #[test]
@@ -1157,6 +1210,62 @@ mod tests {
         // ...but never later than 10 s after the first one of the burst.
         assert_eq!(rescan_deadline(first, first + s(9)), first + s(10));
         assert_eq!(rescan_deadline(first, first + s(30)), first + s(10));
+    }
+
+    /// `wait_out_burst` against a fake clock and a fake event stream: `next`
+    /// answers each wait and says how far the clock moved meanwhile. Returns
+    /// the result, the fake time it returned at (from `first`) and the waits asked
+    /// for. Gives up (as a closed channel) after 100 waits.
+    fn burst_with(
+        mut next: impl FnMut(Duration) -> (Duration, Result<bool, RecvTimeoutError>),
+    ) -> (bool, Duration, Vec<Duration>) {
+        use std::cell::{Cell, RefCell};
+        let first = Instant::now();
+        let clock = Cell::new(first);
+        let waits = RefCell::new(Vec::new());
+        let done = wait_out_burst(
+            first,
+            |left| {
+                waits.borrow_mut().push(left);
+                if waits.borrow().len() > 100 {
+                    return Err(RecvTimeoutError::Disconnected);
+                }
+                let (moved, answer) = next(left);
+                clock.set(clock.get() + moved);
+                answer
+            },
+            || clock.get(),
+        );
+        (done, clock.get() - first, waits.into_inner())
+    }
+
+    #[test]
+    fn a_steady_stream_of_changes_still_flushes_at_max_wait() {
+        let s = Duration::from_secs;
+        // A relevant change every second, or one already queued: never quiet.
+        let (done, at, waits) = burst_with(|_| (s(1), Ok(true)));
+        assert!(done, "flushed, not given up");
+        assert_eq!(at, MAX_WAIT);
+        assert!(waits.iter().all(|w| !w.is_zero()), "no queued change is read past the deadline");
+    }
+
+    #[test]
+    fn a_burst_ends_after_quiet_or_when_the_channel_closes() {
+        let s = Duration::from_secs;
+        // One more change after 1 s, then quiet: QUIET after that change.
+        let mut calls = 0;
+        let (done, at, _) = burst_with(|left| {
+            calls += 1;
+            if calls == 1 { (s(1), Ok(true)) } else { (left, Err(RecvTimeoutError::Timeout)) }
+        });
+        assert!(done);
+        assert_eq!(at, s(1) + QUIET);
+        // Irrelevant changes do not push the deadline.
+        let (done, at, _) = burst_with(|_| (s(1), Ok(false)));
+        assert!(done);
+        assert_eq!(at, QUIET);
+        let (done, _, _) = burst_with(|_| (Duration::ZERO, Err(RecvTimeoutError::Disconnected)));
+        assert!(!done);
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! path only reads memory. Nothing is learned; a row can be pinned or put on
 //! a direct hotkey (its id is the device's id or the network's name).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::devices::{BtAudio, BtDevice, Wifi, WifiProfile};
 use crate::dirs::{Load, Loader, ReadError, FRESH, SLOW};
@@ -109,16 +110,44 @@ pub struct DevicesProvider {
     wifi: Arc<dyn Wifi>,
     bt_list: Arc<Loader<Vec<BtDevice>>>,
     wifi_list: Arc<Loader<Vec<WifiProfile>>>,
+    /// The device list as last read before a connect or disconnect cleared
+    /// it: stored rows keep their names until the list is read again.
+    known: Mutex<Option<Arc<Vec<BtDevice>>>>,
 }
 
 impl DevicesProvider {
     pub fn new(bt: Arc<dyn BtAudio>, wifi: Arc<dyn Wifi>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self::build(bt, wifi, on_ready, FRESH)
+    }
+
+    #[cfg(test)]
+    fn with_fresh(bt: Arc<dyn BtAudio>, wifi: Arc<dyn Wifi>, on_ready: Arc<dyn Fn() + Send + Sync>, fresh: Duration) -> Self {
+        Self::build(bt, wifi, on_ready, fresh)
+    }
+
+    fn build(bt: Arc<dyn BtAudio>, wifi: Arc<dyn Wifi>, on_ready: Arc<dyn Fn() + Send + Sync>, fresh: Duration) -> Self {
         Self {
             bt,
             wifi,
-            bt_list: Loader::new(on_ready.clone(), FRESH, SLOW),
-            wifi_list: Loader::new(on_ready, FRESH, SLOW),
+            bt_list: Loader::new(on_ready.clone(), fresh, SLOW),
+            wifi_list: Loader::new(on_ready, fresh, SLOW),
+            known: Mutex::new(None),
         }
+    }
+
+    /// Forgets the device list (a device's state changed) but keeps its names
+    /// for stored rows.
+    fn forget_devices(&self) {
+        if let Some(devices) = self.bt_list.peek("bt") {
+            *self.known.lock().unwrap_or_else(|e| e.into_inner()) = Some(devices);
+        }
+        self.bt_list.clear();
+    }
+
+    /// The name of the device `id` in the list kept by [`Self::forget_devices`].
+    fn known_name(&self, id: &str) -> Option<String> {
+        let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        known.as_ref()?.iter().find(|d| d.id == id).map(|d| d.name.clone())
     }
 
     /// The paired devices as known now, never waiting.
@@ -206,13 +235,13 @@ impl Provider for DevicesProvider {
         if let Some(device) = id.strip_prefix("connect:") {
             let name = self.device_name(device);
             self.bt.connect(device).map_err(|_| format!("Could not connect {name}"))?;
-            self.bt_list.clear();
+            self.forget_devices();
             return Ok(Outcome::Hide);
         }
         if let Some(device) = id.strip_prefix("disconnect:") {
             let name = self.device_name(device);
             self.bt.disconnect(device).map_err(|_| format!("Could not disconnect {name}"))?;
-            self.bt_list.clear();
+            self.forget_devices();
             return Ok(Outcome::Hide);
         }
         if let Some(network) = id.strip_prefix("wifi:") {
@@ -228,9 +257,14 @@ impl Provider for DevicesProvider {
         None
     }
 
-    /// A stored row (a pin or a direct hotkey), from memory only: the last
-    /// list read decides, and a device or network missing from it is gone.
-    /// Before any read the row is rebuilt from its id alone.
+    /// A stored row (a pin or a direct hotkey), never waiting: the last list
+    /// read decides, and a network missing from it is gone. Rebuilding a device
+    /// row reads the device list in the background when none is known or the
+    /// one known is older than [`FRESH`], whether the device is in it or not.
+    /// Before any read the row is rebuilt from its id alone (a device keeps the
+    /// name it had before a connect or disconnect cleared the list). A device
+    /// missing from a list older than [`FRESH`] may be newly paired: it is gone
+    /// only once that re-read lacks it too.
     fn item(&self, id: &str) -> Option<ResultItem> {
         if let Some(network) = id.strip_prefix("wifi:") {
             return match self.wifi_list.peek("wifi") {
@@ -241,12 +275,23 @@ impl Provider for DevicesProvider {
         let (verb, device) = [Verb::Connect, Verb::Disconnect]
             .into_iter()
             .find_map(|v| id.strip_prefix(v.word()).and_then(|r| r.strip_prefix(':')).map(|d| (v, d)))?;
-        match self.bt_list.peek("bt") {
-            Some(devices) => {
-                let d = devices.iter().find(|d| d.id == device)?;
-                Some(bt_row(verb, &d.id, d.name.clone(), Some(d.connected), 0))
-            }
-            None => Some(bt_row(verb, device, BT_STANDIN.to_string(), None, 0)),
+        let find = |devices: &[BtDevice]| {
+            let d = devices.iter().find(|d| d.id == device)?;
+            Some(bt_row(verb, &d.id, d.name.clone(), Some(d.connected), 0))
+        };
+        let standin = || {
+            let title = self.known_name(device).unwrap_or_else(|| BT_STANDIN.to_string());
+            Some(bt_row(verb, device, title, None, 0))
+        };
+        match self.devices() {
+            Load::Ready(devices) => find(&devices).or_else(|| {
+                if self.bt_list.reading("bt") {
+                    return standin();
+                }
+                // A re-read may have just finished.
+                self.bt_list.peek("bt").and_then(|devices| find(&devices))
+            }),
+            Load::Pending | Load::Slow | Load::NotFound | Load::Denied => standin(),
         }
     }
 
@@ -516,6 +561,55 @@ mod tests {
         }
         assert!(t.p.item("connect:gone").is_none() && t.p.item("wifi:gone").is_none());
         assert!(t.p.item("info").is_none());
+    }
+
+    fn rebuilt(t: &T, id: &str) -> Option<(String, String, String)> {
+        t.p.item(id).map(|i| (i.title, i.subtitle, i.icon))
+    }
+
+    #[test]
+    fn a_stored_device_keeps_its_name_after_a_connect_clears_the_list() {
+        let t = t(two());
+        ready(&t, "connect");
+        // The list is read again only once released: meanwhile the name stays.
+        t.bt.block();
+        assert_eq!(t.p.activate("connect:bt-2", Modifier::None), Ok(Outcome::Hide));
+        let row = |sub: &str| Some(("Speaker".to_string(), sub.to_string(), "builtin:bluetooth".to_string()));
+        assert_eq!(rebuilt(&t, "connect:bt-2"), row(""));
+        assert_eq!(t.p.activate("disconnect:bt-1", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(rebuilt(&t, "disconnect:bt-1").map(|r| r.0), Some("WH-1000XM4".to_string()));
+        // Never read: the stand-in.
+        assert_eq!(rebuilt(&t, "connect:bt-7").map(|r| r.0), Some("Bluetooth audio device".to_string()));
+        t.bt.release();
+        // The read cleared by the disconnect ends into nothing; the next one fills the list.
+        let end = Instant::now() + Duration::from_secs(1);
+        while rebuilt(&t, "connect:bt-2") != row("Not connected") {
+            assert!(Instant::now() < end, "never read again");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_device_paired_since_the_last_read_is_read_again_not_gone() {
+        let (bt, wifi) = (Arc::new(FakeBt::new(two())), Arc::new(FakeWifi::new(vec![])));
+        let (on_ready, rx) = signal();
+        let p = DevicesProvider::with_fresh(bt.clone(), wifi.clone(), on_ready, Duration::from_millis(300));
+        let t = T { p, rx, bt, wifi };
+        ready(&t, "connect");
+        // Fresh: a device missing from the list is gone, nothing is read.
+        assert!(t.p.item("connect:bt-3").is_none());
+        assert_eq!(t.bt.lists(), 1);
+        t.bt.set(vec![dev("bt-1", "WH-1000XM4", true), dev("bt-2", "Speaker", false), dev("bt-3", "Earbuds", false)]);
+        std::thread::sleep(Duration::from_millis(350));
+        // Stale: the miss starts a re-read and the row stands in meanwhile.
+        t.bt.block();
+        assert_eq!(rebuilt(&t, "connect:bt-3").map(|r| (r.0, r.1)), Some(("Bluetooth audio device".to_string(), String::new())));
+        t.bt.release();
+        t.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+        assert_eq!(t.bt.lists(), 2);
+        assert_eq!(rebuilt(&t, "connect:bt-3").map(|r| (r.0, r.1)), Some(("Earbuds".to_string(), "Not connected".to_string())));
+        // Read again and still missing: gone.
+        assert!(t.p.item("connect:gone").is_none());
     }
 
     #[test]
