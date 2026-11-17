@@ -11,8 +11,9 @@ export type Item = {
   pinnable: boolean;
   actions: Action[]; // what the row's actions menu offers, in order
   complete: string; // text Tab puts in the bar, "" = none
+  panel: string; // SVG markup from Flick's backend to show large instead of the list, "" = none
 };
-export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window";
+export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
 export type MenuAction = Action | "pin" | "unpin";
 export type Menu = { index: number; actions: MenuAction[]; selected: number; at: "pointer" | "row" };
@@ -22,6 +23,11 @@ export function menuActions(item: Item): MenuAction[] {
   const actions: MenuAction[] = [...item.actions];
   if (item.pinnable) actions.push(item.pinned ? "unpin" : "pin");
   return actions;
+}
+
+// The row shown as a panel (a QR code): the only item, with markup.
+export function panelItem(s: State): Item | null {
+  return s.items.length === 1 && s.items[0].panel !== "" ? s.items[0] : null;
 }
 
 // The mouse wheel scrolls the list by whole rows: the remainder carries over.
