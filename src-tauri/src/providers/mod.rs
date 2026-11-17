@@ -7,6 +7,7 @@ pub mod flick;
 pub mod history;
 pub mod path;
 pub mod power;
+pub mod qr;
 pub mod recent;
 pub mod settings;
 pub mod shortcuts;
