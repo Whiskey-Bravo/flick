@@ -54,7 +54,12 @@ fn tokenize(text: &str) -> Option<Vec<Tok>> {
                 }
                 if j > digits {
                     let exp: String = chars[i + 1..j].iter().collect();
+                    let mant = v;
                     v *= 10f64.powi(exp.parse::<i32>().ok()?);
+                    // Overflow to inf, or underflow of a nonzero mantissa to 0, is no number.
+                    if !v.is_finite() || (v == 0.0 && mant != 0.0) {
+                        return None;
+                    }
                     i = j;
                 }
             }
@@ -361,7 +366,7 @@ mod tests {
     #[test]
     fn constants_and_scientific_notation() {
         let v = |s| evaluate(s).map(|c| c.value);
-        for s in ["e2", "pi 2", "pi2", "2e3", "1/(10^400)"] {
+        for s in ["e2", "pi 2", "pi2", "2e3", "1/(10^400)", "1/2e400", "2e-400*1"] {
             assert!(evaluate(s).is_none(), "{s}");
         }
         assert_eq!(v("2e3*2"), Some(4000.0));
