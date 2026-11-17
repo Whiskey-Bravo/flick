@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { failureText, initial, reduce, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
+import { failureText, initial, movedEnough, reduce, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -505,5 +505,89 @@ describe("bar", () => {
         { type: "activate", item: item("a"), modifier: "none", text: "cats", scope: "web" },
       ]);
     });
+  });
+});
+
+describe("mouse and menu", () => {
+  const rich = (id: string, o: Partial<Item> = {}): Item => ({ ...item(id), ...o });
+  const click = (index: number, ctrl = false, shift = false): Event => ({ type: "click", index, ctrl, shift });
+
+  it("hover selects a row", () => {
+    const s = withItems(item("a"), item("b"), item("c"));
+    expect(run(s, { type: "hover", index: 2 }).state.selected).toBe(2);
+  });
+
+  it("hover is ignored while the menu is open", () => {
+    const s = withItems(rich("a", { pinnable: true }), item("b"));
+    const open = run(s, { type: "menu", index: 0 }).state;
+    expect(run(open, { type: "hover", index: 1 }).state.selected).toBe(0);
+  });
+
+  it("results arriving under a still pointer keep the keyboard selection", () => {
+    const s = run(withItems(item("a"), item("b"), item("c")), key("ArrowDown"), key("ArrowDown")).state;
+    expect(s.selected).toBe(2);
+    expect(run(s, { type: "results", items: [item("x"), item("y"), item("z")] }).state.selected).toBe(0);
+  });
+
+  it("movedEnough only reports real movement", () => {
+    expect(movedEnough(null, { x: 1, y: 2 })).toBe(true);
+    expect(movedEnough({ x: 1, y: 2 }, { x: 1, y: 2 })).toBe(false);
+    expect(movedEnough({ x: 1, y: 2 }, { x: 1, y: 3 })).toBe(true);
+  });
+
+  it("click activates and a power row needs a second click", () => {
+    const s = withItems(item("a"), item("p", true));
+    expect(run(s, click(0)).effects).toEqual([{ type: "activate", item: item("a"), modifier: "none", text: "", scope: null }]);
+    const first = run(s, click(1));
+    expect(first.effects).toEqual([]);
+    expect(first.state.armed).toBe("p");
+    const second = run(first.state, click(1));
+    expect(second.effects).toEqual([{ type: "activate", item: item("p", true), modifier: "none", text: "", scope: null }]);
+  });
+
+  it("ctrl+shift click runs as admin", () => {
+    const s = withItems(item("a"));
+    expect(run(s, click(0, true, true)).effects).toEqual([
+      { type: "activate", item: item("a"), modifier: "ctrl_shift", text: "", scope: null },
+    ]);
+  });
+
+  it("menu lists only the actions a row supports", () => {
+    const actions = (i: Item) => run(withItems(i), { type: "menu", index: 0 }).state.menu?.actions;
+    expect(actions(rich("f", { pinnable: true, revealable: true }))).toEqual(["pin", "reveal"]);
+    expect(actions(rich("a", { pinnable: true, pinned: true, revealable: true, elevatable: true }))).toEqual(["unpin", "reveal", "admin"]);
+    expect(actions(rich("p", { pinnable: true, confirm: true }))).toEqual(["pin"]);
+    expect(actions(rich("w"))).toBeUndefined();
+  });
+
+  it("menu keys stay inside the menu", () => {
+    const s = withItems(rich("a", { pinnable: true, revealable: true, elevatable: true }));
+    const open = run(s, { type: "menu", index: 0 }).state;
+    expect(run(open, key("ArrowDown")).state.menu?.selected).toBe(1);
+    expect(run(open, key("ArrowUp")).state.menu?.selected).toBe(2);
+    const esc = run(open, key("Escape"));
+    expect(esc.state.menu).toBeNull();
+    expect(esc.effects).toEqual([]);
+  });
+
+  it("menu closes on input, blur and shown", () => {
+    const open = run(withItems(rich("a", { pinnable: true })), { type: "menu", index: 0 }).state;
+    expect(run(open, { type: "input", text: "x" }).state.menu).toBeNull();
+    expect(run(open, { type: "blurred" }).state.menu).toBeNull();
+    expect(run(open, { type: "shown" }).state.menu).toBeNull();
+    expect(run(open, { type: "menuClose" }).state.menu).toBeNull();
+  });
+
+  it("menu picks emit the right effects", () => {
+    const a = rich("a", { pinnable: true, revealable: true, elevatable: true });
+    const open = run(withItems(a), { type: "menu", index: 0 }).state;
+    expect(run(open, { type: "menuPick", action: "pin" }).effects).toEqual([{ type: "togglePin", item: a }]);
+    expect(run(open, { type: "menuPick", action: "reveal" }).effects).toEqual([{ type: "reveal", item: a }]);
+    expect(run(open, { type: "menuPick", action: "admin" }).effects).toEqual([
+      { type: "activate", item: a, modifier: "ctrl_shift", text: "", scope: null },
+    ]);
+    const viaEnter = run(open, key("ArrowDown"), key("Enter"));
+    expect(viaEnter.effects).toEqual([{ type: "reveal", item: a }]);
+    expect(viaEnter.state.menu).toBeNull();
   });
 });

@@ -167,3 +167,28 @@ input::placeholder {
   color: #6b6b76;
   opacity: 1;
 }
+
+.menu {
+  position: fixed;
+  z-index: 10;
+  min-width: 180px;
+  padding: 4px;
+  background: #232329;
+  border: 1px solid #3a3a43;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}
+
+.menu-item {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 30px;
+  white-space: nowrap;
+}
+
+.menu-item.selected,
+.menu-item:hover {
+  background: #34343d;
+}

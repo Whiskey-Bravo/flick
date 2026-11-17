@@ -3,8 +3,12 @@ import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
-import { capOf, failureText, initial, reduce, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
+import {
+  capOf, failureText, initial, movedEnough, reduce, visibleItems,
+  type Effect, type Event, type Item, type MenuAction, type Point, type State,
+} from "./bar";
 
+type Event_ = MouseEvent;
 type Outcome = Extract<Event, { type: "outcome" }>["outcome"];
 
 const panel = document.getElementById("app") as HTMLElement;
@@ -34,7 +38,11 @@ const thumb = document.createElement("div");
 thumb.className = "scroll-thumb";
 track.append(thumb);
 listWrap.append(list, track);
-panel.append(row, errorLine, listWrap);
+const menuEl = document.createElement("div");
+menuEl.className = "menu";
+menuEl.setAttribute("role", "menu");
+menuEl.hidden = true;
+panel.append(row, errorLine, listWrap, menuEl);
 
 // Bundled SVGs by name (src/icons/<name>.svg), resolved to URLs by Vite.
 const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?url", import: "default" });
@@ -89,6 +97,7 @@ function renderIcon(item: Item): HTMLSpanElement {
 function renderItem(item: Item, index: number): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "result";
+  li.dataset.index = String(index);
   if (index === state.selected) li.classList.add("selected");
   const armed = state.armed === item.id;
   if (armed) li.classList.add("armed");
@@ -107,6 +116,42 @@ function renderItem(item: Item, index: number): HTMLLIElement {
     li.append(star);
   }
   return li;
+}
+
+const MENU_LABELS: Record<MenuAction, string> = {
+  pin: "Pin",
+  unpin: "Unpin",
+  reveal: "Open file location",
+  admin: "Run as administrator",
+};
+/// Where the right-click happened, in window coordinates.
+let menuAt: Point = { x: 0, y: 0 };
+
+function renderMenu() {
+  const m = state.menu;
+  menuEl.hidden = !m;
+  if (!m) {
+    menuEl.replaceChildren();
+    return;
+  }
+  menuEl.replaceChildren(
+    ...m.actions.map((action, i) => {
+      const entry = document.createElement("div");
+      entry.className = "menu-item";
+      entry.setAttribute("role", "menuitem");
+      if (i === m.selected) entry.classList.add("selected");
+      entry.dataset.action = action;
+      entry.textContent = MENU_LABELS[action];
+      return entry;
+    }),
+  );
+  // Flip up / shift left when the menu would run past the window edge.
+  const w = menuEl.offsetWidth;
+  const h = menuEl.offsetHeight;
+  const left = menuAt.x + w > window.innerWidth ? menuAt.x - w : menuAt.x;
+  const top = menuAt.y + h > window.innerHeight ? menuAt.y - h : menuAt.y;
+  menuEl.style.left = `${Math.max(0, left)}px`;
+  menuEl.style.top = `${Math.max(0, top)}px`;
 }
 
 function render() {
@@ -129,6 +174,7 @@ function render() {
     thumb.style.height = `${(cap / len) * 100}%`;
     thumb.style.top = `${(state.top / len) * 100}%`;
   }
+  renderMenu();
 }
 
 function dispatch(event: Event) {
@@ -178,6 +224,12 @@ function run(effect: Effect) {
         .then((pinned) => dispatch({ type: "pinned", provider: effect.item.provider, id: effect.item.id, pinned }))
         .catch((err) => dispatch({ type: "failed", message: failureText(effect.item, err) }));
       break;
+    case "reveal":
+      // On success the back end hides the bar; a failure shows like a failed activation.
+      invoke("reveal", { provider: effect.item.provider, id: effect.item.id }).catch((err) =>
+        dispatch({ type: "failed", message: failureText(effect.item, err) }),
+      );
+      break;
     case "hide":
       invoke("hide").catch(() => {});
       break;
@@ -193,7 +245,20 @@ const SWALLOWED_CTRL = ["p", "f", "r"];
 document.addEventListener("keydown", (e) => {
   if (SWALLOWED.includes(e.key) || (e.ctrlKey && SWALLOWED_CTRL.includes(e.key.toLowerCase()))) e.preventDefault();
 });
-document.addEventListener("contextmenu", (e) => e.preventDefault());
+const rowIndex = (e: Event_): number | null => {
+  const li = (e.target as Element | null)?.closest<HTMLElement>("li.result");
+  return li?.dataset.index === undefined ? null : Number(li.dataset.index);
+};
+document.addEventListener("contextmenu", (e) => {
+  e.preventDefault();
+  const index = rowIndex(e);
+  if (index === null) {
+    if (state.menu) dispatch({ type: "menuClose" });
+    return;
+  }
+  menuAt = { x: e.clientX, y: e.clientY };
+  dispatch({ type: "menu", index });
+});
 window.addEventListener("blur", () => dispatch({ type: "blurred" }));
 
 input.addEventListener("keydown", (e) => {
@@ -204,6 +269,30 @@ input.addEventListener("keydown", (e) => {
   // Held Enter/Escape must not repeat: it would skip the two-step confirm.
   if (e.repeat && (key === "Enter" || key === "Escape" || key === "F1" || key === "p")) return;
   dispatch({ type: "key", key, ctrl: e.ctrlKey, shift: e.shiftKey });
+});
+
+// Hover selects only when the pointer really moved: rows replaced under a still
+// pointer fire mouse events too, and must not steal the keyboard selection.
+let lastPointer: Point | null = null;
+list.addEventListener("mousemove", (e) => {
+  const at = { x: e.clientX, y: e.clientY };
+  if (!movedEnough(lastPointer, at)) return;
+  lastPointer = at;
+  const index = rowIndex(e);
+  // Dispatching re-renders the rows, which would swallow a click in progress.
+  if (index !== null && index !== state.selected && !state.menu) dispatch({ type: "hover", index });
+});
+document.addEventListener("click", (e) => {
+  if (e.button !== 0) return;
+  const target = e.target as Element | null;
+  const entry = target?.closest<HTMLElement>(".menu-item");
+  if (entry) {
+    dispatch({ type: "menuPick", action: entry.dataset.action as MenuAction });
+    return;
+  }
+  const index = rowIndex(e);
+  if (index !== null) dispatch({ type: "click", index, ctrl: e.ctrlKey, shift: e.shiftKey });
+  else if (state.menu) dispatch({ type: "menuClose" });
 });
 
 document.addEventListener("mousedown", (e) => {

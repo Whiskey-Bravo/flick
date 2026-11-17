@@ -13,6 +13,8 @@ export type Item = {
   elevatable: boolean;
 };
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
+export type MenuAction = "pin" | "unpin" | "reveal" | "admin";
+export type Menu = { index: number; actions: MenuAction[]; selected: number };
 export type State = {
   text: string;
   items: Item[];
@@ -28,12 +30,14 @@ export type State = {
   top: number; // index of the first visible row
   past: string[]; // past searches, newest first
   recall: number; // index into `past` being shown, -1 = not recalling
+  menu: Menu | null; // the right-click menu, when open
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null }
   | { type: "activate"; item: Item; modifier: Modifier; text: string; scope: string | null }
   | { type: "loadPast" }
   | { type: "togglePin"; item: Item }
+  | { type: "reveal"; item: Item }
   | { type: "hide" };
 export type Event =
   | { type: "shown" }
@@ -41,6 +45,11 @@ export type Event =
   | { type: "input"; text: string }
   | { type: "results"; items: Item[] }
   | { type: "past"; items: string[] }
+  | { type: "hover"; index: number }
+  | { type: "click"; index: number; ctrl: boolean; shift: boolean }
+  | { type: "menu"; index: number }
+  | { type: "menuPick"; action: MenuAction }
+  | { type: "menuClose" }
   | { type: "pinned"; provider: string; id: string; pinned: boolean }
   | { type: "key"; key: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p"; ctrl: boolean; shift: boolean }
   | {
@@ -70,7 +79,15 @@ export const initial: State = {
   top: 0,
   past: [],
   recall: -1,
+  menu: null,
 };
+
+// A mousemove counts only when the pointer really moved: rows changing under a
+// still pointer fire mouse events with the same coordinates.
+export type Point = { x: number; y: number };
+export function movedEnough(prev: Point | null, next: Point): boolean {
+  return !prev || prev.x !== next.x || prev.y !== next.y;
+}
 
 // Text for a failed activation: the item's title, then the back end's message.
 export function failureText(item: Item, err: unknown): string {
@@ -107,7 +124,44 @@ export function reduce(s: State, e: Event): Result {
         { type: "loadPast" },
       ]);
     case "blurred":
-      return done({ ...s, armed: null, queued: null });
+      return done({ ...s, armed: null, queued: null, menu: null });
+    case "menuClose":
+      return done({ ...s, menu: null });
+    case "hover":
+      if (s.menu || !s.items[e.index] || e.index === s.selected) return done(s);
+      return done(fit({ ...s, selected: e.index, armed: null }));
+    case "click": {
+      if (s.menu) return done({ ...s, menu: null });
+      if (!s.items[e.index]) return done(s);
+      const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
+      return onKey(sel, { type: "key", key: "Enter", ctrl: e.ctrl, shift: e.shift });
+    }
+    case "menu": {
+      const item = s.items[e.index];
+      if (!item) return done(s);
+      const actions: MenuAction[] = [];
+      if (item.pinnable) actions.push(item.pinned ? "unpin" : "pin");
+      if (item.revealable) actions.push("reveal");
+      if (item.elevatable) actions.push("admin");
+      const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
+      if (actions.length === 0) return done({ ...sel, menu: null });
+      return done({ ...sel, menu: { index: e.index, actions, selected: 0 } });
+    }
+    case "menuPick": {
+      const m = s.menu;
+      const item = m && s.items[m.index];
+      const closed = { ...s, menu: null };
+      if (!m || !item || !m.actions.includes(e.action)) return done(closed);
+      switch (e.action) {
+        case "pin":
+        case "unpin":
+          return done(closed, [{ type: "togglePin", item }]);
+        case "reveal":
+          return done(closed, [{ type: "reveal", item }]);
+        case "admin":
+          return enter({ ...closed, selected: m.index }, "ctrl_shift");
+      }
+    }
     case "configError":
       return done(fit({ ...s, configError: e.message, error: s.failure ?? e.message }));
     case "input":
@@ -116,6 +170,7 @@ export function reduce(s: State, e: Event): Result {
           ...s,
           text: e.text,
           recall: -1,
+          menu: null,
           selected: 0,
           top: 0,
           armed: null,
@@ -133,7 +188,7 @@ export function reduce(s: State, e: Event): Result {
       if (s.text === "" && !s.scope && !e.items.some((i) => i.provider === "welcome")) {
         selected = Math.max(0, e.items.findIndex((i) => i.origin === "recent"));
       }
-      const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null });
+      const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null, menu: null });
       // An Enter pressed before these results arrived acts on them now.
       return s.queued ? enter(next, s.queued) : done(next);
     }
@@ -175,7 +230,25 @@ export function reduce(s: State, e: Event): Result {
   }
 }
 
+function onMenuKey(s: State, m: Menu, e: Extract<Event, { type: "key" }>): Result {
+  const n = m.actions.length;
+  switch (e.key) {
+    case "ArrowUp":
+    case "ArrowDown": {
+      const step = e.key === "ArrowDown" ? 1 : n - 1;
+      return done({ ...s, menu: { ...m, selected: (m.selected + step) % n } });
+    }
+    case "Enter":
+      return reduce(s, { type: "menuPick", action: m.actions[m.selected] });
+    case "Escape":
+      return done({ ...s, menu: null });
+    default:
+      return done(s);
+  }
+}
+
 function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
+  if (s.menu) return onMenuKey(s, s.menu, e);
   switch (e.key) {
     case "ArrowUp":
     case "ArrowDown": {
