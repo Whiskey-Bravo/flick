@@ -1,5 +1,6 @@
 //! What runs once the bar has hidden: the paste into the window that was in
-//! front, Windows' clipboard history, the snip overlay and the colour picker.
+//! front, Windows' clipboard history, the snip overlay, the colour picker and
+//! the Start menu.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,8 +26,8 @@ pub struct FollowUps {
 
 impl AfterHide for FollowUps {
     fn run(&self, then: Then, started: u64) {
-        // The overlay, Win+V and the picker's frozen frame must not show the
-        // bar, so those wait for it to go; a paste does not.
+        // The overlay, Win+V, the picker's frozen frame and Start must not
+        // show the bar, so those wait for it to go; a paste does not.
         match then {
             Then::Paste { before } => {
                 // The item is already on the clipboard: when the paste cannot
@@ -49,7 +50,7 @@ impl AfterHide for FollowUps {
             }
             Then::StartMenu => {
                 (self.settle)();
-                let _ = crate::controls::open_start_menu();
+                let _ = self.desktop.open_start_menu();
             }
         }
     }
@@ -121,8 +122,15 @@ mod tests {
         assert_eq!(picks.load(Ordering::SeqCst), 1);
         assert_eq!(settles(), 3);
 
+        follow.run(Then::StartMenu, 3);
+        assert_eq!(keys(&desktop, "start_menu"), 1);
+        assert_eq!(settles(), 4);
+
         // Nothing reached a part it should not have.
         assert_eq!(keys(&desktop, "ctrl_v"), 1);
+        assert_eq!(keys(&desktop, "win_v"), 1);
+        assert_eq!(keys(&desktop, "start_menu"), 1);
+        assert_eq!(picks.load(Ordering::SeqCst), 1);
         assert_eq!(launcher.calls().len(), 1);
     }
 
