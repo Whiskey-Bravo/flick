@@ -25,6 +25,23 @@ pub enum Origin {
     Recent,
 }
 
+/// Something a row offers besides its Enter action, shown in its actions menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    /// Show the item in Explorer.
+    Reveal,
+    /// Open a folder in Explorer.
+    OpenFolder,
+    CopyPath,
+    /// Run as administrator. The bar sends it as Ctrl+Shift+Enter through
+    /// `activate`, never to [`Provider::act`].
+    Admin,
+    Uninstall,
+    Close,
+    CloseWindow,
+}
+
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct ResultItem {
     /// Unique within its provider, stable across queries.
@@ -43,8 +60,10 @@ pub struct ResultItem {
     /// Set by the engine.
     pub pinned: bool,
     pub pinnable: bool,
-    pub revealable: bool,
-    pub elevatable: bool,
+    /// The actions menu, in order. Pin/Unpin is added by the bar from `pinnable`.
+    pub actions: Vec<Action>,
+    /// Text Tab puts in the bar ("" = none).
+    pub complete: String,
     /// A computed answer: in plain queries the engine puts it above every other row.
     #[serde(skip)]
     pub top: bool,
@@ -126,9 +145,15 @@ pub trait Provider: Send + Sync {
     fn ready(&self) -> bool {
         true
     }
-    /// Show the item's location in the file manager.
-    fn reveal(&self, _id: &str) -> Result<(), String> {
-        Err("can't show this item's location".to_string())
+    /// Runs one of the row's [`ResultItem::actions`] (never `Admin`). The
+    /// engine records nothing for it.
+    fn act(&self, _id: &str, _action: Action) -> Result<Outcome, String> {
+        Err("can't do that here".to_string())
+    }
+    /// Whether this provider owns `text` (trimmed) by its shape, e.g. a typed
+    /// path: then it alone answers it, like a route. Default: no.
+    fn claims(&self, _text: &str) -> bool {
+        false
     }
 }
 
@@ -171,7 +196,37 @@ impl<P: Provider + ?Sized> Provider for Arc<P> {
     fn ready(&self) -> bool {
         (**self).ready()
     }
-    fn reveal(&self, id: &str) -> Result<(), String> {
-        (**self).reveal(id)
+    fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
+        (**self).act(id, action)
+    }
+    fn claims(&self, text: &str) -> bool {
+        (**self).claims(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn action_serialises_snake_case() {
+        assert_eq!(serde_json::to_value(Action::CopyPath).unwrap(), json!("copy_path"));
+        assert_eq!(serde_json::to_value(Action::OpenFolder).unwrap(), json!("open_folder"));
+        assert_eq!(serde_json::to_value(Action::CloseWindow).unwrap(), json!("close_window"));
+        assert_eq!(serde_json::from_value::<Action>(json!("reveal")).unwrap(), Action::Reveal);
+    }
+
+    #[test]
+    fn result_item_serialises_actions_and_complete() {
+        let v = serde_json::to_value(ResultItem {
+            actions: vec![Action::Reveal],
+            complete: "x".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(v["actions"], json!(["reveal"]));
+        assert_eq!(v["complete"], json!("x"));
+        assert!(v.get("revealable").is_none() && v.get("elevatable").is_none(), "{v}");
     }
 }

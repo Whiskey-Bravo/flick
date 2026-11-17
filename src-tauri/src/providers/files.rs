@@ -17,9 +17,10 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 #[cfg(test)]
 use super::files_scan::skip_by_attributes;
 use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Slot};
+use crate::clipboard::Clipboard;
 use crate::fuzzy;
 use crate::launch::Launcher;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 pub const MAX_ENTRIES: usize = 1_000_000;
 pub const MAX_DEPTH: usize = 9;
@@ -212,6 +213,8 @@ fn path_is_skipped(path: &Path, roots: &[PathBuf]) -> bool {
 
 pub struct FilesProvider {
     launcher: Arc<dyn Launcher>,
+    /// For the Copy path action.
+    clipboard: Arc<dyn Clipboard>,
     index: RwLock<Index>,
     roots: Arc<Mutex<Vec<PathBuf>>>,
     /// Bumped by `set_roots`; a scan started before the bump is thrown away.
@@ -254,18 +257,25 @@ impl Drop for ClearOnPanic<'_> {
 }
 
 impl FilesProvider {
-    pub fn new(launcher: Arc<dyn Launcher>) -> Arc<Self> {
-        Self::with_index(launcher, Index::default(), false)
+    pub fn new(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>) -> Arc<Self> {
+        Self::with_index(launcher, clipboard, Index::default(), false)
+    }
+
+    /// An index that counts as scanned already, and a fake clipboard (tests).
+    #[cfg(test)]
+    pub fn with_entries(launcher: Arc<dyn Launcher>, e: Vec<FileEntry>) -> Arc<Self> {
+        Self::with_clipboard(launcher, Arc::new(crate::clipboard::FakeClipboard::default()), e)
     }
 
     #[cfg(test)]
-    pub fn with_entries(launcher: Arc<dyn Launcher>, e: Vec<FileEntry>) -> Arc<Self> {
-        Self::with_index(launcher, Index::from_entries(e), true)
+    pub fn with_clipboard(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, e: Vec<FileEntry>) -> Arc<Self> {
+        Self::with_index(launcher, clipboard, Index::from_entries(e), true)
     }
 
-    fn with_index(launcher: Arc<dyn Launcher>, index: Index, scanned: bool) -> Arc<Self> {
+    fn with_index(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, index: Index, scanned: bool) -> Arc<Self> {
         Arc::new(Self {
             launcher,
+            clipboard,
             index: RwLock::new(index),
             roots: Arc::new(Mutex::new(default_roots())),
             generation: AtomicU64::new(0),
@@ -477,7 +487,11 @@ impl FilesProvider {
             score,
             icon: file_icon(index.name(s), s.is_dir),
             pinnable: true,
-            revealable: true,
+            actions: if s.is_dir {
+                vec![Action::OpenFolder, Action::CopyPath]
+            } else {
+                vec![Action::Reveal, Action::CopyPath]
+            },
             ..Default::default()
         }
     }
@@ -558,12 +572,19 @@ impl Provider for FilesProvider {
         self.scanned.load(Ordering::SeqCst)
     }
 
-    fn reveal(&self, id: &str) -> Result<(), String> {
+    /// Only for indexed paths; the id is the full path.
+    fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
         let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(id)).is_some();
         if !known {
             return Err(NOT_FOUND.into());
         }
-        self.launcher.reveal(id)
+        match action {
+            Action::Reveal => self.launcher.reveal(id)?,
+            Action::OpenFolder => self.launcher.open(id)?,
+            Action::CopyPath => self.clipboard.set_text(id)?,
+            _ => return Err("can't do that here".into()),
+        }
+        Ok(Outcome::Hide)
     }
 
     fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
@@ -603,7 +624,9 @@ impl Provider for FilesProvider {
 mod tests {
     use super::*;
     use crate::fuzzy;
+    use crate::clipboard::FakeClipboard;
     use crate::launch::testing::RecordingLauncher;
+    use crate::provider::Action;
     use std::fs;
     use std::path::Path;
 
@@ -896,7 +919,7 @@ mod tests {
         let (p, _) = provider(vec![entry(r"C:\x\Report.PDF", false), entry(r"C:\x\docs", true)]);
         let f = p.item(r"C:\x\Report.PDF").unwrap();
         assert_eq!((f.icon.as_str(), f.title.as_str(), f.score), ("ext:.pdf", "Report.PDF", 0));
-        assert!(f.pinnable && f.revealable && !f.elevatable);
+        assert!(f.pinnable);
         assert_eq!(p.item(r"C:\x\docs").unwrap().icon, "folder");
         let (p2, _) = provider(vec![entry(r"C:\x\Makefile", false)]);
         assert_eq!(p2.item(r"C:\x\Makefile").unwrap().icon, "builtin:file");
@@ -905,7 +928,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("a.txt"));
-        let p = FilesProvider::new(Arc::new(RecordingLauncher::default()));
+        let p = FilesProvider::new(Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()));
         assert!(!p.ready());
         p.set_roots(vec![dir.path().to_path_buf()]);
         p.refresh_blocking();
@@ -914,10 +937,50 @@ mod tests {
 
     #[test]
     fn reveal_uses_the_launcher() {
-        let (p, rec) = provider(vec![entry(r"C:\x\a.txt", false)]);
-        assert_eq!(p.reveal(r"C:\x\a.txt"), Ok(()));
-        assert_eq!(rec.calls(), [r"reveal C:\x\a.txt".to_string()]);
-        assert!(p.reveal(r"C:\x\nope.txt").is_err());
+        let (p, rec) = provider(vec![entry(r"C:\x\a.txt", false), entry(r"C:\x\docs", true)]);
+        assert_eq!(p.act(r"C:\x\a.txt", Action::Reveal), Ok(Outcome::Hide));
+        assert_eq!(p.act(r"C:\x\docs", Action::OpenFolder), Ok(Outcome::Hide));
+        assert_eq!(rec.calls(), [r"reveal C:\x\a.txt".to_string(), r"open C:\x\docs".to_string()]);
+        assert!(p.act(r"C:\x\nope.txt", Action::Reveal).is_err());
+        assert_eq!(p.act(r"C:\x\a.txt", Action::Admin), Err("can't do that here".to_string()));
+        assert_eq!(rec.calls().len(), 2);
+    }
+
+    #[test]
+    fn rows_offer_location_or_explorer_and_copy() {
+        let (p, _) = provider(vec![entry(r"C:\x\notes.txt", false), entry(r"C:\x\notes", true)]);
+        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, [Action::OpenFolder, Action::CopyPath]);
+        let rows = p.query(&q("notes"));
+        assert_eq!(rows.len(), 2);
+        for r in rows {
+            let first = if r.icon == "folder" { Action::OpenFolder } else { Action::Reveal };
+            assert_eq!(r.actions, [first, Action::CopyPath], "{}", r.id);
+            assert_eq!(r.complete, "");
+        }
+    }
+
+    fn with_fake_clipboard(entries: Vec<FileEntry>) -> (Arc<FilesProvider>, Arc<RecordingLauncher>, Arc<FakeClipboard>) {
+        let rec = Arc::new(RecordingLauncher::default());
+        let clip = Arc::new(FakeClipboard::default());
+        (FilesProvider::with_clipboard(rec.clone(), clip.clone(), entries), rec, clip)
+    }
+
+    #[test]
+    fn copy_path_copies_the_full_path_and_hides() {
+        let (p, rec, clip) = with_fake_clipboard(vec![entry(r"C:\d\a.txt", false)]);
+        assert_eq!(p.act(r"C:\d\a.txt", Action::CopyPath), Ok(Outcome::Hide));
+        assert_eq!(*clip.0.lock().unwrap(), [r"C:\d\a.txt".to_string()]);
+        assert!(rec.calls().is_empty());
+    }
+
+    #[test]
+    fn act_refuses_unindexed_paths() {
+        let (p, rec, clip) = with_fake_clipboard(vec![entry(r"C:\d\a.txt", false)]);
+        assert_eq!(p.act(r"C:\nope.txt", Action::CopyPath), Err("file not found".to_string()));
+        assert_eq!(p.act(r"C:\nope", Action::OpenFolder), Err("file not found".to_string()));
+        assert!(clip.0.lock().unwrap().is_empty());
+        assert!(rec.calls().is_empty());
     }
 
     #[test]

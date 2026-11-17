@@ -115,7 +115,7 @@ impl Providers {
             windows: control.windows,
             system: control.system,
             status: control.status,
-            files: FilesProvider::new(launcher.clone()),
+            files: FilesProvider::new(launcher.clone(), Arc::new(WindowsClipboard)),
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
@@ -417,7 +417,7 @@ pub fn run() {
             commands::hide,
             commands::toggle_pin,
             commands::past_searches,
-            commands::reveal,
+            commands::act,
             settings::settings_state,
             settings::settings_set,
             settings::settings_save_shortcut,
@@ -1022,9 +1022,10 @@ mod tests {
         let wins = (1..=8).map(|n| chrome_tab(n, &format!("Tab {n}"))).collect();
         let r = rig_with(apps, vec![], wins);
         let res = r.engine.query("g", None);
-        let windows = res.iter().filter(|i| i.provider == "windows").count();
+        // The first page of eight, what the bar shows.
+        let windows = res[..8].iter().filter(|i| i.provider == "windows").count();
         assert!(windows <= 3, "{windows} window rows");
-        assert_eq!(res.iter().filter(|i| i.provider == "apps").count(), 5);
+        assert_eq!(res[..8].iter().filter(|i| i.provider == "apps").count(), 5);
     }
 
     #[test]
@@ -1109,6 +1110,7 @@ mod tests {
                 "Esc",
                 "Ctrl+P",
                 "Up",
+                "Tab",
             ]
         );
         let flick = &help[15];
@@ -1119,7 +1121,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 22);
+        assert_eq!(r.engine.query("Help", None).len(), 23);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
@@ -1184,14 +1186,16 @@ mod tests {
             .chain((0..4).map(|i| file(&format!(r"C:\d\calculator {i}.py"))))
             .collect();
         let r = rig(vec![calculatrice, weak], files);
-        let res = r.engine.query("calc", None);
-        assert_eq!(res.len(), 8);
-        assert_eq!((res[0].provider, res[0].title.as_str()), ("apps", "Rekenmachine"), "{:?}", titles(&res));
-        assert!(titles(&res).contains(&"Math Tool".to_string()), "{:?}", titles(&res));
+        let all = r.engine.query("calc", None);
+        assert!(all.len() >= 8, "{:?}", titles(&all));
+        // The first page of eight, what the bar shows.
+        let res = &all[..8];
+        assert_eq!((res[0].provider, res[0].title.as_str()), ("apps", "Rekenmachine"), "{:?}", titles(res));
+        assert!(titles(res).contains(&"Math Tool".to_string()), "{:?}", titles(res));
         // Files hold at most five rows above the last other result; only rows
         // left over after every other result go to further files.
         let last_other = res.iter().rposition(|i| i.provider != "files").unwrap();
-        assert!(res[..last_other].iter().filter(|i| i.provider == "files").count() <= 5, "{:?}", titles(&res));
+        assert!(res[..last_other].iter().filter(|i| i.provider == "files").count() <= 5, "{:?}", titles(res));
         assert!(res.iter().all(|i| i.provider != "files" || i.score < 650));
     }
 

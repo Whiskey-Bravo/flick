@@ -5,11 +5,16 @@ use std::sync::Arc;
 use crate::fuzzy;
 use crate::history::History;
 use crate::pins::Pins;
-use crate::provider::{HelpLine, Modifier, Origin, Outcome, Provider, Query, ResultItem, Route};
+use crate::provider::{Action, HelpLine, Modifier, Origin, Outcome, Provider, Query, ResultItem, Route};
 use crate::ranking::Ranking;
 
-pub const MAX_RESULTS: usize = 8;
-/// Cap for routed and scoped queries (file lists, shell history, help).
+/// Cap for plain queries.
+pub const MAX_RESULTS: usize = 50;
+/// Rows the bar shows at once; plain-query shares apply per page of this many.
+pub const PAGE: usize = 8;
+/// Cap for the truly empty bar (welcome, pins, recents).
+pub const EMPTY_BAR_ROWS: usize = 8;
+/// Cap for routed, claimed and scoped queries (file lists, shell history, help).
 pub const ROUTED_MAX_RESULTS: usize = 50;
 /// Provider name of help items, and the word that routes to the help list.
 pub const HELP: &str = "help";
@@ -71,7 +76,9 @@ impl Engine {
     ///
     /// A scope wins over routes. Otherwise text that matches a provider's route
     /// (or the built-in `help` route) goes to that provider alone, with the
-    /// prefix removed; providers that own a route never see plain text.
+    /// prefix removed; providers that own a route never see plain text. Text a
+    /// provider claims by its shape (a typed path) goes, whole, to the first
+    /// such provider alone; `help` wins over a claim, a claim over prefixes.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
         let (mut rows, plain) = self.query_rows(text, scope);
         if !plain {
@@ -105,6 +112,11 @@ impl Engine {
         if let Some(rest) = strip_route(text, &HELP_ROUTE) {
             return (self.help_items(rest), false);
         }
+        // The first provider that claims the text by its shape.
+        if let Some(p) = self.providers.iter().find(|p| p.claims(text)) {
+            let q = Query { text: text.to_string(), scope: None };
+            return (self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false), false);
+        }
         for p in &self.providers {
             if let Some(rest) = p.route().and_then(|r| strip_route(text, &r)) {
                 let q = Query { text: rest.to_string(), scope: None };
@@ -117,7 +129,7 @@ impl Engine {
 
     /// The truly empty bar: the providers' own rows (welcome) in registration
     /// order, then pins, then recent launches that are not pinned, cut to
-    /// `MAX_RESULTS`. Pins that do not resolve are skipped, never removed. A
+    /// `EMPTY_BAR_ROWS`. Pins that do not resolve are skipped, never removed. A
     /// recent that does not resolve is forgotten, but only once its (known)
     /// provider has finished its first scan; before that it may just be missing
     /// from an index that is not built yet.
@@ -147,24 +159,28 @@ impl Engine {
         if !stale.is_empty() {
             self.history.forget_launches(&stale);
         }
-        rows.truncate(MAX_RESULTS);
+        rows.truncate(EMPTY_BAR_ROWS);
         rows
     }
 
     /// Whether `text` typed in `scope` is worth remembering as a past search:
-    /// not empty, not inside a scope, and not a route (`help`, `>`, ...).
+    /// not empty, not inside a scope, not a route (`help`, `>`, ...) and not
+    /// claimed (a typed path).
     fn searchable(&self, text: &str, scope: Option<&str>) -> bool {
         let text = text.trim();
         scope.is_none()
             && !text.is_empty()
             && strip_route(text, &HELP_ROUTE).is_none()
+            && !self.providers.iter().any(|p| p.claims(text))
             && !self.providers.iter().any(|p| p.route().is_some_and(|r| strip_route(text, &r).is_some()))
     }
 
     /// Sorted by score + boost, cut to `max`. With `shares` (plain queries),
-    /// `top` rows come first, and each provider
-    /// keeps at most its [`Provider::plain_share`] rows among the others'
-    /// results; its further items fill the rows left over, after them.
+    /// `top` rows come first, and the list is built a page of [`PAGE`] rows at
+    /// a time: within a page each provider keeps at most its
+    /// [`Provider::plain_share`] rows among the others' results; its further
+    /// items fill the page's rows left over, after them, and what the page
+    /// had no room for leads the next page, still in rank order.
     fn rank<'a>(
         &self,
         providers: impl Iterator<Item = &'a Box<dyn Provider>>,
@@ -193,23 +209,33 @@ impl Engine {
             ranked.truncate(max);
             return ranked.into_iter().map(|(_, _, item)| item).collect();
         }
-        let mut taken: std::collections::HashMap<&'static str, usize> = Default::default();
-        let (mut kept, mut spill) = (Vec::new(), Vec::new());
-        for (_, share, item) in ranked {
-            let n = taken.entry(item.provider).or_default();
-            if *n < share {
-                *n += 1;
-                kept.push(item);
-            } else {
-                spill.push(item);
+        let mut pending: std::collections::VecDeque<(usize, ResultItem)> =
+            ranked.into_iter().map(|(_, share, item)| (share, item)).collect();
+        let mut out = Vec::new();
+        while out.len() < max && !pending.is_empty() {
+            let mut taken: std::collections::HashMap<&'static str, usize> = Default::default();
+            let (mut kept, mut spill) = (Vec::new(), Vec::new());
+            while kept.len() < PAGE {
+                let Some((share, item)) = pending.pop_front() else { break };
+                let n = taken.entry(item.provider).or_default();
+                if *n < share {
+                    *n += 1;
+                    kept.push(item);
+                } else {
+                    spill.push((share, item));
+                }
             }
-            if kept.len() == max {
-                break;
+            let room = PAGE - kept.len();
+            let mut spill = spill.into_iter();
+            kept.extend(spill.by_ref().take(room).map(|(_, item)| item));
+            // Spilled rows were ranked above everything not yet looked at.
+            for row in spill.rev() {
+                pending.push_front(row);
             }
+            out.extend(kept);
         }
-        let room = max - kept.len();
-        kept.extend(spill.into_iter().take(room));
-        kept
+        out.truncate(max);
+        out
     }
 
     /// Every provider's help lines in registration order, then the engine's own,
@@ -220,6 +246,7 @@ impl Engine {
             HelpLine { example: "Esc".into(), about: "close the bar".into(), fill: String::new() },
             HelpLine { example: "Ctrl+P".into(), about: "pin or unpin the selected row".into(), fill: String::new() },
             HelpLine { example: "Up".into(), about: "recall past searches (empty bar)".into(), fill: String::new() },
+            HelpLine { example: "Tab".into(), about: "show the actions for the selected row".into(), fill: String::new() },
         ];
         self.providers
             .iter()
@@ -265,8 +292,10 @@ impl Engine {
         self.provider(provider).is_none_or(|p| p.ready())
     }
 
-    pub fn reveal(&self, provider: &str, id: &str) -> Result<(), String> {
-        self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.reveal(id)
+    /// Runs a row's menu action. Nothing is ranked or recorded: an action is
+    /// not a launch.
+    pub fn act(&self, provider: &str, id: &str, action: Action) -> Result<Outcome, String> {
+        self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action)
     }
 
     /// `text` and `scope` are what the bar held when the row was picked. A launch
@@ -346,6 +375,10 @@ mod tests {
         top: bool,
         /// `Query.text` of every query this provider received.
         seen: std::sync::Mutex<Vec<String>>,
+        /// Claims text that starts with this.
+        claims: Option<&'static str>,
+        /// Every `act` call.
+        acted: std::sync::Mutex<Vec<(String, Action)>>,
     }
 
     impl FakeProvider {
@@ -365,6 +398,8 @@ mod tests {
                 pinnable: true,
                 top: false,
                 seen: Default::default(),
+                claims: None,
+                acted: Default::default(),
             }
         }
     }
@@ -384,6 +419,13 @@ mod tests {
         }
         fn plain_share(&self) -> usize {
             self.share
+        }
+        fn claims(&self, text: &str) -> bool {
+            self.claims.is_some_and(|c| text.starts_with(c))
+        }
+        fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
+            self.acted.lock().unwrap().push((id.to_string(), action));
+            Ok(Outcome::Hide)
         }
         fn ready(&self) -> bool {
             self.ready
@@ -517,7 +559,7 @@ mod tests {
             h.record_launch("a", &i.to_string());
         }
         let rows = e.query("", None);
-        assert_eq!(rows.len(), MAX_RESULTS);
+        assert_eq!(rows.len(), EMPTY_BAR_ROWS);
         assert_eq!(rows.iter().filter(|r| r.origin == Origin::Recent).count(), 0);
     }
 
@@ -708,15 +750,44 @@ mod tests {
     }
 
     #[test]
-    fn engine_item_and_reveal_route_to_the_provider() {
+    fn engine_item_routes_to_the_provider() {
         let (e, _, _dir) = engine_boxed(vec![Box::new(FakeProvider::new("a", vec![("x", "Ex", 500)]))]);
         let row = e.item("a", "x").unwrap();
         assert_eq!((row.id.as_str(), row.title.as_str(), row.provider, row.score), ("x", "Ex", "a", 0));
         assert!(e.item("a", "nope").is_none());
         assert!(e.item("nope", "x").is_none());
         assert!(e.ready("a"));
-        assert!(e.reveal("nope", "x").is_err());
-        assert!(e.reveal("a", "x").is_err());
+    }
+
+    #[test]
+    fn act_routes_to_the_provider_and_records_nothing() {
+        let a = Arc::new(FakeProvider::new("a", vec![("x", "Ex", 500)]));
+        let (e, ranking, h, _, dir) = engine_stores(vec![Box::new(a.clone())]);
+        assert_eq!(e.act("a", "x", Action::CopyPath), Ok(Outcome::Hide));
+        assert_eq!(*a.acted.lock().unwrap(), [("x".to_string(), Action::CopyPath)]);
+        assert_eq!(ranking.boost("a", "x"), 0);
+        assert!(h.recents().is_empty() && h.searches().is_empty());
+        assert!(!dir.path().join("picks.json").exists());
+        assert!(e.act("nope", "x", Action::CopyPath).is_err());
+    }
+
+    #[test]
+    fn act_and_claims_default_to_nothing() {
+        struct Bare;
+        impl Provider for Bare {
+            fn name(&self) -> &'static str {
+                "bare"
+            }
+            fn query(&self, _q: &Query) -> Vec<ResultItem> {
+                vec![]
+            }
+            fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+                Ok(Outcome::Hide)
+            }
+        }
+        let (e, _, _dir) = engine_boxed(vec![Box::new(Bare)]);
+        assert_eq!(e.act("bare", "x", Action::Reveal), Err("can't do that here".to_string()));
+        assert!(!Bare.claims("C:\\x"));
     }
 
     #[test]
@@ -782,15 +853,20 @@ mod tests {
         assert_eq!(titles, ["zz", "aaa", "bbb"]);
     }
 
+    /// `n` items `{prefix}0..` at `score`, ids leaked to `'static`.
+    fn numbered(prefix: &str, n: usize, score: u32) -> Vec<Item> {
+        (0..n)
+            .map(|i| {
+                let id: &'static str = Box::leak(format!("{prefix}{i}").into_boxed_str());
+                (id, id, score)
+            })
+            .collect()
+    }
+
     #[test]
-    fn truncates_to_max_results() {
-        let items: Vec<Item> = vec![
-            ("0", "t", 1), ("1", "t", 1), ("2", "t", 1), ("3", "t", 1), ("4", "t", 1),
-            ("5", "t", 1), ("6", "t", 1), ("7", "t", 1), ("8", "t", 1), ("9", "t", 1),
-            ("10", "t", 1), ("11", "t", 1), ("12", "t", 1), ("13", "t", 1), ("14", "t", 1),
-            ("15", "t", 1), ("16", "t", 1), ("17", "t", 1), ("18", "t", 1), ("19", "t", 1),
-        ];
-        let (e, _, _dir) = engine(vec![FakeProvider::new("a", items)]);
+    fn plain_queries_return_up_to_50() {
+        let (e, _, _dir) = engine(vec![FakeProvider::new("a", numbered("", 60, 1))]);
+        assert_eq!(MAX_RESULTS, 50);
         assert_eq!(e.query("x", None).len(), MAX_RESULTS);
     }
 
@@ -982,7 +1058,7 @@ mod tests {
     fn help_word_ignores_case() {
         let (e, _dir) = help_engine();
         let all = e.query("Help", None);
-        assert_eq!(all.len(), 7);
+        assert_eq!(all.len(), 8);
         assert!(all.iter().all(|i| i.provider == HELP));
         let r = e.query("HELP blue", None);
         assert_eq!(r.len(), 1);
@@ -1014,6 +1090,78 @@ mod tests {
         assert!(seen(&sh).is_empty());
     }
 
+    /// A plain provider, then a claimer for text starting with `prefix`; both shared.
+    fn engine_with_claimer(prefix: &'static str) -> (Engine, Arc<FakeProvider>, Arc<FakeProvider>, tempfile::TempDir) {
+        let mut claimer = FakeProvider::new("files", vec![("c", "claimed", 100)]);
+        claimer.claims = Some(prefix);
+        let claimer = Arc::new(claimer);
+        let plain = Arc::new(FakeProvider::new("plain", vec![("p", "plain", 900)]));
+        let (e, _, dir) = engine_boxed(vec![Box::new(plain.clone()), Box::new(claimer.clone())]);
+        (e, claimer, plain, dir)
+    }
+
+    #[test]
+    fn claimed_text_goes_only_to_the_claiming_provider() {
+        let (e, claimer, plain, _dir) = engine_with_claimer("C:\\");
+        let r = e.query(" C:\\x ", None);
+        assert_eq!(r.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["c"]);
+        assert_eq!(seen(&claimer), ["C:\\x"]);
+        assert!(seen(&plain).is_empty());
+        // Other text is a plain query: the claim route is not taken.
+        let r = e.query("cx", None);
+        assert_eq!(r[0].id, "p");
+        assert_eq!(seen(&plain), ["cx"]);
+    }
+
+    #[test]
+    fn claimed_queries_allow_50_results_and_ignore_shares() {
+        let mut claimer = FakeProvider::new("files", numbered("f", 60, 1));
+        claimer.claims = Some("C:\\");
+        claimer.share = 5;
+        let (e, _, _dir) = engine(vec![claimer, FakeProvider::new("apps", vec![("a", "app", 500)])]);
+        let r = e.query("C:\\x", None);
+        assert_eq!(r.len(), ROUTED_MAX_RESULTS);
+        assert!(r.iter().all(|i| i.provider == "files"));
+    }
+
+    #[test]
+    fn scope_and_help_win_over_a_claim() {
+        // This claimer claims every text.
+        let (e, claimer, _, _dir) = engine_with_claimer("");
+        let mut owner = FakeProvider::new("owner", vec![("o", "mine", 100)]);
+        owner.scope = Some("proj");
+        let claimer2 = claimer.clone();
+        let (e2, _, _d2) = engine_boxed(vec![Box::new(claimer2), Box::new(owner)]);
+        let r = e2.query("C:\\x", Some("proj"));
+        assert_eq!(r.iter().map(|i| i.provider).collect::<Vec<_>>(), ["owner"]);
+        let r = e.query("help", None);
+        assert!(!r.is_empty() && r.iter().all(|i| i.provider == HELP));
+        assert!(seen(&claimer).is_empty());
+    }
+
+    #[test]
+    fn claimed_text_is_not_a_past_search() {
+        let mut claimer = FakeProvider::new("files", vec![("x", "X", 1)]);
+        claimer.claims = Some("C:\\");
+        let (e, _, h, _, _dir) = engine_stores(vec![Box::new(claimer)]);
+        e.activate("files", "x", Modifier::None, "C:\\x", None).unwrap();
+        assert!(h.searches().is_empty());
+        assert_eq!(h.recents(), [pair("files", "x")]);
+        e.activate("files", "x", Modifier::None, "x", None).unwrap();
+        assert_eq!(h.searches(), ["x"]);
+    }
+
+    #[test]
+    fn claims_and_act_are_forwarded_through_arc() {
+        let mut claimer = FakeProvider::new("files", vec![]);
+        claimer.claims = Some("C:\\");
+        let shared = Arc::new(claimer);
+        assert!(Provider::claims(&shared, "C:\\x"));
+        assert!(!Provider::claims(&shared, "x"));
+        assert_eq!(Provider::act(&shared, "i", Action::Reveal), Ok(Outcome::Hide));
+        assert_eq!(*shared.acted.lock().unwrap(), [("i".to_string(), Action::Reveal)]);
+    }
+
     #[test]
     fn scope_wins_over_route() {
         let mut owner = FakeProvider::new("owner", vec![("1", "mine", 100)]);
@@ -1034,12 +1182,10 @@ mod tests {
             FakeProvider::new("plain", vec![]),
         );
         assert_eq!(e.query("> x", None).len(), ROUTED_MAX_RESULTS);
-        let mut owner = FakeProvider::new("owner", items.clone());
+        let mut owner = FakeProvider::new("owner", items);
         owner.scope = Some("proj");
         let (e2, _, _d2) = engine(vec![owner]);
         assert_eq!(e2.query("x", Some("proj")).len(), ROUTED_MAX_RESULTS);
-        let (e3, _, _d3) = engine(vec![FakeProvider::new("plain", items)]);
-        assert_eq!(e3.query("x", None).len(), MAX_RESULTS);
     }
 
     fn help_engine() -> (Engine, tempfile::TempDir) {
@@ -1056,16 +1202,17 @@ mod tests {
         let (e, _dir) = help_engine();
         let r = e.query("help", None);
         let titles: Vec<_> = r.iter().map(|i| i.title.as_str()).collect();
-        assert_eq!(titles, ["blender", "bluetooth", "> ls", "help", "Esc", "Ctrl+P", "Up"]);
+        assert_eq!(titles, ["blender", "bluetooth", "> ls", "help", "Esc", "Ctrl+P", "Up", "Tab"]);
         assert!(r.iter().all(|i| i.provider == HELP && !i.confirm));
         let scores: Vec<_> = r.iter().map(|i| i.score).collect();
-        assert_eq!(scores, [1000, 999, 998, 997, 996, 995, 994]);
+        assert_eq!(scores, [1000, 999, 998, 997, 996, 995, 994, 993]);
         assert_eq!(r[2].id, "> ");
         assert_eq!(r[2].subtitle, "run a command");
         assert_eq!(r[3].subtitle, "show this list");
         assert_eq!(r[4].subtitle, "close the bar");
         assert_eq!(r[5].subtitle, "pin or unpin the selected row");
         assert_eq!(r[6].subtitle, "recall past searches (empty bar)");
+        assert_eq!((r[7].subtitle.as_str(), r[7].id.as_str()), ("show the actions for the selected row", ""));
     }
 
     #[test]
@@ -1099,17 +1246,37 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_provider_leaves_rows_for_others_then_fills_the_rest() {
+    fn shares_apply_per_page_of_eight() {
+        // The first page is what a single 8-row list gave; the spill follows.
         let (e, _, _dir) = engine(vec![capped_files(), FakeProvider::new("apps", vec![("a", "app", 500)])]);
         let r = e.query("x", None);
         let rows: Vec<_> = r.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(rows, ["f0", "f1", "f2", "f3", "f4", "a", "f5", "f6"]);
+        assert_eq!(rows, ["f0", "f1", "f2", "f3", "f4", "a", "f5", "f6", "f7"]);
+
+        let mut files = FakeProvider::new("files", numbered("f", 20, 600));
+        files.share = 5;
+        let (e, _, _dir) = engine(vec![files, FakeProvider::new("apps", numbered("a", 10, 500))]);
+        let r = e.query("x", None);
+        assert_eq!(r.len(), 30);
+        let mut apps_left = 10;
+        for page in r.chunks(PAGE) {
+            let files = page.iter().filter(|i| i.provider == "files").count();
+            if apps_left > 0 {
+                assert!(files <= 5, "{:?}", page.iter().map(|i| &i.id).collect::<Vec<_>>());
+            }
+            apps_left -= page.len() - files;
+        }
+        // Each provider's rows keep their rank order.
+        let ids = |p: &str| r.iter().filter(|i| i.provider == p).map(|i| i.id.clone()).collect::<Vec<_>>();
+        let expect = |prefix: &str, n: usize| numbered(prefix, n, 0).iter().map(|i| i.0.to_string()).collect::<Vec<_>>();
+        assert_eq!(ids("apps"), expect("a", 10));
+        assert_eq!(ids("files"), expect("f", 20));
     }
 
     #[test]
     fn a_capped_provider_alone_fills_every_row() {
         let (e, _, _dir) = engine(vec![capped_files(), FakeProvider::new("apps", vec![])]);
-        assert_eq!(e.query("x", None).len(), MAX_RESULTS);
+        assert_eq!(e.query("x", None).len(), 8);
     }
 
     #[test]
