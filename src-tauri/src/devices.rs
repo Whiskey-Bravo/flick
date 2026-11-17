@@ -50,34 +50,47 @@ fn is_bluetooth(filter: &str) -> bool {
 
 /// The endpoints' Bluetooth filters as devices, each with every filter id it
 /// owns. Endpoints sharing a filter (a headset's stereo and hands-free ones)
-/// make one device; filters of the same name are one device too, so a
-/// headset never shows twice. Connected when any endpoint is active.
+/// make one device; filters whose own device name (never a fallback name) is
+/// the same are one device too, so a headset never shows twice. Connected
+/// when any endpoint is active.
 fn group(seen: &[Seen]) -> Vec<(BtDevice, Vec<String>)> {
-    let mut out: Vec<(BtDevice, Vec<String>)> = Vec::new();
+    // Each device with its filters and whether its name is the filter's own.
+    let mut out: Vec<(BtDevice, Vec<String>, bool)> = Vec::new();
     for s in seen.iter().filter(|s| is_bluetooth(&s.filter)) {
-        if let Some((device, _)) = out.iter_mut().find(|(_, filters)| filters.contains(&s.filter)) {
+        if let Some((device, _, _)) = out.iter_mut().find(|(_, filters, _)| filters.contains(&s.filter)) {
             device.connected |= s.active;
             continue;
         }
-        let name = s
-            .filter_name
-            .clone()
-            .or_else(|| s.endpoint_name.clone())
-            .filter(|n| !n.trim().is_empty())
+        // Only a name read from the filter device itself joins filters: a
+        // fallback name says nothing about which device it is.
+        let own_name = s.filter_name.clone().filter(|n| !n.trim().is_empty());
+        if let Some(own) = &own_name {
+            if let Some((device, filters, _)) = out.iter_mut().find(|(d, _, named)| *named && d.name == *own) {
+                device.connected |= s.active;
+                filters.push(s.filter.clone());
+                continue;
+            }
+        }
+        let named = own_name.is_some();
+        let name = own_name
+            .or_else(|| s.endpoint_name.clone().filter(|n| !n.trim().is_empty()))
             .unwrap_or_else(|| "Bluetooth audio device".to_string());
-        if let Some((device, filters)) = out.iter_mut().find(|(d, _)| d.name == name) {
-            device.connected |= s.active;
-            filters.push(s.filter.clone());
-            continue;
-        }
-        out.push((BtDevice { id: s.filter.clone(), name, connected: s.active }, vec![s.filter.clone()]));
+        out.push((BtDevice { id: s.filter.clone(), name, connected: s.active }, vec![s.filter.clone()], named));
     }
-    out
+    out.into_iter().map(|(d, f, _)| (d, f)).collect()
 }
 
 /// The filter ids of the device `id` names (its own id or any of its filters).
 fn filters_of(groups: &[(BtDevice, Vec<String>)], id: &str) -> Option<Vec<String>> {
     groups.iter().find(|(d, f)| d.id == id || f.iter().any(|x| x == id)).map(|(_, f)| f.clone())
+}
+
+/// `primary`, or `fallback` when it fails; both errors when both do.
+fn first_working<T>(
+    primary: impl FnOnce() -> Result<T, String>,
+    fallback: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    primary().or_else(|first| fallback().map_err(|second| format!("{first}; {second}")))
 }
 
 /// The real thing, through the audio endpoints' KS filters: the one-shot
@@ -88,7 +101,7 @@ pub struct KsBtAudio;
 impl BtAudio for KsBtAudio {
     fn list(&self) -> Result<Vec<BtDevice>, String> {
         crate::launch::with_com(|| {
-            let (seen, _) = ks::read()?;
+            let (seen, _, _) = ks::read()?;
             Ok(group(&seen).into_iter().map(|(d, _)| d).collect())
         })
     }
@@ -103,7 +116,7 @@ impl BtAudio for KsBtAudio {
 }
 
 mod ks {
-    use super::{filters_of, group, Seen};
+    use super::{filters_of, first_working, group, Seen};
     use std::collections::HashMap;
     use std::ffi::c_void;
     use windows::core::{Interface, GUID, PCWSTR, PWSTR};
@@ -164,9 +177,10 @@ mod ks {
         }
     }
 
-    /// Every active or unplugged endpoint with its Bluetooth filter, and the
-    /// filters' parts by id. COM must be initialised on this thread.
-    pub fn read() -> Result<(Vec<Seen>, HashMap<String, IPart>), String> {
+    /// Every active or unplugged endpoint with its Bluetooth filter, the
+    /// filters' parts by id, and the enumerator that found them. COM must be
+    /// initialised on this thread.
+    pub fn read() -> Result<(Vec<Seen>, HashMap<String, IPart>, IMMDeviceEnumerator), String> {
         // SAFETY: COM objects and strings are released before returning
         // (drops and `take`); the caller runs inside `with_com`.
         unsafe {
@@ -196,20 +210,27 @@ mod ks {
                 seen.push(Seen { filter: filter.clone(), filter_name, endpoint_name: friendly_name(&endpoint), active });
                 parts.entry(filter).or_insert(part);
             }
-            Ok((seen, parts))
+            Ok((seen, parts, enumerator))
         }
     }
 
     /// Sends the one-shot `property` to every filter of the device `id`;
     /// fine when any filter takes it. COM must be initialised on this thread.
     pub fn oneshot(id: &str, property: u32) -> Result<(), String> {
-        let (seen, parts) = read()?;
+        let (seen, parts, enumerator) = read()?;
         let filters = filters_of(&group(&seen), id).ok_or_else(|| "device not found".to_string())?;
         let (mut sent, mut error) = (false, "device not found".to_string());
         for filter in filters {
             let Some(part) = parts.get(&filter) else { continue };
-            // SAFETY: the part is alive; the property outlives the call.
-            match unsafe { send(part, property) } {
+            // The connector part's KS control first; the filter device's own
+            // when the part does not hand one out (it is not in the part's
+            // documented list).
+            // SAFETY: the part and enumerator are alive on this thread.
+            let result = first_working(
+                || unsafe { send(&part_control(part)?, property) },
+                || unsafe { send(&device_control(&enumerator, &filter)?, property) },
+            );
+            match result {
                 Ok(()) => sent = true,
                 Err(e) => error = e,
             }
@@ -221,16 +242,39 @@ mod ks {
         }
     }
 
+    /// The connector part's KS control.
+    ///
     /// # Safety
     /// COM is initialised on this thread.
-    unsafe fn send(part: &IPart, property: u32) -> Result<(), String> {
+    unsafe fn part_control(part: &IPart) -> Result<IKsControl, String> {
         unsafe {
             let mut raw: *mut c_void = std::ptr::null_mut();
             part.Activate(CLSCTX_INPROC_SERVER.0, &IKsControl::IID, Some(&mut raw)).map_err(|e| e.to_string())?;
             if raw.is_null() {
                 return Err("no KS control".to_string());
             }
-            let control = IKsControl::from_raw(raw);
+            Ok(IKsControl::from_raw(raw))
+        }
+    }
+
+    /// The KS control of the filter device itself.
+    ///
+    /// # Safety
+    /// COM is initialised on this thread.
+    unsafe fn device_control(enumerator: &IMMDeviceEnumerator, filter: &str) -> Result<IKsControl, String> {
+        let wide: Vec<u16> = filter.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let device = enumerator.GetDevice(PCWSTR(wide.as_ptr())).map_err(|e| e.to_string())?;
+            device.Activate::<IKsControl>(CLSCTX_ALL, None).map_err(|e| e.to_string())
+        }
+    }
+
+    /// Sends the one-shot `property` through `control`.
+    ///
+    /// # Safety
+    /// COM is initialised on this thread.
+    unsafe fn send(control: &IKsControl, property: u32) -> Result<(), String> {
+        unsafe {
             let ks = KSIDENTIFIER {
                 Anonymous: KSIDENTIFIER_0 {
                     Anonymous: KSIDENTIFIER_0_0 { Set: KSPROPSETID_BT_AUDIO, Id: property, Flags: KSPROPERTY_TYPE_GET },
@@ -250,29 +294,69 @@ pub struct WlanWifi;
 impl Wifi for WlanWifi {
     fn profiles(&self) -> Result<Vec<WifiProfile>, String> {
         let client = wlan::Client::open()?;
-        let mut out: Vec<WifiProfile> = Vec::new();
-        for interface in client.interfaces()? {
-            let current = client.current(&interface);
-            for name in client.profiles(&interface)? {
-                let connected = current.as_deref() == Some(name.as_str());
-                match out.iter_mut().find(|p| p.name == name) {
-                    Some(p) => p.connected |= connected,
-                    None => out.push(WifiProfile { name, connected }),
-                }
-            }
-        }
-        Ok(out)
+        let read = client
+            .interfaces()?
+            .iter()
+            .map(|interface| (client.profiles(interface), client.current(interface)))
+            .collect();
+        merge_profiles(read)
     }
 
     fn connect(&self, name: &str) -> Result<(), String> {
         let client = wlan::Client::open()?;
-        for interface in client.interfaces()? {
-            if client.profiles(&interface)?.iter().any(|p| p == name) {
-                return client.connect(&interface, name);
+        join_first(&client.interfaces()?, name, |i| client.profiles(i), |i| client.connect(i, name))
+    }
+}
+
+/// Every interface's saved profiles (and the one it is connected with) as
+/// one list, deduplicated by name. An interface whose list cannot be read is
+/// skipped; an error only when every interface failed.
+fn merge_profiles(per_interface: Vec<(Result<Vec<String>, String>, Option<String>)>) -> Result<Vec<WifiProfile>, String> {
+    let mut out: Vec<WifiProfile> = Vec::new();
+    let (mut read_any, mut error) = (per_interface.is_empty(), None);
+    for (profiles, current) in per_interface {
+        let names = match profiles {
+            Ok(names) => names,
+            Err(e) => {
+                error = Some(e);
+                continue;
+            }
+        };
+        read_any = true;
+        for name in names {
+            let connected = current.as_deref() == Some(name.as_str());
+            match out.iter_mut().find(|p| p.name == name) {
+                Some(p) => p.connected |= connected,
+                None => out.push(WifiProfile { name, connected }),
             }
         }
-        Err("no such saved network".to_string())
     }
+    match (read_any, error) {
+        (false, Some(e)) => Err(e),
+        _ => Ok(out),
+    }
+}
+
+/// Joins `name` on the first interface that holds it and takes the join;
+/// an interface whose list or join fails is skipped.
+fn join_first<I>(
+    interfaces: &[I],
+    name: &str,
+    profiles: impl Fn(&I) -> Result<Vec<String>, String>,
+    connect: impl Fn(&I) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut error = "no such saved network".to_string();
+    for interface in interfaces {
+        match profiles(interface) {
+            Ok(names) if names.iter().any(|n| n == name) => match connect(interface) {
+                Ok(()) => return Ok(()),
+                Err(e) => error = e,
+            },
+            Ok(_) => {}
+            Err(e) => error = e,
+        }
+    }
+    Err(error)
 }
 
 mod wlan {
@@ -599,6 +683,80 @@ mod tests {
     fn the_endpoint_name_is_only_a_fallback() {
         let groups = group(&[seen(STEREO, None, "Headphones (Speaker)", true)]);
         assert_eq!(groups[0].0.name, "Headphones (Speaker)");
+    }
+
+    #[test]
+    fn unnamed_devices_stay_apart() {
+        let groups = group(&[
+            seen(STEREO, None, "Headphones", false),
+            seen(HANDS_FREE, None, "Headphones", true),
+        ]);
+        assert_eq!(groups.len(), 2);
+        let generic = group(&[
+            Seen { filter: STEREO.into(), filter_name: None, endpoint_name: None, active: false },
+            Seen { filter: HANDS_FREE.into(), filter_name: None, endpoint_name: None, active: false },
+        ]);
+        assert_eq!(generic.len(), 2);
+        assert!(generic.iter().all(|(d, _)| d.name == "Bluetooth audio device"));
+    }
+
+    #[test]
+    fn an_own_name_never_joins_a_fallback_name() {
+        let groups = group(&[
+            seen(STEREO, None, "Speaker", false),
+            seen(HANDS_FREE, Some("Speaker"), "Headset (Speaker)", false),
+        ]);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn the_fallback_runs_only_when_the_first_way_fails() {
+        let ran = std::cell::Cell::new(false);
+        assert_eq!(first_working(|| Ok(1), || { ran.set(true); Ok(2) }), Ok(1));
+        assert!(!ran.get());
+        assert_eq!(first_working(|| Err::<u32, _>("part".to_string()), || Ok(2)), Ok(2));
+        assert_eq!(
+            first_working(|| Err::<u32, _>("part".to_string()), || Err("device".to_string())),
+            Err("part; device".to_string())
+        );
+    }
+
+    fn names(list: &[&str]) -> Result<Vec<String>, String> {
+        Ok(list.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_failing_interface_is_skipped_when_reading_profiles() {
+        let merged = merge_profiles(vec![
+            (Err("denied".to_string()), None),
+            (names(&["Home-5G", "Office"]), Some("Office".to_string())),
+            (names(&["Office"]), None),
+        ]);
+        assert_eq!(
+            merged,
+            Ok(vec![WifiProfile { name: "Home-5G".into(), connected: false }, WifiProfile { name: "Office".into(), connected: true }])
+        );
+        assert_eq!(merge_profiles(vec![(Err("a".into()), None), (Err("b".into()), None)]), Err("b".to_string()));
+        assert_eq!(merge_profiles(vec![]), Ok(vec![]));
+    }
+
+    #[test]
+    fn joining_skips_failing_interfaces() {
+        let joined = std::cell::RefCell::new(Vec::new());
+        let lists = |i: &u32| match i {
+            0 => Err("denied".to_string()),
+            1 | 2 => names(&["Home-5G"]),
+            _ => names(&[]),
+        };
+        let connect = |i: &u32| {
+            joined.borrow_mut().push(*i);
+            if *i == 1 { Err("busy".to_string()) } else { Ok(()) }
+        };
+        assert_eq!(join_first(&[0, 3, 1, 2], "Home-5G", lists, connect), Ok(()));
+        assert_eq!(*joined.borrow(), vec![1, 2]);
+        assert_eq!(join_first(&[0, 1], "Home-5G", lists, connect), Err("busy".to_string()));
+        assert_eq!(join_first(&[0], "Home-5G", lists, connect), Err("denied".to_string()));
+        assert_eq!(join_first(&[3], "Home-5G", lists, connect), Err("no such saved network".to_string()));
     }
 
     /// By hand: `cargo test --lib real_devices_read -- --ignored --nocapture`.
