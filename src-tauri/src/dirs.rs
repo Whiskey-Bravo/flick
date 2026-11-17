@@ -242,6 +242,12 @@ impl<T: Send + Sync + 'static> Loader<T> {
         }
     }
 
+    /// Whether a read for `key` is in flight. Never starts one.
+    pub fn reading(&self, key: &str) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.slots.get(key).is_some_and(|s| s.reading.is_some())
+    }
+
     fn start(self: &Arc<Self>, key: String, id: u64, load: impl FnOnce() -> Result<T, ReadError> + Send + 'static, first: bool) {
         if first {
             let weak: Weak<Self> = Arc::downgrade(self);
