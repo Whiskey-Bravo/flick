@@ -1,5 +1,12 @@
 import { useEffect, useRef, useState } from "preact/hooks";
-import { settingsClearHistory, settingsPauseHotkey, settingsSetStartAtLogin, type SettingsState } from "./api";
+import {
+  onSettingsChanged,
+  settingsClearHistory,
+  settingsPauseHotkey,
+  settingsSetStartAtLogin,
+  settingsWinKeyStatus,
+  type SettingsState,
+} from "./api";
 import { hotkeyFromEvent, hotkeyKeys } from "./hotkey";
 import { useSaver } from "./saver";
 
@@ -15,6 +22,24 @@ export function General({ state }: { state: SettingsState }) {
   const [loginError, setLoginError] = useState("");
   const [cleared, setCleared] = useState(false);
   const [clearError, setClearError] = useState("");
+  const [winKeyStatus, setWinKeyStatus] = useState<string | null>(null);
+
+  // Asked again whenever the config reloads; a rejection (no answer yet) reads as "fine".
+  useEffect(() => {
+    let alive = true;
+    const ask = () => {
+      settingsWinKeyStatus().then(
+        (s) => alive && setWinKeyStatus(s),
+        () => alive && setWinKeyStatus(null),
+      );
+    };
+    ask();
+    const unlisten = onSettingsChanged(ask);
+    return () => {
+      alive = false;
+      void unlisten.then((u) => u(), () => {});
+    };
+  }, []);
 
   // The global hotkey is released while capturing, or pressing it would toggle the bar.
   const pause = (on: boolean) => {
@@ -115,6 +140,20 @@ export function General({ state }: { state: SettingsState }) {
           Start at login
         </label>
         {loginError && <p class="error">{loginError}</p>}
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input
+            type="checkbox"
+            checked={config.win_key}
+            onChange={(e) => void save("win_key", { key: "win_key", value: e.currentTarget.checked })}
+          />
+          Win key opens Flick
+        </label>
+        <p class="hint">Ctrl+Esc or the Start menu row still open Start.</p>
+        {config.win_key && winKeyStatus && <p class="error">{winKeyStatus}</p>}
+        {errors.win_key && <p class="error">{errors.win_key}</p>}
       </div>
 
       <div class="field">

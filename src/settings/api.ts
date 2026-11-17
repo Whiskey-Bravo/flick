@@ -44,6 +44,7 @@ export type Config = {
   temperature_unit: string;
   search_engine: string;
   check_updates: boolean;
+  win_key: boolean;
   shortcut: ShortcutDef[];
   workspace: WorkspaceDef[];
   direct_hotkey: DirectHotkeyDef[];
@@ -71,7 +72,8 @@ export type Setting =
   | { key: "currency"; value: string }
   | { key: "temperature_unit"; value: string }
   | { key: "search_engine"; value: string }
-  | { key: "check_updates"; value: boolean };
+  | { key: "check_updates"; value: boolean }
+  | { key: "win_key"; value: boolean };
 
 export type ShortcutField = "name" | "aliases" | "target" | "terminal" | "admin" | "pick" | "choices";
 
@@ -125,7 +127,9 @@ export const settingsSaveHotkey = (original: string | null, def: DirectHotkeyDef
   invoke<void>("settings_save_hotkey", { original, def });
 export const settingsDeleteHotkey = (keys: string) => invoke<void>("settings_delete_hotkey", { keys });
 export const settingsHotkeyStatus = () => invoke<KeyStatusRow[]>("settings_hotkey_status");
-export const settingsOpenFile = () => invoke<void>("settings_open_file");
+/** Why the Win key cannot open Flick right now, or null when it can (or the switch is off). */
+export const settingsWinKeyStatus = () => invoke<string | null>("settings_win_key_status");
+export const settingsOpenFile =() => invoke<void>("settings_open_file");
 
 /** Runs `handler` when a list the picker searches (devices, drives, Wi-Fi) has been read. */
 export const onAnswersReady = (handler: () => void): Promise<UnlistenFn> => listen("answers:ready", handler);
