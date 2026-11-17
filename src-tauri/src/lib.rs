@@ -3,6 +3,7 @@ mod clipboard;
 mod commands;
 mod config;
 mod config_edit;
+mod controls;
 mod engine;
 mod fuzzy;
 mod history;
