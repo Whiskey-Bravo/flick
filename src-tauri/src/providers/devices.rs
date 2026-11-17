@@ -75,7 +75,6 @@ pub struct DevicesProvider {
 }
 
 impl DevicesProvider {
-    #[allow(dead_code)]
     pub fn new(bt: Arc<dyn BtAudio>, wifi: Arc<dyn Wifi>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             bt,

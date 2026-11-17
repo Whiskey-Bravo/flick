@@ -4,9 +4,6 @@
 //! the registry sits behind [`GameFiles`] and [`GameSource`]; scanning runs on
 //! a background thread, never on the query path.
 
-// Not registered until the launcher wiring; the compiler would call it all dead.
-#![allow(dead_code)]
-
 use crate::uninstall::{split_command, Program, ProgramSource, RegistryPrograms};
 use std::path::{Path, PathBuf};
 

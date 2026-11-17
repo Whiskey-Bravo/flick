@@ -1,7 +1,5 @@
 //! Online lookups that wait for typing to pause: one key waits at a time, one
 //! worker thread runs its job, and answers are kept in memory only.
-// Until lib.rs registers the words provider (Task 13).
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};

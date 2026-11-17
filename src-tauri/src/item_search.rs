@@ -1,9 +1,6 @@
 //! The Settings item picker's backend: searches through the engine, like the
 //! bar, and keeps only rows a workspace or a direct hotkey can store.
 
-// Not registered until the launcher wiring; the compiler would call it all dead.
-#![allow(dead_code)]
-
 use crate::config::ItemRef;
 use crate::engine::HELP;
 use crate::provider::ResultItem;
@@ -52,6 +49,11 @@ pub fn found(item: Option<&ResultItem>, provider_ready: bool) -> bool {
 
 #[tauri::command(async)]
 pub fn settings_search_items(text: String, for_workspace: bool, state: State<AppState>) -> Vec<PickRow> {
+    // Typed commands give no row that can be stored: never start a `tr`/`def`
+    // lookup or a device or drive read for text typed in the picker.
+    if state.providers.typed_command(&text) {
+        return Vec::new();
+    }
     pick_rows(state.engine.query(&text, None), for_workspace)
 }
 

@@ -3,9 +3,6 @@
 //! The items run on a background thread through an [`ItemRunner`] (the engine);
 //! the provider itself only reads its list on the query path.
 
-// Not registered until the launcher wiring; the compiler would call it all dead.
-#![allow(dead_code)]
-
 use crate::config::{ItemRef, WorkspaceDef};
 use crate::engine::Engine;
 use crate::fuzzy;

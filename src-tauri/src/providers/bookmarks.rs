@@ -1,7 +1,6 @@
 //! Firefox bookmarks as search results. The list is read on a background
 //! thread from a copy of Firefox's database and swapped in; queries only
 //! look at memory.
-#![allow(dead_code)] // until the provider is registered (Task 13)
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

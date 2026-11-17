@@ -1,8 +1,6 @@
 //! `tr <text>` translates between German and English (MyMemory); `def <word>`
 //! shows definitions from English Wiktionary. Online, after typing pauses, and
 //! only the typed text is sent; answers are kept in memory only.
-// Until lib.rs registers the words provider (Task 13).
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

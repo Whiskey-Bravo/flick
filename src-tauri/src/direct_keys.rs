@@ -1,8 +1,6 @@
 //! Direct hotkeys: a global key combination that opens one item without the bar.
 //! The bar hotkey always wins: a combo equal to it (in any spelling) is never
 //! registered, and one combo that fails leaves the others working.
-// Managed and registered in lib.rs by the wiring task.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::str::FromStr;

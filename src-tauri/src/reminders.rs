@@ -114,7 +114,6 @@ pub struct Reminders {
     started: AtomicBool,
 }
 
-#[allow(dead_code)] // registered with the bar in a later change
 impl Reminders {
     /// No I/O: the file is read by [`Reminders::start`]'s thread (or the first `add`/`cancel`).
     pub fn new(path: PathBuf, now: Clock, fire: Fire) -> Arc<Self> {
@@ -193,8 +192,19 @@ impl Reminders {
     }
 
     /// True once the file has been read.
+    #[cfg(test)]
     pub fn ready(&self) -> bool {
         self.lock().loaded
+    }
+
+    /// Writes the file once more when the last save failed (Flick is quitting,
+    /// and the thread will not retry it): a fired or cancelled item left in the
+    /// file would ring again as missed at the next start.
+    pub fn flush(&self) {
+        let mut st = self.lock();
+        if st.dirty {
+            self.persist(&mut st);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -786,6 +796,26 @@ mod tests {
             std::fs::read_to_string(g.path()).is_ok_and(|s| s.contains("second") && !s.contains("first"))
         });
         assert_eq!(g.quiet_for(50), Vec::<String>::new());
+    }
+
+    #[test]
+    fn flush_at_exit_writes_a_save_that_failed() {
+        // No thread: only the exit flush can write the cancel.
+        let g = rig(FAST);
+        let a = g.r.add(g.now() + Duration::from_secs(60), "first", false).unwrap();
+        g.r.add(g.now() + Duration::from_secs(120), "second", false).unwrap();
+        std::fs::remove_file(g.path()).unwrap();
+        std::fs::create_dir(g.path()).unwrap();
+        assert!(g.r.cancel(a.id));
+        std::fs::remove_dir(g.path()).unwrap();
+        assert!(!g.path().exists(), "the failed save wrote nothing");
+        g.r.flush();
+        let saved = std::fs::read_to_string(g.path()).unwrap();
+        assert!(saved.contains("second") && !saved.contains("first"), "{saved}");
+        // Nothing left to write: a second flush leaves the file alone.
+        std::fs::remove_file(g.path()).unwrap();
+        g.r.flush();
+        assert!(!g.path().exists());
     }
 
     #[test]

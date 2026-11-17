@@ -7,7 +7,7 @@
 //! the real path, `hotkey::apply` and `reload_config`.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
@@ -17,6 +17,7 @@ use tauri_plugin_dialog::DialogExt;
 use crate::answers::weather;
 use crate::config::{self, Config, DirectHotkeyDef, FieldError, ShortcutDef, WorkspaceDef};
 use crate::config_edit::{self, Setting};
+use crate::direct_keys::DirectKeys;
 use crate::net::{Fetch, FetchError, WinHttp};
 use crate::{apply_hotkey, reload_config, AppState, WslState};
 
@@ -243,8 +244,6 @@ pub fn settings_delete_shortcut(name: String, app: AppHandle) -> Result<(), Stri
     Ok(())
 }
 
-// Registered with the app in a later step.
-#[allow(dead_code)]
 #[tauri::command(async)]
 pub fn settings_save_workspace(original: Option<String>, def: WorkspaceDef, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
@@ -254,14 +253,12 @@ pub fn settings_save_workspace(original: Option<String>, def: WorkspaceDef, app:
 }
 
 /// Against the last good config, in memory only.
-#[allow(dead_code)]
 #[tauri::command(async)]
 pub fn settings_check_workspace(original: Option<String>, def: WorkspaceDef, state: State<AppState>) -> Option<String> {
     let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     config::check_workspace_in(&config, original.as_deref(), &def).err()
 }
 
-#[allow(dead_code)]
 #[tauri::command(async)]
 pub fn settings_delete_workspace(name: String, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
@@ -270,7 +267,6 @@ pub fn settings_delete_workspace(name: String, app: AppHandle) -> Result<(), Str
     Ok(())
 }
 
-#[allow(dead_code)]
 #[tauri::command(async)]
 pub fn settings_save_hotkey(
     original: Option<String>,
@@ -285,7 +281,6 @@ pub fn settings_save_hotkey(
     Ok(())
 }
 
-#[allow(dead_code)]
 #[tauri::command(async)]
 pub fn settings_delete_hotkey(keys: String, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
@@ -572,8 +567,10 @@ pub fn settings_currencies() -> Vec<String> {
     crate::answers::units::CURRENCIES.iter().map(|c| c.to_string()).collect()
 }
 
-/// Releases the global hotkey while the hotkey box captures keys, then restores it.
+/// Releases the global hotkeys (the bar's and the direct ones) while a keys box
+/// captures keys, then restores them, the bar's first.
 #[tauri::command(async)]
-pub fn settings_pause_hotkey(paused: bool, app: AppHandle) {
+pub fn settings_pause_hotkey(paused: bool, app: AppHandle, keys: State<Arc<DirectKeys>>) {
     crate::hotkey::set_paused(&app, paused);
+    keys.pause(paused);
 }

@@ -36,7 +36,6 @@ pub struct TimersProvider {
     last_timer: Mutex<Option<(String, String)>>,
 }
 
-#[allow(dead_code)] // registered with the bar in a later change
 impl TimersProvider {
     pub fn new(reminders: Arc<Reminders>, now: Clock, tz: TimeZone, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self { reminders, now, tz, on_ready, last_timer: Mutex::new(None) }
