@@ -1,7 +1,6 @@
 //! System chores: the Recycle Bin, removable drives, the DNS cache and
 //! Explorer. Everything Windows-facing sits behind [`Chores`] so tests use
 //! [`testing::FakeChores`] and never touch the real thing.
-#![allow(dead_code)] // until the provider is registered (Task 13)
 
 use std::path::PathBuf;
 use std::time::Duration;

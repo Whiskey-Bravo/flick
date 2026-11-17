@@ -1,7 +1,6 @@
 //! Chores: empty the Recycle Bin, eject a drive, flush the DNS cache,
 //! restart Explorer. The bin and the drives are read on [`Loader`] threads;
 //! the query path only looks at memory. Chores are never learned.
-#![allow(dead_code)] // until the provider is registered (Task 13)
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

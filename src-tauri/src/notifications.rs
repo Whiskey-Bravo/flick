@@ -3,9 +3,6 @@
 //! a balloon from a short-lived notification-area icon of Flick's own.
 //! Everything else talks to the `Notifier` seam so tests never show anything.
 
-// Nothing calls in here until the reminders and direct hotkeys are wired up.
-#![allow(dead_code)]
-
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -136,6 +133,30 @@ fn fill(buf: &mut [u16], text: &str) {
     buf[units.len()] = 0;
 }
 
+/// The windows of the balloons whose icon is in the notification area now
+/// (as `isize`: a window handle is not `Send`).
+static LIVE: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+
+/// Takes the icon of `hwnd`'s balloon out of the notification area.
+fn delete_icon(hwnd: HWND) {
+    let data = NOTIFYICONDATAW {
+        cbSize: size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: BALLOON_ID,
+        ..Default::default()
+    };
+    // SAFETY: `data` is a valid, fully initialised struct that outlives the call.
+    let _ = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+}
+
+/// Flick is quitting: takes out the icon of every balloon still showing, whose
+/// thread would otherwise never remove it (it would stay until hovered).
+pub fn remove_balloons() {
+    for hwnd in LIVE.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+        delete_icon(HWND(hwnd as *mut std::ffi::c_void));
+    }
+}
+
 /// Removes the icon, frees it and destroys the window on every way out.
 struct Balloon {
     hwnd: HWND,
@@ -148,13 +169,8 @@ impl Drop for Balloon {
         // SAFETY: handles this thread created; each freed once, here.
         unsafe {
             if self.added {
-                let data = NOTIFYICONDATAW {
-                    cbSize: size_of::<NOTIFYICONDATAW>() as u32,
-                    hWnd: self.hwnd,
-                    uID: BALLOON_ID,
-                    ..Default::default()
-                };
-                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+                LIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&h| h != self.hwnd.0 as isize);
+                delete_icon(self.hwnd);
             }
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
@@ -221,6 +237,7 @@ fn balloon_thread(title: &str, body: &str, done: &mpsc::Sender<Result<(), String
             return;
         }
         guard.added = true;
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push(hwnd.0 as isize);
         guard
     };
     let _ = done.send(Ok(()));

@@ -1,11 +1,8 @@
 //! The Settings item picker's backend: searches through the engine, like the
 //! bar, and keeps only rows a workspace or a direct hotkey can store.
 
-// Not registered until the launcher wiring; the compiler would call it all dead.
-#![allow(dead_code)]
-
 use crate::config::ItemRef;
-use crate::engine::HELP;
+use crate::engine::{Engine, HELP};
 use crate::provider::ResultItem;
 use crate::providers::workspaces;
 use crate::AppState;
@@ -50,9 +47,21 @@ pub fn found(item: Option<&ResultItem>, provider_ready: bool) -> bool {
     item.is_some() || !provider_ready
 }
 
+/// Providers the picker never asks anything: their rows cannot be stored, and
+/// asking would go online (answers, `ip`, `tr`/`def`) or read the clipboard
+/// (`v`, `qr`). Devices and chores are asked, so a hotkey can connect
+/// headphones or empty the bin; that only reads lists on this PC.
+pub const PICKER_SKIPS: [&str; 6] = ["answers", "status", "words", "timers", "clips", "qr"];
+
+/// The picker's search: the bar's search over every provider except
+/// [`PICKER_SKIPS`], so nothing is fetched online for it.
+pub fn search(engine: &Engine, text: &str, for_workspace: bool) -> Vec<PickRow> {
+    pick_rows(engine.query_except(text, &PICKER_SKIPS), for_workspace)
+}
+
 #[tauri::command(async)]
 pub fn settings_search_items(text: String, for_workspace: bool, state: State<AppState>) -> Vec<PickRow> {
-    pick_rows(state.engine.query(&text, None), for_workspace)
+    search(&state.engine, &text, for_workspace)
 }
 
 #[tauri::command(async)]

@@ -4,7 +4,6 @@
 //! changes in `places.sqlite-wal`. Both files are copied to the temp folder,
 //! the copy is opened read-write so SQLite replays the log into it, and the
 //! copy is deleted afterwards. Firefox's own files are only ever read.
-#![allow(dead_code)] // until the provider is registered (Task 13)
 
 use std::path::{Path, PathBuf};
 

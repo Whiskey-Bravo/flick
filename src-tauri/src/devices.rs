@@ -3,9 +3,6 @@
 //! streaming filters and the WLAN API); tests use the fakes in [`testing`]
 //! and never construct `KsBtAudio` or `WlanWifi`.
 
-// Unused until the devices provider is registered with the engine.
-#![allow(dead_code)]
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct BtDevice {
     /// The KS filter's device id (the first one, when a device has several).

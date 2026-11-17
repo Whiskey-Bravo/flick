@@ -2,9 +2,6 @@
 //! search. The list is scanned on a background thread (`refresh`) and swapped
 //! in; a query only reads it.
 
-// Not registered until the launcher wiring; the compiler would call it all dead.
-#![allow(dead_code)]
-
 use crate::fuzzy;
 use crate::games::{Game, GameSource, Start};
 use crate::launch::Launcher;
