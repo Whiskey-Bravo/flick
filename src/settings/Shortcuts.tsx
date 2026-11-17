@@ -45,6 +45,11 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
   const [changedNote, setChangedNote] = useState(false);
   const [asking, setAsking] = useState<((c: Choice) => void) | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const askRef = useRef<HTMLDivElement>(null);
+  // The question can sit above the scrolled editor: bring it into view.
+  useEffect(() => {
+    if (asking) askRef.current?.scrollIntoView({ block: "nearest" });
+  }, [asking !== null]);
 
   const dirty = open && isDirty(saved, form);
   const key = JSON.stringify(form);
@@ -104,13 +109,22 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
   const valid = check?.key === key && check.error === null && form.name.trim() !== "";
 
   /** Resolves true when the editor may be left or replaced. */
-  const mayLeave = async (): Promise<boolean> => {
-    if (!dirty) return true;
-    const c = await new Promise<Choice>((resolve) => setAsking(() => resolve));
-    setAsking(null);
-    if (c === "stay") return false;
-    if (c === "save") return await doSave();
-    return true;
+  // A second leave request while the question is open (a second click on
+  // the window's X) waits for the same answer instead of replacing it.
+  const pending = useRef<Promise<boolean> | null>(null);
+  const mayLeave = (): Promise<boolean> => {
+    if (!dirty) return Promise.resolve(true);
+    if (pending.current) return pending.current;
+    const p = (async () => {
+      const c = await new Promise<Choice>((resolve) => setAsking(() => resolve));
+      setAsking(null);
+      if (c === "stay") return false;
+      if (c === "save") return await doSave();
+      return true;
+    })();
+    pending.current = p;
+    void p.finally(() => (pending.current = null));
+    return p;
   };
   guard.current = mayLeave;
   useEffect(() => () => void (guard.current = null), []);
@@ -200,7 +214,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
       ) : (
         <div class="sc-editor">
           {asking && (
-            <div class="sc-ask" role="alertdialog">
+            <div class="sc-ask" role="alertdialog" ref={askRef}>
               <span>This shortcut has unsaved changes.</span>
               <button disabled={!valid} onClick={() => asking("save")}>
                 Save
