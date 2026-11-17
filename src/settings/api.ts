@@ -129,7 +129,7 @@ export const settingsDeleteHotkey = (keys: string) => invoke<void>("settings_del
 export const settingsHotkeyStatus = () => invoke<KeyStatusRow[]>("settings_hotkey_status");
 /** Why the Win key cannot open Flick right now, or null when it can (or the switch is off). */
 export const settingsWinKeyStatus = () => invoke<string | null>("settings_win_key_status");
-export const settingsOpenFile =() => invoke<void>("settings_open_file");
+export const settingsOpenFile = () => invoke<void>("settings_open_file");
 
 /** Runs `handler` when a list the picker searches (devices, drives, Wi-Fi) has been read. */
 export const onAnswersReady = (handler: () => void): Promise<UnlistenFn> => listen("answers:ready", handler);
