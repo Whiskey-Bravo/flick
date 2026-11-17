@@ -50,12 +50,22 @@ fn is_windows_package(store_id: &str) -> bool {
     id.starts_with("windows.") || id.starts_with("microsoft.windows.")
 }
 
-/// Words of a name: letters and digits, lowercased, at least 3 characters.
+/// Vendor and filler words: sharing one says nothing about being the same app.
+const FILLER: [&str; 10] = ["microsoft", "google", "adobe", "apple", "mozilla", "app", "apps", "the", "for", "and"];
+
+/// Words of a name: letters and digits, lowercased, at least 3 characters,
+/// without vendor and filler words.
 fn words(name: &str) -> Vec<String> {
     name.split(|c: char| !c.is_alphanumeric())
         .filter(|w| w.chars().count() >= 3)
         .map(str::to_lowercase)
+        .filter(|w| !FILLER.contains(&w.as_str()))
         .collect()
+}
+
+/// Whether the exe is a browser's web-app launcher (`chrome_proxy.exe`).
+fn is_proxy(exe: &Path) -> bool {
+    exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().ends_with("_proxy"))
 }
 
 /// Folders too shared to belong to one program: drive roots, anything under
@@ -74,6 +84,9 @@ pub fn broad_roots_from(env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
         if let Some(v) = env(var).filter(|v| !v.is_empty()) {
             out.push(PathBuf::from(v));
         }
+    }
+    if let Some(users) = env("USERPROFILE").and_then(|p| Path::new(&p).parent().map(Path::to_path_buf)) {
+        out.push(users);
     }
     if let Some(local) = env("LOCALAPPDATA").filter(|v| !v.is_empty()) {
         let local = PathBuf::from(local);
@@ -99,9 +112,12 @@ pub fn broad_roots() -> Vec<PathBuf> {
 /// system component, has an uninstall command and does not live under the
 /// Windows folder, whose location is not a shared folder (`broad`, drive
 /// roots) and whose display name shares a word with the app's `name`;
-/// anything else opens Installed apps.
+/// anything else opens Installed apps, as does a shortcut that passes
+/// arguments or whose exe is a `_proxy` launcher (the program is then a host,
+/// not the app).
 pub fn plan(
     name: &str,
+    has_args: bool,
     exe: Option<&Path>,
     store_id: Option<&str>,
     programs: &[Program],
@@ -116,6 +132,9 @@ pub fn plan(
         return (!is_windows_package(id)).then_some(Uninstall::Settings);
     }
     let Some(exe) = exe else { return Some(Uninstall::Settings) };
+    if has_args || is_proxy(exe) {
+        return Some(Uninstall::Settings);
+    }
     let owner = programs
         .iter()
         .filter_map(|p| {
@@ -311,7 +330,7 @@ mod tests {
     }
 
     fn plan_named(name: &str, exe: &str, programs: &[Program]) -> Option<Uninstall> {
-        plan(name, Some(Path::new(exe)), None, programs, Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
+        plan(name, false, Some(Path::new(exe)), None, programs, Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
     }
 
     fn plan_for(exe: &str, programs: &[Program]) -> Option<Uninstall> {
@@ -345,7 +364,38 @@ mod tests {
         );
         let proxy = r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe";
         assert_eq!(plan_named("YouTube", proxy, &[chrome.clone()]), Some(Uninstall::Settings));
-        assert_eq!(plan_named("Google Chrome", proxy, &[chrome]), direct("chrome-uninstall"));
+        // Even under its own name: the exe is a launcher for web apps.
+        assert_eq!(plan_named("Google Chrome", proxy, &[chrome]), Some(Uninstall::Settings));
+    }
+
+    #[test]
+    fn hosts_arguments_and_vendor_words_never_make_a_match() {
+        let chrome = program(
+            "Google Chrome",
+            Some(r"C:\Program Files\Google\Chrome\Application"),
+            Some("chrome-uninstall"),
+            false,
+        );
+        let proxy = Path::new(r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe");
+        let args = |name, has_args, exe| {
+            plan(name, has_args, Some(exe), None, &[chrome.clone()], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
+        };
+        for has_args in [false, true] {
+            assert_eq!(args("Google Docs", has_args, proxy), Some(Uninstall::Settings));
+        }
+        let foo = program("Foo", Some(r"C:\Program Files\Foo"), Some("foo-uninstall"), false);
+        let foo_exe = Path::new(r"C:\Program Files\Foo\foo.exe");
+        let foo_plan = |has_args| {
+            plan("Foo", has_args, Some(foo_exe), None, &[foo.clone()], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
+        };
+        assert_eq!(foo_plan(false), direct("foo-uninstall"));
+        assert_eq!(foo_plan(true), Some(Uninstall::Settings));
+        let office = program("Microsoft Office", Some(r"C:\Program Files\Microsoft Office"), Some("office-uninstall"), false);
+        assert_eq!(
+            plan_named("Microsoft Teams", r"C:\Program Files\Microsoft Office\root\teams.exe", &[office]),
+            Some(Uninstall::Settings)
+        );
+        assert!(broad().contains(&PathBuf::from(r"C:\Users")));
     }
 
     #[test]
@@ -389,7 +439,7 @@ mod tests {
         for p in [no_location, blank, no_command] {
             assert_eq!(plan_for(r"C:\Program Files\Foo\foo.exe", &[p]), Some(Uninstall::Settings));
         }
-        assert_eq!(plan("Foo", None, None, &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad()), Some(Uninstall::Settings));
+        assert_eq!(plan("Foo", false, None, None, &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad()), Some(Uninstall::Settings));
     }
 
     #[test]
@@ -411,7 +461,7 @@ mod tests {
 
     #[test]
     fn store_apps_open_settings_except_windows_parts() {
-        let plan_of = |id| plan("App", None, Some(id), &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad());
+        let plan_of = |id| plan("App", false, None, Some(id), &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad());
         assert_eq!(plan_of("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"), Some(Uninstall::Settings));
         assert_eq!(plan_of("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"), None);
         assert_eq!(plan_of("Microsoft.Windows.Photos_8wekyb3d8bbwe!App"), None);

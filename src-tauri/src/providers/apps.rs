@@ -1,6 +1,7 @@
 //! Apps provider: Start-menu shortcuts and Store apps, fuzzy-searched in memory.
 
 use std::collections::hash_map::{Entry, HashMap};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
@@ -141,20 +142,33 @@ fn shortcut_alias(name: &str, target: &str) -> Option<String> {
 
 /// Fill each shortcut's alias from its `.lnk` target. Reads every link (a
 /// few hundred, local disk) with COM initialised once: refresh thread only.
-/// Returns each shortcut's `.exe` target, by shortcut path.
-fn add_shortcut_aliases(entries: &mut [AppEntry]) -> HashMap<String, String> {
-    let mut exes = HashMap::new();
+/// Returns each shortcut's `.exe` target, by shortcut path, and which
+/// shortcuts pass command-line arguments.
+fn add_shortcut_aliases(entries: &mut [AppEntry]) -> Targets {
+    let mut found = Targets::default();
     launch::with_com(|| {
         for e in entries.iter_mut().filter(|e| e.kind == AppKind::Shortcut) {
-            if let Some(target) = launch::shortcut_target(&e.target) {
+            if let Some((target, has_args)) = launch::shortcut_details(&e.target) {
                 e.aliases = shortcut_alias(&e.name, &target).into_iter().collect();
                 if Path::new(&target).extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")) {
-                    exes.insert(e.target.clone(), target);
+                    found.exes.insert(e.target.clone(), target);
+                }
+                if has_args {
+                    found.with_args.insert(e.target.clone());
                 }
             }
         }
     });
-    exes
+    found
+}
+
+/// What reading the shortcuts yields besides aliases.
+#[derive(Debug, Default)]
+pub struct Targets {
+    /// Each shortcut's exe, by shortcut path.
+    pub exes: HashMap<String, String>,
+    /// Shortcuts that pass command-line arguments.
+    pub with_args: HashSet<String>,
 }
 
 /// Prefix of a Store app's target; the rest is its AppUserModelID.
@@ -197,7 +211,7 @@ fn windows_dir() -> PathBuf {
 /// Uninstall plan per app target. Pure: the programs are passed in.
 fn plans_for(
     entries: &[AppEntry],
-    exes: &HashMap<String, String>,
+    targets: &Targets,
     programs: &[Program],
     windows_dir: &Path,
     own_dir: &Path,
@@ -210,10 +224,10 @@ fn plans_for(
         .iter()
         .filter_map(|e| {
             let (exe, store_id) = match e.kind {
-                AppKind::Shortcut => (exes.get(&e.target).map(Path::new), None),
+                AppKind::Shortcut => (targets.exes.get(&e.target).map(Path::new), None),
                 AppKind::Store => (None, Some(e.target.strip_prefix(STORE_PREFIX).unwrap_or(&e.target))),
             };
-            plan(&e.name, exe, store_id, programs, windows_dir, own_dir, broad).map(|p| (e.target.clone(), p))
+            plan(&e.name, targets.with_args.contains(&e.target), exe, store_id, programs, windows_dir, own_dir, broad).map(|p| (e.target.clone(), p))
         })
         .collect()
 }
@@ -474,11 +488,14 @@ impl AppsProvider {
         programs: Vec<Program>,
     ) -> Arc<Self> {
         let p = Self::build(launcher, entries, true, Arc::new(NoPrograms));
-        let exes: HashMap<String, String> = exes.into_iter().map(|(l, e)| (l.to_string(), e.to_string())).collect();
+        let targets = Targets {
+            exes: exes.into_iter().map(|(l, e)| (l.to_string(), e.to_string())).collect(),
+            with_args: HashSet::new(),
+        };
         let index = p.index.read().unwrap_or_else(|e| e.into_inner()).clone();
         *p.plans.write().unwrap_or_else(|e| e.into_inner()) =
-            plans_for(&index, &exes, &programs, &p.windows_dir, &p.own_dir, &p.broad);
-        *p.exes.write().unwrap_or_else(|e| e.into_inner()) = exes;
+            plans_for(&index, &targets, &programs, &p.windows_dir, &p.own_dir, &p.broad);
+        *p.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes;
         p
     }
 
@@ -530,7 +547,7 @@ impl AppsProvider {
     fn refresh_from_stages(
         &self,
         start: Vec<AppEntry>,
-        add_aliases: impl FnOnce(&mut [AppEntry]) -> HashMap<String, String>,
+        add_aliases: impl FnOnce(&mut [AppEntry]) -> Targets,
         scan_store: impl FnOnce() -> Option<Vec<AppEntry>>,
     ) {
         let _queue = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
@@ -540,7 +557,7 @@ impl AppsProvider {
     /// `refresh` with the scans passed in and no shortcut aliases (tests).
     #[cfg(test)]
     fn refresh_from(&self, start: Vec<AppEntry>, scan_store: impl FnOnce() -> Option<Vec<AppEntry>>) {
-        self.refresh_from_stages(start, |_| HashMap::new(), scan_store);
+        self.refresh_from_stages(start, |_| Targets::default(), scan_store);
     }
 
     /// `start` is published right away together with the last good Store list,
@@ -553,7 +570,7 @@ impl AppsProvider {
     fn refresh_locked(
         &self,
         mut start: Vec<AppEntry>,
-        add_aliases: impl FnOnce(&mut [AppEntry]) -> HashMap<String, String>,
+        add_aliases: impl FnOnce(&mut [AppEntry]) -> Targets,
         scan_store: impl FnOnce() -> Option<Vec<AppEntry>>,
     ) {
         {
@@ -568,13 +585,13 @@ impl AppsProvider {
         }
         let last_store = self.store.lock().unwrap_or_else(|e| e.into_inner()).clone();
         self.publish(&start, &last_store);
-        let exes = add_aliases(&mut start);
+        let targets = add_aliases(&mut start);
         let programs = self.programs.programs();
-        self.set_plans(&start, &last_store, &exes, &programs);
-        *self.exes.write().unwrap_or_else(|e| e.into_inner()) = exes.clone();
+        self.set_plans(&start, &last_store, &targets, &programs);
+        *self.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes.clone();
         self.publish(&start, &last_store);
         if let Some(fresh) = scan_store() {
-            self.set_plans(&start, &fresh, &exes, &programs);
+            self.set_plans(&start, &fresh, &targets, &programs);
             self.publish(&start, &fresh);
             *self.store.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
         }
@@ -583,9 +600,9 @@ impl AppsProvider {
         self.scanned.store(true, Ordering::SeqCst);
     }
 
-    fn set_plans(&self, start: &[AppEntry], store: &[AppEntry], exes: &HashMap<String, String>, programs: &[Program]) {
+    fn set_plans(&self, start: &[AppEntry], store: &[AppEntry], targets: &Targets, programs: &[Program]) {
         let all: Vec<AppEntry> = start.iter().chain(store).cloned().collect();
-        let plans = plans_for(&all, exes, programs, &self.windows_dir, &self.own_dir, &self.broad);
+        let plans = plans_for(&all, targets, programs, &self.windows_dir, &self.own_dir, &self.broad);
         *self.plans.write().unwrap_or_else(|e| e.into_inner()) = plans;
     }
 
@@ -899,7 +916,7 @@ mod tests {
                 assert_eq!(p2.query(&q("word")).len(), 1);
                 assert!(p2.query(&q("winword")).is_empty());
                 start[0].aliases = vec!["winword".into()];
-                HashMap::new()
+                Targets::default()
             },
             move || {
                 // Aliases published before the Store scan returns.
@@ -916,7 +933,7 @@ mod tests {
         let p = AppsProvider::with_entries(vec![]);
         let add = |start: &mut [AppEntry]| {
             start[0].aliases = vec!["winword".into()];
-            HashMap::new()
+            Targets::default()
         };
         p.refresh_from_stages(vec![shortcut("Word", r"C:\w.lnk")], add, || None);
         assert_eq!(p.query(&q("winword")).len(), 1);
@@ -927,7 +944,7 @@ mod tests {
                 // The first publish of this refresh kept the alias found last time.
                 assert_eq!(p2.query(&q("winword")).len(), 1);
                 start[0].aliases = vec!["winword".into()];
-                HashMap::new()
+                Targets::default()
             },
             || None,
         );
@@ -1471,7 +1488,10 @@ mod tests {
         assert_eq!(source.reads.load(Ordering::SeqCst), 0);
         p.refresh_from_stages(
             vec![shortcut("Foo", r"C:\Foo.lnk")],
-            |_| HashMap::from([(r"C:\Foo.lnk".to_string(), FOO_EXE.to_string())]),
+            |_| Targets {
+                exes: HashMap::from([(r"C:\Foo.lnk".to_string(), FOO_EXE.to_string())]),
+                with_args: HashSet::new(),
+            },
             || Some(vec![store("Calculator", CALC_ID)]),
         );
         assert_eq!(source.reads.load(Ordering::SeqCst), 1);
