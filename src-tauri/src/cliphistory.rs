@@ -253,6 +253,7 @@ pub struct WinRtHistory {
 }
 
 impl WinRtHistory {
+    #[cfg_attr(not(test), allow(dead_code))] // until lib.rs constructs it (Task 8)
     pub fn new() -> Self {
         keep_com_loaded();
         WinRtHistory { held: Held::new() }
