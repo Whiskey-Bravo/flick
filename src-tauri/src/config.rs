@@ -72,6 +72,19 @@ pub(crate) const DEFAULT_FILE: &str = "\
 # about = \"Upgrade Linux packages\"
 # wsl = \"sudo apt upgrade\"
 # terminal = true
+##
+## Workspaces: type the name and press Enter to open every item in order. Set them up in Settings.
+# [[workspace]]
+# name = \"work\"
+# items = [
+#     { provider = \"apps\", id = \"C:/ProgramData/Microsoft/Windows/Start Menu/Programs/Outlook.lnk\", title = \"Outlook\" },
+#     { provider = \"bookmarks\", id = \"https://example.com/\", title = \"Example\" },
+# ]
+##
+## Direct hotkeys: keys that open one item from anywhere, without the bar. Set them up in Settings.
+# [[direct_hotkey]]
+# keys = \"Ctrl+Alt+T\"
+# item = { provider = \"apps\", id = \"C:/ProgramData/Microsoft/Windows/Start Menu/Programs/Windows Terminal.lnk\", title = \"Windows Terminal\" }
 ";
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -99,6 +112,12 @@ pub struct Config {
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
+    /// Named sets of items opened together, validated by `validate`.
+    #[serde(rename = "workspace")]
+    pub workspaces: Vec<WorkspaceDef>,
+    /// Global key combos that activate one item each (`hotkey` is the bar's own key).
+    #[serde(rename = "direct_hotkey")]
+    pub direct_hotkeys: Vec<DirectHotkeyDef>,
 }
 
 impl Default for Config {
@@ -115,8 +134,236 @@ impl Default for Config {
             search_engine: String::new(),
             check_updates: true,
             shortcuts: Vec::new(),
+            workspaces: Vec::new(),
+            direct_hotkeys: Vec::new(),
         }
     }
+}
+
+/// A reference to something Flick can show: the pin key (provider + id) plus the title
+/// shown when it cannot be resolved.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ItemRef {
+    pub provider: String,
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+/// One `[[workspace]]` table.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDef {
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub items: Vec<ItemRef>,
+}
+
+/// One `[[direct_hotkey]]` table.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectHotkeyDef {
+    pub keys: String,
+    pub item: ItemRef,
+}
+
+pub const WEAK_COMBO: &str = "Use two modifiers (like Ctrl+Alt) or Win";
+pub const BAR_COMBO: &str = "This is Flick's own hotkey";
+pub const DUPLICATE_COMBO: &str = "Already used by another hotkey";
+
+const MODIFIERS: [&str; 4] = ["ctrl", "alt", "shift", "super"];
+
+/// The modifier `part` (lower case) stands for, if any.
+fn modifier(part: &str) -> Option<&'static str> {
+    match part {
+        "ctrl" | "control" => Some("ctrl"),
+        "alt" | "option" => Some("alt"),
+        "shift" => Some("shift"),
+        "super" | "win" | "meta" | "cmd" | "command" => Some("super"),
+        // What global-hotkey reads these as on Windows.
+        "cmdorctrl" | "cmdorcontrol" | "commandorctrl" | "commandorcontrol" => Some("ctrl"),
+        _ => None,
+    }
+}
+
+/// One spelling for every name global-hotkey accepts for the same key (`part` is lower
+/// case): `KeyT` is `t`, `Digit1` is `1`, `Esc` is `escape`, `ArrowDown` is `down`,
+/// `Num0` is `numpad0`, `-` is `minus`, and so on.
+fn canonical_key(part: &str) -> String {
+    if let Some(rest) = part.strip_prefix("key").filter(|r| r.len() == 1 && r.chars().all(|c| c.is_ascii_lowercase())) {
+        return rest.to_string();
+    }
+    if let Some(rest) = part.strip_prefix("digit").filter(|r| r.len() == 1 && r.chars().all(|c| c.is_ascii_digit())) {
+        return rest.to_string();
+    }
+    if let Some(rest) = part.strip_prefix("arrow").filter(|r| matches!(*r, "up" | "down" | "left" | "right")) {
+        return rest.to_string();
+    }
+    let numpad = |rest: &str| match rest {
+        "plus" => Some("add".to_string()),
+        r if r.len() == 1 && r.chars().all(|c| c.is_ascii_digit()) => Some(r.to_string()),
+        "add" | "decimal" | "divide" | "enter" | "equal" | "multiply" | "subtract" => Some(rest.to_string()),
+        _ => None,
+    };
+    if let Some(rest) = part.strip_prefix("numpad").or_else(|| part.strip_prefix("num")).and_then(numpad) {
+        return format!("numpad{rest}");
+    }
+    let same = match part {
+        "`" => "backquote",
+        "\\" => "backslash",
+        "[" => "bracketleft",
+        "]" => "bracketright",
+        "," => "comma",
+        "=" => "equal",
+        "-" => "minus",
+        "." => "period",
+        "'" => "quote",
+        ";" => "semicolon",
+        "/" => "slash",
+        "pausebreak" => "pause",
+        "esc" => "escape",
+        "volumedown" => "audiovolumedown",
+        "volumeup" => "audiovolumeup",
+        "volumemute" => "audiovolumemute",
+        "mediatrackprev" => "mediatrackprevious",
+        other => other,
+    };
+    same.to_string()
+}
+
+/// One spelling per combo: lower case, `win`/`meta`/`cmd` as `super`, `CmdOrCtrl` as
+/// `ctrl`, every key in one spelling (`canonical_key`), modifiers in the order ctrl, alt,
+/// shift, super, then the key(s).
+pub fn normalize_combo(keys: &str) -> String {
+    let mut mods = [false; 4];
+    let mut rest = Vec::new();
+    for part in keys.split('+').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()) {
+        match modifier(&part) {
+            Some(m) => mods[MODIFIERS.iter().position(|x| *x == m).unwrap_or(0)] = true,
+            None => rest.push(canonical_key(&part)),
+        }
+    }
+    let mut out: Vec<String> = MODIFIERS.iter().zip(mods).filter(|(_, on)| *on).map(|(m, _)| m.to_string()).collect();
+    out.extend(rest);
+    out.join("+")
+}
+
+/// One non-modifier key plus at least two of Ctrl/Alt/Shift, or Win with anything.
+pub fn combo_allowed(keys: &str) -> bool {
+    let normal = normalize_combo(keys);
+    let parts: Vec<&str> = normal.split('+').filter(|p| !p.is_empty()).collect();
+    let keys_count = parts.iter().filter(|p| !MODIFIERS.contains(p)).count();
+    let plain = parts.iter().filter(|p| matches!(**p, "ctrl" | "alt" | "shift")).count();
+    keys_count == 1 && (parts.contains(&"super") || plain >= 2)
+}
+
+/// Said when a workspace name or alias is a word Flick answers to itself.
+pub const COMMAND_NAME: &str = "name is a Flick command";
+
+/// True when `word` is something Flick answers to itself, so a workspace by
+/// that name could never be opened by typing it: `help`, a route (`v`, `qr`,
+/// `dl`, `recent`, anything starting with `>`), a word a provider claims
+/// (`timer`, `remind`, `tr`, `def`, `connect`, `wifi`, `eject`, a path such as
+/// `~\x`, …) or one that shows its own row (`snip`, `color`, …). Taken from the
+/// providers' own lists.
+pub fn is_command_word(word: &str) -> bool {
+    use crate::providers::{chores, clips, devices, path, qr, recent, screen, timers, words, wsl};
+    let word = word.trim();
+    if path::looks_like_path(word) {
+        return true;
+    }
+    let routes = [clips::ROUTE, qr::ROUTE, recent::DOWNLOADS_ROUTE, recent::RECENT_ROUTE, wsl::ROUTE];
+    let routed = routes.iter().any(|r| {
+        if r.needs_space {
+            r.prefix.eq_ignore_ascii_case(word)
+        } else {
+            word.starts_with(r.prefix)
+        }
+    });
+    routed
+        || std::iter::once(crate::engine::HELP)
+            .chain(timers::WORDS)
+            .chain(words::WORDS)
+            .chain(devices::WORDS)
+            .chain([chores::EJECT])
+            .chain(screen::SNIP_WORDS)
+            .chain(screen::COLOR_WORDS)
+            .any(|w| w.eq_ignore_ascii_case(word))
+}
+
+/// Checks one workspace; `used` holds the lowercase names and aliases taken so far and
+/// grows with this workspace's own.
+fn check_workspace(def: &WorkspaceDef, used: &mut Vec<String>) -> Result<(), String> {
+    if !one_word(&def.name) || def.aliases.iter().any(|a| !one_word(a)) {
+        return Err("name must be one word".into());
+    }
+    if std::iter::once(&def.name).chain(&def.aliases).any(|w| w.contains(':')) {
+        return Err("name cannot contain :".into());
+    }
+    if std::iter::once(&def.name).chain(&def.aliases).any(|w| is_command_word(w)) {
+        return Err(COMMAND_NAME.into());
+    }
+    for word in std::iter::once(&def.name).chain(&def.aliases) {
+        let lower = word.to_lowercase();
+        if used.contains(&lower) {
+            return Err("name is already used".into());
+        }
+        used.push(lower);
+    }
+    if def.items.is_empty() {
+        return Err("needs at least one item".into());
+    }
+    if def.items.iter().any(|i| !item_ok(i)) {
+        return Err("an item needs a provider and an id".into());
+    }
+    Ok(())
+}
+
+fn item_ok(item: &ItemRef) -> bool {
+    !item.provider.trim().is_empty() && !item.id.trim().is_empty()
+}
+
+/// Checks `def` against the other workspaces of `config` (the one named `original` is
+/// left out, as it is being replaced) and Flick's own command words.
+pub fn check_workspace_in(config: &Config, original: Option<&str>, def: &WorkspaceDef) -> Result<(), String> {
+    let mut used: Vec<String> = Vec::new();
+    for w in config.workspaces.iter().filter(|w| Some(w.name.as_str()) != original) {
+        used.extend(std::iter::once(&w.name).chain(&w.aliases).map(|n| n.to_lowercase()));
+    }
+    check_workspace(def, &mut used)
+}
+
+/// Checks one direct hotkey; `used` holds the normalized combos taken so far and grows
+/// with this one's. A weak combo is not an error here (Settings reports it).
+fn check_direct_hotkey(def: &DirectHotkeyDef, used: &mut Vec<String>) -> Result<(), String> {
+    if def.keys.trim().is_empty() {
+        return Err("keys are empty".into());
+    }
+    if !item_ok(&def.item) {
+        return Err("an item needs a provider and an id".into());
+    }
+    let combo = normalize_combo(&def.keys);
+    if used.contains(&combo) {
+        return Err(DUPLICATE_COMBO.into());
+    }
+    used.push(combo);
+    Ok(())
+}
+
+/// Checks `def` against the other direct hotkeys of `config` (the one whose keys equal
+/// `original`, in any spelling, is left out).
+pub fn check_direct_hotkey_in(config: &Config, original: Option<&str>, def: &DirectHotkeyDef) -> Result<(), String> {
+    let original = original.map(normalize_combo);
+    let mut used: Vec<String> = config
+        .direct_hotkeys
+        .iter()
+        .map(|h| normalize_combo(&h.keys))
+        .filter(|c| Some(c) != original.as_ref())
+        .collect();
+    check_direct_hotkey(def, &mut used)
 }
 
 /// One `[[shortcut]]` table.
@@ -216,6 +463,14 @@ pub fn validate(c: &Config) -> Result<(), String> {
     for s in &c.shortcuts {
         check_shortcut(s, &mut used)
             .map_err(|e| format!("shortcut \"{}\": {}", s.name, e.message))?;
+    }
+    let mut used: Vec<String> = Vec::new();
+    for w in &c.workspaces {
+        check_workspace(w, &mut used).map_err(|e| format!("workspace \"{}\": {e}", w.name))?;
+    }
+    let mut used = Vec::new();
+    for h in &c.direct_hotkeys {
+        check_direct_hotkey(h, &mut used).map_err(|e| format!("direct_hotkey \"{}\": {e}", h.keys))?;
     }
     Ok(())
 }
@@ -529,6 +784,8 @@ name = \"{name}\"
         assert_eq!(c.wsl_distro, "Ubuntu");
         assert_eq!(c.file_roots.len(), 3);
         assert_eq!(c.shortcuts.len(), 4);
+        assert_eq!(c.workspaces.len(), 1);
+        assert_eq!(c.direct_hotkeys.len(), 1);
         let base = ShortcutDef {
             name: String::new(), aliases: vec![], about: String::new(), run: None, wsl: None,
             open: None, terminal: None, admin: false, pick: None, choices: vec![],
@@ -850,6 +1107,200 @@ search_engine = \"https://www.google.com/search?q={arg}\"").unwrap();
         let c = Config { shortcuts: vec![ShortcutDef { aliases: vec!["z".into()], ..def("s1") }], ..Default::default() };
         let e = check_shortcut_in(&c, None, &def("z")).unwrap_err();
         assert_eq!(e.field, Field::Name);
+    }
+
+    fn item(provider: &str, id: &str, title: &str) -> ItemRef {
+        ItemRef { provider: provider.into(), id: id.into(), title: title.into() }
+    }
+
+    fn ws(name: &str) -> WorkspaceDef {
+        WorkspaceDef { name: name.into(), aliases: vec![], items: vec![item("apps", "a.lnk", "A")] }
+    }
+
+    fn hk(keys: &str) -> DirectHotkeyDef {
+        DirectHotkeyDef { keys: keys.into(), item: item("apps", "a.lnk", "A") }
+    }
+
+    #[test]
+    fn workspaces_and_direct_hotkeys_parse() {
+        let c = parse("[[workspace]]
+name = \"work\"
+aliases = [\"w\"]
+items = [
+    { provider = \"apps\", id = \"C:/x/Mail.lnk\", title = \"Mail\" },
+    { provider = \"bookmarks\", id = \"https://example.com/\" },
+]
+
+[[direct_hotkey]]
+keys = \"Ctrl+Alt+T\"
+item = { provider = \"apps\", id = \"C:/x/Term.lnk\", title = \"Term\" }
+").unwrap();
+        assert_eq!(c.workspaces, [WorkspaceDef {
+            name: "work".into(),
+            aliases: vec!["w".into()],
+            items: vec![item("apps", "C:/x/Mail.lnk", "Mail"), item("bookmarks", "https://example.com/", "")],
+        }]);
+        assert_eq!(c.direct_hotkeys, [DirectHotkeyDef { keys: "Ctrl+Alt+T".into(), item: item("apps", "C:/x/Term.lnk", "Term") }]);
+        assert!(Config::default().workspaces.is_empty() && Config::default().direct_hotkeys.is_empty());
+        assert!(parse("[[workspace]]\nname = \"a\"\nitems = [{ provider = \"apps\", id = \"x\", tilte = \"t\" }]").is_err());
+    }
+
+    #[test]
+    fn default_file_examples_parse() {
+        assert_eq!(parse(DEFAULT_FILE).unwrap(), Config::default());
+        let c = parse(&uncommented_default_file()).unwrap();
+        assert_eq!(c.workspaces.len(), 1);
+        assert_eq!(c.workspaces[0].name, "work");
+        assert_eq!(c.workspaces[0].items.len(), 2);
+        assert_eq!(c.workspaces[0].items[0].provider, "apps");
+        assert_eq!(c.workspaces[0].items[1].provider, "bookmarks");
+        assert_eq!(c.workspaces[0].items[1].id, "https://example.com/");
+        assert_eq!(c.direct_hotkeys.len(), 1);
+        assert_eq!(c.direct_hotkeys[0].keys, "Ctrl+Alt+T");
+        assert!(DEFAULT_FILE.matches("Set them up in Settings.").count() == 2);
+    }
+
+    #[test]
+    fn workspace_rules() {
+        let none = Config::default();
+        let check = |d: &WorkspaceDef| check_workspace_in(&none, None, d).unwrap_err();
+        assert_eq!(check(&ws("two words")), "name must be one word");
+        assert_eq!(check(&WorkspaceDef { aliases: vec!["b c".into()], ..ws("a") }), "name must be one word");
+        assert_eq!(check(&ws("a:b")), "name cannot contain :");
+        assert_eq!(check(&ws("HELP")), "name is a Flick command");
+        assert_eq!(check(&WorkspaceDef { aliases: vec!["help".into()], ..ws("a") }), "name is a Flick command");
+        for word in [
+            "timer", "Timers", "remind", "reminders", "tr", "DEF", "connect", "disconnect", "wifi", "eject", "v", "dl",
+            "recent", "qr", "snip", "screenshot", "color", "colour", "picker", ">", ">top", r"~\x", "//srv",
+        ] {
+            assert_eq!(check(&ws(word)), "name is a Flick command", "{word}");
+            assert_eq!(check(&WorkspaceDef { aliases: vec![word.into()], ..ws("a") }), "name is a Flick command", "{word}");
+        }
+        for word in ["work", "timerx", "vv", "trip", "define", "wifi2", "ejector", "a>b"] {
+            assert!(check_workspace_in(&none, None, &ws(word)).is_ok(), "{word}");
+        }
+        assert_eq!(check(&WorkspaceDef { items: vec![], ..ws("a") }), "needs at least one item");
+        assert_eq!(check(&WorkspaceDef { items: vec![item("apps", "", "")], ..ws("a") }), "an item needs a provider and an id");
+        assert_eq!(check(&WorkspaceDef { items: vec![item("", "x", "")], ..ws("a") }), "an item needs a provider and an id");
+
+        let c = Config { workspaces: vec![ws("work"), WorkspaceDef { aliases: vec!["w".into()], ..ws("other") }], ..Default::default() };
+        assert_eq!(check_workspace_in(&c, None, &ws("Work")).unwrap_err(), "name is already used");
+        assert_eq!(check_workspace_in(&c, None, &ws("W")).unwrap_err(), "name is already used");
+        assert!(check_workspace_in(&c, Some("work"), &ws("Work")).is_ok());
+        assert_eq!(check_workspace_in(&c, Some("other"), &ws("work")).unwrap_err(), "name is already used");
+        assert!(check_workspace_in(&c, None, &ws("home")).is_ok());
+
+        let text = "[[workspace]]\nname = \"x\"\nitems = []\n";
+        assert_eq!(err(text), "workspace \"x\": needs at least one item");
+        let two = "[[workspace]]\nname = \"work\"\nitems = [{ provider = \"a\", id = \"b\" }]\n\n[[workspace]]\nname = \"Work\"\nitems = [{ provider = \"a\", id = \"b\" }]\n";
+        assert_eq!(err(two), "workspace \"Work\": name is already used");
+    }
+
+    #[test]
+    fn direct_hotkey_rules() {
+        let c = Config { direct_hotkeys: vec![hk("ctrl+alt+t")], ..Default::default() };
+        assert_eq!(check_direct_hotkey_in(&c, None, &hk("")).unwrap_err(), "keys are empty");
+        assert_eq!(check_direct_hotkey_in(&c, None, &hk("  ")).unwrap_err(), "keys are empty");
+        assert_eq!(check_direct_hotkey_in(&c, None, &DirectHotkeyDef { item: item("apps", "", ""), ..hk("Ctrl+Alt+K") }).unwrap_err(), "an item needs a provider and an id");
+        assert_eq!(check_direct_hotkey_in(&c, None, &hk("Alt+Ctrl+T")).unwrap_err(), DUPLICATE_COMBO);
+        assert!(check_direct_hotkey_in(&c, Some("ctrl+alt+t"), &hk("Alt+Ctrl+T")).is_ok());
+        assert!(check_direct_hotkey_in(&c, Some("Ctrl+Alt+T"), &hk("Ctrl+Alt+T")).is_ok());
+        assert!(check_direct_hotkey_in(&c, None, &hk("Ctrl+Alt+K")).is_ok());
+
+        let text = "[[direct_hotkey]]\nkeys = \"Ctrl+T\"\nitem = { provider = \"a\", id = \"b\" }\n\n[[direct_hotkey]]\nkeys = \"t+CTRL\"\nitem = { provider = \"a\", id = \"c\" }\n";
+        assert_eq!(err(text), "direct_hotkey \"t+CTRL\": Already used by another hotkey");
+        assert_eq!(
+            err("[[direct_hotkey]]\nkeys = \"Ctrl+T\"\nitem = { provider = \"a\", id = \"\" }\n"),
+            "direct_hotkey \"Ctrl+T\": an item needs a provider and an id"
+        );
+    }
+
+    #[test]
+    fn weak_combos_are_not_config_errors() {
+        let c = parse("[[direct_hotkey]]\nkeys = \"Ctrl+T\"\nitem = { provider = \"a\", id = \"b\" }\n").unwrap();
+        assert_eq!(c.direct_hotkeys[0].keys, "Ctrl+T");
+        assert!(!combo_allowed("Ctrl+T"));
+    }
+
+    #[test]
+    fn combo_rule() {
+        for ok in ["Ctrl+Alt+T", "Ctrl+Shift+K", "Alt+Shift+1", "Super+N", "Win+N"] {
+            assert!(combo_allowed(ok), "{ok}");
+        }
+        for bad in ["Ctrl+T", "Alt+F4", "F5", "Shift+F5", "Ctrl+Alt", "", "Ctrl+Alt+T+K"] {
+            assert!(!combo_allowed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn normalize_combo_ignores_case_order_and_win() {
+        assert_eq!(normalize_combo("alt+space"), "alt+space");
+        assert_eq!(normalize_combo("Space+Alt"), "alt+space");
+        assert_eq!(normalize_combo(" Alt + Space "), "alt+space");
+        assert_eq!(normalize_combo("Win+E"), normalize_combo("Super+E"));
+        assert_eq!(normalize_combo("meta+e"), "super+e");
+        assert_eq!(normalize_combo("Cmd+E"), "super+e");
+        assert_eq!(normalize_combo("Control+Option+X"), normalize_combo("Ctrl+Alt+X"));
+        assert_eq!(normalize_combo("Win+Shift+Alt+Ctrl+K"), "ctrl+alt+shift+super+k");
+    }
+
+    #[test]
+    fn normalize_combo_folds_every_spelling_of_a_key() {
+        let same = [
+            ("Win+N", "Super+N"),
+            ("Command+N", "Win+N"),
+            ("CmdOrCtrl+Alt+Space", "Ctrl+Alt+Space"),
+            ("CommandOrControl+Alt+X", "Ctrl+Alt+X"),
+            ("CmdOrControl+Alt+X", "Ctrl+Alt+X"),
+            ("CommandOrCtrl+Alt+X", "Ctrl+Alt+X"),
+            ("Ctrl+Alt+KeyT", "Ctrl+Alt+T"),
+            ("Ctrl+Alt+Digit1", "Ctrl+Alt+1"),
+            ("Ctrl+Alt+Esc", "Ctrl+Alt+Escape"),
+            ("Ctrl+Alt+Down", "Ctrl+Alt+ArrowDown"),
+            ("Ctrl+Alt+Up", "Ctrl+Alt+ArrowUp"),
+            ("Ctrl+Alt+Left", "Ctrl+Alt+ArrowLeft"),
+            ("Ctrl+Alt+Right", "Ctrl+Alt+ArrowRight"),
+            ("Ctrl+Alt+Num0", "Ctrl+Alt+Numpad0"),
+            ("Ctrl+Alt+NumPlus", "Ctrl+Alt+NumpadAdd"),
+            ("Ctrl+Alt+NumpadPlus", "Ctrl+Alt+NumAdd"),
+            ("Ctrl+Alt+NumEnter", "Ctrl+Alt+NumpadEnter"),
+            ("Ctrl+Alt+`", "Ctrl+Alt+Backquote"),
+            ("Ctrl+Alt+-", "Ctrl+Alt+Minus"),
+            ("Ctrl+Alt+\\", "Ctrl+Alt+Backslash"),
+            ("Ctrl+Alt+[", "Ctrl+Alt+BracketLeft"),
+            ("Ctrl+Alt+]", "Ctrl+Alt+BracketRight"),
+            ("Ctrl+Alt+,", "Ctrl+Alt+Comma"),
+            ("Ctrl+Alt+=", "Ctrl+Alt+Equal"),
+            ("Ctrl+Alt+.", "Ctrl+Alt+Period"),
+            ("Ctrl+Alt+'", "Ctrl+Alt+Quote"),
+            ("Ctrl+Alt+;", "Ctrl+Alt+Semicolon"),
+            ("Ctrl+Alt+/", "Ctrl+Alt+Slash"),
+            ("Ctrl+Alt+PauseBreak", "Ctrl+Alt+Pause"),
+            ("Ctrl+Alt+VolumeUp", "Ctrl+Alt+AudioVolumeUp"),
+            ("Ctrl+Alt+MediaTrackPrev", "Ctrl+Alt+MediaTrackPrevious"),
+        ];
+        for (a, b) in same {
+            assert_eq!(normalize_combo(a), normalize_combo(b), "{a} vs {b}");
+        }
+        // Different keys stay different.
+        assert_ne!(normalize_combo("Ctrl+Alt+NumLock"), normalize_combo("Ctrl+Alt+Numpad0"));
+        assert_ne!(normalize_combo("Ctrl+Alt+1"), normalize_combo("Ctrl+Alt+Num1"));
+        assert!(combo_allowed("CmdOrCtrl+Alt+Space"));
+    }
+
+    #[test]
+    fn same_key_in_another_spelling_is_a_duplicate() {
+        let c = Config { direct_hotkeys: vec![hk("Ctrl+Alt+T")], ..Default::default() };
+        assert_eq!(check_direct_hotkey_in(&c, None, &hk("Ctrl+Alt+KeyT")).unwrap_err(), DUPLICATE_COMBO);
+    }
+
+    #[test]
+    fn workspace_aliases_follow_the_name_rules() {
+        let none = Config::default();
+        let e = check_workspace_in(&none, None, &WorkspaceDef { aliases: vec!["a:b".into()], ..ws("w") }).unwrap_err();
+        assert_eq!(e, "name cannot contain :");
+        let e = check_workspace_in(&none, None, &WorkspaceDef { aliases: vec!["two words".into()], ..ws("w") }).unwrap_err();
+        assert_eq!(e, "name must be one word");
     }
 
     #[test]

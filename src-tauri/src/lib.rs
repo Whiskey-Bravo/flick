@@ -1,19 +1,26 @@
 mod after_hide;
 mod answers;
+mod bookmarks;
 mod clipboard;
 mod cliphistory;
+mod chores;
 mod commands;
 mod config;
 mod config_edit;
 mod controls;
+mod devices;
 mod dirs;
+mod direct_keys;
 mod engine;
 mod fuzzy;
+mod games;
 mod history;
 mod hotkey;
 mod icon;
+mod item_search;
 mod launch;
 mod net;
+mod notifications;
 mod paste;
 mod pins;
 mod picker;
@@ -23,6 +30,7 @@ mod providers;
 mod quote;
 mod ranking;
 mod refresh;
+mod reminders;
 mod settings;
 mod settings_window;
 mod status;
@@ -34,13 +42,28 @@ mod winlist;
 mod wsl_detect;
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
 use answers::number::{Formats, WindowsFormats};
+use bookmarks::{BookmarkSource, Firefox};
+use chores::{Chores, SystemChores};
+use devices::{BtAudio, KsBtAudio, WlanWifi, Wifi};
+use direct_keys::{DirectKeys, PluginKeys, PressGate, PressTarget, REPEAT_GATE};
+use games::{GameSource, SystemGames};
+use notifications::{Notifier, SystemNotifier, TITLE};
+use provider::{Outcome, ResultItem, Then};
+use providers::bookmarks::BookmarksProvider;
+use providers::chores::ChoresProvider;
+use providers::devices::DevicesProvider;
+use providers::games::GamesProvider;
+use providers::timers::TimersProvider;
+use providers::words::WordsProvider;
+use providers::workspaces::{ItemRunner, Report, WorkspacesProvider};
+use reminders::{Fire, Reminders};
 use answers::rates::RatesStore;
 use answers::weather::WeatherStore;
 use after_hide::FollowUps;
@@ -114,15 +137,31 @@ struct Providers {
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
     update: Arc<UpdateProvider>,
+    /// Installed games: scanned with the apps.
+    games: Arc<GamesProvider>,
+    /// Firefox bookmarks: read at start, then when the bar shows and they are stale.
+    bookmarks: Arc<BookmarksProvider>,
+    workspaces: Arc<WorkspacesProvider>,
+    /// The one strong handle that keeps the reminder thread alive.
+    reminders: Arc<Reminders>,
+    timers: Arc<TimersProvider>,
+    /// `tr` and `def`.
+    words: Arc<WordsProvider>,
+    /// `connect`, `disconnect` and `wifi`.
+    devices: Arc<DevicesProvider>,
+    /// Recycle Bin, eject, DNS cache and Explorer.
+    chores: Arc<ChoresProvider>,
 }
 
 impl Providers {
     /// Cheap: no disk access. File roots and shortcuts arrive with the config.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         answers: Answers,
         control: Control,
         browse: Browse,
         capture: Capture,
+        extras: Extras,
         apps: Arc<AppsProvider>,
         launcher: Arc<dyn Launcher>,
         distro: &str,
@@ -149,19 +188,106 @@ impl Providers {
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
             update: UpdateProvider::new(updates),
+            games: extras.games,
+            bookmarks: extras.bookmarks,
+            workspaces: extras.workspaces,
+            reminders: extras.reminders,
+            timers: extras.timers,
+            words: extras.words,
+            devices: extras.devices,
+            chores: extras.chores,
         }
     }
 
-    /// Reads the open windows and the audio state. Both can block, so this
-    /// runs on its own thread and never on the caller's.
+    /// Reads the open windows and the audio state, and the bookmarks when they
+    /// are stale. All can block, so this runs on other threads, never the caller's.
     pub(crate) fn refresh_on_show(&self) {
         self.refresher.request();
+        self.bookmarks.refresh_if_stale();
     }
 
-    /// The bar hid: drop the clipboard history and clipboard text read for it.
+    /// The bar hid: drop the clipboard history and clipboard text read for it,
+    /// and the `tr`/`def` text still waiting for the typing pause.
     pub(crate) fn on_hide(&self) {
         self.clips.forget();
         self.qr.forget();
+        self.words.forget_waiting();
+    }
+}
+
+/// Games, bookmarks, workspaces, timers and reminders, `tr`/`def`, devices and chores.
+struct Extras {
+    games: Arc<GamesProvider>,
+    bookmarks: Arc<BookmarksProvider>,
+    workspaces: Arc<WorkspacesProvider>,
+    reminders: Arc<Reminders>,
+    timers: Arc<TimersProvider>,
+    words: Arc<WordsProvider>,
+    devices: Arc<DevicesProvider>,
+    chores: Arc<ChoresProvider>,
+}
+
+/// What the extras read and change on this PC (tests use fakes).
+struct ExtraSources {
+    games: Arc<dyn GameSource>,
+    bookmarks: Arc<dyn BookmarkSource>,
+    clipboard: Arc<dyn clipboard::Clipboard>,
+    fetch: Arc<dyn net::Fetch>,
+    bt: Arc<dyn BtAudio>,
+    wifi: Arc<dyn Wifi>,
+    chores: Arc<dyn Chores>,
+    /// `reminders.json`.
+    reminders: PathBuf,
+    now: dirs::Clock,
+    tz: jiff::tz::TimeZone,
+}
+
+impl Extras {
+    /// Cheap, no I/O: games and bookmarks are read by background threads, the
+    /// reminders file by the reminder thread (`Reminders::start`).
+    /// `fire` shows a reminder's notification; `report` tells how a workspace run went.
+    fn new(
+        launcher: Arc<dyn Launcher>,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+        open_settings: Opener,
+        fire: Fire,
+        report: Report,
+    ) -> Self {
+        let sources = ExtraSources {
+            games: Arc::new(SystemGames),
+            bookmarks: Arc::new(Firefox),
+            clipboard: Arc::new(WindowsClipboard),
+            fetch: Arc::new(net::WinHttp),
+            bt: Arc::new(KsBtAudio),
+            wifi: Arc::new(WlanWifi),
+            chores: Arc::new(SystemChores),
+            reminders: reminders_path(),
+            now: Arc::new(std::time::SystemTime::now),
+            tz: jiff::tz::TimeZone::system(),
+        };
+        Self::over(launcher, on_ready, open_settings, fire, report, sources)
+    }
+
+    /// The providers over any sources (tests use fakes).
+    fn over(
+        launcher: Arc<dyn Launcher>,
+        on_ready: Arc<dyn Fn() + Send + Sync>,
+        open_settings: Opener,
+        fire: Fire,
+        report: Report,
+        s: ExtraSources,
+    ) -> Self {
+        let reminders = Reminders::new(s.reminders, s.now.clone(), fire);
+        Extras {
+            games: GamesProvider::new(s.games, launcher.clone()),
+            bookmarks: BookmarksProvider::new(s.bookmarks, launcher, s.clipboard.clone()),
+            workspaces: WorkspacesProvider::new(report),
+            timers: Arc::new(TimersProvider::new(reminders.clone(), s.now, s.tz, on_ready.clone())),
+            reminders,
+            words: Arc::new(WordsProvider::new(s.fetch, s.clipboard, open_settings, on_ready.clone())),
+            devices: Arc::new(DevicesProvider::new(s.bt, s.wifi, on_ready.clone())),
+            chores: Arc::new(ChoresProvider::new(s.chores, on_ready)),
+        }
     }
 }
 
@@ -376,6 +502,10 @@ pub(crate) struct AppState {
     /// Configured accelerator last applied successfully; `None` when the last
     /// `hotkey::apply` failed (the previous hotkey may then still be active).
     pub(crate) hotkey: Mutex<Option<String>>,
+    /// The accelerator registered as the bar hotkey now: kept when an apply
+    /// fails, since `hotkey::apply` registers the previous one again. `None`
+    /// until one has registered. The direct hotkeys are checked against it.
+    bar_hotkey: Mutex<Option<String>>,
     /// Keeps the config watcher alive for the life of the app.
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     /// Latest config/hotkey error text, re-sent on every show so an error from
@@ -414,11 +544,18 @@ fn build_engine(
         Box::new(p.qr.clone()),
         Box::new(SnipProvider),
         Box::new(ColorProvider),
+        Box::new(p.games.clone()),
+        Box::new(p.bookmarks.clone()),
+        Box::new(p.workspaces.clone()),
         Box::new(p.shortcuts.clone()),
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
         Box::new(p.system.clone()),
+        Box::new(p.devices.clone()),
         Box::new(p.status.clone()),
+        Box::new(p.chores.clone()),
+        Box::new(p.timers.clone()),
+        Box::new(p.words.clone()),
         Box::new(PowerProvider::new(power)),
         Box::new(FlickProvider::new(open_config, open_settings)),
         Box::new(HistoryProvider::new(history.clone())),
@@ -504,6 +641,8 @@ fn apply_detection(state: &AppState, detection: wsl_detect::Detection) {
 fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -> bool {
     push_distro(p, new, detected);
     p.status.set_online(new.online);
+    p.words.set_online(new.online);
+    p.workspaces.set(new.workspaces.clone());
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
     let changed = old.file_roots != new.file_roots;
@@ -531,6 +670,10 @@ fn rates_path() -> PathBuf {
 
 fn weather_path() -> PathBuf {
     config::config_path().with_file_name("weather.json")
+}
+
+fn reminders_path() -> PathBuf {
+    config::config_path().with_file_name("reminders.json")
 }
 
 pub fn run() {
@@ -569,6 +712,14 @@ pub fn run() {
             settings::settings_open_file,
             settings::settings_currencies,
             settings::settings_pause_hotkey,
+            settings::settings_save_workspace,
+            settings::settings_check_workspace,
+            settings::settings_delete_workspace,
+            settings::settings_save_hotkey,
+            settings::settings_delete_hotkey,
+            item_search::settings_search_items,
+            item_search::settings_items_found,
+            direct_keys::settings_hotkey_status,
             updates::settings_update_status,
             updates::settings_check_now,
             updates::settings_install_update
@@ -584,8 +735,13 @@ pub fn run() {
             setup(app.handle());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Flick");
+        .build(tauri::generate_context!())
+        .expect("error while running Flick")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                on_exit(app);
+            }
+        });
 }
 
 /// Startup order: config → providers and engine → background index threads →
@@ -600,12 +756,24 @@ fn setup(app: &AppHandle) {
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
     let ready = app.clone();
     // The bar re-runs its query when the text is unchanged, so a placeholder turns into the answer.
+    // The Settings item picker asks again too (a device list read for `connect` has ended).
     let on_ready: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
+        let _ = ready.emit_to(settings::WINDOW, "answers:ready", ());
     });
     let answers = Answers::new(launcher.clone(), on_ready.clone());
     let browse = Browse::new(launcher.clone(), on_ready.clone());
     let capture = Capture::new(launcher.clone(), on_ready.clone());
+    // Reminders that ring and direct hotkeys that fail say so in a notification.
+    let notifier: Arc<dyn Notifier> = Arc::new(SystemNotifier);
+    app.manage(notifier.clone());
+    let fire: Fire = Arc::new(move |body: &str| {
+        let _ = notifier.show(TITLE, body);
+    });
+    // A workspace whose items did not all open brings the bar back with its name and the count.
+    let reopen = app.clone();
+    let report: Report = Arc::new(move |name: &str, message: &str| window::reopen(&reopen, name, message));
+    let extras = Extras::new(launcher.clone(), on_ready.clone(), settings_opener(app), fire, report);
     let control = Control::new(launcher.clone(), on_ready);
     // Paste, Win+V, the snip and the colour picker, run once the bar has hidden.
     app.manage::<Arc<dyn AfterHide>>(Arc::new(FollowUps {
@@ -618,7 +786,7 @@ fn setup(app: &AppHandle) {
     }));
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);
-    let providers = Providers::new(answers, control, browse, capture, AppsProvider::new(launcher.clone()), launcher,
+    let providers = Providers::new(answers, control, browse, capture, extras, AppsProvider::new(launcher.clone()), launcher,
         &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
         settings_opener(app),
         updates.clone(),
@@ -626,12 +794,14 @@ fn setup(app: &AppHandle) {
     providers.apps.set_windows(providers.windows.clone());
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     providers.status.set_online(loaded.config.online);
+    providers.words.set_online(loaded.config.online);
+    providers.workspaces.set(loaded.config.workspaces.clone());
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));
     let history = Arc::new(History::load(history_path(), loaded.config.history));
     let pins = Arc::new(Pins::load(pins_path()));
-    let engine = build_engine(
+    let engine = Arc::new(build_engine(
         &providers,
         Box::new(SystemPower),
         Box::new(launch::open_config),
@@ -639,25 +809,35 @@ fn setup(app: &AppHandle) {
         ranking,
         history.clone(),
         pins,
-    );
+    ));
+    let runner: std::sync::Weak<dyn ItemRunner> = Arc::<Engine>::downgrade(&engine);
+    providers.workspaces.set_runner(runner);
     app.manage(AppState {
-        engine: Arc::new(engine),
+        engine,
         history,
         providers: providers.clone(),
         updates,
         config: Mutex::new(loaded.config.clone()),
         detected: Mutex::new(WslState::Unknown),
         hotkey: Mutex::new(None),
+        bar_hotkey: Mutex::new(None),
         watcher: Mutex::new(None),
         config_error: Mutex::new(None),
     });
+    // Once: reads reminders.json, rings what was missed while Flick was not
+    // running, then each one when it falls due. `AppState` keeps it alive.
+    providers.reminders.start();
 
     start_index_threads(app, providers);
     updates::start_scheduler(app);
 
     window::install_handlers(app);
 
+    let keys = Arc::new(DirectKeys::new(Arc::new(PluginKeys::new(app.clone(), on_direct_press))));
+    app.manage(keys.clone());
     let hotkey_error = apply_hotkey(app, &loaded.config.hotkey);
+    // After the bar hotkey, against the one that registered: it always wins.
+    keys.apply(&registered_bar(app, &loaded.config.hotkey), &loaded.config.direct_hotkeys);
     if first_run {
         // Armed before the show: the empty query that `bar:shown` triggers must find it ready.
         let state = app.state::<AppState>();
@@ -684,6 +864,8 @@ fn setup(app: &AppHandle) {
             let p = &state.providers;
             p.shortcuts.refresh();
             p.apps.refresh();
+            p.games.refresh();
+            p.bookmarks.refresh_now();
             p.files.refresh();
         });
     });
@@ -698,17 +880,23 @@ fn setup(app: &AppHandle) {
 
 /// The threads that build and refresh the indexes, each doing its disk work
 /// with no lock held that a query needs (build, then swap):
-/// - apps: now, then every 10 minutes;
+/// - apps, then games: now, then every 10 minutes;
+/// - bookmarks: now (then whenever the bar shows and they are 5 minutes old);
 /// - shortcuts: the config's definitions now, pick folders every 5 minutes;
 /// - files: the folder watcher, a scan now, then a rescan every 30 minutes.
 fn start_index_threads(app: &AppHandle, p: Providers) {
     load_answer_stores(app, &p);
 
-    let apps = p.apps;
+    let (apps, games) = (p.apps, p.games);
     std::thread::spawn(move || loop {
         apps.refresh();
+        games.refresh();
         std::thread::sleep(APPS_REFRESH_INTERVAL);
     });
+
+    // Its own thread (Firefox's database can be slow to copy), marked as
+    // running so a show meanwhile does not start a second read.
+    p.bookmarks.refresh_if_stale();
 
     let handle = app.clone();
     let shortcuts = p.shortcuts;
@@ -776,9 +964,95 @@ pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String>
     let result = hotkey::apply(app, accelerator);
     let state = app.state::<AppState>();
     *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then(|| accelerator.to_string());
+    if result.is_ok() {
+        *state.bar_hotkey.lock().unwrap_or_else(|e| e.into_inner()) = Some(accelerator.to_string());
+    }
     let error = result.err();
     tray::set_tooltip(app, &tooltip(error.as_deref()));
     error
+}
+
+/// The bar hotkey registered now, or `configured` when none has registered
+/// yet (that combo is then kept from the direct keys too).
+fn registered_bar(app: &AppHandle, configured: &str) -> String {
+    let state = app.state::<AppState>();
+    let registered = state.bar_hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    registered.unwrap_or_else(|| configured.to_string())
+}
+
+/// A direct hotkey was pressed. This may run on the main thread: only the
+/// repeat gate and the lookup happen here; the item opens on its own thread.
+fn on_direct_press(app: &AppHandle, keys: &str) {
+    static GATE: LazyLock<PressGate> = LazyLock::new(|| PressGate::new(REPEAT_GATE));
+    if !GATE.allow(keys, Instant::now()) {
+        return;
+    }
+    let Some(item) = app.try_state::<Arc<DirectKeys>>().and_then(|k| k.item_for(keys)) else {
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || direct_keys::press(&AppPress { app }, &item));
+}
+
+/// What a direct hotkey acts on in the running app.
+struct AppPress {
+    app: AppHandle,
+}
+
+impl PressTarget for AppPress {
+    fn item(&self, provider: &str, id: &str) -> Option<ResultItem> {
+        self.app.state::<AppState>().engine.item(provider, id)
+    }
+
+    fn ready(&self, provider: &str) -> bool {
+        self.app.state::<AppState>().engine.ready(provider)
+    }
+
+    fn open(&self, provider: &str, id: &str) -> Result<Outcome, String> {
+        self.app.state::<AppState>().engine.open_item(provider, id)
+    }
+
+    fn show_armed(&self, item: ResultItem) {
+        window::show_armed(&self.app, &item);
+    }
+
+    fn show_filled(&self, text: &str) {
+        window::reopen(&self.app, text, "");
+    }
+
+    fn show_step(&self, prompt: &str, scope: &str) {
+        window::show_step(&self.app, prompt, scope);
+    }
+
+    fn follow_up(&self, then: Then) {
+        if let Some(follow) = self.app.try_state::<Arc<dyn AfterHide>>() {
+            follow.run(then, window::shows());
+        }
+    }
+
+    fn failed(&self, message: &str) {
+        if let Some(notifier) = self.app.try_state::<Arc<dyn Notifier>>() {
+            let _ = notifier.show(TITLE, message);
+        }
+    }
+}
+
+/// Flick is quitting, by Quit (`RunEvent::Exit`) or by the updater, which
+/// starts the installer and ends the process without that event (it runs this
+/// as its `on_before_exit`). Safe to run more than once.
+pub(crate) fn on_exit(app: &AppHandle) {
+    quit_cleanup(app.try_state::<AppState>().as_ref().map(|s| s.providers.reminders.as_ref()));
+}
+
+/// A reminder change whose save failed is written now (or it would ring again
+/// as missed at the next start), and a notification balloon still showing
+/// takes its icon out of the notification area. A second run finds nothing
+/// left to do.
+fn quit_cleanup(reminders: Option<&Reminders>) {
+    if let Some(reminders) = reminders {
+        reminders.flush();
+    }
+    notifications::remove_balloons();
 }
 
 /// Tray tooltip: "Flick", or "Flick — <hotkey error>".
@@ -814,17 +1088,23 @@ pub(crate) fn reload_config(app: &AppHandle) {
     if loaded.config.weather_city.trim() != config.weather_city.trim() {
         p.weather.set_home(loaded.config.weather_city.trim());
     }
-    *config = loaded.config;
+    let old = std::mem::replace(&mut *config, loaded.config);
     if loaded.error.is_none() {
         state.updates.set_enabled(config.check_updates);
     }
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let hotkey_error = if hotkey_needs_apply(applied.as_deref(), &config.hotkey) {
-        apply_hotkey(app, &config.hotkey)
-    } else {
-        None
-    };
+    // Under the config lock, so two reloads never apply hotkeys interleaved.
+    let keys = app.state::<Arc<DirectKeys>>();
+    let hotkey_error = reapply_hotkeys(
+        &keys,
+        &old,
+        &config,
+        hotkey_needs_apply(applied.as_deref(), &config.hotkey),
+        |accelerator| apply_hotkey(app, accelerator),
+        || registered_bar(app, &config.hotkey),
+    );
     emit_config_error(app, join_errors(loaded.error, hotkey_error));
+    // After the direct keys were applied, so the Hotkeys status read on this is fresh.
     let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
 }
 
@@ -833,6 +1113,68 @@ pub(crate) fn reload_config(app: &AppHandle) {
 /// also retries a hotkey that failed before.
 fn hotkey_needs_apply(applied: Option<&str>, wanted: &str) -> bool {
     applied != Some(wanted)
+}
+
+/// The direct hotkeys are applied again when the bar hotkey is (its combo
+/// decides which of them may register) or when their definitions changed.
+fn direct_keys_need_apply(old: &Config, new: &Config, bar_reapplied: bool) -> bool {
+    bar_reapplied || old.direct_hotkeys != new.direct_hotkeys
+}
+
+/// The hotkeys after a config change, in the order that lets the bar win: the
+/// direct keys let go first (the bar may move onto one of their combos), then
+/// `apply_bar` registers the bar hotkey, then the direct keys register again
+/// against `registered_bar`, the bar hotkey that is registered now. Returns the
+/// bar hotkey's error. Never on the main thread.
+fn reapply_hotkeys(
+    keys: &DirectKeys,
+    old: &Config,
+    new: &Config,
+    bar_needs_apply: bool,
+    apply_bar: impl FnOnce(&str) -> Option<String>,
+    registered_bar: impl FnOnce() -> String,
+) -> Option<String> {
+    if bar_needs_apply {
+        return swap_bar_hotkey(keys, &new.hotkey, &new.direct_hotkeys, apply_bar, registered_bar);
+    }
+    if direct_keys_need_apply(old, new, false) {
+        keys.release_all();
+        keys.apply(&registered_bar(), &new.direct_hotkeys);
+    }
+    None
+}
+
+/// Moves the bar hotkey to `wanted` with the direct keys `defs` around it: they
+/// let go first (the bar may move onto one of their combos), the bar registers,
+/// then they register again against `registered_bar`, the bar hotkey that is
+/// registered now (the old one when `wanted` failed). Used by a reload and by
+/// the Settings window, so both let the bar win. Returns the bar hotkey's error.
+/// Never on the main thread; callers hold the config lock.
+pub(crate) fn swap_bar_hotkey(
+    keys: &DirectKeys,
+    wanted: &str,
+    defs: &[config::DirectHotkeyDef],
+    apply_bar: impl FnOnce(&str) -> Option<String>,
+    registered_bar: impl FnOnce() -> String,
+) -> Option<String> {
+    keys.release_all();
+    let error = apply_bar(wanted);
+    keys.apply(&registered_bar(), defs);
+    error
+}
+
+/// The Settings window's bar hotkey change, under the config lock (so a reload
+/// never interleaves): the direct keys follow it as on a reload, and the reload
+/// that follows finds the bar and the direct keys already in line.
+pub(crate) fn change_bar_hotkey(app: &AppHandle, wanted: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let keys = app.state::<Arc<DirectKeys>>();
+    settings::set_hotkey(&config::config_path(), applied.as_deref(), wanted, |h| {
+        swap_bar_hotkey(&keys, h, &config.direct_hotkeys, |a| apply_hotkey(app, a), || registered_bar(app, &config.hotkey))
+            .map_or(Ok(()), Err)
+    })
 }
 
 /// Config error first, then hotkey error.
@@ -854,7 +1196,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use config::ShortcutDef;
+    use config::{ItemRef, ShortcutDef};
+    use direct_keys::KeyRegistry;
     use launch::testing::RecordingLauncher;
     use provider::Outcome;
     use providers::apps::{AppEntry, AppKind};
@@ -941,7 +1284,8 @@ mod tests {
     /// process: a recording launcher, a recording power runner and a counting
     /// config opener. Keep `dir` alive for the whole test (it holds picks.json).
     struct Rig {
-        engine: Engine,
+        /// Shared, so the workspace runner can hold it weakly, as in `setup`.
+        engine: Arc<Engine>,
         providers: Providers,
         launcher: Arc<RecordingLauncher>,
         power: Arc<Mutex<Vec<PowerAction>>>,
@@ -960,6 +1304,13 @@ mod tests {
         clip_text: Arc<clipboard::FakeText>,
         /// Signalled when a clipboard history or clipboard read has finished.
         capture_ready: std::sync::mpsc::Receiver<()>,
+        /// Every URL asked for (weather, rates, status, `tr`, `def`).
+        fetch: Arc<net::FakeFetch>,
+        /// Signalled when a device, Recycle Bin, drive or lookup read has finished.
+        extras_ready: std::sync::mpsc::Receiver<()>,
+        /// What a workspace run reported: `(name, message)`.
+        reports: std::sync::mpsc::Receiver<(String, String)>,
+        bt: Arc<devices::testing::FakeBt>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
@@ -1040,6 +1391,47 @@ mod tests {
             }),
             Arc::new(|| 7),
         );
+        let bt = Arc::new(devices::testing::FakeBt::new(vec![devices::BtDevice {
+            id: "bt-1".into(),
+            name: "Headphones".into(),
+            connected: false,
+        }]));
+        let wifi = Arc::new(devices::testing::FakeWifi::new(vec![]));
+        let chores = Arc::new(chores::testing::FakeChores::default());
+        let (extras_tx, extras_ready) = std::sync::mpsc::channel();
+        let extras_tx = Mutex::new(extras_tx);
+        let (report_tx, reports) = std::sync::mpsc::channel();
+        let report_tx = Mutex::new(report_tx);
+        let extras = Extras::over(
+            launcher.clone(),
+            Arc::new(move || {
+                let _ = extras_tx.lock().unwrap().send(());
+            }),
+            Box::new(|| Ok(())),
+            // The reminder thread is never started here: nothing fires.
+            Arc::new(|_: &str| {}),
+            Arc::new(move |name: &str, message: &str| {
+                let _ = report_tx.lock().unwrap().send((name.to_string(), message.to_string()));
+            }),
+            ExtraSources {
+                games: Arc::new(FakeGameSource(vec![hades()])),
+                bookmarks: Arc::new(FakeBookmarks(vec![bookmarks::Bookmark {
+                    title: "Example Domain".into(),
+                    url: "https://www.example.com/".into(),
+                }])),
+                clipboard: Arc::new(clipboard::FakeClipboard::default()),
+                fetch: fetch.clone(),
+                bt: bt.clone(),
+                wifi,
+                chores,
+                reminders: dir.path().join("reminders.json"),
+                now: Arc::new(|| std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap())),
+                tz: jiff::tz::TimeZone::UTC,
+            },
+        );
+        // The fakes answer at once: read them here, as the background threads would.
+        extras.games.refresh();
+        extras.bookmarks.refresh();
         let providers = Providers {
             refresher: refresh_windows_and_audio(windows.clone(), system.clone(), Arc::new(|| {})),
             windows,
@@ -1063,12 +1455,20 @@ mod tests {
                 Arc::new(updates::tests::FakeSource::default()),
                 Arc::new(|| {}),
             ))),
+            games: extras.games,
+            bookmarks: extras.bookmarks,
+            workspaces: extras.workspaces,
+            reminders: extras.reminders,
+            timers: extras.timers,
+            words: extras.words,
+            devices: extras.devices,
+            chores: extras.chores,
         };
         let power = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
         let counter = opened.clone();
         let history = Arc::new(History::load(dir.path().join("history.json"), true));
-        let engine = build_engine(
+        let engine = Arc::new(build_engine(
             &providers,
             Box::new(RecordingRunner(power.clone())),
             Box::new(move || {
@@ -1079,7 +1479,9 @@ mod tests {
             ranking.clone(),
             history.clone(),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
-        );
+        ));
+        let runner: std::sync::Weak<dyn ItemRunner> = Arc::<Engine>::downgrade(&engine);
+        providers.workspaces.set_runner(runner);
         Rig {
             engine,
             providers,
@@ -1095,6 +1497,39 @@ mod tests {
             clip_history,
             clip_text,
             capture_ready,
+            fetch,
+            extras_ready,
+            reports,
+            bt,
+        }
+    }
+
+    /// Games a scan would find; nothing is read from disk.
+    struct FakeGameSource(Vec<games::Game>);
+
+    impl GameSource for FakeGameSource {
+        fn scan(&self) -> Vec<games::Game> {
+            self.0.clone()
+        }
+    }
+
+    /// Bookmarks as if read from Firefox; nothing is read from disk.
+    struct FakeBookmarks(Vec<bookmarks::Bookmark>);
+
+    impl BookmarkSource for FakeBookmarks {
+        fn read(&self) -> Result<Vec<bookmarks::Bookmark>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn hades() -> games::Game {
+        games::Game {
+            id: "steam:1145360".into(),
+            name: "Hades".into(),
+            store: games::Store::Steam,
+            start: games::Start::Uri("steam://rungameid/1145360".into()),
+            folder: Some(PathBuf::from(r"D:\SteamLibrary\steamapps\common\Hades")),
+            icon: "builtin:game".into(),
         }
     }
 
@@ -1404,7 +1839,19 @@ mod tests {
                 "> htop -d 10",
                 "bluetooth",
                 "mute / vol 30 / next song / dark mode / wifi off",
+                "connect headphones",
+                "disconnect headphones",
+                "wifi <name>",
                 "battery / cpu / ram / disk / ip",
+                "empty bin",
+                "eject / eject E:",
+                "flush dns",
+                "restart explorer",
+                "timer 5m",
+                "remind 20m pizza / remind 18:30 call mum",
+                "timers",
+                "tr guten Morgen",
+                "def serendipity",
                 "lock / sleep / restart / shut down / sign out",
                 "flick config",
                 "settings",
@@ -1416,7 +1863,7 @@ mod tests {
                 "Tab",
             ]
         );
-        let flick = &help[22];
+        let flick = &help[34];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -1424,7 +1871,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 30);
+        assert_eq!(r.engine.query("Help", None).len(), 42);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
@@ -1768,5 +2215,355 @@ mod tests {
         assert_eq!(r.clip_history.reads(), 2);
         assert_eq!(titles(&query_capture(&r, "qr")), ["hello"]);
         assert_eq!(r.clip_text.calls(), 2);
+    }
+
+    /// Providers whose rows only answer a typed command.
+    const TYPED: [&str; 4] = ["timers", "words", "devices", "chores"];
+
+    fn providers_of(rows: &[provider::ResultItem]) -> Vec<&'static str> {
+        rows.iter().map(|i| i.provider).collect()
+    }
+
+    /// Waits for a device, Recycle Bin or drive read to finish, then asks again.
+    fn query_extras(r: &Rig, text: &str) -> Vec<provider::ResultItem> {
+        let first = r.engine.query(text, None);
+        if first.iter().any(|i| i.title.starts_with("Reading") || i.subtitle == "Recycle Bin") {
+            r.extras_ready.recv_timeout(Duration::from_secs(5)).expect("the read finishes");
+            return r.engine.query(text, None);
+        }
+        first
+    }
+
+    #[test]
+    fn games_and_bookmarks_are_found_by_name() {
+        let r = rig(vec![], vec![]);
+        let res = r.engine.query("hades", None);
+        let game = res.iter().find(|i| i.provider == "games").unwrap_or_else(|| panic!("{:?}", titles(&res)));
+        assert_eq!((game.title.as_str(), game.subtitle.as_str()), ("Hades", "Steam"));
+        let res = r.engine.query("example", None);
+        let mark = res.iter().find(|i| i.provider == "bookmarks").unwrap_or_else(|| panic!("{:?}", titles(&res)));
+        assert_eq!((mark.title.as_str(), mark.subtitle.as_str()), ("Example Domain", "example.com"));
+        assert!(r.launcher.calls().is_empty());
+    }
+
+    #[test]
+    fn claimed_words_leave_lookalikes_to_search() {
+        let r = rig(vec![app("Timeline"), app("Trello"), app("Connections")], vec![]);
+        for text in ["timeline", "trello", "define", "connections", "ejector"] {
+            let res = r.engine.query(text, None);
+            assert!(!res.iter().any(|i| TYPED.contains(&i.provider)), "{text}: {:?}", providers_of(&res));
+        }
+        for (text, provider) in [("timer 5m", "timers"), ("tr hi", "words"), ("connect", "devices"), ("eject", "chores")] {
+            let res = r.engine.query(text, None);
+            assert!(!res.is_empty() && res.iter().all(|i| i.provider == provider), "{text}: {:?}", providers_of(&res));
+        }
+    }
+
+    #[test]
+    fn a_wifi_name_is_claimed_and_never_a_past_search() {
+        let r = rig(vec![app("Notepad")], vec![]);
+        let res = r.engine.query("wifi home", None);
+        assert!(!res.is_empty() && res.iter().all(|i| i.provider == "devices"), "{:?}", providers_of(&res));
+        // Claimed text is never a past search (`Engine::searchable`).
+        let claimed = |text: &str| r.engine.providers().any(|p| p.claims(text));
+        assert!(claimed("wifi home"));
+        // The toggles keep their words, unclaimed.
+        for text in ["wifi on", "wifi off", "wifi"] {
+            assert!(!claimed(text), "{text}");
+        }
+        for text in ["wifi on", "wifi off"] {
+            assert!(r.engine.query(text, None).iter().any(|i| i.provider == "system"), "{text}");
+        }
+    }
+
+    #[test]
+    fn typed_extras_are_never_recorded() {
+        let r = rig(vec![], vec![]);
+        let res = r.engine.query("timer 5m", None);
+        assert_eq!(providers_of(&res), ["timers"]);
+        assert_eq!(res[0].title, "Timer 5 min \u{2014} rings at 14:32");
+        assert_eq!(r.engine.activate("timers", &res[0].id, provider::Modifier::None, "timer 5m", None), Ok(Outcome::Hide));
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+        assert!(r.dir.path().join("reminders.json").exists(), "a set timer is kept until it rings");
+        let pending = r.engine.query("timers", None);
+        let row = pending.iter().find(|i| i.confirm).unwrap_or_else(|| panic!("{:?}", titles(&pending)));
+        assert_eq!(r.engine.activate("timers", &row.id, provider::Modifier::None, "timers", None), Ok(Outcome::Keep));
+        assert!(!r.dir.path().join("reminders.json").exists(), "a cancelled timer leaves the disk");
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+    }
+
+    fn item_ref(provider: &str, id: &str) -> ItemRef {
+        ItemRef { provider: provider.into(), id: id.into(), title: id.into() }
+    }
+
+    #[test]
+    fn a_workspace_opens_its_items_in_order() {
+        // Apps open through the shell itself, not the launcher: the program
+        // item here is a game, which opens through the recording launcher.
+        let r = rig(vec![], vec![]);
+        let game = r.engine.query("hades", None).into_iter().find(|i| i.provider == "games").unwrap();
+        let mark = r.engine.query("example", None).into_iter().find(|i| i.provider == "bookmarks").unwrap();
+        let work = config::WorkspaceDef {
+            name: "work".into(),
+            aliases: vec![],
+            items: vec![
+                item_ref("games", &game.id),
+                item_ref("bookmarks", &mark.id),
+                item_ref("apps", r"C:\definitely\missing\Gone.lnk"),
+            ],
+        };
+        let old = Config::default();
+        let new = Config { workspaces: vec![work], ..Config::default() };
+        push_config(&r.providers, &old, &new, &WslState::Unknown);
+        let row = r.engine.query("work", None).into_iter().find(|i| i.provider == "workspaces").unwrap();
+        assert_eq!((row.title.as_str(), row.subtitle.as_str()), ("Open workspace work", "3 items"));
+        assert_eq!(r.engine.activate("workspaces", "work", provider::Modifier::None, "work", None), Ok(Outcome::Hide));
+        let report = r.reports.recv_timeout(Duration::from_secs(5)).expect("the run reports its failure");
+        let calls = r.launcher.calls();
+        assert_eq!(report, ("work".to_string(), "1 of 3 could not open".to_string()), "{calls:?}");
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].contains("steam://rungameid/1145360") && calls[1].contains("example.com"), "{calls:?}");
+        assert_eq!(r.ranking.boost("games", &game.id), 0);
+        assert_eq!(r.ranking.boost("bookmarks", &mark.id), 0);
+    }
+
+    #[test]
+    fn confirm_chores_and_cancels_need_a_second_enter() {
+        let r = rig(vec![], vec![]);
+        let first = |text: &str, title: &str| {
+            let res = query_extras(&r, text);
+            res.into_iter().find(|i| i.title == title).unwrap_or_else(|| panic!("{text}: no {title}"))
+        };
+        assert!(first("empty bin", "Empty Recycle Bin").confirm);
+        assert!(first("restart explorer", "Restart Explorer").confirm);
+        assert!(!first("flush dns", "Flush DNS cache").confirm);
+        let timer = r.engine.query("timer 5m", None).remove(0);
+        r.engine.activate("timers", &timer.id, provider::Modifier::None, "timer 5m", None).unwrap();
+        let pending = r.engine.query("timers", None);
+        assert!(!pending.is_empty() && pending.iter().all(|i| i.confirm), "{:?}", titles(&pending));
+    }
+
+    #[test]
+    fn online_off_reaches_tr_and_def() {
+        let r = rig(vec![], vec![]);
+        let off = Config { online: false, ..Config::default() };
+        push_config(&r.providers, &Config::default(), &off, &WslState::Unknown);
+        assert_eq!(titles(&r.engine.query("tr hallo", None)), ["Online answers are off"]);
+        assert_eq!(titles(&r.engine.query("def Haus", None)), ["Online answers are off"]);
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(r.fetch.urls().is_empty(), "{:?}", r.fetch.urls());
+    }
+
+    #[test]
+    fn hiding_the_bar_forgets_waiting_lookups() {
+        let r = rig(vec![], vec![]);
+        assert_eq!(titles(&r.engine.query("tr hallo", None)), ["Translating\u{2026}"]);
+        r.providers.on_hide();
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(r.fetch.urls().is_empty(), "{:?}", r.fetch.urls());
+        // A lookup left waiting is sent once the pause has passed.
+        assert_eq!(titles(&r.engine.query("def Haus", None)), ["Looking up\u{2026}"]);
+        r.extras_ready.recv_timeout(Duration::from_secs(5)).expect("the lookup finishes");
+        assert_eq!(r.fetch.urls().len(), 1, "{:?}", r.fetch.urls());
+    }
+
+    #[test]
+    fn quitting_writes_a_failed_reminder_save_once() {
+        let r = rig(vec![], vec![]);
+        let path = r.dir.path().join("reminders.json");
+        let now = std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap());
+        let first = r.providers.reminders.add(now + Duration::from_secs(600), "first", false).unwrap();
+        r.providers.reminders.add(now + Duration::from_secs(1200), "second", false).unwrap();
+        // A folder with the file's name: the cancel's save fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(r.providers.reminders.cancel(first.id));
+        std::fs::remove_dir(&path).unwrap();
+        quit_cleanup(Some(&r.providers.reminders));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("second") && !saved.contains("first"), "{saved}");
+        // Run again (Quit after the updater's hook): nothing left to write.
+        std::fs::remove_file(&path).unwrap();
+        quit_cleanup(Some(&r.providers.reminders));
+        quit_cleanup(None);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_item_picker_never_fetches_or_reads() {
+        let r = rig(vec![], vec![]);
+        // A stored device row resolves before any list was read (a hotkey right after start).
+        let standin = r.engine.item("devices", "connect:bt-9").expect("rebuilt from its id");
+        assert_eq!((standin.title.as_str(), standin.pinnable), ("Bluetooth audio device", true));
+        for text in ["ip", "weather vienna", "20 usd in eur", "tr hallo", "def Haus", "wifi home", "connect", "empty bin", "eject", "v"] {
+            let rows = item_search::search(&r.engine, text, false);
+            assert!(rows.iter().all(|row| !item_search::PICKER_SKIPS.contains(&row.provider.as_str())), "{text}");
+        }
+        // Longer than every typing pause (ip, weather, tr/def).
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(r.fetch.urls().is_empty(), "{:?}", r.fetch.urls());
+        assert_eq!(r.clip_history.reads(), 0);
+        // What can be stored is found: a game, the empty-bin chore (armed on a
+        // hotkey) and, once the list is read, a paired device.
+        let found = item_search::search(&r.engine, "hades", false);
+        assert_eq!(found.iter().map(|p| p.provider.as_str()).collect::<Vec<_>>(), ["games"]);
+        let bin = item_search::search(&r.engine, "empty bin", false);
+        let bin = bin.iter().find(|p| p.provider == "chores" && p.title == "Empty Recycle Bin").expect("the empty-bin row");
+        assert!(bin.confirm);
+        let devices = item_search::search(&r.engine, "connect", false);
+        let headphones = devices.iter().find(|p| p.provider == "devices").expect("a device row");
+        assert_eq!((headphones.id.as_str(), headphones.title.as_str()), ("connect:bt-1", "Headphones"));
+        assert_eq!(r.engine.item("devices", "connect:bt-1").map(|i| i.subtitle), Some("Not connected".to_string()));
+        // Once the list is read, a device that is not in it is gone.
+        assert!(r.engine.item("devices", "connect:bt-9").is_none());
+        assert!(r.bt.calls().iter().all(|c| !c.starts_with("connect")), "{:?}", r.bt.calls());
+    }
+
+    /// The global-shortcut plugin's one app-wide map, shared by the bar hotkey
+    /// and the direct keys: a combo held by either is taken for the other.
+    #[derive(Default)]
+    struct SharedKeys {
+        held: Mutex<Vec<String>>,
+    }
+
+    impl direct_keys::KeyRegistry for SharedKeys {
+        fn register(&self, keys: &str) -> Result<(), direct_keys::RegisterError> {
+            let mut held = self.held.lock().unwrap();
+            if held.iter().any(|k| k == keys) {
+                return Err(direct_keys::RegisterError::Taken);
+            }
+            held.push(keys.to_string());
+            Ok(())
+        }
+        fn unregister(&self, keys: &str) -> bool {
+            self.held.lock().unwrap().retain(|k| k != keys);
+            true
+        }
+    }
+
+    fn direct(keys: &str) -> config::DirectHotkeyDef {
+        config::DirectHotkeyDef { keys: keys.into(), item: item_ref("apps", r"C:\x\Term.lnk") }
+    }
+
+    #[test]
+    fn direct_keys_follow_a_bar_hotkey_change() {
+        let base = Config { hotkey: "Alt+Space".into(), direct_hotkeys: vec![direct("Ctrl+Alt+T")], ..Config::default() };
+        let moved = Config { hotkey: "Ctrl+Alt+T".into(), ..base.clone() };
+        let more = Config { direct_hotkeys: vec![direct("Ctrl+Alt+T"), direct("Win+N")], ..base.clone() };
+        assert!(direct_keys_need_apply(&base, &moved, true));
+        assert!(direct_keys_need_apply(&base, &more, false));
+        assert!(!direct_keys_need_apply(&base, &base.clone(), false));
+
+        let registry = Arc::new(SharedKeys::default());
+        let keys = DirectKeys::new(registry.clone());
+        // The bar first, as in `setup`.
+        registry.register(&config::normalize_combo(&base.hotkey)).unwrap();
+        keys.apply(&base.hotkey, &base.direct_hotkeys);
+        assert_eq!(keys.item_for("Ctrl+Alt+T").map(|i| i.id), Some(r"C:\x\Term.lnk".to_string()));
+
+        // The bar hotkey moves onto the direct key's combo.
+        let bar_registry = registry.clone();
+        let error = reapply_hotkeys(
+            &keys,
+            &base,
+            &moved,
+            true,
+            |accel| {
+                bar_registry.unregister(&config::normalize_combo(&base.hotkey));
+                bar_registry.register(&config::normalize_combo(accel)).err().map(|_| "taken".to_string())
+            },
+            || moved.hotkey.clone(),
+        );
+        assert_eq!(error, None, "the direct key let go before the bar registered");
+        let states: Vec<direct_keys::KeyState> = keys.status(&|_| true).into_iter().map(|s| s.state).collect();
+        assert_eq!(states, [direct_keys::KeyState::Clash]);
+        assert_eq!(keys.item_for("Ctrl+Alt+T"), None);
+        assert_eq!(*registry.held.lock().unwrap(), ["ctrl+alt+t"], "held once, by the bar");
+
+        // Nothing changed: nothing is released or registered again.
+        let untouched = reapply_hotkeys(&keys, &moved, &moved, false, |_| panic!("no bar apply"), || panic!("no direct apply"));
+        assert_eq!(untouched, None);
+    }
+
+    #[test]
+    fn every_route_and_claimed_help_word_is_kept_from_workspace_names() {
+        let r = rig(vec![], vec![]);
+        let mut checked = 0;
+        for p in r.engine.providers() {
+            if let Some(route) = p.route() {
+                let typed = if route.needs_space { route.prefix.to_string() } else { format!("{}x", route.prefix) };
+                assert!(config::is_command_word(&typed), "{} routes {}", p.name(), route.prefix);
+                checked += 1;
+            }
+            for line in p.help() {
+                let Some(word) = line.fill.split_whitespace().next() else { continue };
+                if p.claims(word) || p.claims(&format!("{word} x")) {
+                    assert!(config::is_command_word(word), "{} claims {word}", p.name());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 10, "{checked}");
+    }
+
+    #[test]
+    fn a_settings_bar_hotkey_change_lets_the_bar_win_and_frees_the_old_clash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "hotkey = \"Alt+Space\"\n").unwrap();
+        let defs = vec![direct("Ctrl+Alt+T")];
+        let registry = Arc::new(SharedKeys::default());
+        let keys = DirectKeys::new(registry.clone());
+        let bar = Mutex::new("Alt+Space".to_string());
+        registry.register(&config::normalize_combo("Alt+Space")).unwrap();
+        keys.apply("Alt+Space", &defs);
+        assert!(keys.item_for("Ctrl+Alt+T").is_some());
+
+        // As `change_bar_hotkey` does, with the plugin's one map faked.
+        let change = |applied: &str, wanted: &str| {
+            settings::set_hotkey(&path, Some(applied), wanted, |h| {
+                swap_bar_hotkey(
+                    &keys,
+                    h,
+                    &defs,
+                    |accel| {
+                        let mut bar = bar.lock().unwrap();
+                        registry.unregister(&config::normalize_combo(&bar));
+                        match registry.register(&config::normalize_combo(accel)) {
+                            Ok(()) => {
+                                *bar = accel.to_string();
+                                None
+                            }
+                            Err(_) => {
+                                registry.register(&config::normalize_combo(&bar)).unwrap();
+                                Some(format!("hotkey \"{accel}\" is in use by another program"))
+                            }
+                        }
+                    },
+                    || bar.lock().unwrap().clone(),
+                )
+                .map_or(Ok(()), Err)
+            })
+        };
+        let states = || keys.status(&|_| true).into_iter().map(|s| s.state).collect::<Vec<_>>();
+
+        // The bar moves onto the direct key's combo: the bar wins.
+        change("Alt+Space", "Ctrl+Alt+T").expect("the direct key let go first");
+        assert_eq!(*bar.lock().unwrap(), "Ctrl+Alt+T");
+        assert_eq!(states(), [direct_keys::KeyState::Clash]);
+        assert_eq!(keys.item_for("Ctrl+Alt+T"), None);
+        assert_eq!(*registry.held.lock().unwrap(), ["ctrl+alt+t"], "held once, by the bar");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Ctrl+Alt+T"));
+
+        // The bar moves away: the entry that clashed registers now, with no reload.
+        change("Ctrl+Alt+T", "Ctrl+Shift+K").unwrap();
+        assert_eq!(states(), [direct_keys::KeyState::Ok]);
+        assert_eq!(keys.item_for("Ctrl+Alt+T").map(|i| i.id), Some(r"C:\x\Term.lnk".to_string()));
+        let mut held = registry.held.lock().unwrap().clone();
+        held.sort();
+        assert_eq!(held, [config::normalize_combo("Ctrl+Alt+T"), config::normalize_combo("Ctrl+Shift+K")]);
     }
 }

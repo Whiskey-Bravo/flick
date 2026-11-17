@@ -9,6 +9,8 @@ use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 
+use crate::provider::ResultItem;
+
 pub const LABEL: &str = "bar";
 
 /// Focus-loss events arriving this soon after `show` belong to the show/focus
@@ -53,9 +55,44 @@ fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
     state != Some(QUNS_RUNNING_D3D_FULL_SCREEN)
 }
 
+/// What the page is told when the bar is shown.
+enum Shown<'a> {
+    /// `bar:shown`: a fresh, empty bar.
+    Fresh,
+    /// `bar:armed` with the item: it waits for the second Enter.
+    Armed(&'a ResultItem),
+    /// `bar:reopen` with `{ text, error }`: the text is put back with the error under it.
+    Reopen { text: &'a str, error: &'a str },
+    /// `bar:step` with `{ prompt, scope }`: the bar opens in that pick list.
+    Step { prompt: &'a str, scope: &'a str },
+}
+
 /// Centre horizontally, top edge at 25% of the monitor under the mouse cursor;
 /// show; focus; emit `bar:shown`, then `config:error` with the stored error (or null).
 pub fn show(app: &AppHandle) {
+    show_as(app, Shown::Fresh);
+}
+
+/// Like [`show`], but the bar opens with `item` armed (a direct hotkey on an
+/// item that asks for a second Enter): `bar:armed` instead of `bar:shown`.
+pub fn show_armed(app: &AppHandle, item: &ResultItem) {
+    show_as(app, Shown::Armed(item));
+}
+
+/// Like [`show`], but the bar opens with `text` and `error` under it (a
+/// workspace whose items did not all open): `bar:reopen` instead of `bar:shown`.
+/// An empty `error` shows none (a direct hotkey on an item that needs typing).
+pub fn reopen(app: &AppHandle, text: &str, error: &str) {
+    show_as(app, Shown::Reopen { text, error });
+}
+
+/// Like [`show`], but the bar opens in the pick list `scope` under `prompt`,
+/// as after Enter on its row (a direct hotkey on an item that asks to choose).
+pub fn show_step(app: &AppHandle, prompt: &str, scope: &str) {
+    show_as(app, Shown::Step { prompt, scope });
+}
+
+fn show_as(app: &AppHandle, shown: Shown) {
     // Every open starts fresh: a `v` or `qr` read that raced the last hide
     // is dropped too.
     if let Some(state) = app.try_state::<crate::AppState>() {
@@ -74,7 +111,16 @@ pub fn show(app: &AppHandle) {
         let _ = w.set_position(pos);
     }
     reveal_window(&w);
-    let _ = app.emit_to(LABEL, "bar:shown", ());
+    let _ = match shown {
+        Shown::Fresh => app.emit_to(LABEL, "bar:shown", ()),
+        Shown::Armed(item) => app.emit_to(LABEL, "bar:armed", item),
+        Shown::Reopen { text, error } => {
+            app.emit_to(LABEL, "bar:reopen", serde_json::json!({ "text": text, "error": error }))
+        }
+        Shown::Step { prompt, scope } => {
+            app.emit_to(LABEL, "bar:step", serde_json::json!({ "prompt": prompt, "scope": scope }))
+        }
+    };
     // Re-send the stored error so one raised before the page listened is not lost.
     if let Some(state) = app.try_state::<crate::AppState>() {
         // Open windows and the audio state are read off this thread.

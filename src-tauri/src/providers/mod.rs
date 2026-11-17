@@ -1,11 +1,15 @@
 //! Result providers.
 pub mod answers;
 pub mod apps;
+pub mod bookmarks;
 pub mod clips;
+pub mod chores;
 pub mod files;
 mod files_scan;
 pub mod flick;
+pub mod games;
 pub mod history;
+pub mod devices;
 pub mod path;
 pub mod power;
 pub mod qr;
@@ -15,7 +19,10 @@ pub mod settings;
 pub mod shortcuts;
 pub mod status;
 pub mod system;
+pub mod timers;
 pub mod update;
+pub mod words;
 pub mod welcome;
 pub mod windows;
+pub mod workspaces;
 pub mod wsl;

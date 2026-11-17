@@ -233,8 +233,7 @@ impl<T: Send + Sync + 'static> Loader<T> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.clear();
     }
 
-    /// The last value read for `key`, however old.
-    #[cfg(test)]
+    /// The last value read for `key`, however old. Never starts a read.
     pub fn peek(&self, key: &str) -> Option<Arc<T>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &state.slots.get(key)?.done {

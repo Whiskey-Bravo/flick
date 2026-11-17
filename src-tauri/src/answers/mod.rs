@@ -2,6 +2,7 @@
 
 pub mod calc;
 pub mod clock;
+pub mod lookup;
 pub mod number;
 pub mod rates;
 pub mod units;

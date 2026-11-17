@@ -1,0 +1,36 @@
+.ws-items { list-style: none; margin: 0 0 6px; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.ws-item { display: flex; align-items: center; gap: 6px; }
+.ws-item button, .hk-remove {
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); cursor: pointer;
+}
+.ws-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-missing { color: var(--error); font-size: 12px; }
+.ws-item button:disabled { opacity: 0.45; cursor: default; }
+
+.ip { display: flex; flex-direction: column; gap: 4px; }
+.ip > input {
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); font: inherit;
+}
+.ip-rows { list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.ip-row {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 5px 8px;
+  border: none; background: transparent; color: var(--text); text-align: left; cursor: pointer;
+}
+.ip-row.active { background: var(--panel); }
+.ip-row .icon { flex: none; width: 20px; height: 20px; }
+.ip-title { flex: none; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ip-sub { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.hk-row { flex-direction: row; align-items: center; gap: 6px; padding: 0; }
+.hk-main {
+  flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 6px 10px;
+  border: none; background: transparent; color: var(--text); text-align: left; cursor: pointer;
+}
+.hk-remove { flex: none; margin-right: 6px; }
+/* Long combos wrap inside the row instead of running under Remove. */
+.hk-main .sc-name { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 0; }
+.hk-status { color: var(--error); font-size: 12px; }
+.hk-chosen { padding: 4px 0; }
+.hk-capture { align-self: flex-start; }

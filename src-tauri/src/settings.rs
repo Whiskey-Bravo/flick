@@ -7,7 +7,7 @@
 //! the real path, `hotkey::apply` and `reload_config`.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
@@ -15,10 +15,11 @@ use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::answers::weather;
-use crate::config::{self, Config, FieldError, ShortcutDef};
+use crate::config::{self, Config, DirectHotkeyDef, FieldError, ShortcutDef, WorkspaceDef};
 use crate::config_edit::{self, Setting};
+use crate::direct_keys::DirectKeys;
 use crate::net::{Fetch, FetchError, WinHttp};
-use crate::{apply_hotkey, reload_config, AppState, WslState};
+use crate::{change_bar_hotkey, reload_config, AppState, WslState};
 
 /// Label of the Settings window; events for it are harmless while it is closed.
 pub const WINDOW: &str = "settings";
@@ -95,6 +96,51 @@ pub fn remove_shortcut(path: &Path, name: &str) -> Result<(), String> {
     write(path, &config_edit::delete_shortcut(&text, name)?)
 }
 
+/// Adds a workspace (`original` is `None`) or replaces the one named `original`.
+pub fn save_workspace(path: &Path, original: Option<&str>, def: &WorkspaceDef) -> Result<(), String> {
+    let (text, config) = read_config(path)?;
+    // The original was removed from the file meanwhile: keep the edit and add it as a new one.
+    let original = original.filter(|name| config.workspaces.iter().any(|w| w.name == *name));
+    config::check_workspace_in(&config, original, def)?;
+    write(path, &config_edit::upsert_workspace(&text, original, def)?)
+}
+
+pub fn remove_workspace(path: &Path, name: &str) -> Result<(), String> {
+    let (text, _) = read_config(path)?;
+    write(path, &config_edit::delete_workspace(&text, name)?)
+}
+
+/// Adds a direct hotkey (`original` is `None`) or replaces the one with the keys `original`.
+/// The bar's own combo and a weak combo are refused before the file is read.
+pub fn save_direct_hotkey(
+    path: &Path,
+    original: Option<&str>,
+    def: &DirectHotkeyDef,
+    bar_hotkey: &str,
+) -> Result<(), String> {
+    if def.keys.trim().is_empty() {
+        return Err("keys are empty".into());
+    }
+    if config::normalize_combo(&def.keys) == config::normalize_combo(bar_hotkey) {
+        return Err(config::BAR_COMBO.into());
+    }
+    if !config::combo_allowed(&def.keys) {
+        return Err(config::WEAK_COMBO.into());
+    }
+    let (text, config) = read_config(path)?;
+    let original = original.filter(|keys| {
+        let keys = config::normalize_combo(keys);
+        config.direct_hotkeys.iter().any(|h| config::normalize_combo(&h.keys) == keys)
+    });
+    config::check_direct_hotkey_in(&config, original, def)?;
+    write(path, &config_edit::upsert_direct_hotkey(&text, original, def)?)
+}
+
+pub fn remove_direct_hotkey(path: &Path, keys: &str) -> Result<(), String> {
+    let (text, _) = read_config(path)?;
+    write(path, &config_edit::delete_direct_hotkey(&text, keys)?)
+}
+
 /// One geocoding request for `city`: `"<name>, <country>"` of the best match.
 /// Only asked while online answers are on.
 pub fn check_city(online: bool, fetch: &dyn Fetch, city: &str) -> Result<String, String> {
@@ -149,13 +195,12 @@ pub fn settings_state(app: AppHandle, state: State<AppState>) -> SettingsState {
 /// Applies the new file now rather than waiting for the watcher, which then finds
 /// nothing new. `reload_config` also emits `settings:changed`.
 #[tauri::command(async)]
-pub fn settings_set(setting: Setting, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+pub fn settings_set(setting: Setting, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let path = config::config_path();
     let result = match setting {
         Setting::Hotkey(wanted) => {
-            let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let r = set_hotkey(&path, applied.as_deref(), &wanted, |h| apply_hotkey(&app, h).map_or(Ok(()), Err));
+            let r = change_bar_hotkey(&app, &wanted);
             if r.is_err() {
                 // The old hotkey is registered again; bring the record and the
                 // tooltip back in line with it.
@@ -194,6 +239,51 @@ pub fn settings_check_shortcut(
 pub fn settings_delete_shortcut(name: String, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     remove_shortcut(&config::config_path(), &name)?;
+    reload_config(&app);
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn settings_save_workspace(original: Option<String>, def: WorkspaceDef, app: AppHandle) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    save_workspace(&config::config_path(), original.as_deref(), &def)?;
+    reload_config(&app);
+    Ok(())
+}
+
+/// Against the last good config, in memory only.
+#[tauri::command(async)]
+pub fn settings_check_workspace(original: Option<String>, def: WorkspaceDef, state: State<AppState>) -> Option<String> {
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    config::check_workspace_in(&config, original.as_deref(), &def).err()
+}
+
+#[tauri::command(async)]
+pub fn settings_delete_workspace(name: String, app: AppHandle) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    remove_workspace(&config::config_path(), &name)?;
+    reload_config(&app);
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn settings_save_hotkey(
+    original: Option<String>,
+    def: DirectHotkeyDef,
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let bar = state.config.lock().unwrap_or_else(|e| e.into_inner()).hotkey.clone();
+    save_direct_hotkey(&config::config_path(), original.as_deref(), &def, &bar)?;
+    reload_config(&app);
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn settings_delete_hotkey(keys: String, app: AppHandle) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    remove_direct_hotkey(&config::config_path(), &keys)?;
     reload_config(&app);
     Ok(())
 }
@@ -262,7 +352,7 @@ pub fn settings_check_city(city: String, state: State<AppState>) -> Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Field;
+    use crate::config::{Field, ItemRef};
     use crate::net::FakeFetch;
     use std::cell::Cell;
 
@@ -374,6 +464,72 @@ mod tests {
         assert!(!config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap().history);
     }
 
+    fn ws(name: &str) -> WorkspaceDef {
+        WorkspaceDef {
+            name: name.into(),
+            aliases: vec![],
+            items: vec![ItemRef { provider: "apps".into(), id: "a.lnk".into(), title: "A".into() }],
+        }
+    }
+
+    fn hk(keys: &str) -> DirectHotkeyDef {
+        DirectHotkeyDef { keys: keys.into(), item: ItemRef { provider: "apps".into(), id: "t.lnk".into(), title: String::new() } }
+    }
+
+    #[test]
+    fn weak_or_bar_combos_are_refused_before_the_file_is_read() {
+        for text in [FILE, "hotkey = "] {
+            let (_d, path) = file(text);
+            assert_eq!(save_direct_hotkey(&path, None, &hk("Ctrl+T"), "Alt+Space"), Err(config::WEAK_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("alt+space"), "Alt+Space"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("Alt+Ctrl+T"), "Ctrl+Alt+T"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("Ctrl+Alt+Esc"), "Ctrl+Alt+Escape"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("CmdOrCtrl+Alt+Space"), "Ctrl+Alt+Space"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(save_direct_hotkey(&path, None, &hk("Win+N"), "Super+N"), Err(config::BAR_COMBO.to_string()));
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn broken_file_is_never_overwritten_by_workspace_or_hotkey_saves() {
+        let (_d, path) = file("hotkey = ");
+        assert!(save_workspace(&path, None, &ws("w")).is_err());
+        assert!(remove_workspace(&path, "w").is_err());
+        assert!(save_direct_hotkey(&path, None, &hk("Ctrl+Alt+T"), "Alt+Space").is_err());
+        assert!(remove_direct_hotkey(&path, "Ctrl+Alt+T").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hotkey = ");
+    }
+
+    #[test]
+    fn save_workspace_then_remove_round_trips() {
+        let (_d, path) = file(FILE);
+        save_workspace(&path, None, &ws("work")).unwrap();
+        save_workspace(&path, Some("work"), &ws("job")).unwrap();
+        // The original vanished meanwhile: added as a new one.
+        save_workspace(&path, Some("gone"), &ws("play")).unwrap();
+        assert_eq!(save_workspace(&path, None, &ws("JOB")), Err("name is already used".to_string()));
+        save_direct_hotkey(&path, None, &hk("Ctrl+Alt+T"), "Alt+Space").unwrap();
+        assert_eq!(
+            save_direct_hotkey(&path, None, &hk("alt+ctrl+t"), "Alt+Space"),
+            Err(config::DUPLICATE_COMBO.to_string())
+        );
+        assert_eq!(
+            save_direct_hotkey(&path, None, &hk("Ctrl+Alt+KeyT"), "Alt+Space"),
+            Err(config::DUPLICATE_COMBO.to_string())
+        );
+        save_direct_hotkey(&path, Some("ctrl+alt+t"), &hk("Win+T"), "Alt+Space").unwrap();
+        let config = config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.workspaces, [ws("job"), ws("play")]);
+        assert_eq!(config.direct_hotkeys, [hk("Win+T")]);
+
+        remove_workspace(&path, "job").unwrap();
+        remove_workspace(&path, "play").unwrap();
+        remove_direct_hotkey(&path, "win+t").unwrap();
+        assert!(remove_workspace(&path, "job").is_err());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text, FILE);
+    }
+
     const LONDON_GEO: &[u8] = br#"{"results":[{"name":"London","latitude":51.5,"longitude":-0.12,"country":"United Kingdom"}]}"#;
 
     #[test]
@@ -410,8 +566,10 @@ pub fn settings_currencies() -> Vec<String> {
     crate::answers::units::CURRENCIES.iter().map(|c| c.to_string()).collect()
 }
 
-/// Releases the global hotkey while the hotkey box captures keys, then restores it.
+/// Releases the global hotkeys (the bar's and the direct ones) while a keys box
+/// captures keys, then restores them, the bar's first.
 #[tauri::command(async)]
-pub fn settings_pause_hotkey(paused: bool, app: AppHandle) {
+pub fn settings_pause_hotkey(paused: bool, app: AppHandle, keys: State<Arc<DirectKeys>>) {
     crate::hotkey::set_paused(&app, paused);
+    keys.pause(paused);
 }

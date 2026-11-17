@@ -923,4 +923,59 @@ describe("mouse and menu", () => {
     const r = run(withItems(c), key("Enter", true));
     expect(r.effects).toEqual([{ type: "activate", item: c, modifier: "ctrl", text: "", scope: null }]);
   });
+
+  it("armed_event_shows_the_item_armed", () => {
+    const dirty = run(initial, { type: "input", text: "x" }).state;
+    const it = item("w", true);
+    const r = reduce(dirty, { type: "armed", item: it });
+    expect(r.state.items).toEqual([it]);
+    expect(r.state.armed).toBe("w");
+    expect(r.state.text).toBe("");
+    expect(r.state.hidden).toBe(false);
+    expect(r.effects).toEqual([{ type: "loadPast" }]);
+    const e = reduce(r.state, key("Enter"));
+    expect(e.effects).toEqual([{ type: "activate", item: it, modifier: "none", text: "", scope: null }]);
+  });
+
+  it("reopen_fills_the_text_and_keeps_the_error", () => {
+    const hiddenState = run(initial, { type: "hidden" }).state;
+    const r = reduce(hiddenState, { type: "reopen", text: "work", error: "2 of 5 could not open" });
+    expect(r.state.text).toBe("work");
+    expect(r.state.hidden).toBe(false);
+    expect(r.effects).toEqual([{ type: "query", text: "work", scope: null }, { type: "loadPast" }]);
+    const after = run(r.state, { type: "results", items: [item("a")] }).state;
+    expect(after.error).toBe("2 of 5 could not open");
+    expect(run(after, { type: "input", text: "wor" }).state.error).toBeNull();
+  });
+
+  it("reopen_without_an_error_only_fills_the_text", () => {
+    const r = reduce(run(initial, { type: "hidden" }).state, { type: "reopen", text: "search ", error: "" });
+    expect(r.state.text).toBe("search ");
+    expect(r.state.error).toBeNull();
+    expect(r.state.failure).toBeNull();
+    expect(r.state.hidden).toBe(false);
+    expect(r.effects).toEqual([{ type: "query", text: "search ", scope: null }, { type: "loadPast" }]);
+  });
+
+  it("scoped_event_opens_the_pick_list", () => {
+    const dirty = run(initial, { type: "input", text: "x" }, { type: "hidden" }).state;
+    const r = reduce(dirty, { type: "scoped", prompt: "proj", scope: "shortcut:proj" });
+    expect(r.state.scope).toEqual({ name: "shortcut:proj", prompt: "proj" });
+    expect(r.state.text).toBe("");
+    expect(r.state.hidden).toBe(false);
+    expect(r.effects).toEqual([{ type: "query", text: "", scope: "shortcut:proj" }, { type: "loadPast" }]);
+    const listed = run(r.state, { type: "results", items: [item("a")] }).state;
+    const e = reduce(listed, key("Enter"));
+    expect(e.effects).toEqual([{ type: "activate", item: item("a"), modifier: "none", text: "", scope: "shortcut:proj" }]);
+  });
+
+  it("armed_row_survives_answers_ready", () => {
+    const it = item("w", true);
+    const armed = run(initial, { type: "armed", item: it }).state;
+    expect(armed.queried).toBeNull();
+    const r = reduce(armed, { type: "answersReady" });
+    expect(r.effects).toEqual([]);
+    expect(r.state.items).toEqual([it]);
+    expect(r.state.armed).toBe("w");
+  });
 });

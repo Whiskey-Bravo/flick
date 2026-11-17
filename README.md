@@ -31,6 +31,20 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | `color` (also `colour`, `picker`) | Picks a colour on screen and copies it as `#RRGGBB` | `color` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
+| Part of a game's name | Starts the game through its launcher (Steam, Epic, Rockstar, Minecraft) | `hades` |
+| Part of a bookmark's title or site | Opens the Firefox bookmark in your browser | `example` |
+| A workspace's name | Opens every item of the workspace, in order | `work` |
+| `timer` and a time | A timer that rings with a Windows notification | `timer 5m` |
+| `remind`, a time and a note | A reminder after a while, at a time today, or tomorrow | `remind 20m pizza`, `remind 18:30 call mum`, `remind tomorrow 9:00 dentist` |
+| `timers` | Your pending timers and reminders; Enter twice cancels one | `timers` |
+| `tr` and some text | Translates between German and English (online) | `tr guten Morgen` |
+| `def` and a word | Definitions from Wiktionary (online) | `def serendipity` |
+| `connect` or `disconnect`, and a device | Connects or disconnects a paired Bluetooth audio device | `connect headphones` |
+| `wifi` and a network | Joins a saved Wi-Fi network | `wifi home` |
+| `empty bin` | Empties the Recycle Bin (press Enter twice) | `empty bin` |
+| `eject`, or `eject` and a drive | Safely removes a USB drive | `eject`, `eject E:` |
+| `flush dns` | Clears Windows' DNS cache | `flush dns` |
+| `restart explorer` | Restarts the taskbar and desktop (press Enter twice) | `restart explorer` |
 | A sum, a unit or currency conversion, a time or date, or `weather` | Shows the answer on top; Enter copies it (on a weather answer, Enter opens a web search) | `12*7`, `20 usd in eur`, `time tokyo` (see Quick answers) |
 | `?`, `g`, `yt` or `gh`, then your search | Searches the web in your browser | `? rust lifetimes` |
 | The name of one of your shortcuts | Runs it | `search rust traits` (after adding the `search` shortcut shown below) |
@@ -356,14 +370,56 @@ In `run` and `wsl` shortcuts, what you type is never pasted into the command. Fl
 
 </details>
 
+## Games and bookmarks
+
+Installed games show up in normal search by name: Steam games (in every Steam library, on any drive), Epic games, Rockstar games and Minecraft (the Minecraft Launcher). Enter starts the game through its launcher; Open file location in the row's menu shows the install folder. A game that is still downloading for the first time is not listed; one waiting for an update is. The lists are read in the background when Flick starts and again every 10 minutes, so a game you just installed shows up within minutes (or at once with Reload in the tray menu).
+
+Bookmarks of Firefox's default profile show up in normal search by title and by site. Enter opens the bookmark in your default browser; Copy in the row's menu copies its address. Flick reads a copy of Firefox's bookmark database, so this works while Firefox is open, and reads it again when you open the bar and the last read is more than five minutes old. Only Firefox bookmarks are read: no open tabs, no other browsers.
+
+Games and bookmarks are learned, pinned and kept as recent launches like apps.
+
+## Workspaces and hotkeys
+
+Both are set up in Settings, on the Workspaces and Hotkeys tabs. You pick their items with the search box there, which finds what the bar finds: apps, files, folders, games, bookmarks, shortcuts, Settings pages, Bluetooth devices and Wi-Fi networks (`connect headphones`, `wifi home`), chores and more. Answers, `tr`/`def` and timers are not offered there, so nothing typed in Settings goes online.
+
+**Workspaces.** A workspace is a name for a set of items (`work`, `gaming`). Type its name and the bar shows `Open workspace work`; Enter opens every item in order, with a short pause between them, and the bar hides. An item that no longer exists, one that asks for a second Enter (`empty bin`, power actions), or a shortcut that needs something typed after it is skipped (the Workspaces tab does not offer those). If any item could not open, the bar comes back with the workspace's name and, for example, `1 of 3 could not open`. Right after you sign in, a workspace waits a few seconds for Flick to finish finding your apps and games; if they are still not ready it says `Flick is still starting`. A workspace cannot be named after something Flick answers to itself (`timer`, `tr`, `connect`, `v`, `snip`…). Workspaces do not arrange or close windows.
+
+**Hotkeys.** A hotkey opens one item from anywhere, without the bar. It needs two modifiers (like Ctrl+Alt) or Win: plain keys and single-modifier combos are refused. A combo that another program holds says `Taken by another program` next to it in Settings, and your other hotkeys keep working. Flick's own bar hotkey always wins: a hotkey with the same keys is never registered, also when you later change the bar hotkey to those keys. A hotkey on an item that asks for a second Enter (`empty bin`, `restart explorer`, shut down…) opens the bar with that row ready, so one deliberate Enter is still needed. A hotkey on a shortcut that takes an argument opens the bar with the shortcut typed, ready for the rest; one with a pick list opens the bar on that list. If the item is gone, Settings says `Not found` next to it. A hotkey works everywhere, so it can hide an app's own shortcut with the same keys.
+
+## Timers and reminders
+
+- `timer 5m`, `timer 90s`, `timer 1h30m` (a bare number is minutes): the bar shows `Timer 5 min — rings at 14:32`; Enter starts it, counting from that moment.
+- `remind 20m pizza`, `remind 18:30 call mum` (today, or tomorrow when that time has passed), `remind tomorrow 9:00 dentist`: Enter sets it. Up to 7 days ahead.
+- When one is due, Windows shows a notification from Flick with the note (`Timer done` for a timer).
+- `timers` (also `reminders`) lists what is pending with the time left; Enter on one, then Enter again, cancels it.
+
+Flick must be running for a timer or reminder to ring. It starts at login, so a reminder for tomorrow rings as long as you are signed in. One that fell due while Flick was not running shows once at the next start, as `Missed: call mum`.
+
+## Translate and define
+
+`tr guten Morgen` translates between German and English (whichever way fits the text) through MyMemory; `def serendipity` shows up to three meanings per language from English Wiktionary, for English and German words. Enter copies the row. A lookup starts only once you pause typing, and only while `online` is on; with it off the row says `Online answers are off` and Enter opens Settings. Answers are kept in memory only, until Flick quits.
+
+## Devices and chores
+
+- `connect headphones` / `disconnect headphones`: paired Bluetooth **audio** devices (headphones, earbuds, speakers) by name; bare `connect` or `disconnect` lists them. Other kinds of Bluetooth device are not listed, and pairing a new device still happens in Windows' Settings. Connecting and disconnecting has not been verified on a real device yet.
+- `wifi home`: joins a **saved** Wi-Fi network by name. Networks you have never joined are not offered, and Flick never asks for a password. `wifi on` and `wifi off` switch the radio as before.
+- `empty bin`: shows how many items it holds and how much space; Enter twice empties the Recycle Bin, without Windows' own question.
+- `eject` lists removable drives (`eject E:` picks one); Enter ejects it safely. A drive with a file open on it says `Drive is in use`.
+- `flush dns`: one Enter clears Windows' DNS cache.
+- `restart explorer`: Enter twice restarts the taskbar and desktop.
+
+Of these, `empty bin` and `restart explorer` ask for the second Enter.
+
 ## Settings
 
-Open the Settings window from the tray menu (Settings), by typing `settings` in the bar, or with the Open Settings row on the first-run welcome. Every setting is there, so you never have to open the config file. Changes in General, Search, Quick answers and Updates apply at once; a shortcut is saved when you press Save.
+Open the Settings window from the tray menu (Settings), by typing `settings` in the bar, or with the Open Settings row on the first-run welcome. Every setting is there, so you never have to open the config file. Changes in General, Search, Quick answers and Updates apply at once; a shortcut, workspace or hotkey is saved when you press Save.
 
 - **General**: the hotkey (click the box and press the keys), Start at login, remembering past searches and launches (with a Clear history button), and the WSL distro.
 - **Search**: the folders to search (add or remove them) and your pins, which you can reorder or unpin.
 - **Quick answers**: going online, your home city, currency and temperature unit, and the search engine.
 - **Shortcuts**: your list of shortcuts, with an editor that checks each one as you type.
+- **Workspaces**: your workspaces and their items (see Workspaces and hotkeys).
+- **Hotkeys**: your hotkeys, each with whether it works (see Workspaces and hotkeys).
 - **Updates**: the installed version, Check automatically, Check now, and the update waiting for you, if any.
 
 The config file still works and stays the one source of truth. Edit it by hand if you like; the window follows your changes. Changes made in the window keep your comments, the order of the file and the shortcuts you did not touch. If the file has an error, the window shows it and stays read-only until you fix it.
@@ -398,6 +454,7 @@ open = "https://docs.rs"
 - `online`, `weather_city`, `currency`, `temperature_unit`, `search_engine`: see Quick answers.
 - `check_updates`: set to `false` to stop Flick looking for new versions (see Updates). The default is `true`.
 - `[[shortcut]]`: see Shortcuts.
+- `[[workspace]]` and `[[direct_hotkey]]`: your workspaces and hotkeys (see Workspaces and hotkeys). Settings writes them for you.
 
 <details>
 <summary>When changes take effect, and errors</summary>
@@ -418,11 +475,18 @@ Flick goes online when you ask a currency or weather question, when you type `ip
 - Weather: Flick sends the city name you asked for (or your `weather_city`) to Open-Meteo's place search, then that place's coordinates to Open-Meteo's forecast. Never your own position, and nothing is looked up from your IP address. Only your `weather_city` and its coordinates are kept, in `%APPDATA%\Flick\weather.json`; any other place is remembered only until Flick quits.
 - Flick asks GitHub once a day whether a new version exists (GitHub sees the request; nothing about you is sent). `check_updates = false` or `online = false` stops it.
 - `ip` (also `my ip` and `ip address`) asks api.ipify.org for your public address, only while `online` is on, and only after the text has stayed exactly `ip` for a moment (so typing `ipconfig` sends nothing). api.ipify.org sees the request; nothing about you is sent. Without it you see just your local addresses.
+- `tr` sends only the text typed after `tr` to MyMemory (`api.mymemory.translated.net`), and `def` only the word typed after `def` to Wikimedia (`en.wiktionary.org`); only after typing pauses, and never while `online` is off. Nothing else about you is sent, and the answers are not saved.
 - Nothing else goes online. `online = false` stops all of the above. Web search only opens your browser; Flick itself sends nothing.
 
 `v` reads Windows' clipboard history only while `v` is typed in the bar (a search such as `vlc` passes through `v` on the way). Flick stores none of it and forgets it when the bar closes; copies that password managers ask Windows to leave out of the history stay out. `qr` codes are drawn on your PC and nothing is sent. `v`, `qr`, `snip` and `color` rows are never counted, kept as recent launches or saved as searches.
 
 Paths you type, and the `dl` and `recent` rows, are never counted, kept as recent launches or saved as searches. `recent` only reads the list Windows already keeps; Flick adds nothing to it. Uninstall reads the installed-programs list on this PC and sends nothing anywhere.
+
+The text of a timer or reminder is kept in `%APPDATA%\Flick\reminders.json` only until it rings or you cancel it; the file is removed when nothing is pending.
+
+Flick reads Firefox's bookmarks and the game launchers' lists of installed games on this PC, and sends them nowhere.
+
+None of `tr`, `def`, timers and reminders, devices (`connect`, `disconnect`, `wifi`) or chores (`empty bin`, `eject`, `flush dns`, `restart explorer`) are counted, kept as recent launches or saved as searches.
 
 Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
 
@@ -433,7 +497,7 @@ To switch it off, set `history = false` in the config: Flick stops recording and
 - Open
 - Settings
 - Edit config (opens the file in its associated editor, or in Notepad if `.toml` has none)
-- Reload (reads the config again and refreshes apps, files and shortcut lists)
+- Reload (reads the config again and refreshes apps, games, bookmarks, files and shortcut lists)
 - Start at login (switched on the first time a release build starts)
 - Quit
 

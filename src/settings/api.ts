@@ -14,6 +14,25 @@ export type ShortcutDef = {
   choices: string[];
 };
 
+export type ItemRef = { provider: string; id: string; title: string };
+export type WorkspaceDef = { name: string; aliases: string[]; items: ItemRef[] };
+export type DirectHotkeyDef = { keys: string; item: ItemRef };
+
+export type PickRow = {
+  provider: string;
+  id: string;
+  title: string;
+  subtitle: string;
+  icon: string;
+  confirm: boolean;
+};
+
+export type KeyStatusRow = {
+  keys: string;
+  state: "ok" | "taken" | "not_found" | "weak" | "clash" | "invalid" | "duplicate";
+  message: string;
+};
+
 export type Config = {
   hotkey: string;
   wsl_distro: string;
@@ -26,6 +45,8 @@ export type Config = {
   search_engine: string;
   check_updates: boolean;
   shortcut: ShortcutDef[];
+  workspace: WorkspaceDef[];
+  direct_hotkey: DirectHotkeyDef[];
 };
 
 export type SettingsState = {
@@ -90,7 +111,24 @@ export const settingsCurrencies = () => invoke<string[]>("settings_currencies");
 export const settingsPauseHotkey = (paused: boolean) => invoke<void>("settings_pause_hotkey", { paused });
 /** Pins or unpins an item; resolves to whether it is now pinned. */
 export const togglePin = (provider: string, id: string) => invoke<boolean>("toggle_pin", { provider, id });
+export const settingsSearchItems = (text: string, forWorkspace: boolean) =>
+  invoke<PickRow[]>("settings_search_items", { text, forWorkspace });
+/** For each item, whether its provider can still rebuild it. */
+export const settingsItemsFound = (items: ItemRef[]) => invoke<boolean[]>("settings_items_found", { items });
+export const settingsSaveWorkspace = (original: string | null, def: WorkspaceDef) =>
+  invoke<void>("settings_save_workspace", { original, def });
+/** The first problem with the workspace, or null. */
+export const settingsCheckWorkspace = (original: string | null, def: WorkspaceDef) =>
+  invoke<string | null>("settings_check_workspace", { original, def });
+export const settingsDeleteWorkspace = (name: string) => invoke<void>("settings_delete_workspace", { name });
+export const settingsSaveHotkey = (original: string | null, def: DirectHotkeyDef) =>
+  invoke<void>("settings_save_hotkey", { original, def });
+export const settingsDeleteHotkey = (keys: string) => invoke<void>("settings_delete_hotkey", { keys });
+export const settingsHotkeyStatus = () => invoke<KeyStatusRow[]>("settings_hotkey_status");
 export const settingsOpenFile = () => invoke<void>("settings_open_file");
+
+/** Runs `handler` when a list the picker searches (devices, drives, Wi-Fi) has been read. */
+export const onAnswersReady = (handler: () => void): Promise<UnlistenFn> => listen("answers:ready", handler);
 
 /** Runs `handler` after every config reload. */
 export const onSettingsChanged = (handler: () => void): Promise<UnlistenFn> =>

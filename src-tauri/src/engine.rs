@@ -1,5 +1,7 @@
 //! Engine: fans a query out to providers, merges, ranks and truncates.
 
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::fuzzy;
@@ -20,6 +22,55 @@ pub const ROUTED_MAX_RESULTS: usize = 50;
 pub const HELP: &str = "help";
 
 const HELP_ROUTE: Route = Route { prefix: HELP, needs_space: true };
+
+/// Numbers the queries in the order they reach the engine (the first is 1).
+static QUERY_SEQ: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The number of the query running on this thread; 0 outside one.
+    static CURRENT_QUERY: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The number of the query this provider call belongs to: a later query has a
+/// higher number. Queries run on their own threads and may overlap, so a
+/// provider keeping state across calls can tell an older query that arrives
+/// late from the newest one. 0 when called outside a query (tests).
+pub fn query_seq() -> u64 {
+    CURRENT_QUERY.with(Cell::get)
+}
+
+/// Gives the thread's query its number while it runs.
+struct SeqGuard(u64);
+
+impl SeqGuard {
+    fn enter() -> Self {
+        let seq = QUERY_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        SeqGuard(CURRENT_QUERY.with(|c| c.replace(seq)))
+    }
+}
+
+impl Drop for SeqGuard {
+    fn drop(&mut self) {
+        CURRENT_QUERY.with(|c| c.set(self.0));
+    }
+}
+
+/// Every provider, in order (tests only).
+#[cfg(test)]
+impl Engine {
+    pub fn providers(&self) -> impl Iterator<Item = &dyn Provider> {
+        self.providers.iter().map(|p| p.as_ref())
+    }
+}
+
+/// Runs `f` as if inside query number `seq`.
+#[cfg(test)]
+pub fn as_query<R>(seq: u64, f: impl FnOnce() -> R) -> R {
+    let previous = CURRENT_QUERY.with(|c| c.replace(seq));
+    let r = f();
+    CURRENT_QUERY.with(|c| c.set(previous));
+    r
+}
 
 /// The text after `route.prefix`, trimmed, when `text` is routed there: the
 /// prefix alone, the prefix and a space, or (symbol prefixes) the prefix
@@ -80,9 +131,22 @@ impl Engine {
     /// provider claims by its shape (a typed path) goes, whole, to the first
     /// such provider alone; `help` wins over a claim, a claim over prefixes.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
-        let (mut rows, plain) = self.query_rows(text, scope);
+        self.query_among(text, scope, &|_| true)
+    }
+
+    /// Like [`Engine::query`], but only the providers named nowhere in `skip`
+    /// are asked anything (routes, claims and plain text alike): the others
+    /// are never queried, told `skipped`, or asked for empty-bar rows. For
+    /// callers that must not start a provider's network or device reads.
+    pub fn query_except(&self, text: &str, skip: &[&str]) -> Vec<ResultItem> {
+        self.query_among(text, None, &|p| !skip.contains(&p.name()))
+    }
+
+    fn query_among(&self, text: &str, scope: Option<&str>, asked: &dyn Fn(&dyn Provider) -> bool) -> Vec<ResultItem> {
+        let _seq = SeqGuard::enter();
+        let (mut rows, plain) = self.query_rows(text, scope, asked);
         if !plain {
-            for p in &self.providers {
+            for p in self.providers.iter().filter(|p| asked(p.as_ref())) {
                 p.skipped();
             }
         }
@@ -94,18 +158,25 @@ impl Engine {
 
     /// The rows, and whether the plain providers were asked (a plain query or
     /// the truly empty bar); when not, the engine tells them with `skipped`.
-    fn query_rows(&self, text: &str, scope: Option<&str>) -> (Vec<ResultItem>, bool) {
+    /// Only providers `asked` accepts take part.
+    fn query_rows(
+        &self,
+        text: &str,
+        scope: Option<&str>,
+        asked: &dyn Fn(&dyn Provider) -> bool,
+    ) -> (Vec<ResultItem>, bool) {
+        let providers = || self.providers.iter().filter(|p| asked(p.as_ref()));
         let untrimmed_empty = text.is_empty();
         let text = text.trim();
         if let Some(scope) = scope {
             let q = Query { text: text.to_string(), scope: Some(scope.to_string()) };
-            let owners = self.providers.iter().filter(|p| p.owns_scope(scope));
+            let owners = providers().filter(|p| p.owns_scope(scope));
             return (self.rank(owners, &q, ROUTED_MAX_RESULTS, false), false);
         }
         if text.is_empty() {
             // Only the unscoped, truly empty bar (not whitespace) shows rows.
             if untrimmed_empty {
-                return (self.empty_bar(), true);
+                return (self.empty_bar(asked), true);
             }
             return (vec![], false);
         }
@@ -113,18 +184,18 @@ impl Engine {
             return (self.help_items(rest), false);
         }
         // The first provider that claims the text by its shape.
-        if let Some(p) = self.providers.iter().find(|p| p.claims(text)) {
+        if let Some(p) = providers().find(|p| p.claims(text)) {
             let q = Query { text: text.to_string(), scope: None };
             return (self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false), false);
         }
-        for p in &self.providers {
+        for p in providers() {
             if let Some(rest) = p.route().and_then(|r| strip_route(text, &r)) {
                 let q = Query { text: rest.to_string(), scope: None };
                 return (self.rank(std::iter::once(p), &q, ROUTED_MAX_RESULTS, false), false);
             }
         }
         let q = Query { text: text.to_string(), scope: None };
-        (self.rank(self.providers.iter().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true), true)
+        (self.rank(providers().filter(|p| p.route().is_none()), &q, MAX_RESULTS, true), true)
     }
 
     /// The truly empty bar: the providers' own rows (welcome) in registration
@@ -133,8 +204,9 @@ impl Engine {
     /// recent that does not resolve is forgotten, but only once its (known)
     /// provider has finished its first scan; before that it may just be missing
     /// from an index that is not built yet.
-    fn empty_bar(&self) -> Vec<ResultItem> {
-        let mut rows: Vec<ResultItem> = self.providers.iter().flat_map(|p| p.empty_query()).collect();
+    fn empty_bar(&self, asked: &dyn Fn(&dyn Provider) -> bool) -> Vec<ResultItem> {
+        let mut rows: Vec<ResultItem> =
+            self.providers.iter().filter(|p| asked(p.as_ref())).flat_map(|p| p.empty_query()).collect();
         let pins = self.pins.list();
         for (provider, id) in &pins {
             if let Some(item) = self.item(provider, id) {
@@ -298,6 +370,17 @@ impl Engine {
         self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action)
     }
 
+    /// Runs an item like Enter on its row (no modifier) for a workspace or a
+    /// direct hotkey. Nothing is ranked or recorded. An item that asks for a
+    /// confirm is refused: there is no second Enter to give.
+    pub fn open_item(&self, provider: &str, id: &str) -> Result<Outcome, String> {
+        let item = self.item(provider, id).ok_or_else(|| "not found".to_string())?;
+        if item.confirm {
+            return Err("needs a second Enter".to_string());
+        }
+        self.provider(provider).ok_or_else(|| "not found".to_string())?.activate(id, Modifier::None)
+    }
+
     /// `text` and `scope` are what the bar held when the row was picked. A launch
     /// that is learned (`rank_key`) is ranked; when its provider can also rebuild
     /// the row (`item`) it is recorded as a recent launch (unless it asks for a
@@ -379,6 +462,8 @@ mod tests {
         claims: Option<&'static str>,
         /// Every `act` call.
         acted: std::sync::Mutex<Vec<(String, Action)>>,
+        /// Every `activate` call: id and modifier.
+        activated: std::sync::Mutex<Vec<(String, Modifier)>>,
     }
 
     impl FakeProvider {
@@ -400,6 +485,7 @@ mod tests {
                 seen: Default::default(),
                 claims: None,
                 acted: Default::default(),
+                activated: Default::default(),
             }
         }
     }
@@ -458,7 +544,8 @@ mod tests {
         fn rank_key(&self, id: &str) -> Option<String> {
             self.learn.then(|| id.to_string())
         }
-        fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+        fn activate(&self, id: &str, m: Modifier) -> Result<Outcome, String> {
+            self.activated.lock().unwrap().push((id.to_string(), m));
             if let Some(e) = self.fail {
                 return Err(e.to_string());
             }
@@ -1315,5 +1402,30 @@ mod tests {
         scoped.scope = Some("proj");
         let (e, _, _dir) = engine(vec![scoped]);
         assert_eq!(e.query("x", Some("proj"))[0].id, "b", "scoped: score order");
+    }
+
+    #[test]
+    fn open_item_records_nothing() {
+        let a = Arc::new(FakeProvider::new("a", vec![("x", "Ex", 500)]));
+        let (e, ranking, h, _, dir) = engine_stores(vec![Box::new(a.clone())]);
+        assert_eq!(e.open_item("a", "x"), Ok(Outcome::Hide));
+        assert_eq!(*a.activated.lock().unwrap(), [("x".to_string(), Modifier::None)]);
+        assert_eq!(ranking.boost("a", "x"), 0);
+        assert!(h.recents().is_empty() && h.searches().is_empty());
+        assert!(!dir.path().join("picks.json").exists());
+    }
+
+    #[test]
+    fn open_item_refuses_confirm_and_unknown() {
+        let mut c = FakeProvider::new("c", vec![("off", "Shut down", 1)]);
+        c.confirm = true;
+        let c = Arc::new(c);
+        let a = Arc::new(FakeProvider::new("a", vec![("x", "Ex", 500)]));
+        let (e, _, _dir) = engine_boxed(vec![Box::new(c.clone()), Box::new(a.clone())]);
+        assert_eq!(e.open_item("c", "off"), Err("needs a second Enter".to_string()));
+        assert_eq!(e.open_item("a", "gone"), Err("not found".to_string()));
+        assert_eq!(e.open_item("nowhere", "x"), Err("not found".to_string()));
+        assert_eq!(e.open_item(HELP, "timer"), Err("not found".to_string()));
+        assert!(c.activated.lock().unwrap().is_empty() && a.activated.lock().unwrap().is_empty());
     }
 }

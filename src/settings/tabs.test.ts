@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { TABS, TAB_LABELS, nextTab } from "./tabs";
 
 describe("tabs", () => {
-  it("has the five tabs in order with the spec names", () => {
-    expect(TABS).toEqual(["general", "search", "answers", "shortcuts", "updates"]);
-    expect(TABS.map((t) => TAB_LABELS[t])).toEqual(["General", "Search", "Quick answers", "Shortcuts", "Updates"]);
+  it("has the seven tabs in order with the spec names", () => {
+    expect(TABS).toEqual(["general", "search", "answers", "shortcuts", "workspaces", "hotkeys", "updates"]);
+    expect(TABS.map((t) => TAB_LABELS[t])).toEqual(["General", "Search", "Quick answers", "Shortcuts", "Workspaces", "Hotkeys", "Updates"]);
   });
 
   it("moves to the next and previous tab", () => {

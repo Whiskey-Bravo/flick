@@ -373,12 +373,19 @@ document.addEventListener("mousedown", (e) => {
 
 const listenFailed = (err: unknown) => dispatch({ type: "failed", message: `Event listener failed: ${err}` });
 
-const shownListener = listen("bar:shown", () => {
+const afterShow = (event: Event) => {
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
-  dispatch({ type: "shown" });
+  dispatch(event);
   input.focus();
-});
+};
+const shownListener = listen("bar:shown", () => afterShow({ type: "shown" }));
+// A direct hotkey's item needs a second Enter: the bar opens with it armed.
+listen<Item>("bar:armed", (e) => afterShow({ type: "armed", item: e.payload })).catch(listenFailed);
+// A workspace run had failures: the bar opens with the text and the error.
+listen<{ text: string; error: string }>("bar:reopen", (e) => afterShow({ type: "reopen", text: e.payload.text, error: e.payload.error })).catch(listenFailed);
+// A direct hotkey's item asks to choose: the bar opens in its pick list.
+listen<{ prompt: string; scope: string }>("bar:step", (e) => afterShow({ type: "scoped", prompt: e.payload.prompt, scope: e.payload.scope })).catch(listenFailed);
 shownListener.catch(listenFailed);
 // A rate or forecast arrived: the bar asks again if the text is still the same.
 listen("answers:ready", () => dispatch({ type: "answersReady" })).catch(listenFailed);
