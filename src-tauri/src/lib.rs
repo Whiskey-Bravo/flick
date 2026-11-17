@@ -17,6 +17,7 @@ mod process;
 mod providers;
 mod quote;
 mod ranking;
+mod refresh;
 mod settings;
 mod settings_window;
 mod status;
@@ -80,6 +81,8 @@ struct Providers {
     apps: Arc<AppsProvider>,
     /// Open windows: refreshed whenever the bar is shown.
     windows: Arc<WindowList>,
+    /// Re-reads the open windows and the audio state, one run at a time.
+    refresher: Arc<refresh::Refresher>,
     /// Volume, media, theme and radio commands; caches the audio state.
     system: Arc<SystemProvider>,
     /// Battery, CPU, memory, disk and IP answers.
@@ -108,6 +111,7 @@ impl Providers {
             rates: answers.rates,
             formats: answers.formats,
             apps,
+            refresher: control.refresher,
             windows: control.windows,
             system: control.system,
             status: control.status,
@@ -122,16 +126,28 @@ impl Providers {
     /// Reads the open windows and the audio state. Both can block, so this
     /// runs on its own thread and never on the caller's.
     pub(crate) fn refresh_on_show(&self) {
-        let (windows, system) = (self.windows.clone(), self.system.clone());
-        std::thread::spawn(move || {
+        self.refresher.request();
+    }
+}
+
+/// The job behind `refresh_on_show`; `on_done` runs after each completed run.
+fn refresh_windows_and_audio(
+    windows: Arc<WindowList>,
+    system: Arc<SystemProvider>,
+    on_done: Arc<dyn Fn() + Send + Sync>,
+) -> Arc<refresh::Refresher> {
+    refresh::Refresher::new(
+        Box::new(move || {
             windows.refresh();
             system.refresh();
-        });
-    }
+        }),
+        Box::new(move || on_done()),
+    )
 }
 
 /// The providers that steer running windows and the PC.
 struct Control {
+    refresher: Arc<refresh::Refresher>,
     windows: Arc<WindowList>,
     system: Arc<SystemProvider>,
     status: Arc<StatusProvider>,
@@ -144,12 +160,17 @@ impl Control {
         let store = StatusStore::new(
             Arc::new(SystemStatus),
             Arc::new(net::WinHttp),
-            on_ready,
+            on_ready.clone(),
             Duration::from_millis(500),
         );
+        let windows = WindowList::new(Arc::new(SystemWindows::new()));
+        let system = Arc::new(SystemProvider::new(Arc::new(SystemControls), launcher));
+        // Done: the bar re-runs its query, so a row typed for the old snapshot is rebuilt.
+        let refresher = refresh_windows_and_audio(windows.clone(), system.clone(), on_ready.clone());
         Control {
-            windows: WindowList::new(Arc::new(SystemWindows::new())),
-            system: Arc::new(SystemProvider::new(Arc::new(SystemControls), launcher)),
+            refresher,
+            windows,
+            system,
             status: Arc::new(StatusProvider::new(store, Arc::new(WindowsClipboard))),
         }
     }
@@ -819,9 +840,11 @@ mod tests {
             ),
             Arc::new(clipboard::FakeClipboard::default()),
         ));
+        let system = Arc::new(SystemProvider::new(Arc::new(FakeControls), launcher.clone()));
         let providers = Providers {
+            refresher: refresh_windows_and_audio(windows.clone(), system.clone(), Arc::new(|| {})),
             windows,
-            system: Arc::new(SystemProvider::new(Arc::new(FakeControls), launcher.clone())),
+            system,
             status,
             answers,
             weather,
@@ -1108,7 +1131,9 @@ mod tests {
         let res = r.engine.query("bluetooth", None);
         assert_eq!(res[0].provider, "settings");
         let file_at = res.iter().position(|i| i.provider == "files").unwrap();
-        assert!(res[..file_at].iter().all(|i| i.provider == "settings" || i.provider == "system"), "{:?}", titles(&res));
+        assert!(res[..file_at]
+                .iter()
+                .all(|i| i.provider == "settings" || (i.provider == "system" && i.id.starts_with("radio:bt:"))), "{:?}", titles(&res));
     }
 
     #[test]
