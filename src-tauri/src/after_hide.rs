@@ -47,6 +47,10 @@ impl AfterHide for FollowUps {
                 (self.settle)();
                 (self.pick_color)();
             }
+            Then::StartMenu => {
+                (self.settle)();
+                let _ = crate::controls::open_start_menu();
+            }
         }
     }
 }
