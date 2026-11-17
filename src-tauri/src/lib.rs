@@ -3,6 +3,7 @@ mod clipboard;
 mod commands;
 mod config;
 mod config_edit;
+mod controls;
 mod engine;
 mod fuzzy;
 mod history;
@@ -16,11 +17,14 @@ mod process;
 mod providers;
 mod quote;
 mod ranking;
+mod refresh;
 mod settings;
 mod settings_window;
+mod status;
 mod updates;
 mod tray;
 mod window;
+mod winlist;
 mod wsl_detect;
 
 use std::path::PathBuf;
@@ -45,6 +49,12 @@ use providers::flick::{FlickProvider, Opener};
 use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
 use providers::settings::SettingsProvider;
+use providers::status::StatusProvider;
+use providers::system::SystemProvider;
+use providers::windows::WindowsProvider;
+use status::{StatusStore, SystemStatus};
+use winlist::{SystemWindows, WindowList};
+use controls::SystemControls;
 use providers::shortcuts::ShortcutsProvider;
 use providers::update::UpdateProvider;
 use providers::welcome::WelcomeProvider;
@@ -69,6 +79,14 @@ struct Providers {
     /// The Windows locale: defaults for the answers' currency and temperature unit.
     formats: Arc<dyn Formats>,
     apps: Arc<AppsProvider>,
+    /// Open windows: refreshed whenever the bar is shown.
+    windows: Arc<WindowList>,
+    /// Re-reads the open windows and the audio state, one run at a time.
+    refresher: Arc<refresh::Refresher>,
+    /// Volume, media, theme and radio commands; caches the audio state.
+    system: Arc<SystemProvider>,
+    /// Battery, CPU, memory, disk and IP answers.
+    status: Arc<StatusProvider>,
     files: Arc<FilesProvider>,
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
@@ -80,6 +98,7 @@ impl Providers {
     /// Cheap: no disk access. File roots and shortcuts arrive with the config.
     fn new(
         answers: Answers,
+        control: Control,
         apps: Arc<AppsProvider>,
         launcher: Arc<dyn Launcher>,
         distro: &str,
@@ -92,11 +111,67 @@ impl Providers {
             rates: answers.rates,
             formats: answers.formats,
             apps,
+            refresher: control.refresher,
+            windows: control.windows,
+            system: control.system,
+            status: control.status,
             files: FilesProvider::new(launcher.clone()),
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
             update: UpdateProvider::new(updates),
+        }
+    }
+
+    /// Reads the open windows and the audio state. Both can block, so this
+    /// runs on its own thread and never on the caller's.
+    pub(crate) fn refresh_on_show(&self) {
+        self.refresher.request();
+    }
+}
+
+/// The job behind `refresh_on_show`; `on_done` runs after each completed run.
+fn refresh_windows_and_audio(
+    windows: Arc<WindowList>,
+    system: Arc<SystemProvider>,
+    on_done: Arc<dyn Fn() + Send + Sync>,
+) -> Arc<refresh::Refresher> {
+    refresh::Refresher::new(
+        Box::new(move || {
+            windows.refresh();
+            system.refresh();
+        }),
+        Box::new(move || on_done()),
+    )
+}
+
+/// The providers that steer running windows and the PC.
+struct Control {
+    refresher: Arc<refresh::Refresher>,
+    windows: Arc<WindowList>,
+    system: Arc<SystemProvider>,
+    status: Arc<StatusProvider>,
+}
+
+impl Control {
+    /// Cheap: nothing is read until the bar is shown or a status is asked for.
+    /// `on_ready` runs when a status sample has finished.
+    fn new(launcher: Arc<dyn Launcher>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let store = StatusStore::new(
+            Arc::new(SystemStatus),
+            Arc::new(net::WinHttp),
+            on_ready.clone(),
+            Duration::from_millis(500),
+        );
+        let windows = WindowList::new(Arc::new(SystemWindows::new()));
+        let system = Arc::new(SystemProvider::new(Arc::new(SystemControls), launcher));
+        // Done: the bar re-runs its query, so a row typed for the old snapshot is rebuilt.
+        let refresher = refresh_windows_and_audio(windows.clone(), system.clone(), on_ready.clone());
+        Control {
+            refresher,
+            windows,
+            system,
+            status: Arc::new(StatusProvider::new(store, Arc::new(WindowsClipboard))),
         }
     }
 }
@@ -200,10 +275,13 @@ fn build_engine(
         Box::new(p.update.clone()),
         Box::new(p.answers.clone()),
         Box::new(p.apps.clone()),
+        Box::new(WindowsProvider::new(p.windows.clone())),
         Box::new(p.files.clone()),
         Box::new(p.shortcuts.clone()),
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
+        Box::new(p.system.clone()),
+        Box::new(p.status.clone()),
         Box::new(PowerProvider::new(power)),
         Box::new(FlickProvider::new(open_config, open_settings)),
         Box::new(HistoryProvider::new(history.clone())),
@@ -288,6 +366,7 @@ fn apply_detection(state: &AppState, detection: wsl_detect::Detection) {
 /// files in the background (the watcher has already moved to the new roots).
 fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -> bool {
     push_distro(p, new, detected);
+    p.status.set_online(new.online);
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
     let changed = old.file_roots != new.file_roots;
@@ -384,17 +463,20 @@ fn setup(app: &AppHandle) {
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
     let ready = app.clone();
     // The bar re-runs its query when the text is unchanged, so a placeholder turns into the answer.
-    let answers = Answers::new(launcher.clone(), Arc::new(move || {
+    let on_ready: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = ready.emit_to(window::LABEL, "answers:ready", ());
-    }));
+    });
+    let answers = Answers::new(launcher.clone(), on_ready.clone());
+    let control = Control::new(launcher.clone(), on_ready);
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);
-    let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher,
+    let providers = Providers::new(answers, control, AppsProvider::new(launcher.clone()), launcher,
         &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown),
         settings_opener(app),
         updates.clone(),
     );
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
+    providers.status.set_online(loaded.config.online);
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));
@@ -629,6 +711,73 @@ mod tests {
     use providers::apps::{AppEntry, AppKind};
     use providers::files::FileEntry;
     use providers::power::PowerAction;
+    use controls::{Audio, Controls, MediaKey, RadioKind};
+    use status::{Battery, CpuTimes, Disk, Memory, StatusSource};
+    use winlist::{WinInfo, WindowOps};
+
+    /// Windows that exist only in memory; nothing is ever closed or focused.
+    struct FakeWins(Vec<WinInfo>);
+
+    impl WindowOps for FakeWins {
+        fn list(&self) -> Vec<WinInfo> {
+            self.0.clone()
+        }
+        fn exists(&self, _hwnd: isize) -> bool {
+            true
+        }
+        fn focus(&self, _hwnd: isize) -> Result<(), String> {
+            Ok(())
+        }
+        fn close(&self, _hwnd: isize, _pid: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn kill(&self, _pid: u32, _exe: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct FakeControls;
+
+    impl Controls for FakeControls {
+        fn audio(&self) -> Result<Audio, String> {
+            Ok(Audio { volume: 40, muted: false })
+        }
+        fn set_volume(&self, _pct: u8) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_muted(&self, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn media(&self, _key: MediaKey) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_dark(&self, _dark: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_radio(&self, _kind: RadioKind, _on: bool) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct FakeStatus;
+
+    impl StatusSource for FakeStatus {
+        fn battery(&self) -> Option<Battery> {
+            Some(Battery { percent: 82, charging: false, minutes_left: None })
+        }
+        fn memory(&self) -> Memory {
+            Memory { used: 1, total: 2 }
+        }
+        fn disks(&self) -> Vec<Disk> {
+            vec![]
+        }
+        fn cpu_times(&self) -> CpuTimes {
+            CpuTimes { idle: 0, kernel: 0, user: 0 }
+        }
+        fn local_ips(&self) -> Vec<String> {
+            vec![]
+        }
+    }
 
     struct RecordingRunner(Arc<Mutex<Vec<PowerAction>>>);
 
@@ -650,15 +799,22 @@ mod tests {
         opened: Arc<AtomicUsize>,
         dir: tempfile::TempDir,
         ranking: Arc<Ranking>,
+        history: Arc<History>,
+        /// Signalled when a status sample has finished.
+        status_ready: std::sync::mpsc::Receiver<()>,
     }
 
     fn rig(apps: Vec<AppEntry>, files: Vec<FileEntry>) -> Rig {
+        rig_with(apps, files, vec![])
+    }
+
+    fn rig_with(apps: Vec<AppEntry>, files: Vec<FileEntry>, wins: Vec<WinInfo>) -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let ranking = Arc::new(Ranking::load(dir.path().join("picks.json")));
         let launcher = Arc::new(RecordingLauncher::default());
         let fetch = Arc::new(net::FakeFetch::offline());
         let rates = RatesStore::new(dir.path().join("rates.json"), fetch.clone(), Arc::new(|| {}));
-        let weather = WeatherStore::new(dir.path().join("weather.json"), fetch, Arc::new(|| {}));
+        let weather = WeatherStore::new(dir.path().join("weather.json"), fetch.clone(), Arc::new(|| {}));
         let formats: Arc<dyn Formats> = Arc::new(answers::number::TestFormats { decimal: ',', group: '.' });
         let answers = AnswersProvider::new(
             formats.clone(),
@@ -669,7 +825,27 @@ mod tests {
             Box::new(|| Ok(())),
             Arc::new(|| "2026-11-17T18:00:00Z".parse().unwrap()),
         );
+        let windows = winlist::WindowList::new(Arc::new(FakeWins(wins)));
+        windows.refresh();
+        let (tx, status_ready) = std::sync::mpsc::channel();
+        let tx = Mutex::new(tx);
+        let status = Arc::new(StatusProvider::new(
+            StatusStore::new(
+                Arc::new(FakeStatus),
+                fetch.clone(),
+                Arc::new(move || {
+                    let _ = tx.lock().unwrap().send(());
+                }),
+                Duration::ZERO,
+            ),
+            Arc::new(clipboard::FakeClipboard::default()),
+        ));
+        let system = Arc::new(SystemProvider::new(Arc::new(FakeControls), launcher.clone()));
         let providers = Providers {
+            refresher: refresh_windows_and_audio(windows.clone(), system.clone(), Arc::new(|| {})),
+            windows,
+            system,
+            status,
             answers,
             weather,
             rates,
@@ -687,6 +863,7 @@ mod tests {
         let power = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
         let counter = opened.clone();
+        let history = Arc::new(History::load(dir.path().join("history.json"), true));
         let engine = build_engine(
             &providers,
             Box::new(RecordingRunner(power.clone())),
@@ -696,10 +873,10 @@ mod tests {
             }),
             Box::new(|| Ok(())),
             ranking.clone(),
-            Arc::new(History::load(dir.path().join("history.json"), true)),
+            history.clone(),
             Arc::new(Pins::load(dir.path().join("pins.json"))),
         );
-        Rig { engine, providers, launcher, power, opened, dir, ranking }
+        Rig { engine, providers, launcher, power, opened, dir, ranking, history, status_ready }
     }
 
     fn app(name: &str) -> AppEntry {
@@ -807,6 +984,93 @@ mod tests {
         assert!(r.power.lock().unwrap().is_empty());
     }
 
+    fn chrome_window() -> WinInfo {
+        WinInfo {
+            hwnd: 1,
+            pid: 20,
+            title: "Docs".into(),
+            exe: r"C:\Apps\Chrome\chrome.exe".into(),
+            app: "Google Chrome".into(),
+            elevated: false,
+        }
+    }
+
+    #[test]
+    fn an_open_window_ranks_above_its_app_even_when_learned() {
+        let r = rig_with(vec![app("Google Chrome")], vec![], vec![chrome_window()]);
+        let id = r.engine.query("chrome", None).iter().find(|i| i.provider == "apps").unwrap().id.clone();
+        for _ in 0..30 {
+            r.ranking.record("apps", &id);
+        }
+        assert_eq!(r.engine.query("chrome", None)[0].provider, "windows");
+    }
+
+    fn chrome_tab(hwnd: isize, title: &str) -> WinInfo {
+        WinInfo { hwnd, title: title.into(), ..chrome_window() }
+    }
+
+    #[test]
+    fn an_unrelated_window_title_does_not_beat_an_exact_app() {
+        let r = rig_with(vec![app("Word")], vec![], vec![chrome_tab(1, "Wordle - Google Chrome")]);
+        let res = r.engine.query("word", None);
+        assert_eq!((res[0].provider, res[0].title.as_str()), ("apps", "Word"));
+    }
+
+    #[test]
+    fn many_windows_of_one_app_do_not_fill_the_list() {
+        let apps = ["Gimp", "Git Bash", "Godot", "Gedit", "Gnome Boxes"].map(app).to_vec();
+        let wins = (1..=8).map(|n| chrome_tab(n, &format!("Tab {n}"))).collect();
+        let r = rig_with(apps, vec![], wins);
+        let res = r.engine.query("g", None);
+        let windows = res.iter().filter(|i| i.provider == "windows").count();
+        assert!(windows <= 3, "{windows} window rows");
+        assert_eq!(res.iter().filter(|i| i.provider == "apps").count(), 5);
+    }
+
+    #[test]
+    fn status_answers_sit_on_top() {
+        let r = rig(vec![app("Battery")], vec![]);
+        assert_eq!(r.engine.query("battery", None)[0].title, "Checking\u{2026}");
+        r.status_ready.recv_timeout(Duration::from_secs(2)).expect("sample finished");
+        let res = r.engine.query("battery", None);
+        assert_eq!((res[0].provider, res[0].title.as_str()), ("status", "82%"));
+    }
+
+    #[test]
+    fn help_lists_the_new_commands() {
+        let r = rig(vec![], vec![]);
+        let help = titles(&r.engine.query("help", None));
+        for needle in ["close chrome", "vol 30", "battery"] {
+            assert!(help.iter().any(|t| t.contains(needle)), "{needle}: {help:?}");
+        }
+    }
+
+    #[test]
+    fn windows_rows_are_never_recorded() {
+        let r = rig_with(vec![], vec![], vec![chrome_window()]);
+        let res = r.engine.query("docs", None);
+        let row = res.iter().find(|i| i.provider == "windows").unwrap();
+        assert_eq!(r.engine.activate("windows", &row.id, provider::Modifier::None, "docs", None), Ok(Outcome::Hide));
+        assert_eq!(r.ranking.boost("windows", &row.id), 0);
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+    }
+
+    #[test]
+    fn system_toggles_are_never_recorded() {
+        let r = rig(vec![], vec![]);
+        for (text, id) in [("wifi off", "radio:wifi:off"), ("dark mode", "theme:dark"), ("mute", "mute")] {
+            let res = r.engine.query(text, None);
+            assert!(res.iter().any(|i| i.id == id), "{id}");
+            assert_eq!(r.engine.activate("system", id, provider::Modifier::None, text, None), Ok(Outcome::Hide));
+            assert_eq!(r.ranking.boost("system", id), 0);
+        }
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+    }
+
     #[test]
     fn sleep_ranks_the_power_action_first() {
         let r = rig(vec![], vec![]);
@@ -830,10 +1094,13 @@ mod tests {
                 "in 45 days",
                 "weather london",
                 "blender",
+                "close chrome / quit all",
                 "report.pdf",
                 "your shortcuts",
                 "> htop -d 10",
                 "bluetooth",
+                "mute / vol 30 / next song / dark mode / wifi off",
+                "battery / cpu / ram / disk / ip",
                 "lock / sleep / restart / shut down / sign out",
                 "flick config",
                 "settings",
@@ -844,7 +1111,7 @@ mod tests {
                 "Up",
             ]
         );
-        let flick = &help[12];
+        let flick = &help[15];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -852,7 +1119,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 19);
+        assert_eq!(r.engine.query("Help", None).len(), 22);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
@@ -900,7 +1167,9 @@ mod tests {
         let res = r.engine.query("bluetooth", None);
         assert_eq!(res[0].provider, "settings");
         let file_at = res.iter().position(|i| i.provider == "files").unwrap();
-        assert!(res[..file_at].iter().all(|i| i.provider == "settings"), "{:?}", titles(&res));
+        assert!(res[..file_at]
+                .iter()
+                .all(|i| i.provider == "settings" || (i.provider == "system" && i.id.starts_with("radio:bt:"))), "{:?}", titles(&res));
     }
 
     #[test]
