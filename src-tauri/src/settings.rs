@@ -392,3 +392,9 @@ mod tests {
 pub fn settings_open_file() -> Result<(), String> {
     crate::launch::open_config()
 }
+
+/// The ECB currencies the `currency` setting accepts (single source: `units::CURRENCIES`).
+#[tauri::command]
+pub fn settings_currencies() -> Vec<String> {
+    crate::answers::units::CURRENCIES.iter().map(|c| c.to_string()).collect()
+}

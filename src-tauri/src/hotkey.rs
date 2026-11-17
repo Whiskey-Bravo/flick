@@ -111,4 +111,11 @@ mod tests {
             "hotkey \"Alt+Space\" is taken, probably by PowerToys Run: turn PowerToys Run off in PowerToys, or set hotkey in Flick's config"
         );
     }
+
+    #[test]
+    fn settings_hotkey_strings_parse() {
+        for s in ["Alt+Space", "Ctrl+Shift+K", "F5", "Ctrl+Alt+Super+F12", "Alt+F1", "Ctrl+Alt+Shift+Super+F24"] {
+            assert!(parse(s).is_ok(), "{s} should parse");
+        }
+    }
 }

@@ -1,17 +1,36 @@
 import { useEffect, useState } from "preact/hooks";
 import { onSettingsChanged, settingsOpenFile, settingsState, type SettingsState } from "./api";
+import { Answers } from "./Answers";
+import { General } from "./General";
+import { Search } from "./Search";
 import { TABS, TAB_LABELS, nextTab, type Tab } from "./tabs";
 
 export function App() {
   const [state, setState] = useState<SettingsState | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("general");
 
   useEffect(() => {
     const load = () => {
-      settingsState().then(setState, () => {});
+      settingsState().then(
+        (s) => {
+          setLoadError(null);
+          setState(s);
+        },
+        (e) => setLoadError(String(e)),
+      );
     };
-    load();
-    const unlisten = onSettingsChanged(load);
+    // Listen first, so a change between the first load and the listener is not missed.
+    const unlisten = onSettingsChanged(load).then(
+      (f) => {
+        load();
+        return f;
+      },
+      () => {
+        load();
+        return () => {};
+      },
+    );
     return () => {
       unlisten.then((f) => f());
     };
@@ -28,7 +47,7 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const broken = state?.file_error != null;
+  const broken = state === null || state.file_error != null;
 
   return (
     <div class="settings">
@@ -45,7 +64,12 @@ export function App() {
           </button>
         ))}
       </div>
-      {broken && (
+      {loadError !== null && (
+        <div class="banner" role="alert">
+          <span>Could not read the settings: {loadError}</span>
+        </div>
+      )}
+      {state?.file_error != null && (
         <div class="banner" role="alert">
           <span>config.toml has a problem: {state?.file_error}</span>
           <button onClick={() => settingsOpenFile().catch(() => {})}>Open the file</button>
@@ -54,7 +78,10 @@ export function App() {
       {/* While the file is broken every input inside is disabled. */}
       <fieldset class="page" disabled={broken}>
         <h1>{TAB_LABELS[tab]}</h1>
-        <p class="placeholder">Coming soon.</p>
+        {state !== null && tab === "general" && <General state={state} />}
+        {state !== null && tab === "search" && <Search state={state} />}
+        {state !== null && tab === "answers" && <Answers state={state} />}
+        {tab !== "general" && tab !== "search" && tab !== "answers" && <p class="placeholder">Coming soon.</p>}
       </fieldset>
     </div>
   );
