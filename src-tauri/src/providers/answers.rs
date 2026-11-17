@@ -631,6 +631,10 @@ mod tests {
         assert_eq!(*r.clipboard.0.lock().unwrap(), ["12.345.678.902"]);
         // Float noise stays hidden.
         assert_eq!(titled(&r, "0,1+0,2"), ("= 0,3".into(), "0,1 + 0,2".into()));
+        assert_eq!(titled(&r, "1,1-1"), ("= 0,1".into(), "1,1 - 1".into()));
+        assert_eq!(titled(&r, "0,3-0,1"), ("= 0,2".into(), "0,3 - 0,1".into()));
+        assert_eq!(titled(&r, "10,1-10"), ("= 0,1".into(), "10,1 - 10".into()));
+        assert_eq!(one(&r, "10000000000001*1").title, "= 10.000.000.000.001");
     }
 
     #[test]

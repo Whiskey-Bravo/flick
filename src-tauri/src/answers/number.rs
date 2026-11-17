@@ -60,8 +60,22 @@ pub fn parse_number(s: &str) -> Option<f64> {
     Some(if neg { -v } else { v })
 }
 
-/// Formats with up to 15 significant digits (exact for integers below 1e15, while
-/// binary float noise such as `0.1 + 0.2` stays hidden), no trailing zeros,
+/// Significant digits shown for `x`: every digit of an integer below 1e15 (exact
+/// in f64), otherwise the fewest (up to 15) that are within 1e-14 of `x`, so
+/// binary float noise (`0.1 + 0.2`, `10.1 - 10`) is dropped.
+fn precision(x: f64) -> usize {
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        return 15;
+    }
+    (1..15)
+        .find(|&p| {
+            let rounded: f64 = format!("{:.*e}", p - 1, x).parse().unwrap_or(f64::NAN);
+            (rounded - x).abs() < x.abs() * 1e-14
+        })
+        .unwrap_or(15)
+}
+
+/// Formats with up to 15 significant digits (see [`precision`]), no trailing zeros,
 /// thousands grouping and scientific notation for very large or very small magnitudes.
 pub fn format_number(x: f64, decimal: char, group: char) -> String {
     if !x.is_finite() {
@@ -70,7 +84,7 @@ pub fn format_number(x: f64, decimal: char, group: char) -> String {
     if x == 0.0 {
         return "0".into();
     }
-    let sci = format!("{:.14e}", x.abs());
+    let sci = format!("{:.*e}", precision(x) - 1, x.abs());
     let (mant, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
     let exp: i32 = exp.parse().unwrap_or(0);
     let digits: String = mant.chars().filter(|c| *c != '.').collect();
@@ -289,7 +303,21 @@ mod tests {
         assert_eq!(format_number(12345678902.0, ',', '.'), "12.345.678.902");
         assert_eq!(format_number(999999999999999.0, '.', ','), "999,999,999,999,999");
         assert_eq!(format_number(0.1 + 0.2, ',', '.'), "0,3");
-        assert_eq!(format_number(1.0 / 3.0, '.', ','), "0.333333333333333");
+        assert_eq!(format_number(1.0 / 3.0, '.', ','), "0.33333333333333");
+    }
+
+    #[test]
+    fn float_noise_is_dropped() {
+        assert_eq!(format_number(1.1 - 1.0, ',', '.'), "0,1");
+        assert_eq!(format_number(0.3 - 0.1, ',', '.'), "0,2");
+        assert_eq!(format_number(0.1 * 3.0 * 10.0, ',', '.'), "3");
+        assert_eq!(format_number(10000000000001.0, ',', '.'), "10.000.000.000.001");
+        // Integers below 1e15 are exact in f64: every digit shows.
+        assert_eq!(format_number(999999999999991.0, ',', '.'), "999.999.999.999.991");
+        assert_eq!(format_number(-(1.1 - 1.0), ',', '.'), "-0,1");
+        assert_eq!(format_number(2.0f64.sqrt(), '.', ','), "1.4142135623731");
+        // Noise in the 15th digit: 10.1 - 10 is 0.09999999999999964.
+        assert_eq!(format_number(10.1 - 10.0, ',', '.'), "0,1");
     }
 
     #[test]
