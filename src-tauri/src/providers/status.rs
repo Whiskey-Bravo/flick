@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub use crate::clipboard::Clipboard;
-use crate::provider::{Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 use crate::status::{StatusKind, StatusStore, StatusValue};
 
 const NAME: &str = "status";
@@ -97,6 +97,14 @@ impl Provider for StatusProvider {
         }
         self.clipboard.set_text(&text)?;
         Ok(Outcome::Hide)
+    }
+
+    fn help(&self) -> Vec<HelpLine> {
+        vec![HelpLine {
+            example: "battery / cpu / ram / disk / ip".into(),
+            about: "live status of this PC; Enter copies the value".into(),
+            fill: String::new(),
+        }]
     }
 
     /// Values change by the second: never learned, saved or pinned.

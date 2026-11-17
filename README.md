@@ -141,6 +141,26 @@ The config keys for quick answers, all optional:
 - `temperature_unit`: `"c"` or `"f"`. Leave it out to follow your Windows region.
 - `search_engine`: the search page `?` uses (and Enter on a weather answer), starting with `https://` and containing `{arg}`.
 
+## Control Windows
+
+Flick can switch to a window, close apps, and steer the PC without the mouse. Rows for open windows rank above the app's own row.
+
+| You type | What happens |
+|---|---|
+| Part of a window title or app name | Lists the matching open windows; Enter brings one to the front |
+| `close chrome` | Closes all windows of that app politely (they may ask to save) |
+| `kill chrome` | Forces the app to end (press Enter twice); unsaved work is lost |
+| `quit all` | Closes every open window except Explorer (press Enter twice) |
+| `vol 30`, `vol up`, `vol down` | Sets or steps the volume |
+| `mute`, `unmute` | Mutes or unmutes the sound |
+| `next song`, `previous song`, `play`, `pause` | Sends the media key to the player |
+| `dark mode`, `light mode` | Switches the Windows theme |
+| `wifi off`, `wifi on`, `bluetooth off`, `bluetooth on` | Switches the radio (if Windows will not allow it, the Settings page opens) |
+| `night light` | Opens the Night light settings page |
+| `battery`, `cpu`, `ram`, `disk`, `ip` | Shows the value on top; Enter copies it |
+
+Apps that run as administrator cannot be closed or ended from Flick and say so. Explorer can be closed but never ended. Window rows and status values are never learned or saved.
+
 ## Files and folders
 
 Type part of a file or folder name. Search is by name only, not by content. Two characters find only an exact name (`db`); the start of a name or word needs three, any other part of the name four. Enter opens the file or folder; Ctrl+Enter shows it selected in Explorer.
@@ -370,6 +390,7 @@ Flick goes online when you ask a currency or weather question, and to look for u
 - Currency: when the saved rates are older than the latest publication, Flick downloads the European Central Bank's daily rates file (at most once an hour) and keeps it in `%APPDATA%\Flick\rates.json`. Nothing about you is sent beyond the request itself.
 - Weather: Flick sends the city name you asked for (or your `weather_city`) to Open-Meteo's place search, then that place's coordinates to Open-Meteo's forecast. Never your own position, and nothing is looked up from your IP address. Only your `weather_city` and its coordinates are kept, in `%APPDATA%\Flick\weather.json`; any other place is remembered only until Flick quits.
 - Flick asks GitHub once a day whether a new version exists (GitHub sees the request; nothing about you is sent). `check_updates = false` or `online = false` stops it.
+- `ip` asks api.ipify.org for your public address, only while `online` is on, and only when you type `ip`. Without it you see just your local addresses.
 - Nothing else goes online. `online = false` stops all of the above. Web search only opens your browser; Flick itself sends nothing.
 
 Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.

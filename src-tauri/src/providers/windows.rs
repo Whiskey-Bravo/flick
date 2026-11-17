@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::fuzzy;
-use crate::provider::{Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 use crate::winlist::{WinInfo, WindowList};
 
 /// Above the engine's learned-boost cap (300), so a window you are looking for
@@ -181,6 +181,14 @@ impl Provider for WindowsProvider {
                 .map(|g| kill_row(g, 0));
         }
         None
+    }
+
+    fn help(&self) -> Vec<HelpLine> {
+        vec![HelpLine {
+            example: "close chrome / quit all".into(),
+            about: "close or end an app; `kill` forces it".into(),
+            fill: String::new(),
+        }]
     }
 
     /// Windows come and go; nothing here is worth learning.

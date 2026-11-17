@@ -66,6 +66,8 @@ pub fn show(app: &AppHandle) {
     let _ = app.emit_to(LABEL, "bar:shown", ());
     // Re-send the stored error so one raised before the page listened is not lost.
     if let Some(state) = app.try_state::<crate::AppState>() {
+        // Open windows and the audio state are read off this thread.
+        state.providers.refresh_on_show();
         let _ = app.emit_to(LABEL, "config:error", state.config_error());
     }
 }
