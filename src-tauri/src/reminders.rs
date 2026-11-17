@@ -1,6 +1,7 @@
 //! Timers and reminders. Pending ones are kept in `reminders.json` only until
 //! they fire or are cancelled; one thread fires each exactly once.
 
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
@@ -64,14 +65,30 @@ pub fn unix_ceil(t: SystemTime) -> i64 {
     }
 }
 
-/// Unix seconds as a time.
-pub fn from_unix(secs: i64) -> SystemTime {
-    if secs >= 0 {
-        UNIX_EPOCH + Duration::from_secs(secs as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_secs(secs.unsigned_abs())
+/// `t` in Unix seconds, rounded down, and the nanoseconds past that second.
+fn unix_floor(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            match d.subsec_nanos() {
+                0 => (-(d.as_secs() as i64), 0),
+                n => (-(d.as_secs() as i64) - 1, 1_000_000_000 - n),
+            }
+        }
     }
 }
+
+/// Unix seconds as a time, clamped to what the platform can hold.
+pub fn from_unix(secs: i64) -> SystemTime {
+    let d = Duration::from_secs(secs.unsigned_abs());
+    let t = if secs >= 0 { UNIX_EPOCH.checked_add(d) } else { UNIX_EPOCH.checked_sub(d) };
+    t.unwrap_or(UNIX_EPOCH)
+}
+
+/// Items in the file due later than now + `MAX_AHEAD` + this were not set by
+/// Flick (a hand edit) and are dropped.
+const SLACK: Duration = Duration::from_secs(24 * 3600);
 
 struct State {
     /// By due.
@@ -79,6 +96,8 @@ struct State {
     next_id: u64,
     /// The file has been read.
     loaded: bool,
+    /// The file does not match `items` (a save failed); the thread retries.
+    dirty: bool,
 }
 
 pub struct Reminders {
@@ -110,7 +129,7 @@ impl Reminders {
             now,
             fire,
             max_sleep,
-            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false }),
+            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false }),
             wake: Condvar::new(),
             started: AtomicBool::new(false),
         })
@@ -140,16 +159,19 @@ impl Reminders {
         let at = st.items.partition_point(|x| x.due <= r.due);
         st.items.insert(at, r.clone());
         if self.save(&st.items).is_err() {
+            // The file is as it was: `dirty` stays what it was too.
             st.items.remove(at);
             return Err(SAVE_FAILED.to_string());
         }
+        st.dirty = false;
         st.next_id += 1;
         self.wake.notify_all();
         Ok(r)
     }
 
     /// Drops a pending item; false when there is none with `id` (it may have
-    /// just fired). A cancelled item never fires in this run, even if the save fails.
+    /// just fired). A cancelled item never fires in this run; if the save
+    /// fails the thread retries it until the file no longer has it.
     pub fn cancel(&self, id: u64) -> bool {
         let mut st = self.lock();
         self.load(&mut st);
@@ -157,7 +179,7 @@ impl Reminders {
             return false;
         };
         st.items.remove(at);
-        let _ = self.save(&st.items);
+        self.persist(&mut st);
         self.wake.notify_all();
         true
     }
@@ -176,21 +198,42 @@ impl Reminders {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reads the file once; a missing or corrupt one gives none.
+    /// Reads the file once; a missing or corrupt one gives none. Items due
+    /// further ahead than Flick sets are dropped and repeated ids renumbered
+    /// (then the file is rewritten by the thread).
     fn load(&self, st: &mut State) {
         if st.loaded {
             return;
         }
-        let mut items = std::fs::read_to_string(&self.path)
+        let read = std::fs::read_to_string(&self.path)
             .ok()
             .and_then(|s| serde_json::from_str::<FileIn>(&s).ok())
             .filter(|f| f.version == VERSION)
             .map(|f| f.items)
             .unwrap_or_default();
+        let latest = unix_ceil((self.now)()).saturating_add((MAX_AHEAD + SLACK).as_secs() as i64);
+        let mut items: Vec<Reminder> = read.iter().filter(|r| r.due <= latest).cloned().collect();
+        let mut changed = items.len() != read.len();
         items.sort_by_key(|r| r.due);
-        st.next_id = items.iter().map(|r| r.id).max().map_or(1, |m| m.saturating_add(1)).max(st.next_id);
+        let mut next = items.iter().map(|r| r.id).max().map_or(1, |m| m.saturating_add(1)).max(st.next_id);
+        let mut seen = std::collections::HashSet::new();
+        for r in &mut items {
+            if !seen.insert(r.id) {
+                r.id = next;
+                seen.insert(next);
+                next = next.saturating_add(1);
+                changed = true;
+            }
+        }
+        st.next_id = next;
         st.items = items;
         st.loaded = true;
+        st.dirty = changed;
+    }
+
+    /// Saves `items` and records whether the file now matches them.
+    fn persist(&self, st: &mut State) {
+        st.dirty = self.save(&st.items).is_err();
     }
 
     /// Writes `items`; an empty list removes the file.
@@ -208,32 +251,45 @@ impl Reminders {
     /// fires: a crash in between loses one rather than repeating it.
     fn take_due(&self, st: &mut State) -> Vec<Reminder> {
         self.load(st);
-        let now = (self.now)();
-        let n = st.items.partition_point(|r| from_unix(r.due) <= now);
+        // Whole Unix seconds: no time arithmetic that could overflow on an odd due.
+        let (now, _) = unix_floor((self.now)());
+        let n = st.items.partition_point(|r| r.due <= now);
         if n == 0 {
             return vec![];
         }
         let due: Vec<Reminder> = st.items.drain(..n).collect();
-        let _ = self.save(&st.items);
+        self.persist(st);
         due
     }
 
     /// Waits once, until the earliest item is due, an `add`/`cancel`, or
-    /// `max_sleep`; returns what is due then.
+    /// `max_sleep`; returns what is due then. A save that failed earlier is
+    /// retried first (so at least every `max_sleep`).
     fn wait_once(&self) -> Vec<Reminder> {
         let mut st = self.lock();
+        if st.dirty {
+            self.persist(&mut st);
+        }
         let due = self.take_due(&mut st);
         if !due.is_empty() {
             return due;
         }
-        let now = (self.now)();
+        let (now, nanos) = unix_floor((self.now)());
         let wait = st
             .items
             .first()
-            .map(|r| from_unix(r.due).duration_since(now).unwrap_or_default())
+            .map(|r| {
+                let secs = u64::try_from(r.due.saturating_sub(now)).unwrap_or(0);
+                Duration::from_secs(secs).saturating_sub(Duration::from_nanos(u64::from(nanos)))
+            })
             .map_or(self.max_sleep, |w| w.min(self.max_sleep));
         let mut st = self.wake.wait_timeout(st, wait).unwrap_or_else(PoisonError::into_inner).0;
         self.take_due(&mut st)
+    }
+
+    /// Shows one notification; a panic in it does not stop the thread.
+    fn fire_one(&self, text: &str) {
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| (self.fire)(text)));
     }
 }
 
@@ -245,13 +301,13 @@ fn run(weak: Weak<Reminders>) {
         me.take_due(&mut st)
     };
     for r in &missed {
-        (me.fire)(&format!("Missed: {}", body(r)));
+        me.fire_one(&format!("Missed: {}", body(r)));
     }
     drop(me);
     loop {
         let Some(me) = weak.upgrade() else { return };
         for r in me.wait_once() {
-            (me.fire)(&body(&r));
+            me.fire_one(&body(&r));
         }
     }
 }
@@ -657,5 +713,129 @@ mod tests {
         let r = g.r.add(g.now() + Duration::from_secs(60), "y", false).unwrap();
         assert_eq!(r.id, 8);
         assert_eq!(g.r.pending().len(), 2, "add reads the file first, never writes over it");
+    }
+
+    fn write_items(dir: &tempfile::TempDir, items: serde_json::Value) {
+        let file = serde_json::json!({"version": 1, "items": items});
+        std::fs::write(dir.path().join("reminders.json"), file.to_string()).unwrap();
+    }
+
+    fn wait_until(what: &str, ms: u64, ok: impl Fn() -> bool) {
+        let end = std::time::Instant::now() + Duration::from_millis(ms);
+        while !ok() {
+            assert!(std::time::Instant::now() < end, "{what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn odd_unix_seconds_never_panic() {
+        for s in [i64::MAX, i64::MIN, 99_999_999_999_999, -99_999_999_999_999] {
+            let _ = unix_ceil(from_unix(s));
+        }
+        assert_eq!(from_unix(unix_ceil(t0())), t0());
+        assert_eq!(unix_floor(UNIX_EPOCH - Duration::from_millis(1500)), (-2, 500_000_000));
+    }
+
+    #[test]
+    fn absurd_dues_in_a_hand_edited_file_do_not_stop_the_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        write_items(&dir, serde_json::json!([
+            {"id": 1, "due": 99_999_999_999_999_i64, "text": "far", "timer": false},
+            {"id": 2, "due": -99_999_999_999_999_i64, "text": "old", "timer": false},
+            {"id": 3, "due": unix_ceil(t0()) + 1, "text": "pizza", "timer": false},
+        ]));
+        let g = rig_in(dir, FAST);
+        g.r.start();
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Missed: old");
+        assert_eq!(g.r.pending().iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["pizza"], "far is dropped");
+        g.advance(Duration::from_secs(1));
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
+        assert_eq!(g.quiet_for(100), Vec::<String>::new());
+        assert!(!g.path().exists());
+    }
+
+    #[test]
+    fn a_failed_save_on_cancel_is_retried_until_the_file_matches() {
+        let g = rig(FAST);
+        g.r.start();
+        let a = g.r.add(g.now() + Duration::from_secs(60), "first", false).unwrap();
+        g.r.add(g.now() + Duration::from_secs(120), "second", false).unwrap();
+        // A folder with the file's name: neither the write nor the rename can succeed.
+        std::fs::remove_file(g.path()).unwrap();
+        std::fs::create_dir(g.path()).unwrap();
+        assert!(g.r.cancel(a.id));
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(g.path().is_dir(), "still blocked");
+        std::fs::remove_dir(g.path()).unwrap();
+        wait_until("the cancel never reached the file", 500, || {
+            std::fs::read_to_string(g.path()).is_ok_and(|s| s.contains("second") && !s.contains("first"))
+        });
+        assert_eq!(g.quiet_for(50), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_failed_save_while_firing_is_retried_so_the_text_leaves_disk() {
+        let g = rig(FAST);
+        g.r.start();
+        g.r.add(g.now() + Duration::from_secs(1), "pizza", false).unwrap();
+        std::fs::remove_file(g.path()).unwrap();
+        std::fs::create_dir(g.path()).unwrap();
+        std::fs::write(g.path().join("x"), "keeps the folder from being removed as a file").unwrap();
+        g.advance(Duration::from_secs(1));
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
+        std::fs::remove_dir_all(g.path()).unwrap();
+        // Stand-in for the stale file a failed save leaves behind.
+        std::fs::write(g.path(), "stale").unwrap();
+        wait_until("the fired text stayed on disk", 500, || !g.path().exists());
+        assert_eq!(g.quiet_for(50), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_panicking_fire_does_not_stop_later_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(Mutex::new(t0()));
+        let c = Arc::clone(&clock);
+        let now: Clock = Arc::new(move || *c.lock().unwrap());
+        let (tx, rx) = channel::<String>();
+        let fire: Fire = Arc::new(move |b: &str| {
+            assert!(b != "boom", "the notifier broke");
+            let _ = tx.send(b.to_string());
+        });
+        let r = Reminders::with_max_sleep(dir.path().join("reminders.json"), now, fire, Duration::from_millis(10));
+        r.start();
+        r.add(t0() + Duration::from_secs(1), "boom", false).unwrap();
+        r.add(t0() + Duration::from_secs(1), "pizza", false).unwrap();
+        r.add(t0() + Duration::from_secs(5), "later", false).unwrap();
+        *clock.lock().unwrap() = t0() + Duration::from_secs(1);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
+        *clock.lock().unwrap() = t0() + Duration::from_secs(5);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), "later");
+    }
+
+    #[test]
+    fn repeated_ids_in_the_file_are_renumbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let due = unix_ceil(t0()) + 600;
+        write_items(&dir, serde_json::json!([
+            {"id": 3, "due": due, "text": "a", "timer": false},
+            {"id": 3, "due": due + 1, "text": "b", "timer": false},
+        ]));
+        let g = rig_in(dir, FAST);
+        g.r.start();
+        g.wait_ready();
+        let ids: Vec<u64> = g.r.pending().iter().map(|r| r.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        // The thread writes the renumbered list back.
+        wait_until("the file kept the repeated id", 500, || {
+            let s = std::fs::read_to_string(g.path()).unwrap_or_default();
+            serde_json::from_str::<serde_json::Value>(&s).is_ok_and(|v| {
+                let ids: Vec<u64> = v["items"].as_array().unwrap().iter().map(|i| i["id"].as_u64().unwrap()).collect();
+                ids.len() == 2 && ids[0] != ids[1]
+            })
+        });
+        assert!(g.r.cancel(ids[1]));
+        assert_eq!(g.r.pending().iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["a"]);
     }
 }

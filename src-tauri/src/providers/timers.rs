@@ -84,7 +84,8 @@ impl TimersProvider {
         let due = due_z.timestamp().as_second();
         let text: String = text.chars().take(MAX_TEXT).collect();
         let left = duration_text(Duration::from_secs(due.saturating_sub(now).max(0) as u64));
-        let day = if due_z.date() != now_z.date() { "tomorrow, " } else { "" };
+        let tomorrow = now_z.date().tomorrow().ok();
+        let day = if Some(due_z.date()) == tomorrow { "tomorrow, " } else { "" };
         row(
             format!("set:{due}:r:{text}"),
             format!("Remind at {} \u{2014} {text}", self.clock_text(due)),
@@ -213,7 +214,7 @@ impl Provider for TimersProvider {
     /// The first word (any case) is `timer`, `remind`, `timers` or `reminders`,
     /// followed by a space or the end.
     fn claims(&self, text: &str) -> bool {
-        let word = text.split(char::is_whitespace).next().unwrap_or("");
+        let word = text.trim().split(char::is_whitespace).next().unwrap_or("");
         WORDS.iter().any(|w| w.eq_ignore_ascii_case(word))
     }
 }
@@ -284,6 +285,12 @@ mod tests {
         assert_eq!(r[0].title, "Remind at 15:00 \u{2014} dentist");
         assert_eq!(r[0].subtitle, "tomorrow, in 1 d");
         assert_eq!(titles(&g.p, "remind 5m"), ["Remind at 14:32 \u{2014} Reminder"]);
+        // Only the very next day says "tomorrow".
+        let r = rows(&g.p, "remind 72h x");
+        assert_eq!(r[0].title, "Remind at 14:27 \u{2014} x");
+        assert_eq!(r[0].subtitle, "in 3 d");
+        assert_eq!(rows(&g.p, "remind 34h x")[0].subtitle, "in 1 d 10 h");
+        assert_eq!(rows(&g.p, "remind 10h x")[0].subtitle, "tomorrow, in 10 h");
     }
 
     #[test]
@@ -348,7 +355,7 @@ mod tests {
     #[test]
     fn only_these_words_are_claimed() {
         let g = rig();
-        for yes in ["timer", "Timer 5m", "remind x", "timers", "REMINDERS"] {
+        for yes in ["timer", "Timer 5m", "remind x", "timers", "REMINDERS", "  timer 5m ", " timers"] {
             assert!(g.p.claims(yes), "{yes}");
         }
         for no in ["timeline", "reminder app", "remindme", "timers5", ""] {
