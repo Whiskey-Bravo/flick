@@ -449,10 +449,6 @@ function enter(s: State, modifier: Modifier): Result {
   if (s.armed === item.id && s.armedAction === "uninstall") {
     return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: "uninstall" }]);
   }
-  // Ctrl+Enter on a row that offers Copy copies without the main action.
-  if (modifier === "ctrl" && item.panel === "" && item.actions.includes("copy")) {
-    return done({ ...s, armed: null, pending: true }, [{ type: "act", item, action: "copy" }]);
-  }
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
   return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);
 }

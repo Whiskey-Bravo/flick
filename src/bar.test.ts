@@ -918,10 +918,9 @@ describe("mouse and menu", () => {
     expect(r.state.pending).toBe(true);
   });
 
-  it("ctrl_enter_copies_a_row_that_offers_copy", () => {
+  it("ctrl_enter_activates_with_the_ctrl_modifier", () => {
     const c = { ...item("c"), actions: ["copy" as const] };
     const r = run(withItems(c), key("Enter", true));
-    expect(r.effects).toEqual([{ type: "act", item: c, action: "copy" }]);
-    expect(r.state.pending).toBe(true);
+    expect(r.effects).toEqual([{ type: "activate", item: c, modifier: "ctrl", text: "", scope: null }]);
   });
 });
