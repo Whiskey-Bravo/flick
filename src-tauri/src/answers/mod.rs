@@ -6,3 +6,6 @@ pub mod number;
 
 #[allow(dead_code)]
 pub mod calc;
+
+#[allow(dead_code)]
+pub mod units;
