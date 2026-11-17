@@ -51,6 +51,7 @@ fn split_https(url: &str) -> Result<(String, u16, String), FetchError> {
 
 mod winhttp {
     use std::ffi::c_void;
+    use std::time::{Duration, Instant};
 
     use windows::core::{w, Error, HSTRING, HRESULT, PCWSTR};
     use windows::Win32::Networking::WinHttp::*;
@@ -58,6 +59,8 @@ mod winhttp {
     use super::FetchError;
 
     const TIMEOUT_MS: i32 = 5_000;
+    /// The whole fetch (resolve, connect, send, headers, body) must finish within this.
+    const TOTAL: Duration = Duration::from_millis(TIMEOUT_MS as u64);
     const MAX_BODY: usize = 2 * 1024 * 1024;
 
     /// A WinHTTP handle, closed on drop.
@@ -96,12 +99,27 @@ mod winhttp {
         }
     }
 
+    /// Milliseconds left until `deadline`, or None when it has passed.
+    pub(super) fn remaining_ms(deadline: Instant, now: Instant) -> Option<i32> {
+        let left = deadline.saturating_duration_since(now).as_millis();
+        (left > 0).then(|| i32::try_from(left).unwrap_or(i32::MAX))
+    }
+
+    /// Caps every timeout of the next blocking call at the time left; past the deadline
+    /// the fetch counts as offline.
+    fn arm(request: &Handle, deadline: Instant) -> Result<(), FetchError> {
+        let ms = remaining_ms(deadline, Instant::now()).ok_or(FetchError::Offline)?;
+        // SAFETY: a live request handle.
+        unsafe { WinHttpSetTimeouts(request.0, ms, ms, ms, ms) }.map_err(map)
+    }
+
     fn set_u32(handle: &Handle, option: u32, value: u32) -> Result<(), FetchError> {
         // SAFETY: a live handle and a 4-byte buffer, as these options expect.
         unsafe { WinHttpSetOption(Some(handle.0), option, Some(&value.to_ne_bytes())) }.map_err(map)
     }
 
     pub(super) fn get(host: &str, port: u16, path: &str) -> Result<Vec<u8>, FetchError> {
+        let deadline = Instant::now() + TOTAL;
         // Declared in this order so they drop request → connection → session.
         // SAFETY (all calls below): every handle passed is live and owned by a guard;
         // string arguments outlive the calls; out-pointers point at locals of the right size.
@@ -128,7 +146,9 @@ mod winhttp {
         set_u32(&request, WINHTTP_OPTION_AUTOLOGON_POLICY, WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH)?;
         set_u32(&request, WINHTTP_OPTION_REDIRECT_POLICY, WINHTTP_OPTION_REDIRECT_POLICY_DISALLOW_HTTPS_TO_HTTP)?;
 
+        arm(&request, deadline)?;
         unsafe { WinHttpSendRequest(request.0, None, None, 0, 0, 0) }.map_err(map)?;
+        arm(&request, deadline)?;
         unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }.map_err(map)?;
 
         let mut status: u32 = 0;
@@ -151,6 +171,7 @@ mod winhttp {
         let mut body = Vec::new();
         let mut buf = vec![0u8; 64 * 1024];
         loop {
+            arm(&request, deadline)?;
             let mut read: u32 = 0;
             unsafe { WinHttpReadData(request.0, buf.as_mut_ptr() as *mut c_void, buf.len() as u32, &mut read) }
                 .map_err(map)?;
@@ -256,6 +277,17 @@ mod tests {
         for bad in ["https://example.com:0/", "https://example.com:x/", "https://[::1]/", "https://a b/", "https://a/b c"] {
             assert!(split_https(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn deadline_counts_down_and_expires() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(5_000);
+        assert_eq!(winhttp::remaining_ms(deadline, now), Some(5_000));
+        assert_eq!(winhttp::remaining_ms(deadline, now + Duration::from_millis(4_999)), Some(1));
+        assert_eq!(winhttp::remaining_ms(deadline, deadline), None);
+        assert_eq!(winhttp::remaining_ms(deadline, deadline + Duration::from_secs(1)), None);
     }
 
     #[test]

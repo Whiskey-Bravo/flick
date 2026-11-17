@@ -162,12 +162,11 @@ struct State {
     rates: Option<Arc<Rates>>,
     /// When the last fetch attempt started (in memory only; a restart resets it).
     last_attempt: Option<Timestamp>,
+    /// Counts attempts; a fetch thread only settles `fetching`/`failed` for its own.
+    attempt: u64,
     fetching: bool,
     /// The last finished attempt failed.
     failed: bool,
-    /// The publication a successful fetch was made for. The ECB has nothing newer
-    /// until `latest_publication` moves past it (e.g. on its holidays).
-    fetched_for: Option<Date>,
 }
 
 /// Currency rates kept in memory, loaded from and saved to `rates.json`,
@@ -199,8 +198,10 @@ impl RatesStore {
         }
     }
 
-    /// Query path: reads memory only. When the rates are stale, `online` is set and no
-    /// attempt started in the last hour, starts one fetch on a background thread.
+    /// Query path: reads memory only. When the rates are older than the latest ECB
+    /// publication, `online` is set and no attempt started in the last hour, starts one
+    /// fetch on a background thread. A fetch still running after an hour no longer
+    /// blocks a new attempt.
     pub fn lookup(&self, now: Timestamp, online: bool) -> RatesState {
         let latest = latest_publication(now);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -208,9 +209,8 @@ impl RatesStore {
         if !online {
             return RatesState::Off(rates);
         }
-        let stale =
-            rates.as_ref().is_none_or(|r| r.date < latest) && st.fetched_for != Some(latest);
-        if !stale || st.fetching {
+        let stale = rates.as_ref().is_none_or(|r| r.date < latest);
+        if !stale {
             return rates.map_or(RatesState::Fetching, RatesState::Ready);
         }
         let recent = st.last_attempt.is_some_and(|t| {
@@ -218,49 +218,63 @@ impl RatesStore {
             since >= SignedDuration::ZERO && since < RETRY_AFTER
         });
         if recent {
-            return if st.failed {
+            return if st.failed && !st.fetching {
                 RatesState::Offline(rates)
             } else {
                 rates.map_or(RatesState::Fetching, RatesState::Ready)
             };
         }
+        st.attempt += 1;
+        let attempt = st.attempt;
         st.fetching = true;
+        st.failed = false;
         st.last_attempt = Some(now);
         drop(st);
-        self.spawn_fetch(latest);
-        rates.map_or(RatesState::Fetching, RatesState::Ready)
+        if self.spawn_fetch(attempt) {
+            rates.map_or(RatesState::Fetching, RatesState::Ready)
+        } else {
+            (self.on_ready)();
+            RatesState::Offline(rates)
+        }
     }
 
-    /// One fetch on its own thread: save and swap in on success, then `on_ready` once.
-    fn spawn_fetch(&self, latest: Date) {
+    /// One fetch on its own thread: swap in and save on success, then `on_ready` once.
+    /// Returns false (and records the failure) when the thread could not start.
+    fn spawn_fetch(&self, attempt: u64) -> bool {
         let path = self.path.clone();
         let fetch = self.fetch.clone();
         let on_ready = self.on_ready.clone();
         let state = self.state.clone();
         let spawned = std::thread::Builder::new().name("flick-rates".into()).spawn(move || {
-            let got = fetch.get(ECB_URL).ok().and_then(|body| parse_ecb(&body));
-            if let Some(rates) = &got {
-                // Not saved = fetched again after a restart; memory still gets the rates.
-                let _ = crate::ranking::save_json(&path, &Stored::from_rates(rates));
-            }
-            {
+            let got = fetch.get(ECB_URL).ok().and_then(|body| parse_ecb(&body)).map(Arc::new);
+            let swapped = {
                 let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                st.fetching = false;
-                st.failed = got.is_none();
-                if let Some(rates) = got {
-                    st.fetched_for = Some(latest);
-                    if st.rates.as_ref().is_none_or(|r| r.date <= rates.date) {
-                        st.rates = Some(Arc::new(rates));
-                    }
+                if st.attempt == attempt {
+                    st.fetching = false;
+                    st.failed = got.is_none();
                 }
+                match &got {
+                    Some(rates) if st.rates.as_ref().is_none_or(|r| r.date <= rates.date) => {
+                        st.rates = Some(rates.clone());
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if let (true, Some(rates)) = (swapped, &got) {
+                // Not saved = fetched again after a restart; memory still has the rates.
+                let _ = crate::ranking::save_json(&path, &Stored::from_rates(rates));
             }
             on_ready();
         });
         if spawned.is_err() {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.fetching = false;
-            st.failed = true;
+            if st.attempt == attempt {
+                st.fetching = false;
+                st.failed = true;
+            }
         }
+        spawned.is_ok()
     }
 }
 
@@ -458,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn same_publication_is_not_fetched_again_after_success() {
+    fn same_publication_is_retried_hourly_until_it_appears() {
         // ECB holiday: the newest file is older than the expected publication.
         let dir = tempfile::tempdir().unwrap();
         let fetch = Arc::new(FakeFetch::offline().respond(ECB_URL, Ok(FIXTURE.to_vec())));
@@ -467,14 +481,76 @@ mod tests {
         store.lookup(ts("2026-11-18T16:00:00Z"), true);
         wait(&rx);
         assert!(matches!(
-            store.lookup(ts("2026-11-18T19:00:00Z"), true),
+            store.lookup(ts("2026-11-18T16:59:00Z"), true),
             RatesState::Ready(r) if r.date == date(2026, 11, 17)
         ));
-        assert_eq!(fetch.urls().len(), 1);
-        // The next publication is worth asking for.
-        store.lookup(ts("2026-11-19T16:00:00Z"), true);
+        assert_eq!(fetch.urls().len(), 1, "no refetch within the hour");
+        store.lookup(ts("2026-11-18T17:00:00Z"), true);
+        wait(&rx);
+        store.lookup(ts("2026-11-18T17:30:00Z"), true);
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(fetch.urls().len(), 2, "exactly one refetch after the hour");
+    }
+
+    /// Answers each request with the next scripted body.
+    struct Sequence(Mutex<Vec<Vec<u8>>>);
+
+    impl crate::net::Fetch for Sequence {
+        fn get(&self, _url: &str) -> Result<Vec<u8>, FetchError> {
+            let mut left = self.0.lock().unwrap();
+            if left.is_empty() { Err(FetchError::Offline) } else { Ok(left.remove(0)) }
+        }
+    }
+
+    #[test]
+    fn fetched_before_upload_is_retried_after_an_hour() {
+        // Just after 16:00 Berlin the ECB may still serve yesterday's file.
+        let yesterday = String::from_utf8(FIXTURE.to_vec()).unwrap().replace("2026-11-17", "2026-11-16");
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(Sequence(Mutex::new(vec![yesterday.into_bytes(), FIXTURE.to_vec()])));
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let store = RatesStore::new(
+            dir.path().join("rates.json"),
+            fetch,
+            Arc::new(move || {
+                let _ = tx.lock().unwrap().send(());
+            }),
+        );
+        store.load();
+        let after_four = ts("2026-11-17T15:01:00Z");
+        assert!(matches!(store.lookup(after_four, true), RatesState::Fetching));
+        wait(&rx);
+        assert!(matches!(
+            store.lookup(ts("2026-11-17T15:30:00Z"), true),
+            RatesState::Ready(r) if r.date == date(2026, 11, 16)
+        ));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no refetch within the hour");
+        assert!(matches!(
+            store.lookup(ts("2026-11-17T16:01:00Z"), true),
+            RatesState::Ready(r) if r.date == date(2026, 11, 16)
+        ));
+        wait(&rx);
+        assert!(matches!(
+            store.lookup(ts("2026-11-17T16:02:00Z"), true),
+            RatesState::Ready(r) if r.date == date(2026, 11, 17)
+        ));
+    }
+
+    #[test]
+    fn hung_fetch_does_not_block_retries_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = Arc::new(FakeFetch::offline().with_delay(Duration::from_millis(300)));
+        let (store, rx) = store_with(&dir, fetch.clone());
+        store.load();
+        assert!(matches!(store.lookup(ts("2026-11-18T16:00:00Z"), true), RatesState::Fetching));
+        assert!(matches!(store.lookup(ts("2026-11-18T16:30:00Z"), true), RatesState::Fetching));
+        assert!(matches!(store.lookup(ts("2026-11-18T17:00:00Z"), true), RatesState::Fetching));
+        wait(&rx);
         wait(&rx);
         assert_eq!(fetch.urls().len(), 2);
+        // Both finished; the newer attempt's failure is what shows.
+        assert!(matches!(store.lookup(ts("2026-11-18T17:10:00Z"), true), RatesState::Offline(None)));
     }
 
     #[test]
