@@ -1005,6 +1005,28 @@ mod tests {
         assert_eq!(r.engine.query("chrome", None)[0].provider, "windows");
     }
 
+    fn chrome_tab(hwnd: isize, title: &str) -> WinInfo {
+        WinInfo { hwnd, title: title.into(), ..chrome_window() }
+    }
+
+    #[test]
+    fn an_unrelated_window_title_does_not_beat_an_exact_app() {
+        let r = rig_with(vec![app("Word")], vec![], vec![chrome_tab(1, "Wordle - Google Chrome")]);
+        let res = r.engine.query("word", None);
+        assert_eq!((res[0].provider, res[0].title.as_str()), ("apps", "Word"));
+    }
+
+    #[test]
+    fn many_windows_of_one_app_do_not_fill_the_list() {
+        let apps = ["Gimp", "Git Bash", "Godot", "Gedit", "Gnome Boxes"].map(app).to_vec();
+        let wins = (1..=8).map(|n| chrome_tab(n, &format!("Tab {n}"))).collect();
+        let r = rig_with(apps, vec![], wins);
+        let res = r.engine.query("g", None);
+        let windows = res.iter().filter(|i| i.provider == "windows").count();
+        assert!(windows <= 3, "{windows} window rows");
+        assert_eq!(res.iter().filter(|i| i.provider == "apps").count(), 5);
+    }
+
     #[test]
     fn status_answers_sit_on_top() {
         let r = rig(vec![app("Battery")], vec![]);
@@ -1030,6 +1052,20 @@ mod tests {
         let row = res.iter().find(|i| i.provider == "windows").unwrap();
         assert_eq!(r.engine.activate("windows", &row.id, provider::Modifier::None, "docs", None), Ok(Outcome::Hide));
         assert_eq!(r.ranking.boost("windows", &row.id), 0);
+        assert!(r.history.recents().is_empty());
+        assert!(r.history.searches().is_empty());
+        assert!(!r.dir.path().join("picks.json").exists());
+    }
+
+    #[test]
+    fn system_toggles_are_never_recorded() {
+        let r = rig(vec![], vec![]);
+        for (text, id) in [("wifi off", "radio:wifi:off"), ("dark mode", "theme:dark"), ("mute", "mute")] {
+            let res = r.engine.query(text, None);
+            assert!(res.iter().any(|i| i.id == id), "{id}");
+            assert_eq!(r.engine.activate("system", id, provider::Modifier::None, text, None), Ok(Outcome::Hide));
+            assert_eq!(r.ranking.boost("system", id), 0);
+        }
         assert!(r.history.recents().is_empty());
         assert!(r.history.searches().is_empty());
         assert!(!r.dir.path().join("picks.json").exists());

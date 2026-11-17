@@ -112,7 +112,7 @@ mod sys {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-        IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE,
+        IsWindow, IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindowAsync, GWL_EXSTYLE, GW_OWNER, SW_RESTORE,
         WM_CLOSE, WS_EX_TOOLWINDOW,
     };
 
@@ -288,7 +288,8 @@ mod sys {
         // SAFETY: calls on a window handle; failures are reported, not assumed.
         unsafe {
             if IsIconic(w).as_bool() {
-                let _ = ShowWindow(w, SW_RESTORE);
+                // Async: a hung window must not block this thread.
+                let _ = ShowWindowAsync(w, SW_RESTORE);
             }
             if SetForegroundWindow(w).as_bool() {
                 Ok(())

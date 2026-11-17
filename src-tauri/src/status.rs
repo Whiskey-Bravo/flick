@@ -13,6 +13,9 @@ use crate::net::Fetch;
 const PUBLIC_IP_URL: &str = "https://api.ipify.org";
 /// A cached value younger than this is served as is.
 const FRESH: Duration = Duration::from_secs(3);
+/// The public address is asked for only once `ip` stayed typed this long
+/// (the same pause the weather lookup waits for).
+const IP_PAUSE: Duration = Duration::from_millis(400);
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,9 +124,13 @@ fn cpu_line(a: CpuTimes, b: CpuTimes) -> (String, String) {
     (text.clone(), text)
 }
 
-fn ip_lines(src: &dyn StatusSource, fetch: &dyn Fetch, online: bool) -> Vec<(String, String)> {
+/// Local addresses always; the public one only when `online`, and fetched only when `fetch_public`
+/// (else a placeholder row until the typing pause is over).
+fn ip_lines(src: &dyn StatusSource, fetch: &dyn Fetch, online: bool, fetch_public: bool) -> Vec<(String, String)> {
     let mut lines: Vec<(String, String)> = src.local_ips().into_iter().map(|ip| (ip.clone(), ip)).collect();
-    if online {
+    if online && !fetch_public {
+        lines.push(("Public IP: checking…".into(), String::new()));
+    } else if online {
         let public = fetch
             .get(PUBLIC_IP_URL)
             .ok()
@@ -147,6 +154,10 @@ fn ip_lines(src: &dyn StatusSource, fetch: &dyn Fetch, online: bool) -> Vec<(Str
 struct State {
     values: HashMap<StatusKind, (StatusValue, Instant)>,
     running: HashSet<StatusKind>,
+    /// The cached `Ip` value includes the public address lookup.
+    ip_public: bool,
+    /// Since when the text has stayed `ip` (a timer re-asks once the pause is over).
+    ip_since: Option<Instant>,
 }
 
 /// Cached samples, refreshed in the background.
@@ -173,9 +184,27 @@ impl StatusStore {
     /// called once when it is done; meanwhile the old value or `Pending` is returned.
     pub fn get(&self, kind: StatusKind, online: bool) -> StatusValue {
         let mut st = self.state.lock().unwrap();
+        // The public address waits for the typing pause; a timer re-asks when it is over.
+        let mut fetch_public = false;
+        if kind == StatusKind::Ip && online {
+            match st.ip_since {
+                Some(since) => fetch_public = since.elapsed() >= IP_PAUSE,
+                None => {
+                    st.ip_since = Some(Instant::now());
+                    let (state, on_ready) = (self.state.clone(), self.on_ready.clone());
+                    std::thread::spawn(move || {
+                        std::thread::sleep(IP_PAUSE);
+                        if state.lock().unwrap().ip_since.is_some() {
+                            on_ready();
+                        }
+                    });
+                }
+            }
+        }
         let cached = st.values.get(&kind).cloned();
         if let Some((v, at)) = &cached {
-            if at.elapsed() < FRESH {
+            let wants_public = kind == StatusKind::Ip && fetch_public && !st.ip_public;
+            if at.elapsed() < FRESH && !wants_public {
                 return v.clone();
             }
         }
@@ -192,10 +221,13 @@ impl StatusStore {
                         std::thread::sleep(gap);
                         vec![cpu_line(a, src.cpu_times())]
                     }
-                    StatusKind::Ip => ip_lines(src.as_ref(), fetch.as_ref(), online),
+                    StatusKind::Ip => ip_lines(src.as_ref(), fetch.as_ref(), online, fetch_public),
                 };
                 {
                     let mut st = state.lock().unwrap();
+                    if kind == StatusKind::Ip {
+                        st.ip_public = online && fetch_public;
+                    }
                     st.values.insert(kind, (StatusValue::Lines(lines), Instant::now()));
                     st.running.remove(&kind);
                 }
@@ -203,6 +235,11 @@ impl StatusStore {
             });
         }
         cached.map_or(StatusValue::Pending, |(v, _)| v)
+    }
+
+    /// The text is no longer `ip`: the next `ip` starts a new typing pause.
+    pub fn leave_ip(&self) {
+        self.state.lock().unwrap().ip_since = None;
     }
 }
 
@@ -482,17 +519,45 @@ mod tests {
     fn public_ip_is_fetched_when_online() {
         let fetch = Arc::new(FakeFetch::offline().respond(PUBLIC_IP_URL, Ok(b"203.0.113.9\n".to_vec())));
         let src = FakeStatus { ips: vec!["192.168.1.20".into()], ..Default::default() };
-        let (s, rx) = store(src, fetch);
+        let (s, rx) = store(src, fetch.clone());
+        // Local lines first, the public one is only a placeholder while the pause runs.
+        s.get(StatusKind::Ip, true);
+        ready(&rx);
+        let StatusValue::Lines(l) = s.get(StatusKind::Ip, true) else { panic!() };
+        assert_eq!(l[0].0, "192.168.1.20");
+        assert_eq!(l[1].0, "Public IP: checking…");
+        assert!(fetch.urls().is_empty());
+        // The timer re-asks after the pause; then the address is fetched.
+        ready(&rx);
         s.get(StatusKind::Ip, true);
         ready(&rx);
         let StatusValue::Lines(l) = s.get(StatusKind::Ip, true) else { panic!() };
         assert_eq!(l[1], ("Public IP 203.0.113.9".to_string(), "203.0.113.9".to_string()));
+        assert_eq!(fetch.urls().len(), 1);
+    }
+
+    #[test]
+    fn passing_through_ip_while_typing_never_fetches() {
+        let fetch = Arc::new(FakeFetch::new(Ok(b"203.0.113.9".to_vec())));
+        let (s, rx) = store(FakeStatus { ips: vec!["10.0.0.2".into()], ..Default::default() }, fetch.clone());
+        s.get(StatusKind::Ip, true);
+        ready(&rx);
+        s.leave_ip(); // "ipc": the text moved on
+        std::thread::sleep(IP_PAUSE + Duration::from_millis(150));
+        assert!(rx.try_recv().is_err(), "no timer wake-up after leaving");
+        s.get(StatusKind::Ip, true); // "ip" typed again: a fresh pause starts
+        s.leave_ip();
+        std::thread::sleep(IP_PAUSE + Duration::from_millis(150));
+        assert!(fetch.urls().is_empty());
     }
 
     #[test]
     fn public_ip_failure_says_unavailable() {
         let fetch = Arc::new(FakeFetch::new(Err(FetchError::Offline)));
         let (s, rx) = store(FakeStatus { ips: vec!["10.0.0.2".into()], ..Default::default() }, fetch);
+        s.get(StatusKind::Ip, true);
+        ready(&rx);
+        ready(&rx);
         s.get(StatusKind::Ip, true);
         ready(&rx);
         let StatusValue::Lines(l) = s.get(StatusKind::Ip, true) else { panic!() };

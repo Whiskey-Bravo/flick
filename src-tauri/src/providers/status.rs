@@ -61,7 +61,13 @@ impl Provider for StatusProvider {
     }
 
     fn query(&self, q: &Query) -> Vec<ResultItem> {
-        let Some(kind) = kind_of(&q.text) else { return vec![] };
+        let Some(kind) = kind_of(&q.text) else {
+            self.store.leave_ip();
+            return vec![];
+        };
+        if kind != StatusKind::Ip {
+            self.store.leave_ip();
+        }
         let lines = match self.store.get(kind, self.online.load(Ordering::Relaxed)) {
             StatusValue::Pending => vec![("Checking…".to_string(), String::new())],
             StatusValue::Lines(l) => l,

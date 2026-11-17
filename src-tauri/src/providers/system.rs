@@ -201,9 +201,10 @@ impl Provider for SystemProvider {
         CMDS.iter().find(|c| c.id == id).map(|c| self.cmd_row(c, 0))
     }
 
-    /// Typed numbers must not become learned keys.
-    fn rank_key(&self, id: &str) -> Option<String> {
-        CMDS.iter().any(|c| c.id == id).then(|| id.to_string())
+    /// Never learned or kept as a recent: a habitual Enter in the empty bar must not
+    /// toggle Wi-Fi or skip a track again. (Pins still work, through `item`.)
+    fn rank_key(&self, _id: &str) -> Option<String> {
+        None
     }
 
     fn help(&self) -> Vec<HelpLine> {
@@ -482,7 +483,10 @@ mod tests {
             assert!(p.item(id).is_none(), "{id}");
         }
         assert_eq!(p.rank_key("vol:30"), None);
-        assert_eq!(p.rank_key("mute"), Some("mute".into()));
+        assert_eq!(p.rank_key("mute"), None);
+        for c in CMDS {
+            assert_eq!(p.rank_key(c.id), None, "{}", c.id);
+        }
     }
 
     #[test]

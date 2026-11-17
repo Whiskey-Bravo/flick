@@ -9,6 +9,11 @@ use crate::winlist::{WinInfo, WindowList};
 /// Above the engine's learned-boost cap (300), so a window you are looking for
 /// outranks an app that merely has a habit.
 pub const WINDOW_BONUS: u32 = 310;
+/// The bonus applies only when the app's name matches at least this well
+/// (word prefix or better); weaker matches rank like any other row.
+const STRONG: u32 = 800;
+/// Window rows a plain search may take among other providers' results.
+const PLAIN_SHARE: usize = 3;
 
 pub struct WindowsProvider {
     list: Arc<WindowList>,
@@ -67,7 +72,7 @@ fn window_row(w: &WinInfo, score: u32) -> ResultItem {
         id: format!("win:{}", w.hwnd),
         provider: "windows",
         title: w.title.clone(),
-        subtitle: if w.elevated { NEEDS_ADMIN.to_string() } else { format!("{} \u{b7} window", w.app) },
+        subtitle: format!("{} \u{b7} window", w.app),
         score,
         icon: format!("file:{}", w.exe),
         ..Default::default()
@@ -153,8 +158,13 @@ impl Provider for WindowsProvider {
         } else {
             snap.iter()
                 .filter_map(|w| {
-                    let best = fuzzy::score(text, &w.title).into_iter().chain(fuzzy::score(text, &w.app)).max()?;
-                    Some(window_row(w, best + WINDOW_BONUS))
+                    // The bonus puts a window above its own app's row, so it needs the
+                    // app's name to match well; a title match alone ranks like an app.
+                    let title = fuzzy::score(text, &w.title);
+                    let app = fuzzy::score(text, &w.app).into_iter().chain(fuzzy::score(text, &stem(&w.exe))).max();
+                    let boosted = app.filter(|s| *s >= STRONG).map(|s| s + WINDOW_BONUS);
+                    let best = title.into_iter().chain(boosted).chain(app).max()?;
+                    Some(window_row(w, best))
                 })
                 .collect()
         };
@@ -183,6 +193,10 @@ impl Provider for WindowsProvider {
         None
     }
 
+    fn plain_share(&self) -> usize {
+        PLAIN_SHARE
+    }
+
     fn help(&self) -> Vec<HelpLine> {
         vec![HelpLine {
             example: "close chrome / quit all".into(),
@@ -207,9 +221,6 @@ impl Provider for WindowsProvider {
         }
         if let Some(h) = id.strip_prefix("win:") {
             let h: isize = h.parse().map_err(|_| "That window is gone.".to_string())?;
-            if snap.iter().any(|w| w.hwnd == h && w.elevated) {
-                return Err(NEEDS_ADMIN.to_string());
-            }
             if !ops.exists(h) {
                 return Err("That window is gone.".to_string());
             }
@@ -350,6 +361,26 @@ mod tests {
     }
 
     #[test]
+    fn only_a_strong_app_name_match_gets_the_bonus() {
+        let (p, _) = setup(vec![win(1, 10, "Wordle - Google Chrome", r"C:\Apps\Chrome\chrome.exe", "Google Chrome", false)]);
+        // The title alone matches: ranks like any app row, no bonus.
+        let title_only = p.query(&q("wordle"))[0].score;
+        assert_eq!(title_only, fuzzy::score("wordle", "Wordle - Google Chrome").unwrap());
+        assert_eq!(p.query(&q("word"))[0].score, fuzzy::score("word", "Wordle - Google Chrome").unwrap());
+        // A weak (substring) app name match gets none either.
+        assert_eq!(p.query(&q("oogle"))[0].score, fuzzy::score("oogle", "Google Chrome").unwrap());
+        // The app's name (or exe) matching well gets it.
+        assert_eq!(p.query(&q("chrome"))[0].score, 1000 + WINDOW_BONUS);
+        assert_eq!(p.query(&q("google"))[0].score, 900 + WINDOW_BONUS);
+    }
+
+    #[test]
+    fn plain_search_takes_few_window_rows() {
+        let (p, _) = setup(mail_and_word());
+        assert_eq!(p.plain_share(), 3);
+    }
+
+    #[test]
     fn enter_focuses_the_window_and_hides() {
         let (p, ops) = setup(mail_and_word());
         assert_eq!(p.activate("win:1", Modifier::None), Ok(Outcome::Hide));
@@ -408,11 +439,13 @@ mod tests {
     }
 
     #[test]
-    fn elevated_targets_say_needs_administrator() {
+    fn elevated_windows_can_be_switched_to_but_not_closed_or_ended() {
         let (p, ops) = setup(vec![win(5, 50, "Task Manager", r"C:\Windows\taskmgr.exe", "Task Manager", true)]);
         let rows = p.query(&q("task"));
-        assert_eq!(rows[0].subtitle, "Needs administrator");
-        assert_eq!(p.activate("win:5", Modifier::None), Err("Needs administrator".to_string()));
+        assert_eq!(rows[0].subtitle, "Task Manager \u{b7} window");
+        assert_eq!(p.activate("win:5", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(ops.calls(), vec!["focus 5"]);
+        ops.calls.lock().unwrap().clear();
         let rows = p.query(&q("close task"));
         assert_eq!(rows[0].subtitle, "Needs administrator");
         assert_eq!(p.activate(&rows[0].id, Modifier::None), Err("Needs administrator".to_string()));
