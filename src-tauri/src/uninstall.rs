@@ -3,7 +3,7 @@
 //! `split_command`) are pure; the registry walk is thin and runs on the apps
 //! refresh thread only.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// An entry of Windows' uninstall list.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,19 +50,64 @@ fn is_windows_package(store_id: &str) -> bool {
     id.starts_with("windows.") || id.starts_with("microsoft.windows.")
 }
 
+/// Words of a name: letters and digits, lowercased, at least 3 characters.
+fn words(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Folders too shared to belong to one program: drive roots, anything under
+/// the Windows folder, and the given `broad` roots themselves.
+fn is_broad(loc: &Path, windows_dir: &Path, broad: &[PathBuf]) -> bool {
+    let depth = parts(loc).len();
+    depth <= 2 || inside(loc, windows_dir) || broad.iter().any(|b| parts(b) == parts(loc))
+}
+
+/// The shared folders (`Program Files`, `Program Files (x86)`, `%LOCALAPPDATA%\Programs`,
+/// the profile folder, `AppData` and its `Local` / `Roaming`, `ProgramData`)
+/// whose own location never identifies one program. `env` reads a variable.
+pub fn broad_roots_from(env: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData", "USERPROFILE", "APPDATA", "LOCALAPPDATA"] {
+        if let Some(v) = env(var).filter(|v| !v.is_empty()) {
+            out.push(PathBuf::from(v));
+        }
+    }
+    if let Some(local) = env("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        let local = PathBuf::from(local);
+        out.push(local.join("Programs"));
+        if let Some(app_data) = local.parent() {
+            out.push(app_data.to_path_buf());
+        }
+    }
+    out
+}
+
+/// [`broad_roots_from`] with the real environment.
+#[cfg_attr(test, allow(dead_code))]
+pub fn broad_roots() -> Vec<PathBuf> {
+    broad_roots_from(|v| std::env::var(v).ok())
+}
+
 /// How to uninstall an app, or `None` when it must not be offered at all:
 /// Flick itself (`own_dir`), anything in the Windows folder, Windows' own
 /// Store packages. A Store app opens Installed apps. A desktop app is
 /// uninstalled directly only when its exe lies inside the install location
 /// of one registered program (the longest such location) that is not a
 /// system component, has an uninstall command and does not live under the
-/// Windows folder; anything else opens Installed apps.
+/// Windows folder, whose location is not a shared folder (`broad`, drive
+/// roots) and whose display name shares a word with the app's `name`;
+/// anything else opens Installed apps.
 pub fn plan(
+    name: &str,
     exe: Option<&Path>,
     store_id: Option<&str>,
     programs: &[Program],
     windows_dir: &Path,
     own_dir: &Path,
+    broad: &[PathBuf],
 ) -> Option<Uninstall> {
     if exe.is_some_and(|e| inside(e, own_dir) || inside(e, windows_dir)) {
         return None;
@@ -81,7 +126,9 @@ pub fn plan(
         .max_by_key(|(depth, ..)| *depth);
     let direct = owner.and_then(|(_, p, loc)| {
         let command = p.uninstall.as_deref()?.trim();
-        (!p.system && !command.is_empty() && !inside(loc, windows_dir)).then(|| command.to_string())
+        let wanted = words(name);
+        let same_app = words(&p.name).iter().any(|w| wanted.contains(w));
+        (!p.system && !command.is_empty() && !is_broad(loc, windows_dir, broad) && same_app).then(|| command.to_string())
     });
     Some(match direct {
         Some(command) => Uninstall::Direct { command },
@@ -125,7 +172,7 @@ mod sys {
     use windows::core::PCWSTR;
     use windows::Win32::System::Registry::{
         RegCloseKey, RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-        KEY_READ, RRF_RT_REG_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        KEY_READ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
     };
 
     const UNINSTALL: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
@@ -138,7 +185,8 @@ mod sys {
     fn string_value(key: HKEY, name: &str) -> Option<String> {
         let name = wide(name);
         let mut bytes = 0u32;
-        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+        // Plain strings only: asking for REG_EXPAND_SZ without RRF_NOEXPAND fails the call.
+        let flags = RRF_RT_REG_SZ;
         // SAFETY: the size query passes no buffer; the read passes the buffer it sized.
         unsafe {
             RegGetValueW(key, PCWSTR::null(), PCWSTR(name.as_ptr()), flags, None, None, Some(&mut bytes)).ok().ok()?;
@@ -247,8 +295,27 @@ mod tests {
         }
     }
 
+    fn broad() -> Vec<PathBuf> {
+        broad_roots_from(|v| {
+            match v {
+                "ProgramFiles" => Some(r"C:\Program Files"),
+                "ProgramFiles(x86)" => Some(r"C:\Program Files (x86)"),
+                "ProgramData" => Some(r"C:\ProgramData"),
+                "USERPROFILE" => Some(r"C:\Users\someone"),
+                "APPDATA" => Some(r"C:\Users\someone\AppData\Roaming"),
+                "LOCALAPPDATA" => Some(r"C:\Users\someone\AppData\Local"),
+                _ => None,
+            }
+            .map(String::from)
+        })
+    }
+
+    fn plan_named(name: &str, exe: &str, programs: &[Program]) -> Option<Uninstall> {
+        plan(name, Some(Path::new(exe)), None, programs, Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
+    }
+
     fn plan_for(exe: &str, programs: &[Program]) -> Option<Uninstall> {
-        plan(Some(Path::new(exe)), None, programs, Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"))
+        plan_named("Foo Suite Tool", exe, programs)
     }
 
     fn direct(command: &str) -> Option<Uninstall> {
@@ -262,6 +329,47 @@ mod tests {
         assert_eq!(plan_for(r"c:\program files\foo\bin\foo.exe", &[foo.clone()]), direct(r"C:\Program Files\Foo\unins000.exe"));
         // A sibling that merely shares a name prefix is not inside.
         assert_eq!(plan_for(r"C:\Program Files\Foobar\foobar.exe", &[foo]), Some(Uninstall::Settings));
+    }
+
+    #[test]
+    fn the_program_name_must_share_a_word_with_the_app() {
+        let foo = program("Foo 2.1", Some(r"C:\Program Files\Foo"), Some("foo-uninstall"), false);
+        assert_eq!(plan_named("Foo", r"C:\Program Files\Foo\foo.exe", &[foo.clone()]), direct("foo-uninstall"));
+        assert_eq!(plan_named("Bar", r"C:\Program Files\Foo\bar.exe", &[foo]), Some(Uninstall::Settings));
+        // A web-app shortcut hosted by the browser must not uninstall the browser.
+        let chrome = program(
+            "Google Chrome",
+            Some(r"C:\Program Files\Google\Chrome\Application"),
+            Some("chrome-uninstall"),
+            false,
+        );
+        let proxy = r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe";
+        assert_eq!(plan_named("YouTube", proxy, &[chrome.clone()]), Some(Uninstall::Settings));
+        assert_eq!(plan_named("Google Chrome", proxy, &[chrome]), direct("chrome-uninstall"));
+    }
+
+    #[test]
+    fn broad_install_locations_never_uninstall_directly() {
+        for loc in [
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\Users\someone\AppData\Local\Programs",
+            r"C:\Users\someone",
+            r"C:\Users\someone\AppData",
+            r"C:\Users\someone\AppData\Local",
+            r"C:\Users\someone\AppData\Roaming",
+            r"C:\ProgramData",
+            r"C:\",
+            r"C:\Windows\Foo",
+        ] {
+            let p = program("Foo", Some(loc), Some("foo-uninstall"), false);
+            let exe = format!(r"{}\Foo\foo.exe", loc.trim_end_matches('\\'));
+            let got = plan_named("Foo", &exe, &[p]);
+            assert!(matches!(got, Some(Uninstall::Settings) | None), "{loc}: {got:?}");
+        }
+        // One level below a shared folder is a program's own folder.
+        let p = program("Foo", Some(r"C:\Users\someone\AppData\Local\Programs\Foo"), Some("foo-uninstall"), false);
+        assert_eq!(plan_named("Foo", r"C:\Users\someone\AppData\Local\Programs\Foo\foo.exe", &[p]), direct("foo-uninstall"));
     }
 
     #[test]
@@ -281,7 +389,7 @@ mod tests {
         for p in [no_location, blank, no_command] {
             assert_eq!(plan_for(r"C:\Program Files\Foo\foo.exe", &[p]), Some(Uninstall::Settings));
         }
-        assert_eq!(plan(None, None, &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick")), Some(Uninstall::Settings));
+        assert_eq!(plan("Foo", None, None, &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad()), Some(Uninstall::Settings));
     }
 
     #[test]
@@ -303,7 +411,7 @@ mod tests {
 
     #[test]
     fn store_apps_open_settings_except_windows_parts() {
-        let plan_of = |id| plan(None, Some(id), &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"));
+        let plan_of = |id| plan("App", None, Some(id), &[], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad());
         assert_eq!(plan_of("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"), Some(Uninstall::Settings));
         assert_eq!(plan_of("windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"), None);
         assert_eq!(plan_of("Microsoft.Windows.Photos_8wekyb3d8bbwe!App"), None);
@@ -330,5 +438,15 @@ mod tests {
         assert_eq!(split(""), None);
         assert_eq!(split("   "), None);
         assert_eq!(split("\"\" /x"), None);
+    }
+
+    /// Reads the real registry: run by hand, never in the normal suite.
+    /// `cargo test real_registry -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_registry_lists_programs() {
+        let programs = RegistryPrograms.programs();
+        println!("{} programs, {} with an uninstall command", programs.len(), programs.iter().filter(|p| p.uninstall.is_some()).count());
+        assert!(!programs.is_empty());
     }
 }

@@ -201,6 +201,7 @@ fn plans_for(
     programs: &[Program],
     windows_dir: &Path,
     own_dir: &Path,
+    broad: &[PathBuf],
 ) -> HashMap<String, Uninstall> {
     if own_dir.as_os_str().is_empty() {
         return HashMap::new();
@@ -212,7 +213,7 @@ fn plans_for(
                 AppKind::Shortcut => (exes.get(&e.target).map(Path::new), None),
                 AppKind::Store => (None, Some(e.target.strip_prefix(STORE_PREFIX).unwrap_or(&e.target))),
             };
-            plan(exe, store_id, programs, windows_dir, own_dir).map(|p| (e.target.clone(), p))
+            plan(&e.name, exe, store_id, programs, windows_dir, own_dir, broad).map(|p| (e.target.clone(), p))
         })
         .collect()
 }
@@ -385,6 +386,8 @@ pub struct AppsProvider {
     programs: Arc<dyn ProgramSource>,
     windows_dir: PathBuf,
     own_dir: PathBuf,
+    /// Shared folders no single program owns.
+    broad: Vec<PathBuf>,
 }
 
 /// What building rows needs besides the entry: held for a whole query, so
@@ -474,7 +477,7 @@ impl AppsProvider {
         let exes: HashMap<String, String> = exes.into_iter().map(|(l, e)| (l.to_string(), e.to_string())).collect();
         let index = p.index.read().unwrap_or_else(|e| e.into_inner()).clone();
         *p.plans.write().unwrap_or_else(|e| e.into_inner()) =
-            plans_for(&index, &exes, &programs, &p.windows_dir, &p.own_dir);
+            plans_for(&index, &exes, &programs, &p.windows_dir, &p.own_dir, &p.broad);
         *p.exes.write().unwrap_or_else(|e| e.into_inner()) = exes;
         p
     }
@@ -486,9 +489,17 @@ impl AppsProvider {
         programs: Arc<dyn ProgramSource>,
     ) -> Arc<Self> {
         #[cfg(test)]
-        let (windows_dir, own_dir) = (PathBuf::from(r"C:\Windows"), PathBuf::from(r"C:\Apps\Flick"));
+        let (windows_dir, own_dir, broad) = (
+            PathBuf::from(r"C:\Windows"),
+            PathBuf::from(r"C:\Apps\Flick"),
+            uninstall::broad_roots_from(|v| match v {
+                "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+                "LOCALAPPDATA" => Some(r"C:\Users\someone\AppData\Local".to_string()),
+                _ => None,
+            }),
+        );
         #[cfg(not(test))]
-        let (windows_dir, own_dir) = (windows_dir(), own_dir());
+        let (windows_dir, own_dir, broad) = (windows_dir(), own_dir(), uninstall::broad_roots());
         Arc::new(Self {
             plans: RwLock::new(HashMap::new()),
             exes: RwLock::new(HashMap::new()),
@@ -496,6 +507,7 @@ impl AppsProvider {
             programs,
             windows_dir,
             own_dir,
+            broad,
             index: RwLock::new(e),
             store: Mutex::new(Vec::new()),
             refreshing: Mutex::new(()),
@@ -573,7 +585,7 @@ impl AppsProvider {
 
     fn set_plans(&self, start: &[AppEntry], store: &[AppEntry], exes: &HashMap<String, String>, programs: &[Program]) {
         let all: Vec<AppEntry> = start.iter().chain(store).cloned().collect();
-        let plans = plans_for(&all, exes, programs, &self.windows_dir, &self.own_dir);
+        let plans = plans_for(&all, exes, programs, &self.windows_dir, &self.own_dir, &self.broad);
         *self.plans.write().unwrap_or_else(|e| e.into_inner()) = plans;
     }
 
