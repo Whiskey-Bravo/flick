@@ -23,6 +23,7 @@ mod providers;
 mod quote;
 mod ranking;
 mod refresh;
+mod reminders;
 mod settings;
 mod settings_window;
 mod status;

@@ -15,6 +15,7 @@ pub mod settings;
 pub mod shortcuts;
 pub mod status;
 pub mod system;
+pub mod timers;
 pub mod update;
 pub mod welcome;
 pub mod windows;
