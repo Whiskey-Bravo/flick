@@ -130,6 +130,7 @@ pub enum RatesState {
     /// The last attempt failed; old rates if any.
     Offline(Option<Arc<Rates>>),
     /// `online = false`: no requests; old rates if any.
+    #[allow(dead_code)] // the bar says answers are off rather than using old rates
     Off(Option<Arc<Rates>>),
 }
 

@@ -1,4 +1,5 @@
 mod answers;
+mod clipboard;
 mod commands;
 mod config;
 mod engine;
@@ -7,8 +8,6 @@ mod history;
 mod hotkey;
 mod icon;
 mod launch;
-// Used by answers (rates now, weather later); wired into the app in a later task.
-#[allow(dead_code)]
 mod net;
 mod pins;
 mod provider;
@@ -27,10 +26,15 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
+use answers::number::{Formats, WindowsFormats};
+use answers::rates::RatesStore;
+use answers::weather::WeatherStore;
+use clipboard::WindowsClipboard;
 use config::Config;
 use engine::Engine;
 use launch::{Launcher, SystemLauncher};
 use provider::Provider;
+use providers::answers::{AnswersConfig, AnswersProvider, DUCKDUCKGO};
 use providers::apps::AppsProvider;
 use providers::files::FilesProvider;
 use providers::flick::{FlickProvider, Opener};
@@ -52,6 +56,12 @@ const SHORTCUTS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// between the engine and the threads that keep them up to date.
 #[derive(Clone)]
 struct Providers {
+    answers: Arc<AnswersProvider>,
+    /// The answers' weather store: the home city is set on it off the query path.
+    weather: Arc<WeatherStore>,
+    rates: Arc<RatesStore>,
+    /// The Windows locale: defaults for the answers' currency and temperature unit.
+    formats: Arc<dyn Formats>,
     apps: Arc<AppsProvider>,
     files: Arc<FilesProvider>,
     shortcuts: Arc<ShortcutsProvider>,
@@ -61,14 +71,72 @@ struct Providers {
 
 impl Providers {
     /// Cheap: no disk access. File roots and shortcuts arrive with the config.
-    fn new(apps: Arc<AppsProvider>, launcher: Arc<dyn Launcher>, distro: &str) -> Self {
+    fn new(answers: Answers, apps: Arc<AppsProvider>, launcher: Arc<dyn Launcher>, distro: &str) -> Self {
         Self {
+            answers: answers.provider,
+            weather: answers.weather,
+            rates: answers.rates,
+            formats: answers.formats,
             apps,
             files: FilesProvider::new(launcher.clone()),
             shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows)),
         }
+    }
+}
+
+/// The answers provider and the stores behind it.
+struct Answers {
+    provider: Arc<AnswersProvider>,
+    weather: Arc<WeatherStore>,
+    rates: Arc<RatesStore>,
+    formats: Arc<dyn Formats>,
+}
+
+impl Answers {
+    /// Cheap: reads the locale and time zone, no files or network. The stores
+    /// load on a background thread (`load_answer_stores`); `on_ready` runs
+    /// when a fetch has finished.
+    fn new(launcher: Arc<dyn Launcher>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        let formats: Arc<dyn Formats> = Arc::new(WindowsFormats::new());
+        let fetch: Arc<dyn net::Fetch> = Arc::new(net::WinHttp);
+        let rates = RatesStore::new(rates_path(), fetch.clone(), on_ready.clone());
+        let weather = WeatherStore::new(weather_path(), fetch, on_ready);
+        let provider = AnswersProvider::new(
+            formats.clone(),
+            rates.clone(),
+            weather.clone(),
+            Arc::new(WindowsClipboard),
+            launcher,
+            Box::new(launch::open_config),
+            Arc::new(jiff::Timestamp::now),
+        );
+        Answers { provider, weather, rates, formats }
+    }
+}
+
+/// The answer keys of `c` with their defaults filled in: currency from the
+/// Windows region (EUR when that is not an ECB currency), temperature unit
+/// from the region, DuckDuckGo as the search engine.
+fn answers_config(c: &Config, formats: &dyn Formats) -> AnswersConfig {
+    let known = |code: &String| answers::units::CURRENCIES.contains(&code.as_str());
+    let currency = Some(c.currency.trim().to_uppercase())
+        .filter(|code| !code.is_empty())
+        .or_else(|| formats.currency().map(|code| code.to_uppercase()).filter(known))
+        .unwrap_or_else(|| "EUR".to_string());
+    let fahrenheit = match c.temperature_unit.as_str() {
+        "f" => true,
+        "c" => false,
+        _ => formats.fahrenheit(),
+    };
+    let search_engine = if c.search_engine.is_empty() { DUCKDUCKGO.to_string() } else { c.search_engine.clone() };
+    AnswersConfig {
+        online: c.online,
+        weather_city: c.weather_city.trim().to_string(),
+        currency,
+        fahrenheit,
+        search_engine,
     }
 }
 
@@ -110,6 +178,7 @@ fn build_engine(
     pins: Arc<Pins>,
 ) -> Engine {
     let providers: Vec<Box<dyn Provider>> = vec![
+        Box::new(p.answers.clone()),
         Box::new(p.apps.clone()),
         Box::new(p.files.clone()),
         Box::new(p.shortcuts.clone()),
@@ -211,6 +280,14 @@ fn pins_path() -> PathBuf {
     config::config_path().with_file_name("pins.json")
 }
 
+fn rates_path() -> PathBuf {
+    config::config_path().with_file_name("rates.json")
+}
+
+fn weather_path() -> PathBuf {
+    config::config_path().with_file_name("weather.json")
+}
+
 pub fn run() {
     // Everything Flick starts inherits this directory unless told otherwise:
     // the user profile, not wherever Flick happened to be started from (and
@@ -257,7 +334,13 @@ fn setup(app: &AppHandle) {
 
     // One launcher for every provider that starts something.
     let launcher: Arc<dyn Launcher> = Arc::new(SystemLauncher);
-    let providers = Providers::new(AppsProvider::new(launcher.clone()), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
+    let ready = app.clone();
+    // The bar re-runs its query when the text is unchanged, so a placeholder turns into the answer.
+    let answers = Answers::new(launcher.clone(), Arc::new(move || {
+        let _ = ready.emit_to(window::LABEL, "answers:ready", ());
+    }));
+    let providers = Providers::new(answers, AppsProvider::new(launcher.clone()), launcher, &effective_distro(&loaded.config.wsl_distro, &WslState::Unknown));
+    providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));
@@ -331,6 +414,8 @@ fn setup(app: &AppHandle) {
 /// - shortcuts: the config's definitions now, pick folders every 5 minutes;
 /// - files: the folder watcher, a scan now, then a rescan every 30 minutes.
 fn start_index_threads(app: &AppHandle, p: Providers) {
+    load_answer_stores(app, &p);
+
     let apps = p.apps;
     std::thread::spawn(move || loop {
         apps.refresh();
@@ -382,6 +467,21 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
     });
 }
 
+/// Reads `rates.json` and `weather.json`, then gives the weather store the home
+/// city of the current config. Under the config lock, so a reload never sets
+/// the home city between these steps.
+fn load_answer_stores(app: &AppHandle, p: &Providers) {
+    let (rates, weather) = (p.rates.clone(), p.weather.clone());
+    let handle = app.clone();
+    std::thread::spawn(move || {
+        let state = handle.state::<AppState>();
+        let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+        rates.load();
+        weather.load();
+        weather.set_home(config.weather_city.trim());
+    });
+}
+
 /// Registers `accelerator`, records the result and updates the tray tooltip.
 /// Returns the user-facing error text on failure.
 fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
@@ -419,6 +519,12 @@ fn reload_config(app: &AppHandle) {
     // At most one `remove_file`, and only when the switch changed.
     if loaded.config.history != config.history {
         state.history.set_enabled(loaded.config.history);
+    }
+    let p = &state.providers;
+    p.answers.set_config(&answers_config(&loaded.config, p.formats.as_ref()));
+    // Touches weather.json: only when the home city changed.
+    if loaded.config.weather_city.trim() != config.weather_city.trim() {
+        p.weather.set_home(loaded.config.weather_city.trim());
     }
     *config = loaded.config;
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -488,7 +594,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ranking = Arc::new(Ranking::load(dir.path().join("picks.json")));
         let launcher = Arc::new(RecordingLauncher::default());
+        let fetch = Arc::new(net::FakeFetch::offline());
+        let rates = RatesStore::new(dir.path().join("rates.json"), fetch.clone(), Arc::new(|| {}));
+        let weather = WeatherStore::new(dir.path().join("weather.json"), fetch, Arc::new(|| {}));
+        let formats: Arc<dyn Formats> = Arc::new(answers::number::TestFormats { decimal: ',', group: '.' });
+        let answers = AnswersProvider::new(
+            formats.clone(),
+            rates.clone(),
+            weather.clone(),
+            Arc::new(clipboard::FakeClipboard::default()),
+            launcher.clone(),
+            Box::new(|| Ok(())),
+            Arc::new(|| "2026-11-17T18:00:00Z".parse().unwrap()),
+        );
         let providers = Providers {
+            answers,
+            weather,
+            rates,
+            formats,
             apps: AppsProvider::with_entries(apps),
             files: FilesProvider::with_entries(launcher.clone(), files),
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
@@ -545,6 +668,71 @@ mod tests {
     }
 
     #[test]
+    fn answers_sit_above_an_app_with_the_same_text() {
+        let r = rig(vec![app("12*7")], vec![]);
+        let res = r.engine.query("12*7", None);
+        assert_eq!((res[0].provider, res[0].title.as_str()), ("answers", "= 84"));
+        assert_eq!((res[1].provider, res[1].title.as_str()), ("apps", "12*7"));
+        // A bare keyword ranks like a name.
+        let r = rig(vec![app("Time")], vec![]);
+        assert_eq!(r.engine.query("time", None)[0].provider, "apps");
+        assert!(r.launcher.calls().is_empty());
+    }
+
+    /// Windows formats as a region may report them.
+    struct Region(Option<&'static str>, bool);
+
+    impl Formats for Region {
+        fn number(&self, x: f64) -> String {
+            x.to_string()
+        }
+        fn date(&self, d: jiff::civil::Date, _long: bool) -> String {
+            d.to_string()
+        }
+        fn time(&self, t: jiff::civil::Time) -> String {
+            t.to_string()
+        }
+        fn fahrenheit(&self) -> bool {
+            self.1
+        }
+        fn currency(&self) -> Option<String> {
+            self.0.map(String::from)
+        }
+    }
+
+    #[test]
+    fn answers_config_fills_defaults_from_the_region() {
+        let c = answers_config(&Config::default(), &Region(Some("USD"), true));
+        assert_eq!(
+            c,
+            AnswersConfig {
+                online: true,
+                weather_city: String::new(),
+                currency: "USD".into(),
+                fahrenheit: true,
+                search_engine: "https://duckduckgo.com/?q={arg}".into(),
+            }
+        );
+        // Not an ECB currency, or none: EUR.
+        assert_eq!(answers_config(&Config::default(), &Region(Some("XAF"), false)).currency, "EUR");
+        assert_eq!(answers_config(&Config::default(), &Region(None, false)).currency, "EUR");
+        let set = Config {
+            online: false,
+            weather_city: " London ".into(),
+            currency: "gbp".into(),
+            temperature_unit: "c".into(),
+            search_engine: "https://www.google.com/search?q={arg}".into(),
+            ..Config::default()
+        };
+        let c = answers_config(&set, &Region(Some("USD"), true));
+        assert!(!c.online && !c.fahrenheit);
+        assert_eq!((c.weather_city.as_str(), c.currency.as_str()), ("London", "GBP"));
+        assert_eq!(c.search_engine, "https://www.google.com/search?q={arg}");
+        let f = Config { temperature_unit: "f".into(), ..Config::default() };
+        assert!(answers_config(&f, &Region(None, false)).fahrenheit);
+    }
+
+    #[test]
     fn engine_with_all_real_providers_answers_bluetooth() {
         let r = rig(vec![], vec![]);
         let results = r.engine.query("bluetooth", None);
@@ -568,6 +756,12 @@ mod tests {
         assert_eq!(
             titles(&help),
             [
+                "12*7",
+                "5 km in miles",
+                "20 usd in eur",
+                "time tokyo",
+                "in 45 days",
+                "weather london",
                 "blender",
                 "report.pdf",
                 "your shortcuts",
@@ -582,7 +776,7 @@ mod tests {
                 "Up",
             ]
         );
-        let flick = &help[6];
+        let flick = &help[12];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -590,7 +784,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 12);
+        assert_eq!(r.engine.query("Help", None).len(), 18);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));

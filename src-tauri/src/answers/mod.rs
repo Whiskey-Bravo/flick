@@ -1,20 +1,8 @@
-//! Quick answers: numbers, calculator, units, time, currency (built up task by task).
+//! Quick answers: numbers, calculator, units, time, currency and weather.
 
-// Consumed by later tasks (calculator, units, time, currency).
-#[allow(dead_code)]
-pub mod number;
-
-#[allow(dead_code)]
 pub mod calc;
-
-#[allow(dead_code)]
-pub mod units;
-
-#[allow(dead_code)]
 pub mod clock;
-
-#[allow(dead_code)]
+pub mod number;
 pub mod rates;
-
-#[allow(dead_code)]
+pub mod units;
 pub mod weather;

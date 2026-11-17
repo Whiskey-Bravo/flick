@@ -23,6 +23,21 @@ const DEFAULT_FILE: &str = "\
 ## history: remember recent searches and launches (false: forget and stop).
 # history = true
 ##
+## online: allow currency and weather answers to go online (false: never).
+# online = true
+##
+## weather_city: the city for a bare `weather`.
+# weather_city = \"London\"
+##
+## currency: the currency for a bare `20 usd`. Leave unset to use the one of your Windows region.
+# currency = \"EUR\"
+##
+## temperature_unit: \"c\" or \"f\". Leave unset to follow your Windows region.
+# temperature_unit = \"c\"
+##
+## search_engine: the web search used by Enter on a weather answer; {arg} is the search text.
+# search_engine = \"https://duckduckgo.com/?q={arg}\"
+##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
@@ -66,6 +81,16 @@ pub struct Config {
     pub file_roots: Vec<PathBuf>,
     /// Remember recent searches and launches; false forgets them and stops.
     pub history: bool,
+    /// Currency and weather answers may go online.
+    pub online: bool,
+    /// City for a bare `weather`; empty means none.
+    pub weather_city: String,
+    /// ISO code for a bare `20 usd`; empty means the Windows region's.
+    pub currency: String,
+    /// `"c"`, `"f"`, or empty for the Windows region's.
+    pub temperature_unit: String,
+    /// Web search URL with `{arg}`; empty means DuckDuckGo.
+    pub search_engine: String,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -78,6 +103,11 @@ impl Default for Config {
             wsl_distro: String::new(),
             file_roots: Vec::new(),
             history: true,
+            online: true,
+            weather_city: String::new(),
+            currency: String::new(),
+            temperature_unit: String::new(),
+            search_engine: String::new(),
             shortcuts: Vec::new(),
         }
     }
@@ -156,8 +186,21 @@ fn one_word(s: &str) -> bool {
     !s.trim().is_empty() && !s.contains(char::is_whitespace)
 }
 
-/// Checks shortcut definitions, in file order; the first broken rule is reported.
+/// Checks the answer keys, then shortcut definitions in file order; the first
+/// broken rule is reported.
 pub fn validate(c: &Config) -> Result<(), String> {
+    let currency = c.currency.trim().to_uppercase();
+    if !currency.is_empty() && !crate::answers::units::CURRENCIES.contains(&currency.as_str()) {
+        return Err(format!("currency \"{}\" is not one of the supported currencies", c.currency));
+    }
+    if !matches!(c.temperature_unit.as_str(), "" | "c" | "f") {
+        return Err("temperature_unit must be \"c\" or \"f\"".into());
+    }
+    let engine = &c.search_engine;
+    let engine_ok = engine.is_empty() || (engine.starts_with("https://") && engine.contains("{arg}"));
+    if !engine_ok {
+        return Err("search_engine must start with https:// and contain {arg}".into());
+    }
     let mut used: Vec<String> = vec!["help".to_string()];
     for s in &c.shortcuts {
         let n = &s.name;
@@ -638,5 +681,36 @@ pick = \"C:/p\"")).is_ok());
         let l = load(&p, Some(&good));
         assert_eq!(l.config, good);
         assert_eq!(l.error.unwrap(), "config.toml: shortcut \"a\": needs exactly one of run, wsl, open");
+    }
+
+    #[test]
+    fn config_validates_new_keys() {
+        let c = parse("").unwrap();
+        assert!(c.online);
+        assert_eq!((c.weather_city.as_str(), c.currency.as_str()), ("", ""));
+        assert_eq!((c.temperature_unit.as_str(), c.search_engine.as_str()), ("", ""));
+        let c = parse("online = false
+weather_city = \"London\"
+currency = \"usd\"
+temperature_unit = \"f\"
+search_engine = \"https://www.google.com/search?q={arg}\"").unwrap();
+        assert!(!c.online);
+        assert_eq!(c.weather_city, "London");
+        assert_eq!(c.currency, "usd");
+        assert_eq!(c.temperature_unit, "f");
+        assert!(err("currency = \"XYZ\"").contains("currency"));
+        assert!(err("temperature_unit = \"k\"").contains("temperature_unit"));
+        assert!(err("search_engine = \"https://example.com/?q=\"").contains("search_engine"));
+        assert!(err("search_engine = \"http://example.com/?q={arg}\"").contains("search_engine"));
+    }
+
+    #[test]
+    fn full_example_sets_answer_keys() {
+        let c = parse(&uncommented_default_file()).unwrap();
+        assert!(c.online);
+        assert_eq!(c.weather_city, "London");
+        assert_eq!(c.currency, "EUR");
+        assert_eq!(c.temperature_unit, "c");
+        assert_eq!(c.search_engine, "https://duckduckgo.com/?q={arg}");
     }
 }

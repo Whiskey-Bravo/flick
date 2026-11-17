@@ -148,6 +148,7 @@ pub fn shift(d: Date, amount: i64, unit: Span) -> Option<Date> {
 }
 
 /// The place's local date and time, and how many minutes it is ahead of the PC's zone.
+#[allow(dead_code)] // the bar uses `time_in_from` with the zone it read at start
 pub fn time_in(place: &Place, now: Timestamp) -> Option<(DateTime, i64)> {
     static LOCAL: std::sync::OnceLock<TimeZone> = std::sync::OnceLock::new();
     time_in_from(place, now, LOCAL.get_or_init(TimeZone::system))

@@ -45,6 +45,9 @@ pub struct ResultItem {
     pub pinnable: bool,
     pub revealable: bool,
     pub elevatable: bool,
+    /// A computed answer: in plain queries the engine puts it above every other row.
+    #[serde(skip)]
+    pub top: bool,
 }
 
 /// A provider that owns a typed prefix: when the text matches, only it is queried.
@@ -72,7 +75,6 @@ pub enum Outcome {
     /// Done, hide the bar.
     Hide,
     /// Done, bar stays.
-    #[allow(dead_code)] // part of the front-end contract (bar.ts handles it); no provider produces it yet
     Keep,
     /// Show `prompt`; next queries carry `scope`.
     Step { prompt: String, scope: String },

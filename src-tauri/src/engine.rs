@@ -154,7 +154,8 @@ impl Engine {
             && !self.providers.iter().any(|p| p.route().is_some_and(|r| strip_route(text, &r).is_some()))
     }
 
-    /// Sorted by score + boost, cut to `max`. With `shares`, each provider
+    /// Sorted by score + boost, cut to `max`. With `shares` (plain queries),
+    /// `top` rows come first, and each provider
     /// keeps at most its [`Provider::plain_share`] rows among the others'
     /// results; its further items fill the rows left over, after them.
     fn rank<'a>(
@@ -173,8 +174,11 @@ impl Engine {
                 })
             })
             .collect();
+        // Plain queries put computed answers (`top`) above everything else.
         ranked.sort_by(|(sa, _, a), (sb, _, b)| {
-            sb.cmp(sa)
+            (shares && b.top)
+                .cmp(&(shares && a.top))
+                .then_with(|| sb.cmp(sa))
                 .then_with(|| a.title.chars().count().cmp(&b.title.chars().count()))
                 .then_with(|| a.title.cmp(&b.title))
         });
@@ -321,6 +325,8 @@ mod tests {
         /// Every item's `confirm` and `pinnable`.
         confirm: bool,
         pinnable: bool,
+        /// Every query row's `top`.
+        top: bool,
         /// `Query.text` of every query this provider received.
         seen: std::sync::Mutex<Vec<String>>,
     }
@@ -340,6 +346,7 @@ mod tests {
                 ready: true,
                 confirm: false,
                 pinnable: true,
+                top: false,
                 seen: Default::default(),
             }
         }
@@ -384,6 +391,7 @@ mod tests {
                     title: title.to_string(),
                     subtitle: String::new(),
                     score: *score,
+                    top: self.top,
                     ..Default::default()
                 })
                 .collect()
@@ -1104,5 +1112,24 @@ mod tests {
         let shared = Arc::new(capped_files());
         assert_eq!(Provider::plain_share(&shared), 5);
         assert_eq!(Provider::plain_share(&Arc::new(FakeProvider::new("a", vec![]))), usize::MAX);
+    }
+
+    #[test]
+    fn top_rows_come_first_in_plain_queries_only() {
+        let mut answer = FakeProvider::new("answers", vec![("a", "= 84", 10)]);
+        answer.top = true;
+        answer.learn = false;
+        let (e, ranking, _dir) = engine(vec![answer, FakeProvider::new("apps", vec![("x", "app", 1000)])]);
+        for _ in 0..50 {
+            ranking.record("apps", "x");
+        }
+        let r = e.query("12*7", None);
+        assert_eq!((r[0].provider, r[1].provider), ("answers", "apps"));
+
+        let mut scoped = FakeProvider::new("answers", vec![("a", "= 84", 10), ("b", "high", 900)]);
+        scoped.top = true;
+        scoped.scope = Some("proj");
+        let (e, _, _dir) = engine(vec![scoped]);
+        assert_eq!(e.query("x", Some("proj"))[0].id, "b", "scoped: score order");
     }
 }
