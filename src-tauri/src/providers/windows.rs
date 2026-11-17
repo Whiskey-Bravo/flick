@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::fuzzy;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{Action, HelpLine,Modifier, Outcome, Provider, Query, ResultItem};
 use crate::winlist::{WinInfo, WindowList};
 
 /// Above the engine's learned-boost cap (300), so a window you are looking for
@@ -75,6 +75,7 @@ fn window_row(w: &WinInfo, score: u32) -> ResultItem {
         subtitle: format!("{} \u{b7} window", w.app),
         score,
         icon: format!("file:{}", w.exe),
+        actions: vec![Action::CloseWindow],
         ..Default::default()
     }
 }
@@ -208,6 +209,23 @@ impl Provider for WindowsProvider {
     /// Windows come and go; nothing here is worth learning.
     fn rank_key(&self, _id: &str) -> Option<String> {
         None
+    }
+
+    fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
+        const GONE: &str = "That window is gone.";
+        let hwnd = id.strip_prefix("win:").filter(|_| action == Action::CloseWindow);
+        let Some(hwnd) = hwnd else { return Err("can't do that here".to_string()) };
+        let hwnd: isize = hwnd.parse().map_err(|_| GONE.to_string())?;
+        let w = self.list.snapshot().into_iter().find(|w| w.hwnd == hwnd).ok_or_else(|| GONE.to_string())?;
+        if w.elevated {
+            return Err(NEEDS_ADMIN.to_string());
+        }
+        let ops = self.list.ops();
+        if !ops.exists(hwnd) {
+            return Err(GONE.to_string());
+        }
+        ops.close(hwnd, w.pid)?;
+        Ok(Outcome::Hide)
     }
 
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
@@ -523,5 +541,42 @@ mod tests {
         assert!(!listable("A", 5, 1, "x", false, false, false));
         assert!(!listable("A", 1, 1, "x", false, false, true));
         assert!(!listable("A", 5, 1, "  ", false, false, true));
+    }
+
+    #[test]
+    fn window_rows_offer_close_window() {
+        let (p, _) = setup(mail_and_word());
+        assert_eq!(p.query(&q("inbox"))[0].actions, [Action::CloseWindow]);
+        assert_eq!(p.item("win:1").unwrap().actions, [Action::CloseWindow]);
+        // Group rows keep their own enter action.
+        let (p, _) = setup(chromes());
+        assert_eq!(p.item(r"close:c:\apps\chrome\chrome.exe").unwrap().actions, []);
+    }
+
+    #[test]
+    fn close_window_closes_that_window_only() {
+        let (p, ops) = setup(chromes());
+        assert_eq!(p.act("win:1", Action::CloseWindow), Ok(Outcome::Hide));
+        assert_eq!(ops.calls(), ["close 1"]);
+        assert_eq!(*ops.args.lock().unwrap(), ["close 1 20"]);
+    }
+
+    #[test]
+    fn close_window_on_an_elevated_window_needs_administrator() {
+        let (p, ops) = setup(vec![win(1, 10, "Admin tool", r"C:\Apps\Tool\tool.exe", "Tool", true)]);
+        assert_eq!(p.act("win:1", Action::CloseWindow), Err("Needs administrator".to_string()));
+        assert!(ops.calls().is_empty());
+    }
+
+    #[test]
+    fn close_window_on_a_gone_window_says_so() {
+        let (p, ops) = setup(mail_and_word());
+        ops.gone.lock().unwrap().push(1);
+        assert_eq!(p.act("win:1", Action::CloseWindow), Err("That window is gone.".to_string()));
+        // Not in the list at all, or not a window id, or another action.
+        assert_eq!(p.act("win:99", Action::CloseWindow), Err("That window is gone.".to_string()));
+        assert!(p.act("quit-all", Action::CloseWindow).is_err());
+        assert!(p.act("win:2", Action::Close).is_err());
+        assert!(ops.calls().is_empty());
     }
 }

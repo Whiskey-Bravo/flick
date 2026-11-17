@@ -23,6 +23,7 @@ mod settings_window;
 mod status;
 mod updates;
 mod tray;
+mod uninstall;
 mod window;
 mod winlist;
 mod wsl_detect;
