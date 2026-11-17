@@ -358,6 +358,22 @@ impl WordsProvider {
         self.definitions.forget_waiting();
     }
 
+    /// The rows for `text`, once `query` found its query the newest and holds
+    /// `copies`.
+    fn answer(&self, text: &str, copies: &mut Vec<String>) -> Vec<ResultItem> {
+        copies.clear();
+        let Some((cmd, rest)) = split(text) else {
+            *self.answered.lock().unwrap() = None;
+            self.forget_waiting();
+            return vec![];
+        };
+        *self.answered.lock().unwrap() = Some(query_seq());
+        match cmd {
+            Command::Translate => self.translate(rest, copies),
+            Command::Define => self.define(rest, copies),
+        }
+    }
+
     fn translate(&self, text: &str, copies: &mut Vec<String>) -> Vec<ResultItem> {
         self.definitions.forget_waiting();
         if text.chars().count() > MAX_TRANSLATE {
@@ -441,27 +457,20 @@ impl Provider for WordsProvider {
         NAME
     }
 
+    /// Holds `copies` from the newest-query check to the ask, as `skipped` and
+    /// `empty_query` do: a newer query's forgetting never falls in between.
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let mut copies = self.copies.lock().unwrap();
         if !self.is_newest() {
             return vec![];
         }
-        copies.clear();
-        let Some((cmd, rest)) = split(&q.text) else {
-            *self.answered.lock().unwrap() = None;
-            self.forget_waiting();
-            return vec![];
-        };
-        *self.answered.lock().unwrap() = Some(query_seq());
-        match cmd {
-            Command::Translate => self.translate(rest, &mut copies),
-            Command::Define => self.define(rest, &mut copies),
-        }
+        self.answer(&q.text, &mut copies)
     }
 
     /// Text that went elsewhere (another route, a scope, help): what was waiting is not sent.
     /// An older query arriving late forgets nothing.
     fn skipped(&self) {
+        let _turn = self.copies.lock().unwrap();
         if !self.is_newest() {
             return;
         }
@@ -473,6 +482,7 @@ impl Provider for WordsProvider {
     /// The bar was cleared (the engine calls neither `query` nor `skipped` then):
     /// what was waiting is not sent. Memory only.
     fn empty_query(&self) -> Vec<ResultItem> {
+        let _turn = self.copies.lock().unwrap();
         if self.is_newest() {
             *self.answered.lock().unwrap() = None;
             self.forget_waiting();
@@ -788,6 +798,32 @@ mod tests {
         crate::engine::as_query(5, || r.p.skipped());
         std::thread::sleep(P * 3);
         assert!(r.fetch.urls().is_empty());
+    }
+
+    #[test]
+    fn a_newer_skip_or_clear_waits_for_a_query_already_past_its_check() {
+        type Step = fn(&WordsProvider);
+        let steps: [(&str, Step); 2] = [("skipped", |p| p.skipped()), ("empty_query", |p| {
+            p.empty_query();
+        })];
+        for (what, step) in steps {
+            let r = rig(FakeFetch::new(Ok(MYMEMORY_GUTEN_MORGEN.as_bytes().to_vec())));
+            let p = &r.p;
+            std::thread::scope(|s| {
+                // Query 5 holds `copies` and has passed its newest-query check ...
+                let mut copies = p.copies.lock().unwrap();
+                assert!(crate::engine::as_query(5, || p.is_newest()));
+                // ... when query 6 (the bar cleared, or text sent elsewhere) arrives.
+                let newer = s.spawn(move || crate::engine::as_query(6, || step(p)));
+                std::thread::sleep(Duration::from_millis(50));
+                // Query 5 goes on to ask; then query 6 must still forget it.
+                crate::engine::as_query(5, || p.answer("tr hallo", &mut copies));
+                drop(copies);
+                newer.join().unwrap();
+            });
+            std::thread::sleep(P * 3);
+            assert!(r.fetch.urls().is_empty(), "{what}: the older text was sent");
+        }
     }
 
     #[test]
