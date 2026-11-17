@@ -1,7 +1,7 @@
 //! Edits `config.toml` text in place with `toml_edit`: comments, order and untouched
 //! shortcuts survive, and nothing is returned that `config::parse` would reject.
 
-#![allow(dead_code)] // used by the settings commands (next task)
+#![allow(dead_code)] // used by the settings commands (Task 3)
 
 use std::path::{Path, PathBuf};
 
@@ -26,21 +26,86 @@ pub enum Setting {
 }
 
 /// Parses `text` (refusing a file that is already broken) and returns the editable document
-/// plus whether the file uses CRLF line ends. Editing happens on LF text; `finish` restores CRLF.
-fn open(text: &str) -> Result<(DocumentMut, bool), String> {
+/// together with the original text. `toml_edit` works on LF; `finish` puts the original line
+/// ends back, so lines the edit did not touch keep their exact bytes.
+fn open(text: &str) -> Result<(DocumentMut, String), String> {
     config::parse(text)?;
     let doc = text.replace("\r\n", "\n").parse::<DocumentMut>().map_err(|e| e.to_string())?;
-    Ok((doc, text.contains("\r\n")))
+    Ok((doc, text.to_string()))
 }
 
-/// Renders the edited document and checks that Flick would accept it.
-fn finish(doc: &DocumentMut, crlf: bool) -> Result<String, String> {
-    let mut out = doc.to_string();
-    if crlf {
-        out = out.replace('\n', "\r\n");
-    }
+/// Renders the edited document, restores line ends, and checks that Flick would accept it.
+fn finish(doc: &DocumentMut, original: &str) -> Result<String, String> {
+    let out = restore_line_ends(original, &doc.to_string());
     config::parse(&out)?;
     Ok(out)
+}
+
+/// `(content, line end)` per line; the end is "" for a last line without one.
+fn split_lines(s: &str) -> Vec<(&str, &str)> {
+    s.split_inclusive('\n')
+        .map(|l| match l.strip_suffix("\r\n") {
+            Some(c) => (c, "\r\n"),
+            None => match l.strip_suffix('\n') {
+                Some(c) => (c, "\n"),
+                None => (l, ""),
+            },
+        })
+        .collect()
+}
+
+/// Gives the LF text `edited` the line ends of `original`: a line that survived keeps its own
+/// end, a changed or added line takes the end of the line it replaces (else of the line above),
+/// and a file without a final newline stays that way.
+fn restore_line_ends(original: &str, edited: &str) -> String {
+    let old = split_lines(original);
+    let new = split_lines(edited);
+    let (n, m) = (old.len(), new.len());
+    // lcs[i][j]: longest common run of lines in old[i..] and new[j..].
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old[i].0 == new[j].0 {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let no_final_newline = !original.is_empty() && !original.ends_with('\n');
+    let mut prev = old.first().map_or("\n", |l| if l.1.is_empty() { "\n" } else { l.1 });
+    let mut out = String::with_capacity(edited.len() + m);
+    let (mut i, mut j) = (0, 0);
+    let mut removed: Vec<&str> = Vec::new();
+    let mut added = 0;
+    while j < m {
+        let mut end;
+        if i < n && old[i].0 == new[j].0 && lcs[i][j] == lcs[i + 1][j + 1] + 1 {
+            end = old[i].1;
+            i += 1;
+            removed.clear();
+            added = 0;
+        } else if i < n && lcs[i + 1][j] >= lcs[i][j + 1] {
+            removed.push(old[i].1);
+            i += 1;
+            continue;
+        } else {
+            end = removed.get(added).copied().filter(|e| !e.is_empty()).unwrap_or(prev);
+            added += 1;
+        }
+        if j == m - 1 {
+            end = if no_final_newline { "" } else if end.is_empty() { prev } else { end };
+        } else if end.is_empty() {
+            end = prev;
+        }
+        out.push_str(new[j].0);
+        out.push_str(end);
+        if !end.is_empty() {
+            prev = end;
+        }
+        j += 1;
+    }
+    out
 }
 
 fn text_value(s: &str) -> Option<Value> {
@@ -52,49 +117,50 @@ fn prepend_prefix(decor: &mut Decor, add: &str) {
     decor.set_prefix(format!("{add}{old}"));
 }
 
-/// Removes a root key's line. A comment above it is handed to whatever follows, so it is never lost.
-fn remove_key(doc: &mut DocumentMut, key: &str) {
-    let root = doc.as_table_mut();
-    let Some(position) = root.iter().position(|(k, _)| k == key) else { return };
-    let next = root.iter().nth(position + 1).map(|(k, _)| k.to_string());
-    let prefix = root
+/// Removes `key` from `table`. A comment above it moves to whatever follows; when nothing
+/// follows in this table, the comment is returned for the caller to place.
+fn remove_in(table: &mut Table, key: &str) -> Option<String> {
+    let position = table.iter().position(|(k, _)| k == key)?;
+    let next = table.iter().nth(position + 1).map(|(k, _)| k.to_string());
+    let prefix = table
         .key(key)
         .and_then(|k| k.leaf_decor().prefix())
         .and_then(|p| p.as_str())
         .filter(|p| p.contains('#'))
         .map(str::to_string);
-    root.remove(key);
-    let Some(prefix) = prefix else { return };
-    match next {
-        Some(next) => {
-            let is_value = matches!(root.get(&next), Some(Item::Value(_)));
-            if is_value {
-                if let Some(mut k) = root.key_mut(&next) {
-                    prepend_prefix(k.leaf_decor_mut(), &prefix);
-                }
-            } else {
-                match root.get_mut(&next) {
-                    Some(Item::ArrayOfTables(tables)) => {
-                        if let Some(first) = tables.get_mut(0) {
-                            prepend_prefix(first.decor_mut(), &prefix);
-                        }
-                    }
-                    Some(Item::Table(t)) => prepend_prefix(t.decor_mut(), &prefix),
-                    _ => {}
+    table.remove(key);
+    let prefix = prefix?;
+    let Some(next) = next else { return Some(prefix) };
+    if matches!(table.get(&next), Some(Item::Value(_))) {
+        if let Some(mut k) = table.key_mut(&next) {
+            prepend_prefix(k.leaf_decor_mut(), &prefix);
+        }
+    } else {
+        match table.get_mut(&next) {
+            Some(Item::ArrayOfTables(tables)) => {
+                if let Some(first) = tables.get_mut(0) {
+                    prepend_prefix(first.decor_mut(), &prefix);
                 }
             }
+            Some(Item::Table(t)) => prepend_prefix(t.decor_mut(), &prefix),
+            _ => {}
         }
-        None => {
-            let rest = doc.trailing().as_str().unwrap_or("").to_string();
-            doc.set_trailing(format!("{prefix}{rest}"));
-        }
+    }
+    None
+}
+
+/// Removes a root key's line, keeping the comment above it.
+fn remove_key(doc: &mut DocumentMut, key: &str) {
+    if let Some(prefix) = remove_in(doc.as_table_mut(), key) {
+        let rest = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{prefix}{rest}"));
     }
 }
 
 /// Changes one setting. The value of an existing line is replaced in place (its comments stay);
 /// an unset value removes the line; a new key goes after the last top-level key.
 pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
-    let (mut doc, crlf) = open(text)?;
+    let (mut doc, original) = open(text)?;
     let (key, new): (&str, Option<Value>) = match setting {
         Setting::Hotkey(s) => ("hotkey", text_value(s)),
         Setting::WslDistro(s) => ("wsl_distro", text_value(s)),
@@ -126,7 +192,7 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
         }
         None => remove_key(&mut doc, key),
     }
-    finish(&doc, crlf)
+    finish(&doc, &original)
 }
 
 fn build_shortcut(def: &ShortcutDef) -> Table {
@@ -165,10 +231,51 @@ fn position_of(tables: &ArrayOfTables, name: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("no shortcut named \"{name}\""))
 }
 
+fn same_value(old: &Value, new: &Value) -> bool {
+    match (old, new) {
+        (Value::String(a), Value::String(b)) => a.value() == b.value(),
+        (Value::Boolean(a), Value::Boolean(b)) => a.value() == b.value(),
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| same_value(x, y))
+        }
+        _ => false,
+    }
+}
+
+/// Brings an existing shortcut table in line with `def` without rewriting it: changed values
+/// keep their old decor, unset keys go (their comment moves on), new keys are appended in the
+/// canonical order, everything else stays byte for byte. Returns a comment that had nowhere to go.
+fn edit_shortcut(table: &mut Table, def: &ShortcutDef) -> Option<String> {
+    let wanted = build_shortcut(def);
+    let mut leftover = String::new();
+    for key in ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices"] {
+        match wanted.get(key) {
+            Some(Item::Value(new)) => match table.get_mut(key) {
+                Some(Item::Value(old)) => {
+                    if !same_value(old, new) {
+                        let mut v = new.clone();
+                        *v.decor_mut() = old.decor().clone();
+                        *old = v;
+                    }
+                }
+                _ => {
+                    table.insert(key, Item::Value(new.clone()));
+                }
+            },
+            _ => {
+                if let Some(p) = remove_in(table, key) {
+                    leftover.push_str(&p);
+                }
+            }
+        }
+    }
+    (!leftover.is_empty()).then_some(leftover)
+}
+
 /// Adds a shortcut at the end (`original` is `None`) or replaces the one named `original`
 /// where it stands, keeping the comments above it.
 pub fn upsert_shortcut(text: &str, original: Option<&str>, def: &ShortcutDef) -> Result<String, String> {
-    let (mut doc, crlf) = open(text)?;
+    let (mut doc, text_before) = open(text)?;
     let root = doc.as_table_mut();
     if !root.contains_key("shortcut") {
         root.insert("shortcut", Item::ArrayOfTables(ArrayOfTables::new()));
@@ -176,27 +283,40 @@ pub fn upsert_shortcut(text: &str, original: Option<&str>, def: &ShortcutDef) ->
     let Some(Item::ArrayOfTables(tables)) = root.get_mut("shortcut") else {
         return Err("shortcut must be a list of [[shortcut]] tables".into());
     };
-    let mut table = build_shortcut(def);
+    let mut leftover = None;
     match original {
         Some(name) => {
             let at = position_of(tables, name)?;
-            if let Some(old) = tables.get(at) {
-                *table.decor_mut() = old.decor().clone();
+            if let Some(table) = tables.get_mut(at) {
+                leftover = edit_shortcut(table, def).map(|p| (at, p));
             }
-            tables.replace(at, table);
         }
         None => {
+            let mut table = build_shortcut(def);
             if !text.trim().is_empty() {
                 table.decor_mut().set_prefix("\n");
             }
             tables.push(table);
         }
     }
-    finish(&doc, crlf)
+    if let Some((at, prefix)) = leftover {
+        let next = match doc.as_table_mut().get_mut("shortcut") {
+            Some(Item::ArrayOfTables(t)) => t.get_mut(at + 1),
+            _ => None,
+        };
+        match next {
+            Some(t) => prepend_prefix(t.decor_mut(), &prefix),
+            None => {
+                let rest = doc.trailing().as_str().unwrap_or("").to_string();
+                doc.set_trailing(format!("{prefix}{rest}"));
+            }
+        }
+    }
+    finish(&doc, &text_before)
 }
 
 pub fn delete_shortcut(text: &str, name: &str) -> Result<String, String> {
-    let (mut doc, crlf) = open(text)?;
+    let (mut doc, original) = open(text)?;
     let root = doc.as_table_mut();
     let Some(Item::ArrayOfTables(tables)) = root.get_mut("shortcut") else {
         return Err(format!("no shortcut named \"{name}\""));
@@ -206,7 +326,7 @@ pub fn delete_shortcut(text: &str, name: &str) -> Result<String, String> {
     if tables.is_empty() {
         root.remove("shortcut");
     }
-    finish(&doc, crlf)
+    finish(&doc, &original)
 }
 
 /// Writes to a temp file next to `path`, then renames it over, so a reader never sees half a file.
@@ -361,6 +481,41 @@ mod tests {
         assert!(config::parse(&none).unwrap().shortcuts.is_empty());
         assert!(!none.contains("[[shortcut]]"));
         assert!(delete_shortcut(TWO, "nope").is_err());
+    }
+
+    #[test]
+    fn mixed_line_endings_survive() {
+        let text = "# a\r\nhotkey = \"Alt+Space\"\nonline = true\r\n\n[[shortcut]]\nname = \"s\"\r\nopen = \"x\"\n";
+        let out = set(text, &Setting::Online(false)).unwrap();
+        assert_eq!(out, text.replace("online = true", "online = false"));
+        let out = set(text, &Setting::WeatherCity("Paris".into())).unwrap();
+        assert!(out.starts_with("# a\r\nhotkey = \"Alt+Space\"\nonline = true\r\n"), "{out:?}");
+        assert!(out.ends_with("\n\n[[shortcut]]\nname = \"s\"\r\nopen = \"x\"\n") || out.contains("[[shortcut]]\nname = \"s\"\r\nopen = \"x\"\n"), "{out:?}");
+    }
+
+    #[test]
+    fn missing_final_newline_is_kept() {
+        let out = set("online = true\nhotkey = \"Alt+Space\"", &Setting::Online(false)).unwrap();
+        assert_eq!(out, "online = false\nhotkey = \"Alt+Space\"");
+        let crlf = set("online = true\r\nhotkey = \"Alt+Space\"", &Setting::Online(false)).unwrap();
+        assert_eq!(crlf, "online = false\r\nhotkey = \"Alt+Space\"");
+    }
+
+    #[test]
+    fn editing_a_shortcut_keeps_its_inner_comments_and_order() {
+        let text = "[[shortcut]]\nopen = \"https://a.example\" # where\nname = \"s1\"\n# why\nabout = \"Old\"\n\n[[shortcut]]\nname = \"s2\"\nopen = \"x\"\n";
+        let mut d = def("s1", "https://a.example");
+        d.about = "New".into();
+        let out = upsert_shortcut(text, Some("s1"), &d).unwrap();
+        assert_eq!(out, text.replace("\"Old\"", "\"New\""));
+
+        d.about = String::new();
+        d.aliases = vec!["q".into()];
+        let out = upsert_shortcut(text, Some("s1"), &d).unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!(c.shortcuts[0], d);
+        assert!(out.contains("# why\n"), "{out}");
+        assert!(out.contains("open = \"https://a.example\" # where\nname = \"s1\"\n"), "{out}");
     }
 
     #[test]
