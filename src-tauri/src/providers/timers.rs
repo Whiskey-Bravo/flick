@@ -2,7 +2,7 @@
 //! list and cancel pending ones. Rows are never learned; the query reads only
 //! memory (the reminder thread reads the file).
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::tz::TimeZone;
@@ -19,6 +19,8 @@ use crate::reminders::{
 const NAME: &str = "timers";
 const ICON: &str = "builtin:timer";
 const INERT: &str = "inert:";
+/// Id prefix of a timer row: `timer:<seconds>`.
+const TIMER: &str = "timer:";
 const TIMER_USAGE: &str = "Type a time, like timer 5m";
 const REMIND_USAGE: &str = "Type a time and a note, like remind 20m pizza";
 const TOO_FAR: &str = "Up to 7 days ahead";
@@ -31,14 +33,11 @@ pub struct TimersProvider {
     now: Clock,
     tz: TimeZone,
     on_ready: Arc<dyn Fn() + Send + Sync>,
-    /// The last timer row shown and its label (`Timer 5 min`), so Enter keeps
-    /// the duration as typed even if a moment passed since the query.
-    last_timer: Mutex<Option<(String, String)>>,
 }
 
 impl TimersProvider {
     pub fn new(reminders: Arc<Reminders>, now: Clock, tz: TimeZone, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { reminders, now, tz, on_ready, last_timer: Mutex::new(None) }
+        Self { reminders, now, tz, on_ready }
     }
 
     /// Now, in whole seconds rounded up (as dues are).
@@ -61,11 +60,14 @@ impl TimersProvider {
         if d > MAX_AHEAD {
             return inert(TOO_FAR);
         }
+        // The row says when it would ring now; Enter counts from its own moment.
         let due = self.now_secs() + d.as_secs() as i64;
-        let label = format!("Timer {}", duration_text(d));
-        let id = format!("set:{due}:t:");
-        *self.last_timer.lock().unwrap_or_else(PoisonError::into_inner) = Some((id.clone(), label.clone()));
-        row(id, format!("{label} \u{2014} rings at {}", self.clock_text(due)), STARTS.into(), false)
+        row(
+            format!("{TIMER}{}", d.as_secs()),
+            format!("{} \u{2014} rings at {}", timer_label(d), self.clock_text(due)),
+            STARTS.into(),
+            false,
+        )
     }
 
     fn remind_row(&self, rest: &str) -> ResultItem {
@@ -121,26 +123,30 @@ impl TimersProvider {
             return Err(unknown());
         };
         let due: i64 = due.parse().map_err(|_| unknown())?;
-        let id = format!("set:{rest}");
-        match kind {
-            "t" => {
-                let remembered = self.last_timer.lock().unwrap_or_else(PoisonError::into_inner).clone();
-                let label = match remembered {
-                    Some((last, label)) if last == id => label,
-                    _ => {
-                        let left = due.saturating_sub(self.now_secs()).max(0) as u64;
-                        format!("Timer {}", duration_text(Duration::from_secs(left)))
-                    }
-                };
-                self.reminders.add(from_unix(due), &label, true)?;
-            }
-            "r" => {
-                self.reminders.add(from_unix(due), text, false)?;
-            }
-            _ => return Err(unknown()),
+        if kind != "r" {
+            return Err(unknown());
         }
+        self.reminders.add(from_unix(due), text, false)?;
         Ok(Outcome::Hide)
     }
+
+    /// A timer of `secs` seconds, due that long after Enter (not after the row
+    /// was shown), labelled with the duration as typed.
+    fn start_timer(&self, secs: &str) -> Result<Outcome, String> {
+        let secs: u64 = secs.parse().map_err(|_| unknown())?;
+        let d = Duration::from_secs(secs);
+        if d > MAX_AHEAD {
+            return Err(unknown());
+        }
+        let due = self.now_secs() + secs as i64;
+        self.reminders.add(from_unix(due), &timer_label(d), true)?;
+        Ok(Outcome::Hide)
+    }
+}
+
+/// `Timer 5 min`.
+fn timer_label(d: Duration) -> String {
+    format!("Timer {}", duration_text(d))
 }
 
 fn unknown() -> String {
@@ -180,6 +186,9 @@ impl Provider for TimersProvider {
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
         if id.starts_with(INERT) {
             return Ok(Outcome::Keep);
+        }
+        if let Some(secs) = id.strip_prefix(TIMER) {
+            return self.start_timer(secs);
         }
         if let Some(rest) = id.strip_prefix("set:") {
             return self.set(rest);
@@ -231,12 +240,15 @@ mod tests {
         reminders: Arc<Reminders>,
         p: TimersProvider,
         ready: Arc<AtomicUsize>,
+        now: Arc<std::sync::Mutex<SystemTime>>,
     }
 
     fn rig() -> Rig {
         let dir = tempfile::tempdir().unwrap();
         let t0 = SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap());
-        let now: Clock = Arc::new(move || t0);
+        let time = Arc::new(std::sync::Mutex::new(t0));
+        let clock = Arc::clone(&time);
+        let now: Clock = Arc::new(move || *clock.lock().unwrap());
         let fire: Fire = Arc::new(|_: &str| {});
         let reminders = Reminders::new(dir.path().join("reminders.json"), Arc::clone(&now), fire);
         let ready = Arc::new(AtomicUsize::new(0));
@@ -245,7 +257,7 @@ mod tests {
             r.fetch_add(1, Ordering::SeqCst);
         });
         let p = TimersProvider::new(Arc::clone(&reminders), now, jiff::tz::TimeZone::UTC, on_ready);
-        Rig { _dir: dir, reminders, p, ready }
+        Rig { _dir: dir, reminders, p, ready, now: time }
     }
 
     fn rows(p: &TimersProvider, text: &str) -> Vec<ResultItem> {
@@ -263,9 +275,25 @@ mod tests {
         assert_eq!(r.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), ["Timer 5 min \u{2014} rings at 14:32"]);
         assert_eq!(r[0].subtitle, "Enter starts it");
         assert_eq!(r[0].icon, "builtin:timer");
-        let due = "2026-11-17T14:32:00Z".parse::<jiff::Timestamp>().unwrap().as_second();
-        assert_eq!(r[0].id, format!("set:{due}:t:"));
+        assert_eq!(r[0].id, "timer:300");
         assert_eq!(r[0].provider, "timers");
+    }
+
+    #[test]
+    fn a_timer_counts_from_enter_not_from_the_row() {
+        let g = rig();
+        let id = rows(&g.p, "timer 5m")[0].id.clone();
+        // A while passes between the row and Enter.
+        *g.now.lock().unwrap() += Duration::from_secs(40);
+        assert_eq!(g.p.activate(&id, Modifier::None), Ok(Outcome::Hide));
+        let pending = g.reminders.pending();
+        let due = "2026-11-17T14:32:40Z".parse::<jiff::Timestamp>().unwrap().as_second();
+        assert_eq!((pending[0].due, pending[0].text.as_str()), (due, "Timer 5 min"));
+        assert!(pending[0].timer);
+        assert_eq!(g.p.activate("timer:999999999", Modifier::None), Err(unknown()));
+        assert_eq!(g.p.activate("timer:x", Modifier::None), Err(unknown()));
+        assert_eq!(g.p.activate("set:1:t:", Modifier::None), Err(unknown()));
+        assert_eq!(g.reminders.pending().len(), 1);
     }
 
     #[test]
@@ -372,6 +400,7 @@ mod tests {
             }
         }
         assert_eq!(g.p.rank_key("set:1:r:pizza"), None);
+        assert_eq!(g.p.rank_key("timer:300"), None);
         assert_eq!(g.p.name(), "timers");
     }
 
