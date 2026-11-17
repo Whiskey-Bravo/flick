@@ -35,7 +35,7 @@ const DEFAULT_FILE: &str = "\
 ## temperature_unit: \"c\" or \"f\". Leave unset to follow your Windows region.
 # temperature_unit = \"c\"
 ##
-## search_engine: the web search used by Enter on a weather answer; {arg} is the search text.
+## search_engine: the web search behind `? text` and Enter on a weather answer; {arg} is the search text.
 # search_engine = \"https://duckduckgo.com/?q={arg}\"
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
@@ -605,6 +605,12 @@ admin = true")),
 admin = true")).is_ok());
         assert!(parse(&sc("a", "run = \"x\"
 admin = true")).is_ok());
+    }
+
+    #[test]
+    fn question_mark_is_a_valid_name() {
+        // The built-in web search is named `?`; a config shortcut may replace it.
+        assert!(parse(&sc("?", "open = \"https://example.com/?q={arg}\"")).is_ok());
     }
 
     #[test]

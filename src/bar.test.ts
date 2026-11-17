@@ -620,4 +620,59 @@ describe("mouse and menu", () => {
     expect(viaEnter.effects).toEqual([{ type: "reveal", item: a }]);
     expect(viaEnter.state.menu).toBeNull();
   });
+
+  describe("answers ready", () => {
+    const typed = (text: string, ...items: Item[]) =>
+      run(initial, { type: "shown" }, { type: "input", text }, { type: "results", items }).state;
+
+    it("ready_ignored_when_text_changed", () => {
+      const s = { ...typed("20 usd", item("a")), text: "20 usd i" };
+      const text = run(s, { type: "answersReady" });
+      expect(text.effects).toEqual([]);
+      // Text and scope unchanged since the last query: nothing to do while hidden, a re-query otherwise.
+      const scoped = run(typed("20 usd", item("a")), { type: "outcome", outcome: { kind: "step", prompt: "P", scope: "web" } });
+      expect(run(scoped.state, { type: "answersReady" }).effects).toEqual([
+        { type: "query", text: "", scope: "web", keepSelection: true },
+      ]);
+    });
+
+    it("ready_requeries_and_keeps_selection", () => {
+      const s = run(typed("20 usd", item("w"), item("x"), item("y")), key("ArrowDown")).state;
+      expect(s.selected).toBe(1);
+      const r = run(s, { type: "answersReady" });
+      expect(r.effects).toEqual([{ type: "query", text: "20 usd", scope: null, keepSelection: true }]);
+      expect(r.state.awaiting).toBe(false);
+      const got = run(r.state, { type: "results", items: [item("w"), item("v"), item("x")] }).state;
+      expect(got.selected).toBe(2);
+      // The row is gone: back to the first.
+      const gone = run(r.state, { type: "results", items: [item("p"), item("q")] }).state;
+      expect(gone.selected).toBe(0);
+      // Only the answersReady query keeps the selection; later results behave as before.
+      const later = run(got, { type: "results", items: [item("x"), item("w")] }).state;
+      expect(later.selected).toBe(0);
+    });
+
+    it("ready_keeps_provider_and_id_together", () => {
+      const other = { ...item("x"), provider: "files" };
+      const s = run(typed("t", item("a"), item("x")), key("ArrowDown")).state;
+      const r = run(s, { type: "answersReady" });
+      expect(run(r.state, { type: "results", items: [other, item("x")] }).state.selected).toBe(1);
+    });
+
+    it("ready_ignored_when_hidden", () => {
+      const s = typed("20 usd", item("a"));
+      expect(run(s, { type: "blurred" }, { type: "answersReady" }).effects).toEqual([]);
+      const esc = run(s, key("Escape"));
+      expect(esc.effects).toEqual([{ type: "hide" }]);
+      expect(run(esc.state, { type: "answersReady" }).effects).toEqual([]);
+      // Shown again: live once more.
+      expect(run(esc.state, { type: "shown" }, { type: "input", text: "a" }, { type: "answersReady" }).effects).toEqual([
+        { type: "query", text: "a", scope: null, keepSelection: true },
+      ]);
+    });
+
+    it("ready_ignored_before_any_query", () => {
+      expect(run(initial, { type: "answersReady" }).effects).toEqual([]);
+    });
+  });
 });

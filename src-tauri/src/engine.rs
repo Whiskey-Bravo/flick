@@ -594,7 +594,7 @@ mod tests {
             choices: vec![],
         };
         let sc = ShortcutsProvider::new(Arc::new(RecordingLauncher::default()), "");
-        sc.set(vec![def("search", "x {arg}"), def("hello", "notepad")], "");
+        sc.set(vec![def("search", "x {arg}"), def("hello", "notepad")], "", "");
         let (e, _, h, _, dir) = engine_stores(vec![Box::new(sc)]);
         e.activate("shortcuts", "arg:search:secret words", Modifier::None, "search secret words", None).unwrap();
         e.activate("shortcuts", "run:hello", Modifier::None, "hello", None).unwrap();

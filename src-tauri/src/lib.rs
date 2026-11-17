@@ -238,7 +238,7 @@ fn record_detection(state: &AppState, detection: wsl_detect::Detection) {
 /// `shortcuts.set` reads the pick folders: never call on the main thread.
 fn push_distro(p: &Providers, config: &Config, detected: &WslState) {
     let distro = effective_distro(&config.wsl_distro, detected);
-    p.shortcuts.set(config.shortcuts.clone(), &distro);
+    p.shortcuts.set(config.shortcuts.clone(), &distro, &config.search_engine);
     p.wsl.set_distro(&distro);
 }
 
@@ -814,7 +814,7 @@ mod tests {
     #[test]
     fn shortcut_beats_app_with_same_name() {
         let r = rig(vec![app("hello")], vec![]);
-        r.providers.shortcuts.set(vec![shortcut("hello", "notepad")], "Debian");
+        r.providers.shortcuts.set(vec![shortcut("hello", "notepad")], "Debian", "");
         let res = r.engine.query("hello", None);
         assert_eq!((res[0].provider, res[0].title.as_str()), ("shortcuts", "hello"));
         assert_eq!((res[1].provider, res[1].title.as_str()), ("apps", "hello"));

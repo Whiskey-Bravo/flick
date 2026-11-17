@@ -31,9 +31,12 @@ export type State = {
   past: string[]; // past searches, newest first
   recall: number; // index into `past` being shown, -1 = not recalling
   menu: Menu | null; // the right-click menu, when open
+  hidden: boolean; // the bar was hidden (Esc, focus loss) and not shown or typed into since
+  queried: { text: string; scope: string | null } | null; // what the last query asked for
+  keep: { provider: string; id: string } | null; // row to stay on when the re-query's results arrive
 };
 export type Effect =
-  | { type: "query"; text: string; scope: string | null }
+  | { type: "query"; text: string; scope: string | null; keepSelection?: true }
   | { type: "activate"; item: Item; modifier: Modifier; text: string; scope: string | null }
   | { type: "loadPast" }
   | { type: "togglePin"; item: Item }
@@ -42,6 +45,7 @@ export type Effect =
 export type Event =
   | { type: "shown" }
   | { type: "blurred" }
+  | { type: "answersReady" }
   | { type: "input"; text: string }
   | { type: "results"; items: Item[] }
   | { type: "past"; items: string[] }
@@ -80,6 +84,9 @@ export const initial: State = {
   past: [],
   recall: -1,
   menu: null,
+  hidden: false,
+  queried: null,
+  keep: null,
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -113,7 +120,19 @@ const fit = (s: State): State => {
 type Result = { state: State; effects: Effect[] };
 const done = (state: State, effects: Effect[] = []): Result => ({ state, effects });
 
+// Remembers what the last query asked for, and drops a pending "keep this row"
+// unless the query is the re-query that asked for it.
 export function reduce(s: State, e: Event): Result {
+  const r = step(s, e);
+  const q = [...r.effects].reverse().find((f): f is Extract<Effect, { type: "query" }> => f.type === "query");
+  const hide = r.effects.some((f) => f.type === "hide");
+  const hidden = e.type === "shown" || e.type === "input" ? false : r.state.hidden || e.type === "blurred" || hide;
+  if (!q) return hidden === r.state.hidden ? r : done({ ...r.state, hidden }, r.effects);
+  const keep = q.keepSelection ? r.state.keep : null;
+  return done({ ...r.state, hidden, keep, queried: { text: q.text, scope: q.scope } }, r.effects);
+}
+
+function step(s: State, e: Event): Result {
   switch (e.type) {
     case "shown":
       // The empty text is queried so providers can offer rows for an empty bar
@@ -127,6 +146,16 @@ export function reduce(s: State, e: Event): Result {
       ]);
     case "blurred":
       return done({ ...s, armed: null, queued: null, menu: null });
+    case "answersReady": {
+      // A rate or forecast arrived: ask again, but only when the text is still
+      // what was asked and the bar is showing it.
+      const q = s.queried;
+      if (s.hidden || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s);
+      if (s.text.trim() === "" && !s.scope) return done(s);
+      const sel = s.items[s.selected];
+      const keep = sel ? { provider: sel.provider, id: sel.id } : null;
+      return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }]);
+    }
     case "menuClose":
       return done({ ...s, menu: null });
     case "hover":
@@ -190,6 +219,13 @@ export function reduce(s: State, e: Event): Result {
       // The empty unscoped bar opens on the latest recent launch, unless a
       // welcome row is shown: that stays on top.
       let selected = 0;
+      if (s.keep) {
+        // The answers' re-query: stay on the row the user was on, if it is still there.
+        const k = s.keep;
+        selected = Math.max(0, e.items.findIndex((i) => i.provider === k.provider && i.id === k.id));
+        const armed = s.armed !== null && e.items.some((i) => i.id === s.armed) ? s.armed : null;
+        return done(fit({ ...s, items: e.items, selected, top: 0, armed, awaiting: false, menu: null, keep: null }));
+      }
       if (s.text === "" && !s.scope && !e.items.some((i) => i.provider === "welcome")) {
         selected = Math.max(0, e.items.findIndex((i) => i.origin === "recent"));
       }

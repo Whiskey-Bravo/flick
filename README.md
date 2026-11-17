@@ -24,6 +24,8 @@ To uninstall, use Settings, Apps. This also removes start at login.
 | Part of a file or folder name | Opens it (searches your whole user folder by default) | `invoice` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
 | A power action | Lock, sleep, restart, shut down or sign out | `lock` |
+| A sum, a unit or currency conversion, a time or date, or `weather` | Shows the answer on top; Enter copies it | `12*7`, `20 usd in eur`, `time tokyo` (see Quick answers) |
+| `?`, `g`, `yt` or `gh`, then your search | Searches the web in your browser | `? rust lifetimes` |
 | The name of one of your shortcuts | Runs it | `search rust traits` (after adding the `search` shortcut shown below) |
 | `>` and a command | Runs the command in WSL | `> htop -d 10` |
 | `clear history` | Forgets recent searches and launches (press Enter twice) | `clear history` |
@@ -89,6 +91,53 @@ Power actions (lock, sleep, restart and so on) are never saved as recent launche
 ## Help
 
 Type `help` (in any case) to see one line for each kind of result, with an example. Type more after it to filter the list (`help file`). Picking a line puts its example in the bar, so `> htop -d 10` gives you `> ` ready to type. F1 does the same as typing `help`, and leaves a shortcut's list first.
+
+## Quick answers
+
+Type a question and the answer appears as the first row, above apps. Enter copies the answer (the bar closes). Numbers are shown in your Windows number format, and you may type `,` or `.` as the decimal mark.
+
+| You type | You get |
+|---|---|
+| `12*7`, `15% of 80`, `sqrt(2)`, `2pi` | The result |
+| `5.5 km in m`, `70 f in c`, `3 cups in ml` | The conversion |
+| `20 usd in eur`, `$20 in gbp` | The conversion at the European Central Bank's latest rates |
+| `20 usd` | The same, into your home currency |
+| `time tokyo` | The time there, with the day if it differs |
+| `in 45 days`, `3 weeks ago`, `days until 24 dec` | The date, or the number of days |
+| `weather london` | The weather there now; Enter opens a web search for it |
+| `weather` | The weather in your `weather_city` |
+
+Only text that is clearly a question gets an answer: a bare number or an app name is never read as maths. The answer comes first, and your other matches follow below as usual.
+
+A currency or weather answer needs the internet. The row says `Getting rates...` or `Getting weather...` for a moment and turns into the answer by itself. If a city is not found, or you are offline, the row says so. Answers are never saved: not in past searches, not as recent launches, not as pins.
+
+**Web search.** Four searches are built in. Type the name, a space, then what to search for; Enter opens it in your browser.
+
+| You type | Searches |
+|---|---|
+| `? text` (also `?text`) | Your search engine (DuckDuckGo unless you set `search_engine`) |
+| `g text` | Google |
+| `yt text` | YouTube |
+| `gh text` | GitHub |
+
+To add another engine, add a shortcut that opens its search page with `{arg}` where the text goes (see Shortcuts):
+
+```toml
+[[shortcut]]
+name = "w"
+about = "Search Wikipedia"
+open = "https://en.wikipedia.org/w/index.php?search={arg}"
+```
+
+A shortcut of yours with the same name (or alias) as a built-in one replaces it. Like all shortcut arguments, what you type after the name is never saved.
+
+The config keys for quick answers, all optional:
+
+- `online`: `false` stops every request; currency and weather rows then say `Online answers are off`. The default is `true`.
+- `weather_city`: the city for a bare `weather`, for example `"London"`.
+- `currency`: the currency for a bare `20 usd`, for example `"EUR"`. Leave it out to use the currency of your Windows region.
+- `temperature_unit`: `"c"` or `"f"`. Leave it out to follow your Windows region.
+- `search_engine`: the search page `?` uses (and Enter on a weather answer), starting with `https://` and containing `{arg}`.
 
 ## Files and folders
 
@@ -277,6 +326,7 @@ open = "https://docs.rs"
 - `wsl_distro`: the WSL distro for `>` commands and `wsl` shortcuts. Leave it out to use WSL's default distro.
 - `file_roots`: the folders searched for files. Leave it out to search your whole user folder.
 - `history`: set to `false` to stop saving past searches and recent launches (see Past searches). The default is `true`.
+- `online`, `weather_city`, `currency`, `temperature_unit`, `search_engine`: see Quick answers.
 - `[[shortcut]]`: see Shortcuts.
 
 <details>
@@ -290,9 +340,15 @@ Changes are picked up as soon as you save the file; changed `file_roots` are sea
 
 Flick counts only which result you picked (an app, a Settings page, a file, a shortcut, an entry of a shortcut's list). This is stored only on this PC in `%APPDATA%\Flick\picks.json` and never shown. Power actions are never counted.
 
-The text of a search is saved when you open a result from it, on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`. Nothing is sent anywhere.
+The text of a search is saved when you open a result from it, on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`.
 
-Never saved: WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
+Flick goes online only when you ask a currency or weather question, and only while `online` is not `false`:
+
+- Currency: when the saved rates are older than the latest publication, Flick downloads the European Central Bank's daily rates file (at most once an hour) and keeps it in `%APPDATA%\Flick\rates.json`. Nothing about you is sent beyond the request itself.
+- Weather: Flick sends the city name you asked for (or your `weather_city`) to Open-Meteo's place search, then that place's coordinates to Open-Meteo's forecast. Never your own position, and nothing is looked up from your IP address. The places it found are kept in `%APPDATA%\Flick\weather.json`.
+- Nothing else goes online. `online = false` stops both. Web search only opens your browser; Flick itself sends nothing.
+
+Never saved: answers, WSL commands (text after `>`), the text you give a shortcut or type into its list, `help`, and power actions.
 
 To switch it off, set `history = false` in the config: Flick stops recording and deletes `history.json`. `clear history` empties it at any time.
 
@@ -310,8 +366,6 @@ PowerToys Run also uses Alt+Space by default. Only one program can own a hotkey,
 
 ## Not yet
 
-- Calculator and unit conversions
-- Web search
 - Clipboard history
 - Taking over the Win key
 

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::config::ShortcutDef;
+use crate::providers::answers::DUCKDUCKGO;
 use crate::fuzzy;
 use crate::launch::{bind_bash, bind_windows, check_windows_value, to_wsl_path, valid_distro, Launcher, Shell};
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
@@ -22,6 +23,38 @@ const MAX_ENTRIES: usize = 50;
 const BONUS: u32 = 50;
 const GONE: &str = "shortcut no longer exists";
 const CHOICE_GONE: &str = "choice no longer exists";
+
+/// The web searches every install has: `?` (the configured engine, or
+/// DuckDuckGo when `search_engine` is empty), `g`, `yt` and `gh`.
+pub fn builtin_shortcuts(search_engine: &str) -> Vec<ShortcutDef> {
+    let engine = if search_engine.is_empty() { DUCKDUCKGO } else { search_engine };
+    let web = |name: &str, about: &str, url: &str| ShortcutDef {
+        name: name.into(),
+        aliases: vec![],
+        about: about.into(),
+        run: None,
+        wsl: None,
+        open: Some(url.into()),
+        terminal: None,
+        admin: false,
+        pick: None,
+        choices: vec![],
+    };
+    vec![
+        web("?", "Web search", engine),
+        web("g", "Search Google", "https://www.google.com/search?q={arg}"),
+        web("yt", "Search YouTube", "https://www.youtube.com/results?search_query={arg}"),
+        web("gh", "Search GitHub", "https://github.com/search?q={arg}"),
+    ]
+}
+
+/// `defs` plus the built-in searches whose name no definition uses as a name or alias.
+fn with_builtins(mut defs: Vec<ShortcutDef>, search_engine: &str) -> Vec<ShortcutDef> {
+    let taken: HashSet<String> =
+        defs.iter().flat_map(|d| std::iter::once(&d.name).chain(&d.aliases)).map(|w| w.to_lowercase()).collect();
+    defs.extend(builtin_shortcuts(search_engine).into_iter().filter(|b| !taken.contains(&b.name.to_lowercase())));
+    defs
+}
 
 /// Values for a shortcut's placeholders.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -271,9 +304,12 @@ impl ShortcutsProvider {
         Arc::new(Self { launcher, state: Arc::new(RwLock::new(state)), refreshing: Arc::default() })
     }
 
-    /// New definitions from the config (reload thread). Reads the pick
-    /// folders before swapping, so queries never see a half-built list.
-    pub fn set(&self, defs: Vec<ShortcutDef>, distro: &str) {
+    /// New definitions from the config (reload thread), with the built-in web
+    /// searches added under them (`search_engine` is the config's, "" = the
+    /// default). Reads the pick folders before swapping, so queries never see
+    /// a half-built list.
+    pub fn set(&self, defs: Vec<ShortcutDef>, distro: &str, search_engine: &str) {
+        let defs = with_builtins(defs, search_engine);
         let entries = load_entries(&defs);
         let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
         st.generation += 1;
@@ -397,6 +433,15 @@ impl Provider for ShortcutsProvider {
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let st = self.state.read().unwrap_or_else(|e| e.into_inner());
         let text = q.text.trim();
+        // `?rust` is `? rust`: the one name that needs no space.
+        let spaced;
+        let text = match text.strip_prefix('?') {
+            Some(rest) if !rest.is_empty() && !rest.starts_with(char::is_whitespace) => {
+                spaced = format!("? {rest}");
+                spaced.as_str()
+            }
+            _ => text,
+        };
 
         if let Some(scope) = &q.scope {
             let Some(def) = scope.strip_prefix("shortcut:").and_then(|n| find(&st.defs, n, Kind::Pick)) else {
@@ -627,7 +672,7 @@ mod tests {
     fn setup(defs: Vec<ShortcutDef>) -> (Arc<ShortcutsProvider>, Arc<RecordingLauncher>) {
         let rec = Arc::new(RecordingLauncher::default());
         let p = ShortcutsProvider::new(rec.clone(), "Debian");
-        p.set(defs, "Debian");
+        p.set(defs, "Debian", "");
         (p, rec)
     }
 
@@ -1079,10 +1124,10 @@ mod tests {
     #[test]
     fn wsl_shortcut_is_listed_but_explains_itself_without_wsl() {
         let (p, rec) = setup(vec![wsl("upgrade", "x"), run("calc", "calc.exe")]);
-        p.set(vec![wsl("upgrade", "x"), run("calc", "calc.exe")], "");
+        p.set(vec![wsl("upgrade", "x"), run("calc", "calc.exe")], "", "");
         assert_eq!(p.query(&Query { text: "upgrade".into(), scope: None })[0].subtitle, "WSL is not installed");
         assert_eq!(p.query(&Query { text: "calc".into(), scope: None })[0].subtitle, "calc.exe");
-        assert_eq!(p.help().len(), 2);
+        assert_eq!(p.help().len(), 2 + builtin_shortcuts("").len());
         assert_eq!(p.activate("run:upgrade", Modifier::None), Err("WSL is not installed".to_string()));
         assert!(rec.calls().is_empty());
     }
@@ -1090,7 +1135,7 @@ mod tests {
     #[test]
     fn set_changes_the_distro() {
         let (p, rec) = setup(vec![wsl("upgrade", "x")]);
-        p.set(vec![wsl("upgrade", "x")], "Ubuntu");
+        p.set(vec![wsl("upgrade", "x")], "Ubuntu", "");
         p.activate("run:upgrade", Modifier::None).unwrap();
         assert_eq!(rec.calls(), vec!["run_command Wsl(Ubuntu) env=[] keep=true elevated=false cwd=-: x"]);
         assert_eq!(prepare(&wsl("v", "x"), &Substitution::default(), "a b"), Err("invalid wsl distro name".to_string()));
@@ -1215,14 +1260,14 @@ mod tests {
             run("search", "p {arg}"),
             picker(run("proj", "code {path}"), dir.path()),
         ]);
-        p.set(vec![], "Debian");
+        p.set(vec![], "Debian", "");
         let gone = Err(GONE.to_string());
         for id in ["run:hello", "need:search", "arg:search:x", "step:proj", "pick:proj:beta", "garbage", "", "run:"] {
             assert_eq!(p.activate(id, Modifier::None), gone, "{id}");
         }
         assert!(!p.owns_scope("shortcut:proj"));
         // An id of the wrong kind for the current definition is gone too.
-        p.set(vec![run("hello", "p {arg}")], "Debian");
+        p.set(vec![run("hello", "p {arg}")], "Debian", "");
         assert_eq!(p.activate("run:hello", Modifier::None), gone);
         assert_eq!(p.activate("step:hello", Modifier::None), gone);
         assert!(rec.calls().is_empty());
@@ -1255,16 +1300,66 @@ mod tests {
                 line("hello", "say hi", "hello "),
                 line("search <argument>", "p {arg}", "search "),
                 line("proj …", "code {path}", "proj "),
+                line("? <argument>", "Web search", "? "),
+                line("g <argument>", "Search Google", "g "),
+                line("yt <argument>", "Search YouTube", "yt "),
+                line("gh <argument>", "Search GitHub", "gh "),
             ]
         );
-        p.set(vec![], "Debian");
-        assert_eq!(
-            p.help(),
-            vec![line(
-                "your shortcuts",
-                "define your own commands in the config (type: flick config)",
-                "flick config"
-            )]
-        );
+    }
+
+    fn opened(rec: &RecordingLauncher) -> Vec<String> {
+        rec.calls()
+    }
+
+    fn open_row(p: &ShortcutsProvider, text: &str) -> ResultItem {
+        p.query(&q(text)).into_iter().find(|i| i.id.starts_with("arg:")).expect("an argument row")
+    }
+
+    #[test]
+    fn builtin_search_shortcuts() {
+        let (p, rec) = setup(vec![]);
+        for text in ["? rust lang", "?rust lang"] {
+            let row = open_row(&p, text);
+            assert_eq!(row.id, "arg:?:rust lang");
+            assert_eq!(p.rank_key(&row.id).as_deref(), Some("?"));
+            assert!(!row.pinnable);
+            p.activate(&row.id, Modifier::None).unwrap();
+        }
+        p.activate(&open_row(&p, "g cats").id, Modifier::None).unwrap();
+        p.activate(&open_row(&p, "yt a b").id, Modifier::None).unwrap();
+        p.activate(&open_row(&p, "gh x/y").id, Modifier::None).unwrap();
+        let calls = opened(&rec).join("\n");
+        assert_eq!(calls.matches("https://duckduckgo.com/?q=rust%20lang").count(), 2, "{calls}");
+        assert!(calls.contains("https://www.google.com/search?q=cats"), "{calls}");
+        assert!(calls.contains("https://www.youtube.com/results?search_query=a%20b"), "{calls}");
+        assert!(calls.contains("https://github.com/search?q=x%2Fy"), "{calls}");
+        // `?` alone steps nowhere: the name row asks for an argument.
+        assert_eq!(p.query(&q("?"))[0].id, "need:?");
+        // Only `?` needs no space.
+        assert!(p.query(&q("grust")).iter().all(|i| !i.id.starts_with("arg:")));
+    }
+
+    #[test]
+    fn config_shortcut_replaces_a_builtin() {
+        let (p, rec) = setup(vec![open("g", "https://example.com/?q={arg}")]);
+        p.activate(&open_row(&p, "g cats").id, Modifier::None).unwrap();
+        let calls = opened(&rec).join("\n");
+        assert!(calls.contains("https://example.com/?q=cats") && !calls.contains("google"), "{calls}");
+        // An alias counts too.
+        let def = ShortcutDef { aliases: vec!["yt".into()], ..open("video", "https://example.org/?q={arg}") };
+        p.set(vec![def], "Debian", "");
+        let row = open_row(&p, "yt cats");
+        assert_eq!(row.id, "arg:video:cats");
+        assert_eq!(p.query(&q("yt cats")).iter().filter(|i| i.id.starts_with("arg:")).count(), 1);
+    }
+
+    #[test]
+    fn search_engine_config_changes_question_mark() {
+        let (p, rec) = setup(vec![]);
+        p.set(vec![], "Debian", "https://www.startpage.com/do/search?q={arg}");
+        p.activate(&open_row(&p, "? x").id, Modifier::None).unwrap();
+        let calls = opened(&rec).join("\n");
+        assert!(calls.contains("https://www.startpage.com/do/search?q=x"), "{calls}");
     }
 }

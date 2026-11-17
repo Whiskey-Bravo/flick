@@ -84,6 +84,11 @@ fn reveal_window(w: &WebviewWindow) {
 }
 
 pub fn hide(app: &AppHandle) {
+    // A weather city still waiting for the typing pause is forgotten, so a
+    // hidden bar never sends a request.
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        crate::provider::Provider::skipped(&*state.providers.answers);
+    }
     if let Some(w) = bar(app) {
         let _ = w.hide();
     }
