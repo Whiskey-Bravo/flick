@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { builtinName, fallbackName, serverUrl } from "./icons";
+import { builtinName, fallbackName, serverUrl, pickIconSrc } from "./icons";
 
 describe("icons", () => {
   it("builds the server url from the encoded key and scaled size", () => {
@@ -16,5 +16,12 @@ describe("icons", () => {
     expect(fallbackName({ icon: "ext:.txt", provider: "files" })).toBe("file");
     expect(fallbackName({ icon: "file:C:\\a.exe", provider: "apps" })).toBe("app");
     expect(fallbackName({ icon: "file:C:\\a.txt", provider: "files" })).toBe("file");
+  });
+  it("picks the icon source from what is known about the url", () => {
+    const loaded = new Set(["a"]);
+    const failed = new Set(["b"]);
+    expect(pickIconSrc("a", loaded, failed, "fb")).toEqual({ src: "a", visible: true });
+    expect(pickIconSrc("b", loaded, failed, "fb")).toEqual({ src: "fb", visible: true });
+    expect(pickIconSrc("c", loaded, failed, "fb")).toEqual({ src: "c", visible: false });
   });
 });

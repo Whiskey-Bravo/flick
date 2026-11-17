@@ -2,7 +2,7 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { builtinName, fallbackName, serverUrl } from "./icons";
+import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import { capOf, failureText, initial, reduce, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
 
 type Outcome = Extract<Event, { type: "outcome" }>["outcome"];
@@ -49,6 +49,7 @@ let shows = 0;
 // A fixed 24x24 box, so a late image never moves the row. Server icons fade in
 // once loaded; a 404 swaps in the bundled SVG for the kind of thing.
 const loadedIcons = new Set<string>();
+const failedIcons = new Set<string>();
 
 function renderIcon(item: Item): HTMLSpanElement {
   const box = document.createElement("span");
@@ -62,17 +63,24 @@ function renderIcon(item: Item): HTMLSpanElement {
     img.src = svgUrl(name);
     img.className = "loaded";
   } else {
-    img.onload = () => {
-      loadedIcons.add(url);
-      img.classList.add("loaded");
-    };
-    img.onerror = () => {
-      img.onerror = null;
-      img.src = svgUrl(fallbackName(item));
-    };
-    img.src = url;
-    // Rows are rebuilt on every render: an icon seen before shows at once.
-    if (loadedIcons.has(url)) img.classList.add("loaded");
+    const fallback = svgUrl(fallbackName(item));
+    const pick = pickIconSrc(url, loadedIcons, failedIcons, fallback);
+    if (pick.src === url) {
+      img.onload = () => {
+        loadedIcons.add(url);
+        img.classList.add("loaded");
+      };
+      img.onerror = () => {
+        img.onerror = null;
+        img.onload = () => img.classList.add("loaded");
+        failedIcons.add(url);
+        img.src = fallback;
+      };
+    } else {
+      img.onload = () => img.classList.add("loaded");
+    }
+    img.src = pick.src;
+    if (pick.visible) img.classList.add("loaded");
   }
   box.append(img);
   return box;

@@ -17,3 +17,16 @@ export function fallbackName(item: Pick<Item, "icon" | "provider">): string {
   if (item.icon.startsWith("file:")) return item.provider === "files" ? "file" : "app";
   return "file";
 }
+
+// Rows are rebuilt on every render, so remember how each server URL fared:
+// a known failure goes straight to the fallback, a known success is shown at
+// once, and only an unknown URL is loaded (and faded in).
+export function pickIconSrc(
+  url: string,
+  loaded: ReadonlySet<string>,
+  failed: ReadonlySet<string>,
+  fallback: string,
+): { src: string; visible: boolean } {
+  if (failed.has(url)) return { src: fallback, visible: true };
+  return { src: url, visible: loaded.has(url) };
+}
