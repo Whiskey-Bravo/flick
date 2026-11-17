@@ -51,6 +51,18 @@ pub trait Desktop: Send + Sync {
     fn bring_to_front(&self, hwnd: isize) -> bool;
     fn send_ctrl_v(&self) -> Result<(), String>;
     fn send_win_v(&self) -> Result<(), String>;
+    /// Windows' clipboard sequence number: it changes whenever the
+    /// clipboard's content does.
+    fn clipboard_sequence(&self) -> u32;
+}
+
+/// Reads the clipboard sequence number (real one: [`clipboard_sequence`]).
+pub type Sequence = std::sync::Arc<dyn Fn() -> u32 + Send + Sync>;
+
+/// The real clipboard sequence number. Never use in tests.
+pub fn clipboard_sequence() -> u32 {
+    // SAFETY: no arguments; reads a per-window-station counter.
+    unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,25 +73,66 @@ pub enum Pasted {
     Blocked,
     NotInFront,
     KeysFailed,
+    /// The clipboard did not take the item (or kept changing) in time.
+    ClipboardUnchanged,
+    /// The clipboard changed again after it took the item.
+    ClipboardChanged,
+    /// The bar was shown again meanwhile.
+    Superseded,
 }
 
 pub const PASTE_WAIT: Duration = Duration::from_millis(500);
 pub const POLL: Duration = Duration::from_millis(10);
 
-/// Paste into `target` only when it is certain to receive the keys.
-pub fn paste_into(target: Option<isize>, d: &dyn Desktop, wait: Duration, poll: Duration) -> Pasted {
+/// Paste into `target` only when it is certain to receive the keys and the
+/// clipboard holds what was just put on it. `before` is the clipboard
+/// sequence number read before the item was set: the paste waits until the
+/// number has moved on and holds still for one poll, and sends the keys only
+/// if it is still that number right before them. `still_current` is false
+/// once the bar has been shown again. Everything shares one `wait` budget;
+/// on any doubt nothing is sent and the item stays copied.
+pub fn paste_into(
+    target: Option<isize>,
+    d: &dyn Desktop,
+    before: u32,
+    still_current: &dyn Fn() -> bool,
+    wait: Duration,
+    poll: Duration,
+) -> Pasted {
     let Some(t) = target else {
         return Pasted::NoTarget;
     };
+    if !still_current() {
+        return Pasted::Superseded;
+    }
     if !d.exists(t) {
         return Pasted::Gone;
     }
     if d.blocks_input(t) {
         return Pasted::Blocked;
     }
-    d.bring_to_front(t);
     let start = Instant::now();
+    // The item reached the clipboard and settled there.
+    let mut last = None;
+    let taken = loop {
+        if !still_current() {
+            return Pasted::Superseded;
+        }
+        let now = d.clipboard_sequence();
+        if now != before && last == Some(now) {
+            break now;
+        }
+        last = Some(now);
+        if start.elapsed() >= wait {
+            return Pasted::ClipboardUnchanged;
+        }
+        std::thread::sleep(poll);
+    };
+    d.bring_to_front(t);
     loop {
+        if !still_current() {
+            return Pasted::Superseded;
+        }
         if d.foreground() == Some(t) {
             break;
         }
@@ -87,6 +140,13 @@ pub fn paste_into(target: Option<isize>, d: &dyn Desktop, wait: Duration, poll: 
             return Pasted::NotInFront;
         }
         std::thread::sleep(poll);
+    }
+    // Right before the keys.
+    if !still_current() {
+        return Pasted::Superseded;
+    }
+    if d.clipboard_sequence() != taken {
+        return Pasted::ClipboardChanged;
     }
     match d.send_ctrl_v() {
         Ok(()) => Pasted::Pasted,
@@ -134,6 +194,9 @@ impl Desktop for SystemDesktop {
         use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_LWIN};
         sys::send_chord(VK_LWIN, VIRTUAL_KEY(0x56))
     }
+    fn clipboard_sequence(&self) -> u32 {
+        clipboard_sequence()
+    }
 }
 
 mod sys {
@@ -168,19 +231,25 @@ mod sys {
 
     /// `modifier` down, `key` down, `key` up, `modifier` up.
     pub fn send_chord(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY) -> Result<(), String> {
+        // SAFETY: a valid slice of fully initialised INPUTs.
+        chord(modifier, key, &mut |inputs| unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) })
+    }
+
+    /// The chord through `send` (which returns how many events went in).
+    /// When not all went in, the key and the modifier are released (best
+    /// effort), so Ctrl is never left held down.
+    pub fn chord(modifier: VIRTUAL_KEY, key: VIRTUAL_KEY, send: &mut dyn FnMut(&[INPUT]) -> u32) -> Result<(), String> {
         let inputs = [
             key_input(modifier, false),
             key_input(key, false),
             key_input(key, true),
             key_input(modifier, true),
         ];
-        // SAFETY: a valid slice of fully initialised INPUTs.
-        let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
-        if sent == inputs.len() as u32 {
-            Ok(())
-        } else {
-            Err("could not send the keys".to_string())
+        if send(&inputs) == inputs.len() as u32 {
+            return Ok(());
         }
+        let _ = send(&[key_input(key, true), key_input(modifier, true)]);
+        Err("could not send the keys".to_string())
     }
 }
 
@@ -188,6 +257,7 @@ mod sys {
 pub struct FakeDesktop {
     pub calls: Mutex<Vec<String>>,
     foreground: Mutex<std::collections::VecDeque<Option<isize>>>,
+    sequence: Mutex<std::collections::VecDeque<u32>>,
     pub exists: bool,
     pub blocked: bool,
     pub keys_ok: bool,
@@ -196,15 +266,22 @@ pub struct FakeDesktop {
 #[cfg(test)]
 impl FakeDesktop {
     /// `foreground` is the answer to successive `foreground()` calls; the last
-    /// one repeats forever.
+    /// one repeats forever. The clipboard sequence number is 1 throughout
+    /// (tests read 0 before the item was set) unless `sequence` scripts it.
     pub fn new(foreground: Vec<Option<isize>>) -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
             foreground: Mutex::new(foreground.into()),
+            sequence: Mutex::new(vec![1].into()),
             exists: true,
             blocked: false,
             keys_ok: true,
         }
+    }
+    /// Answers to successive `clipboard_sequence()` calls; the last repeats.
+    pub fn sequence(self, sequence: Vec<u32>) -> Self {
+        *self.sequence.lock().unwrap() = sequence.into();
+        self
     }
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
@@ -249,6 +326,15 @@ impl Desktop for FakeDesktop {
         self.log("win_v");
         Ok(())
     }
+    fn clipboard_sequence(&self) -> u32 {
+        self.log("sequence");
+        let mut q = self.sequence.lock().unwrap();
+        if q.len() > 1 {
+            q.pop_front().unwrap()
+        } else {
+            q.front().copied().unwrap_or(0)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -261,6 +347,10 @@ mod tests {
 
     fn facts(hwnd: isize, pid: u32, class: &str) -> Option<WindowFacts> {
         Some(WindowFacts { hwnd, pid, class: class.to_string() })
+    }
+
+    fn current() -> bool {
+        true
     }
 
     fn no_input(d: &FakeDesktop) -> bool {
@@ -281,12 +371,12 @@ mod tests {
     #[test]
     fn no_target_or_a_gone_window_pastes_nothing() {
         let d = FakeDesktop::new(vec![Some(1)]);
-        assert_eq!(paste_into(None, &d, WAIT, TICK), Pasted::NoTarget);
+        assert_eq!(paste_into(None, &d, 0, &current, WAIT, TICK), Pasted::NoTarget);
         assert!(no_input(&d));
 
         let mut d = FakeDesktop::new(vec![Some(1)]);
         d.exists = false;
-        assert_eq!(paste_into(Some(1), &d, WAIT, TICK), Pasted::Gone);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Gone);
         assert!(no_input(&d));
     }
 
@@ -294,7 +384,7 @@ mod tests {
     fn an_elevated_window_pastes_nothing() {
         let mut d = FakeDesktop::new(vec![Some(1)]);
         d.blocked = true;
-        assert_eq!(paste_into(Some(1), &d, WAIT, TICK), Pasted::Blocked);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Blocked);
         assert!(no_input(&d));
     }
 
@@ -302,12 +392,12 @@ mod tests {
     fn pastes_only_once_the_target_is_in_front() {
         let d = FakeDesktop::new(vec![Some(2)]);
         let start = Instant::now();
-        assert_eq!(paste_into(Some(1), &d, WAIT, TICK), Pasted::NotInFront);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::NotInFront);
         assert!(start.elapsed() >= WAIT);
         assert!(d.calls().iter().all(|c| c != "ctrl_v"));
 
         let d = FakeDesktop::new(vec![Some(2), Some(2), Some(1)]);
-        assert_eq!(paste_into(Some(1), &d, WAIT, TICK), Pasted::Pasted);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Pasted);
         let calls = d.calls();
         assert_eq!(calls.iter().filter(|c| *c == "ctrl_v").count(), 1);
         assert_eq!(calls.iter().filter(|c| *c == "foreground").count(), 3);
@@ -320,6 +410,83 @@ mod tests {
     fn failed_keys_are_reported() {
         let mut d = FakeDesktop::new(vec![Some(1)]);
         d.keys_ok = false;
-        assert_eq!(paste_into(Some(1), &d, WAIT, TICK), Pasted::KeysFailed);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::KeysFailed);
+    }
+
+    #[test]
+    fn pastes_only_once_the_clipboard_took_the_item() {
+        // The clipboard never moves on from the number read before the set.
+        let d = FakeDesktop::new(vec![Some(1)]).sequence(vec![0]);
+        let start = Instant::now();
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::ClipboardUnchanged);
+        assert!(start.elapsed() >= WAIT);
+        assert!(no_input(&d), "{:?}", d.calls());
+
+        // It moves on late, settles, then the paste goes ahead.
+        let d = FakeDesktop::new(vec![Some(1)]).sequence(vec![0, 0, 5, 6, 6]);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Pasted);
+        let calls = d.calls();
+        let front = calls.iter().position(|c| c.starts_with("bring_to_front")).unwrap();
+        let settled = calls.iter().rposition(|c| c == "sequence").unwrap();
+        let keys = calls.iter().position(|c| c == "ctrl_v").unwrap();
+        assert!(calls[..front].iter().filter(|c| *c == "sequence").count() >= 5, "{calls:?}");
+        assert!(settled < keys, "checked right before the keys: {calls:?}");
+
+        // Still changing when the wait runs out.
+        let seq: Vec<u32> = (1..10_000).collect();
+        let d = FakeDesktop::new(vec![Some(1)]).sequence(seq);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::ClipboardUnchanged);
+        assert!(no_input(&d));
+    }
+
+    #[test]
+    fn a_clipboard_changed_again_before_the_keys_is_not_pasted() {
+        // Settles on 3, the target comes to the front, then someone else copies.
+        let d = FakeDesktop::new(vec![Some(2), Some(1)]).sequence(vec![3, 3, 4]);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::ClipboardChanged);
+        assert!(d.calls().iter().all(|c| c != "ctrl_v"));
+    }
+
+    #[test]
+    fn a_bar_shown_again_stops_the_paste() {
+        let d = FakeDesktop::new(vec![Some(1)]);
+        assert_eq!(paste_into(Some(1), &d, 0, &|| false, WAIT, TICK), Pasted::Superseded);
+        assert!(no_input(&d));
+
+        // Shown again while waiting for the target: checked on every poll
+        // and right before the keys.
+        for allowed in 0..7 {
+            let d = FakeDesktop::new(vec![Some(2), Some(2), Some(1)]);
+            let checks = std::sync::atomic::AtomicUsize::new(0);
+            let still = || checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < allowed;
+            assert_eq!(paste_into(Some(1), &d, 0, &still, WAIT, TICK), Pasted::Superseded, "{allowed}");
+            assert!(d.calls().iter().all(|c| c != "ctrl_v"), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn a_short_send_releases_the_key_and_the_modifier() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_CONTROL};
+        let v = VIRTUAL_KEY(0x56);
+        let keys = |batch: &[INPUT]| -> Vec<(u16, bool)> {
+            // SAFETY: every INPUT here is a keyboard input.
+            batch.iter().map(|i| unsafe { (i.Anonymous.ki.wVk.0, i.Anonymous.ki.dwFlags.contains(KEYEVENTF_KEYUP)) }).collect()
+        };
+        let mut sent = Vec::new();
+        let r = sys::chord(VK_CONTROL, v, &mut |batch| {
+            sent.push(keys(batch));
+            if sent.len() == 1 { 1 } else { batch.len() as u32 }
+        });
+        assert!(r.is_err());
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1], [(0x56, true), (VK_CONTROL.0, true)]);
+
+        let mut sent = Vec::new();
+        let r = sys::chord(VK_CONTROL, v, &mut |batch| {
+            sent.push(keys(batch));
+            batch.len() as u32
+        });
+        assert!(r.is_ok());
+        assert_eq!(sent, [vec![(VK_CONTROL.0, false), (0x56, false), (0x56, true), (VK_CONTROL.0, true)]]);
     }
 }
