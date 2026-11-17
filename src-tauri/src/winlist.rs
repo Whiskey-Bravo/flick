@@ -32,7 +32,7 @@ pub trait WindowOps: Send + Sync {
 }
 
 /// Window classes that belong to the shell, never offered.
-const EXCLUDED_CLASSES: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+pub(crate) const EXCLUDED_CLASSES: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
 
 /// Whether a top-level window is one the user would call "an open window".
 /// `tool` is WS_EX_TOOLWINDOW.
@@ -168,7 +168,7 @@ mod sys {
     }
 
     /// True when the token cannot be read from here or reports elevation.
-    fn is_elevated(pid: u32) -> bool {
+    pub(super) fn is_elevated(pid: u32) -> bool {
         // SAFETY: handles are closed; the out buffer matches the size passed.
         unsafe {
             let Ok(p) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
@@ -405,6 +405,12 @@ mod sys {
             r
         }
     }
+}
+
+/// True when the process token cannot be read from here or reports elevation.
+#[allow(dead_code)] // Used by paste.rs until Task 8 wires it in.
+pub(crate) fn process_elevated(pid: u32) -> bool {
+    sys::is_elevated(pid)
 }
 
 impl WindowOps for SystemWindows {
