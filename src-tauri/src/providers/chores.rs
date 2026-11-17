@@ -10,6 +10,7 @@ use crate::chores::{BinInfo, Chores, Drive, EjectError};
 use crate::dirs::{size_text, Load, Loader, ReadError, FRESH, SLOW};
 use crate::fuzzy;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::providers::power::POWER_PENALTY;
 
 const NAME: &str = "chores";
 
@@ -222,7 +223,8 @@ impl Provider for ChoresProvider {
             .filter_map(|(id, words)| {
                 let best = words.iter().filter_map(|w| fuzzy::score(text, w)).max()?;
                 let mut row = self.chore_row(id)?;
-                row.score = best;
+                // Like power actions: an app matching the same text ranks first.
+                row.score = best.saturating_sub(POWER_PENALTY).max(1);
                 Some(row)
             })
             .collect();
@@ -516,6 +518,18 @@ mod tests {
         assert!(!t.p.claims("ejector"));
         assert!(!t.p.claims("empty bin"));
         assert!(!t.p.claims("flush dns"));
+    }
+
+    #[test]
+    fn chores_score_below_equal_app_match() {
+        let t = setup();
+        assert_eq!(row(&t, "flush dns", FLUSH_DNS).score, 1000 - POWER_PENALTY);
+        assert_eq!(row(&t, "restart explorer", RESTART_EXPLORER).score, 1000 - POWER_PENALTY);
+        for text in ["d", "e", "r", "c", "t"] {
+            for r in t.p.query(&q(text)) {
+                assert!(r.score <= 900 - POWER_PENALTY, "{text}: {} scored {}", r.id, r.score);
+            }
+        }
     }
 
     #[test]

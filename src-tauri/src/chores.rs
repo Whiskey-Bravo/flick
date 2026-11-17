@@ -58,6 +58,7 @@ fn windows_dir() -> PathBuf {
 
 mod win {
     use std::mem::size_of;
+    use std::time::{Duration, Instant};
 
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
@@ -68,8 +69,11 @@ mod win {
     };
     use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, WIN32_ERROR};
     use windows::Win32::Storage::FileSystem::{
-        BusTypeUsb, CreateFileW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW, FILE_FLAGS_AND_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        BusTypeMmc, BusTypeSd, BusTypeUsb, CreateFileW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+        FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, STORAGE_BUS_TYPE,
+    };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Ioctl::{
         PropertyStandardQuery, StorageDeviceProperty, GUID_DEVINTERFACE_DISK, IOCTL_STORAGE_GET_DEVICE_NUMBER,
@@ -153,9 +157,10 @@ mod win {
         Some(out)
     }
 
-    fn is_usb(letter: char) -> bool {
+    /// The bus the volume's disk sits on, if Windows says.
+    fn bus_type(letter: char) -> Option<STORAGE_BUS_TYPE> {
         let path = volume_path(letter);
-        let Some(h) = open(PCWSTR(path.as_ptr())) else { return false };
+        let h = open(PCWSTR(path.as_ptr()))?;
         let query = STORAGE_PROPERTY_QUERY {
             PropertyId: StorageDeviceProperty,
             QueryType: PropertyStandardQuery,
@@ -179,11 +184,60 @@ mod win {
         }
         .is_ok();
         if !ok || (got as usize) < size_of::<STORAGE_DEVICE_DESCRIPTOR>() {
-            return false;
+            return None;
         }
         // SAFETY: the buffer is aligned, large enough and was filled above.
         let desc = unsafe { std::ptr::read(buf.as_ptr() as *const STORAGE_DEVICE_DESCRIPTOR) };
-        desc.BusType == BusTypeUsb
+        Some(desc.BusType)
+    }
+
+    /// Kept from `SetThreadErrorMode` until dropped, so reading an empty
+    /// card slot can't show Windows' "No disk" dialog.
+    struct QuietErrors(u32);
+
+    // Declared by hand: the windows crate only has it under a feature this
+    // build does not enable (Win32_System_Diagnostics_Debug).
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadErrorMode(new_mode: u32, old_mode: *mut u32) -> i32;
+    }
+
+    const SEM_FAILCRITICALERRORS: u32 = 1;
+
+    impl QuietErrors {
+        fn new() -> Self {
+            let mut old = 0u32;
+            // SAFETY: `old` is writable; this thread's mode only.
+            unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut old) };
+            Self(old)
+        }
+    }
+
+    impl Drop for QuietErrors {
+        fn drop(&mut self) {
+            // SAFETY: restores the mode read in `new`.
+            unsafe { SetThreadErrorMode(self.0, std::ptr::null_mut()) };
+        }
+    }
+
+    fn explorer_running() -> bool {
+        let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+            // Unknown: assume it runs rather than start a second shell.
+            return true;
+        };
+        let snapshot = Handle(snapshot);
+        let mut entry = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        // SAFETY: a valid snapshot; `entry` is sized above.
+        let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) }.is_ok();
+        while more {
+            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            if String::from_utf16_lossy(&entry.szExeFile[..len]).eq_ignore_ascii_case("explorer.exe") {
+                return true;
+            }
+            // SAFETY: as above.
+            more = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
+        }
+        false
     }
 
     /// The volume's label, or `None` when it has no readable volume (an
@@ -217,6 +271,7 @@ mod win {
     }
 
     pub fn drives() -> Result<Vec<Drive>, String> {
+        let _quiet = QuietErrors::new();
         // SAFETY: no arguments.
         let mask = unsafe { GetLogicalDrives() };
         let mut out = Vec::new();
@@ -228,9 +283,12 @@ mod win {
             let root = wide(&format!(r"{letter}:\"));
             // SAFETY: `root` is NUL-terminated.
             let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+            // Removable volumes on USB (sticks; a built-in USB card reader
+            // can't be told apart and is kept) or SD/MMC; fixed disks on USB.
+            let bus = bus_type(letter);
             let wanted = match kind {
-                DRIVE_REMOVABLE => true,
-                DRIVE_FIXED => is_usb(letter),
+                DRIVE_REMOVABLE => bus.is_some_and(|b| b == BusTypeUsb || b == BusTypeSd || b == BusTypeMmc),
+                DRIVE_FIXED => bus == Some(BusTypeUsb),
                 _ => false,
             };
             if !wanted {
@@ -331,10 +389,38 @@ mod win {
         let files = [PCWSTR(exe.as_ptr())];
         // SAFETY: `files` holds one NUL-terminated path that outlives the call.
         check(unsafe { RmRegisterResources(session.0, Some(&files), None, None) }, "RmRegisterResources")?;
+        // Once a shutdown has been tried, Explorer may be gone, so from here
+        // on nothing returns early. Order: 1) RmRestart whatever RmShutdown
+        // said; 2) if no explorer.exe runs, start it ourselves; 3) Err only
+        // when Explorer still isn't running.
         // SAFETY: a started session; no callback.
-        check(unsafe { RmShutdown(session.0, RmForceShutdown.0 as u32, None) }, "RmShutdown")?;
+        let shutdown = check(unsafe { RmShutdown(session.0, RmForceShutdown.0 as u32, None) }, "RmShutdown");
         // SAFETY: a started session; no callback.
-        check(unsafe { RmRestart(session.0, None, None) }, "RmRestart")
+        let restart = check(unsafe { RmRestart(session.0, None, None) }, "RmRestart");
+        drop(session);
+        if wait_for_explorer(Duration::from_secs(2)) {
+            return Ok(());
+        }
+        let _ = std::process::Command::new(explorer).spawn();
+        if wait_for_explorer(Duration::from_secs(5)) {
+            Ok(())
+        } else {
+            Err(shutdown.and(restart).err().unwrap_or_else(|| "Explorer did not come back".to_string()))
+        }
+    }
+
+    /// Polls until an explorer.exe process exists or `limit` passes.
+    fn wait_for_explorer(limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            if explorer_running() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 }
 
