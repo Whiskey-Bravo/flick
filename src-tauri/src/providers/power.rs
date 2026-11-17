@@ -177,7 +177,7 @@ mod tests {
     fn power_rows_are_pinnable_but_not_learned() {
         let (p, _) = provider();
         let r = p.item("restart").unwrap();
-        assert!(r.confirm && r.pinnable && !r.revealable && !r.elevatable);
+        assert!(r.confirm && r.pinnable && r.actions.is_empty());
         assert_eq!((r.title.as_str(), r.score, r.icon.as_str()), ("Restart", 0, "builtin:power"));
         assert_eq!(p.rank_key("restart"), None);
         assert!(p.item("nope").is_none());

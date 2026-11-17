@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::fuzzy;
 use crate::launch::{self, Launcher};
 use crate::process;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 /// Shortcuts whose name has one of these as a whole word (case-insensitive,
 /// split like `fuzzy::words`) are not apps. "Revo Uninstaller" and "HelpNDoc" stay.
@@ -284,7 +284,7 @@ pub struct AppsProvider {
     store: Mutex<Vec<AppEntry>>,
     /// Held for a whole refresh, so overlapping refreshes queue.
     refreshing: Mutex<()>,
-    #[allow(dead_code)] // used by `reveal`, which the menu task calls
+    /// Shows a shortcut in Explorer.
     launcher: Arc<dyn Launcher>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
@@ -411,7 +411,10 @@ fn store_elevation_error(err: String) -> String {
 
 /// The row for an app; `score` 0 when rebuilt from an id.
 fn row(e: &AppEntry, score: u32) -> ResultItem {
-    let shortcut = e.kind == AppKind::Shortcut;
+    let actions = match e.kind {
+        AppKind::Shortcut => vec![Action::Admin, Action::Reveal],
+        AppKind::Store => vec![],
+    };
     ResultItem {
         id: e.target.clone(),
         provider: "apps",
@@ -421,8 +424,7 @@ fn row(e: &AppEntry, score: u32) -> ResultItem {
         // Store apps too: `file:shell:AppsFolder\<AUMID>`, which the icon server resolves.
         icon: format!("file:{}", e.target),
         pinnable: true,
-        revealable: shortcut,
-        elevatable: true,
+        actions,
         ..Default::default()
     }
 }
@@ -466,7 +468,11 @@ impl Provider for AppsProvider {
         self.scanned.load(Ordering::SeqCst)
     }
 
-    fn reveal(&self, id: &str) -> Result<(), String> {
+    /// Reveal only, and only for a Start menu shortcut.
+    fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
+        if action != Action::Reveal {
+            return Err("can't do that here".into());
+        }
         let shortcut = {
             let index = self.index.read().unwrap_or_else(|e| e.into_inner());
             index.iter().any(|e| e.target == id && e.kind == AppKind::Shortcut)
@@ -474,7 +480,8 @@ impl Provider for AppsProvider {
         if !shortcut {
             return Err("can't show this item's location".into());
         }
-        self.launcher.reveal(id)
+        self.launcher.reveal(id)?;
+        Ok(Outcome::Hide)
     }
 
     fn help(&self) -> Vec<HelpLine> {
@@ -508,6 +515,7 @@ impl Provider for AppsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::Action;
     use std::fs;
 
     fn shortcut(name: &str, target: &str) -> AppEntry {
@@ -543,13 +551,16 @@ mod tests {
         );
         let r = p.item(r"C:\b.lnk").unwrap();
         assert_eq!((r.title.as_str(), r.icon.as_str(), r.score), ("Blender", r"file:C:\b.lnk", 0));
-        assert!(r.pinnable && r.revealable && r.elevatable);
+        assert!(r.pinnable);
+        assert_eq!(r.actions, [Action::Admin, Action::Reveal]);
         assert!(p.item("nope").is_none());
         let s = p.item(r"shell:AppsFolder\Microsoft.WindowsCalculator_x!App").unwrap();
         assert_eq!(s.icon, r"file:shell:AppsFolder\Microsoft.WindowsCalculator_x!App");
-        assert!(s.pinnable && !s.revealable && s.elevatable);
-        assert_eq!(p.reveal(r"C:\b.lnk"), Ok(()));
-        assert!(p.reveal(&s.id).is_err());
+        assert!(s.pinnable);
+        assert_eq!(s.actions, []);
+        assert_eq!(p.act(r"C:\b.lnk", Action::Reveal), Ok(Outcome::Hide));
+        assert!(p.act(&s.id, Action::Reveal).is_err());
+        assert!(p.act(r"C:\b.lnk", Action::CopyPath).is_err());
         assert_eq!(rec.calls(), [r"reveal C:\b.lnk".to_string()]);
         assert!(p.ready());
         assert!(!AppsProvider::new(rec).ready());
