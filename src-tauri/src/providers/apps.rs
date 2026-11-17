@@ -1397,6 +1397,21 @@ mod tests {
         assert_eq!(actions_of(&p, r"C:\Foo.lnk"), [Action::Admin, Action::Reveal, Action::Uninstall]);
     }
 
+    /// A window whose AUMID comes from its process (not a window property) and
+    /// differs only in case still makes the Store row offer Close.
+    #[test]
+    fn store_close_offered_for_process_aumid_ignoring_case() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = app_with_programs(&rec);
+        let (list, _) = fake_windows(
+            vec![win(3, 12, r"C:\Program Files\WindowsApps\Microsoft.WindowsCalculator\CalculatorApp.exe", false)],
+            &[(3, "MICROSOFT.WINDOWSCALCULATOR_8WEKYB3D8BBWE!APP")],
+        );
+        p.set_windows(list);
+        let calc = format!("shell:AppsFolder\\{CALC_ID}");
+        assert_eq!(actions_of(&p, &calc), [Action::Uninstall, Action::Close]);
+    }
+
     #[test]
     fn uninstall_runs_the_registered_uninstaller() {
         let rec = Arc::new(RecordingLauncher::default());

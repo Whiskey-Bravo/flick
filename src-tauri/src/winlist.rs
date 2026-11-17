@@ -125,6 +125,8 @@ mod sys {
         PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
     use windows::core::GUID;
+    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
     use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
@@ -341,6 +343,11 @@ mod sys {
         PROPERTYKEY { fmtid: GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3), pid: 5 };
 
     pub fn aumid(h: isize) -> Option<String> {
+        window_aumid(h).or_else(|| process_aumid(h))
+    }
+
+    /// The window's own `PKEY_AppUserModel_ID`; many packaged apps do not set it.
+    fn window_aumid(h: isize) -> Option<String> {
         // SAFETY: the property store and the string it hands out are released
         // before returning; a window without the property reads as empty.
         unsafe {
@@ -350,6 +357,30 @@ mod sys {
             let id = text.to_string().ok().filter(|s| !s.is_empty());
             windows::Win32::System::Com::CoTaskMemFree(Some(text.as_ptr() as *const c_void));
             id
+        }
+    }
+
+    /// The AUMID of the window's process (a packaged app's identity). Windows
+    /// hosted by ApplicationFrameHost.exe report the host's process, which has
+    /// none, so those still do not match; that is accepted.
+    fn process_aumid(h: isize) -> Option<String> {
+        // SAFETY: the one handle is closed on every path; the buffer outlives the call.
+        unsafe {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hw(h), Some(&mut pid));
+            if pid == 0 {
+                return None;
+            }
+            let proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; 256];
+            let mut len = buf.len() as u32;
+            let rc = GetApplicationUserModelId(proc, &mut len, Some(PWSTR(buf.as_mut_ptr())));
+            let _ = CloseHandle(proc);
+            if rc != ERROR_SUCCESS || len < 2 {
+                return None;
+            }
+            // `len` counts the terminating nul.
+            String::from_utf16(&buf[..(len as usize - 1).min(buf.len())]).ok().filter(|s| !s.is_empty())
         }
     }
 
@@ -443,5 +474,16 @@ mod tests {
         assert_eq!(list.aumid(1).as_deref(), Some("Contoso.Foo_abc!App"));
         assert_eq!(list.aumid(2), None);
         assert_eq!(list.snapshot().len(), 2);
+    }
+
+    /// Prints each real window's AUMID; reads only, closes nothing.
+    /// `cargo test real_windows -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_windows_list_aumids() {
+        let ops = SystemWindows::new();
+        for w in ops.list() {
+            println!("{:?} {} {} -> {:?}", w.hwnd, w.app, w.title, ops.aumid(w.hwnd));
+        }
     }
 }
