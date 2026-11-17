@@ -226,37 +226,59 @@ fn definitions_of(word: &str, fetch: &dyn Fetch) -> Result<Vec<Sense>, LookupErr
     }
 }
 
+/// What `def` found for a word: its senses (none means no definition), and
+/// whether every page asked for was read. An incomplete answer is shown but
+/// not kept, so the next ask looks the word up again.
+#[derive(Debug, PartialEq)]
+pub struct Definitions {
+    pub senses: Vec<Sense>,
+    pub complete: bool,
+}
+
 /// The word as typed, then (Wiktionary titles being case-sensitive: `gift` is
 /// English, `Gift` German) once more with the first letter's case flipped when
 /// the first page has no page, no senses, or senses in only one of German and
 /// English. A language missing from the first page is taken from the second,
-/// German first; when the second fails or has nothing, the first page's answer stands.
-/// The second request is sent only while `wanted()` (the word is still the text
-/// asked last, and online answers are on); else the first page's answer stands.
-fn define_job(word: &str, fetch: &dyn Fetch, wanted: &dyn Fn() -> bool) -> Result<Vec<Sense>, LookupError> {
+/// German first; when the second has no page or no senses, the first page's
+/// answer stands. The second request is sent only while `wanted()` (the word is
+/// still the text asked last, and online answers are on). When it is not sent,
+/// or fails, the first page's answer stands but is incomplete.
+fn define_job(word: &str, fetch: &dyn Fetch, wanted: &dyn Fn() -> bool) -> Result<Definitions, LookupError> {
     let first = definitions_of(word, fetch);
     let has = |senses: &[Sense], lang: Lang| senses.iter().any(|s| s.lang == lang);
     let wants_more = match &first {
         Ok(senses) => !(has(senses, Lang::German) && has(senses, Lang::English)),
         Err(e) => *e == LookupError::NotFound,
     };
-    let Some(other) = flip_first(word).filter(|_| wants_more && wanted()) else {
-        return first;
+    let whole = |senses| Ok(Definitions { senses, complete: true });
+    let partial = |senses| Ok(Definitions { senses, complete: false });
+    let Some(other) = flip_first(word).filter(|_| wants_more) else {
+        return first.and_then(whole);
     };
+    if !wanted() {
+        // The other page was never read: no definition yet is not "none".
+        return match first {
+            Ok(senses) => partial(senses),
+            Err(LookupError::NotFound) => partial(Vec::new()),
+            Err(e) => Err(e),
+        };
+    }
     let second = definitions_of(&other, fetch);
     let first = match first {
         Ok(senses) => senses,
-        Err(_) => return second,
+        Err(_) => return second.and_then(whole),
     };
-    let Ok(second) = second else {
-        return Ok(first);
+    let second = match second {
+        Ok(senses) => senses,
+        Err(LookupError::NotFound) => return whole(first),
+        Err(_) => return partial(first),
     };
     let mut merged = Vec::new();
     for lang in [Lang::German, Lang::English] {
         let source = if has(&first, lang) { &first } else { &second };
         merged.extend(source.iter().filter(|s| s.lang == lang).cloned());
     }
-    Ok(merged)
+    whole(merged)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -281,7 +303,7 @@ fn split(text: &str) -> Option<(Command, &str)> {
 
 pub struct WordsProvider {
     translations: Arc<Lookups<String>>,
-    definitions: Arc<Lookups<Vec<Sense>>>,
+    definitions: Arc<Lookups<Definitions>>,
     clipboard: Arc<dyn Clipboard>,
     open_settings: Opener,
     online: AtomicBool,
@@ -325,7 +347,7 @@ impl WordsProvider {
     ) -> Self {
         WordsProvider {
             translations: Lookups::new(fetch.clone(), on_ready.clone(), pause),
-            definitions: Lookups::new(fetch, on_ready, pause),
+            definitions: Lookups::keeping(fetch, on_ready, pause, |d| d.complete),
             clipboard,
             open_settings,
             online: AtomicBool::new(true),
@@ -415,7 +437,9 @@ impl WordsProvider {
         let owned = word.to_string();
         match self.definitions.ask(word, move |f, wanted| define_job(&owned, f, wanted)) {
             Lookup::Waiting => vec![inert("Looking up…", DEFINE_ICON)],
-            Lookup::Ready(senses) => senses
+            Lookup::Ready(found) if found.senses.is_empty() => vec![inert("No definition found", DEFINE_ICON)],
+            Lookup::Ready(found) => found
+                .senses
                 .iter()
                 .enumerate()
                 .map(|(n, s)| {
@@ -991,6 +1015,41 @@ mod tests {
         r.p.query(&q("def 42"));
         r.wait();
         assert_eq!(r.fetch.urls().len(), 1);
+    }
+
+    #[test]
+    fn a_partial_answer_is_shown_once_and_asked_again() {
+        // The other case's page failed: the English senses show, but are not kept.
+        let r = rig(
+            FakeFetch::offline()
+                .respond(DEF_GIFT, Ok(WIKTIONARY_GIFT.as_bytes().to_vec()))
+                .respond(DEF_GIFT_UPPER, Err(FetchError::Status(500))),
+        );
+        r.p.query(&q("def gift"));
+        r.wait();
+        assert_eq!(r.p.query(&q("def gift")).len(), 3);
+        assert_eq!(titles(&r.p.query(&q("def gift"))), ["Looking up…"], "asked again");
+        r.wait();
+        assert_eq!(r.fetch.urls(), [DEF_GIFT, DEF_GIFT_UPPER, DEF_GIFT, DEF_GIFT_UPPER]);
+
+        // The other case's page was skipped (the text moved on meanwhile).
+        let r = rig(
+            FakeFetch::offline()
+                .respond(DEF_GIFT, Ok(WIKTIONARY_GIFT.as_bytes().to_vec()))
+                .respond(DEF_GIFT_UPPER, Ok(WIKTIONARY_GIFT_UPPER.as_bytes().to_vec()))
+                .with_delay(Duration::from_millis(300)),
+        );
+        r.p.query(&q("def gift"));
+        std::thread::sleep(Duration::from_millis(200));
+        r.p.forget_waiting();
+        r.wait();
+        assert_eq!(r.fetch.urls(), [DEF_GIFT]);
+        assert_eq!(r.p.query(&q("def gift")).len(), 3, "the first page, told once");
+        assert_eq!(titles(&r.p.query(&q("def gift"))), ["Looking up…"]);
+        r.wait();
+        assert_eq!(r.p.query(&q("def gift")).len(), 5, "both pages, now kept");
+        assert_eq!(r.p.query(&q("def gift")).len(), 5);
+        assert_eq!(r.fetch.urls(), [DEF_GIFT, DEF_GIFT, DEF_GIFT_UPPER]);
     }
 
     #[test]
