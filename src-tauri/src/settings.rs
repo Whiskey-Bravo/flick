@@ -19,7 +19,7 @@ use crate::config::{self, Config, DirectHotkeyDef, FieldError, ShortcutDef, Work
 use crate::config_edit::{self, Setting};
 use crate::direct_keys::DirectKeys;
 use crate::net::{Fetch, FetchError, WinHttp};
-use crate::{apply_hotkey, reload_config, AppState, WslState};
+use crate::{change_bar_hotkey, reload_config, AppState, WslState};
 
 /// Label of the Settings window; events for it are harmless while it is closed.
 pub const WINDOW: &str = "settings";
@@ -195,13 +195,12 @@ pub fn settings_state(app: AppHandle, state: State<AppState>) -> SettingsState {
 /// Applies the new file now rather than waiting for the watcher, which then finds
 /// nothing new. `reload_config` also emits `settings:changed`.
 #[tauri::command(async)]
-pub fn settings_set(setting: Setting, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+pub fn settings_set(setting: Setting, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let path = config::config_path();
     let result = match setting {
         Setting::Hotkey(wanted) => {
-            let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let r = set_hotkey(&path, applied.as_deref(), &wanted, |h| apply_hotkey(&app, h).map_or(Ok(()), Err));
+            let r = change_bar_hotkey(&app, &wanted);
             if r.is_err() {
                 // The old hotkey is registered again; bring the record and the
                 // tooltip back in line with it.
