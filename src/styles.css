@@ -188,7 +188,7 @@ input::placeholder {
   white-space: nowrap;
 }
 
-.menu-item.selected,
-.menu-item:hover {
+/* One highlight only: the selected entry (keyboard), not also the hovered one. */
+.menu-item.selected {
   background: #34343d;
 }

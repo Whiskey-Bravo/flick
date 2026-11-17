@@ -224,12 +224,15 @@ function run(effect: Effect) {
         .then((pinned) => dispatch({ type: "pinned", provider: effect.item.provider, id: effect.item.id, pinned }))
         .catch((err) => dispatch({ type: "failed", message: failureText(effect.item, err) }));
       break;
-    case "reveal":
-      // On success the back end hides the bar; a failure shows like a failed activation.
-      invoke("reveal", { provider: effect.item.provider, id: effect.item.id }).catch((err) =>
-        dispatch({ type: "failed", message: failureText(effect.item, err) }),
-      );
+    case "reveal": {
+      // On success the back end hides the bar; a failure shows like a failed
+      // activation, unless the bar was shown again meanwhile.
+      const at = shows;
+      invoke("reveal", { provider: effect.item.provider, id: effect.item.id }).catch((err) => {
+        if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+      });
       break;
+    }
     case "hide":
       invoke("hide").catch(() => {});
       break;
