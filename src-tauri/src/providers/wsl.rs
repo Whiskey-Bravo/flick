@@ -5,6 +5,9 @@ use std::sync::{Arc, RwLock};
 use crate::launch::{Launcher, Shell};
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route};
 
+/// `> command`.
+pub const ROUTE: Route = Route { prefix: ">", needs_space: false };
+
 pub struct WslProvider {
     launcher: Arc<dyn Launcher>,
     distro: RwLock<String>,
@@ -59,7 +62,7 @@ impl Provider for WslProvider {
     }
 
     fn route(&self) -> Option<Route> {
-        Some(Route { prefix: ">", needs_space: false })
+        Some(ROUTE)
     }
 
     fn help(&self) -> Vec<HelpLine> {

@@ -11,6 +11,8 @@ use crate::fuzzy::score;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 const NAME: &str = "devices";
+/// The words this provider claims (with text after them for `wifi`).
+pub const WORDS: [&str; 3] = ["connect", "disconnect", "wifi"];
 const READING_BT: &str = "Reading Bluetooth devices\u{2026}";
 const NONE_PAIRED: &str = "No paired Bluetooth audio devices";
 const NONE_CONNECTED: &str = "No connected Bluetooth audio devices";

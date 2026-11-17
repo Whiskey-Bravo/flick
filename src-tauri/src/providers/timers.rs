@@ -26,7 +26,8 @@ const REMIND_USAGE: &str = "Type a time and a note, like remind 20m pizza";
 const TOO_FAR: &str = "Up to 7 days ahead";
 const NONE_PENDING: &str = "No timers or reminders";
 const STARTS: &str = "Enter starts it";
-const WORDS: [&str; 4] = ["timer", "remind", "timers", "reminders"];
+/// The words this provider claims.
+pub const WORDS: [&str; 4] = ["timer", "remind", "timers", "reminders"];
 
 pub struct TimersProvider {
     reminders: Arc<Reminders>,

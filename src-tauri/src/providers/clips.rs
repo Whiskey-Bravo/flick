@@ -12,6 +12,9 @@ use crate::launch::Launcher;
 use crate::paste::Sequence;
 use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route, Then};
 
+/// `v` / `v invoice`.
+pub const ROUTE: Route = Route { prefix: "v", needs_space: true };
+
 pub const CLIPBOARD_SETTINGS: &str = "ms-settings:clipboard";
 /// Characters of the text shown as the row title.
 pub const MAX_TITLE: usize = 120;
@@ -225,7 +228,7 @@ impl Provider for ClipsProvider {
     }
 
     fn route(&self) -> Option<Route> {
-        Some(Route { prefix: "v", needs_space: true })
+        Some(ROUTE)
     }
 
     fn help(&self) -> Vec<HelpLine> {

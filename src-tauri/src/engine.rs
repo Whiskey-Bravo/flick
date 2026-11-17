@@ -55,6 +55,14 @@ impl Drop for SeqGuard {
     }
 }
 
+/// Every provider, in order (tests only).
+#[cfg(test)]
+impl Engine {
+    pub fn providers(&self) -> impl Iterator<Item = &dyn Provider> {
+        self.providers.iter().map(|p| p.as_ref())
+    }
+}
+
 /// Runs `f` as if inside query number `seq`.
 #[cfg(test)]
 pub fn as_query<R>(seq: u64, f: impl FnOnce() -> R) -> R {

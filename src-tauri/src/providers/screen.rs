@@ -3,6 +3,11 @@
 
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
 
+/// The words that show the snip row.
+pub const SNIP_WORDS: [&str; 2] = ["snip", "screenshot"];
+/// The words that show the colour picker row.
+pub const COLOR_WORDS: [&str; 3] = ["color", "colour", "picker"];
+
 /// Opens the Windows snipping overlay; the snip lands on the clipboard.
 pub const SNIP_URI: &str = "ms-screenclip:";
 
@@ -33,7 +38,7 @@ impl Provider for SnipProvider {
     }
 
     fn query(&self, q: &Query) -> Vec<ResultItem> {
-        row(&q.text, &["snip", "screenshot"], "snip", "Snip a region", "Copies it to the clipboard", "builtin:snip")
+        row(&q.text, &SNIP_WORDS, "snip", "Snip a region", "Copies it to the clipboard", "builtin:snip")
     }
 
     fn activate(&self, _id: &str, _modifier: Modifier) -> Result<Outcome, String> {
@@ -62,7 +67,7 @@ impl Provider for ColorProvider {
     }
 
     fn query(&self, q: &Query) -> Vec<ResultItem> {
-        row(&q.text, &["color", "colour", "picker"], "color", "Pick a colour", "Copies it as #RRGGBB", "builtin:color")
+        row(&q.text, &COLOR_WORDS, "color", "Pick a colour", "Copies it as #RRGGBB", "builtin:color")
     }
 
     fn activate(&self, _id: &str, _modifier: Modifier) -> Result<Outcome, String> {

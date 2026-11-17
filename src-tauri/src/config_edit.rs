@@ -696,7 +696,7 @@ mod tests {
         let e = upsert_workspace(SPACES, Some("work"), &ws("Home", &[("a", "b")])).unwrap_err();
         assert!(e.contains("name is already used"), "{e}");
         let e = upsert_workspace(SPACES, None, &ws("help", &[("a", "b")])).unwrap_err();
-        assert!(e.contains("name is already used"), "{e}");
+        assert!(e.contains("name is a Flick command"), "{e}");
         let e = upsert_workspace(SPACES, None, &ws("x", &[])).unwrap_err();
         assert!(e.contains("needs at least one item"), "{e}");
     }

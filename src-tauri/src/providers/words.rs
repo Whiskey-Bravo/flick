@@ -24,6 +24,8 @@ const TRANSLATE_ICON: &str = "builtin:translate";
 const DEFINE_ICON: &str = "builtin:define";
 /// Longest text `tr` sends, in characters.
 const MAX_TRANSLATE: usize = 200;
+/// The words this provider claims (with text after them).
+pub const WORDS: [&str; 2] = ["tr", "def"];
 /// Senses shown per language.
 const SENSES: usize = 3;
 

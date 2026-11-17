@@ -2472,6 +2472,27 @@ mod tests {
     }
 
     #[test]
+    fn every_route_and_claimed_help_word_is_kept_from_workspace_names() {
+        let r = rig(vec![], vec![]);
+        let mut checked = 0;
+        for p in r.engine.providers() {
+            if let Some(route) = p.route() {
+                let typed = if route.needs_space { route.prefix.to_string() } else { format!("{}x", route.prefix) };
+                assert!(config::is_command_word(&typed), "{} routes {}", p.name(), route.prefix);
+                checked += 1;
+            }
+            for line in p.help() {
+                let Some(word) = line.fill.split_whitespace().next() else { continue };
+                if p.claims(word) || p.claims(&format!("{word} x")) {
+                    assert!(config::is_command_word(word), "{} claims {word}", p.name());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 10, "{checked}");
+    }
+
+    #[test]
     fn a_settings_bar_hotkey_change_lets_the_bar_win_and_frees_the_old_clash() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
