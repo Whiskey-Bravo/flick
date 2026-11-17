@@ -94,13 +94,15 @@ fn scan_with_limits(roots: &[PathBuf], max_entries: usize, max_depth: usize, max
     scan_index(roots, None, max_entries, max_depth, max_per_folder).entries()
 }
 
-/// `dir` with a leading `home` shown as `~`.
+/// `dir` with a leading `home` shown as `~`, always with `\` separators
+/// (roots in the config may be written with `/`).
 fn shorten_home(dir: &Path, home: Option<&Path>) -> String {
-    match home.and_then(|h| dir.strip_prefix(h).ok()) {
+    let shown = match home.and_then(|h| dir.strip_prefix(h).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => "~".into(),
         Some(rest) => format!(r"~\{}", rest.display()),
         None => dir.display().to_string(),
-    }
+    };
+    shown.replace('/', r"\")
 }
 
 /// Folder scores per tier; a file scores 10 less. All stay below 650, the
@@ -881,6 +883,9 @@ mod tests {
         assert_eq!(shorten_home(Path::new(r"C:\Users\x"), Some(home)), "~");
         assert_eq!(shorten_home(Path::new(r"D:\Stuff"), Some(home)), r"D:\Stuff");
         assert_eq!(shorten_home(Path::new(r"D:\Stuff"), None), r"D:\Stuff");
+        // Roots written with `/` in the config still show `\`.
+        assert_eq!(shorten_home(Path::new(r"C:\Users\x\Documents/Demo\Trip"), Some(home)), r"~\Documents\Demo\Trip");
+        assert_eq!(shorten_home(Path::new("D:/Stuff/Old"), None), r"D:\Stuff\Old");
 
         let (p, _) = provider(vec![entry(r"D:\Stuff\taxes.txt", false)]);
         assert_eq!(p.query(&q("taxes"))[0].subtitle, r"D:\Stuff");
