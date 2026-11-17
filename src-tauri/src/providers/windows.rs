@@ -193,7 +193,7 @@ impl Provider for WindowsProvider {
         let snap = self.list.snapshot();
         if id == "quit-all" {
             for w in snap.iter().filter(|w| !is_explorer(&w.exe) && !w.elevated) {
-                let _ = ops.close(w.hwnd);
+                let _ = ops.close(w.hwnd, w.pid);
             }
             return Ok(Outcome::Hide);
         }
@@ -223,8 +223,9 @@ impl Provider for WindowsProvider {
             return Err(NEEDS_ADMIN.to_string());
         }
         if verb == "close" {
-            for w in &g.wins {
-                let _ = ops.close(w.hwnd);
+            let closed = g.wins.iter().filter(|w| ops.close(w.hwnd, w.pid).is_ok()).count();
+            if closed == 0 {
+                return Err("That window is gone.".to_string());
             }
         } else {
             if is_explorer(&g.exe) {
@@ -233,8 +234,14 @@ impl Provider for WindowsProvider {
             let mut pids: Vec<u32> = g.wins.iter().map(|w| w.pid).collect();
             pids.sort_unstable();
             pids.dedup();
+            let mut failed: Option<String> = None;
             for pid in pids {
-                ops.kill(pid)?;
+                if let Err(e) = ops.kill(pid, &g.exe) {
+                    failed.get_or_insert(e);
+                }
+            }
+            if let Some(e) = failed {
+                return Err(e);
             }
         }
         Ok(Outcome::Hide)
@@ -251,6 +258,7 @@ mod tests {
         wins: Mutex<Vec<WinInfo>>,
         gone: Mutex<Vec<isize>>,
         calls: Mutex<Vec<String>>,
+        args: Mutex<Vec<String>>,
     }
 
     impl FakeOps {
@@ -270,12 +278,14 @@ mod tests {
             self.calls.lock().unwrap().push(format!("focus {hwnd}"));
             Ok(())
         }
-        fn close(&self, hwnd: isize) -> Result<(), String> {
+        fn close(&self, hwnd: isize, pid: u32) -> Result<(), String> {
             self.calls.lock().unwrap().push(format!("close {hwnd}"));
+            self.args.lock().unwrap().push(format!("close {hwnd} {pid}"));
             Ok(())
         }
-        fn kill(&self, pid: u32) -> Result<(), String> {
+        fn kill(&self, pid: u32, exe: &str) -> Result<(), String> {
             self.calls.lock().unwrap().push(format!("kill {pid}"));
+            self.args.lock().unwrap().push(format!("kill {pid} {exe}"));
             Ok(())
         }
     }
@@ -285,7 +295,7 @@ mod tests {
     }
 
     fn setup(wins: Vec<WinInfo>) -> (WindowsProvider, Arc<FakeOps>) {
-        let ops = Arc::new(FakeOps { wins: Mutex::new(wins), gone: Mutex::new(vec![]), calls: Mutex::new(vec![]) });
+        let ops = Arc::new(FakeOps { wins: Mutex::new(wins), gone: Mutex::new(vec![]), calls: Mutex::new(vec![]), args: Mutex::new(vec![]) });
         let list = WindowList::new(ops.clone());
         list.refresh();
         (WindowsProvider::new(list), ops)
@@ -356,6 +366,7 @@ mod tests {
         assert!(!rows[0].confirm);
         assert_eq!(p.activate(&rows[0].id, Modifier::None), Ok(Outcome::Hide));
         assert_eq!(ops.calls(), vec!["close 1", "close 2"]);
+        assert_eq!(ops.args.lock().unwrap().clone(), vec!["close 1 20", "close 2 20"]);
         let one = p.query(&q("close explorer"));
         assert_eq!(one[0].title, "Close Windows Explorer · 1 window");
     }
@@ -371,6 +382,7 @@ mod tests {
         assert!(p.query(&q("kill explorer")).is_empty());
         assert_eq!(p.activate(&rows[0].id, Modifier::None), Ok(Outcome::Hide));
         assert_eq!(ops.calls(), vec!["kill 20"]);
+        assert_eq!(ops.args.lock().unwrap().clone(), vec![r"kill 20 C:\Apps\Chrome\chrome.exe"]);
         assert!(p.activate(r"kill:c:\windows\explorer.exe", Modifier::None).is_err());
     }
 
@@ -417,6 +429,7 @@ mod tests {
             wins: Mutex::new(mail_and_word()),
             gone: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
+            args: Mutex::new(vec![]),
         });
         let list = WindowList::new(ops);
         assert!(list.snapshot().is_empty());
@@ -435,6 +448,25 @@ mod tests {
         let snap = list.snapshot();
         assert_eq!(snap.len(), 1);
         assert_eq!(snap[0].hwnd, 9);
+    }
+
+    #[test]
+    fn terminate_and_close_need_a_live_match() {
+        use crate::winlist::{may_close, may_terminate};
+        let chrome = r"C:\Apps\Chrome\chrome.exe";
+        assert!(may_terminate(chrome, &chrome.to_uppercase(), 20, 1));
+        assert!(!may_terminate(r"C:\Otherpp.exe", chrome, 20, 1));
+        assert!(!may_terminate(chrome, chrome, 1, 1));
+        assert!(!may_terminate(chrome, chrome, 0, 1));
+        assert!(!may_terminate("", "", 20, 1));
+        let ex = r"C:\Windows\Explorer.exe";
+        assert!(!may_terminate(ex, ex, 30, 1));
+        assert!(may_close(20, 20, 1, "Chrome_WidgetWin_1"));
+        assert!(!may_close(21, 20, 1, "Chrome_WidgetWin_1"));
+        assert!(!may_close(1, 1, 1, "X"));
+        assert!(!may_close(0, 0, 1, "X"));
+        assert!(!may_close(20, 20, 1, "Progman"));
+        assert!(!may_close(20, 20, 1, "shell_traywnd"));
     }
 
     #[test]

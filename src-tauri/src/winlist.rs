@@ -21,8 +21,10 @@ pub trait WindowOps: Send + Sync {
     fn list(&self) -> Vec<WinInfo>;
     fn exists(&self, hwnd: isize) -> bool;
     fn focus(&self, hwnd: isize) -> Result<(), String>;
-    fn close(&self, hwnd: isize) -> Result<(), String>;
-    fn kill(&self, pid: u32) -> Result<(), String>;
+    /// `pid` is the owner the window had when listed; the live window must still match.
+    fn close(&self, hwnd: isize, pid: u32) -> Result<(), String>;
+    /// `exe` is the image the process had when listed; the live process must still match.
+    fn kill(&self, pid: u32, exe: &str) -> Result<(), String>;
 }
 
 /// Window classes that belong to the shell, never offered.
@@ -36,6 +38,26 @@ pub fn listable(class: &str, pid: u32, own_pid: u32, title: &str, tool: bool, cl
         && !tool
         && pid != own_pid
         && !title.trim().is_empty()
+        && !EXCLUDED_CLASSES.iter().any(|c| c.eq_ignore_ascii_case(class))
+}
+
+/// Whether a process found live under `pid` may be ended: it must still be the
+/// image that was listed, and never Flick itself or explorer.exe.
+pub fn may_terminate(live_exe: &str, expected_exe: &str, pid: u32, own_pid: u32) -> bool {
+    let name = std::path::Path::new(live_exe).file_name().map(|s| s.to_string_lossy().to_lowercase());
+    pid != 0
+        && pid != own_pid
+        && !live_exe.is_empty()
+        && live_exe.eq_ignore_ascii_case(expected_exe)
+        && name.as_deref() != Some("explorer.exe")
+}
+
+/// Whether a live window may be sent WM_CLOSE: still owned by the listed
+/// process, not Flick's own, not a shell window.
+pub fn may_close(live_pid: u32, expected_pid: u32, own_pid: u32, class: &str) -> bool {
+    live_pid != 0
+        && live_pid == expected_pid
+        && live_pid != own_pid
         && !EXCLUDED_CLASSES.iter().any(|c| c.eq_ignore_ascii_case(class))
 }
 
@@ -106,16 +128,22 @@ mod sys {
         String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
     }
 
+    /// Image path of an open process handle.
+    fn image_of(h: HANDLE) -> Option<String> {
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        // SAFETY: buf and len describe the same buffer.
+        unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) }.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+
     fn image_path(pid: u32) -> Option<String> {
-        // SAFETY: plain handle calls; the handle is closed below.
+        // SAFETY: the handle is closed before returning.
         unsafe {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-            let mut buf = vec![0u16; 1024];
-            let mut len = buf.len() as u32;
-            let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+            let r = image_of(h);
             let _ = CloseHandle(h);
-            r.ok()?;
-            Some(String::from_utf16_lossy(&buf[..len as usize]))
+            r
         }
     }
 
@@ -270,21 +298,44 @@ mod sys {
         }
     }
 
-    pub fn close(h: isize) -> Result<(), String> {
-        // SAFETY: posting a message to a window handle.
-        unsafe { PostMessageW(Some(hw(h)), WM_CLOSE, WPARAM(0), LPARAM(0)) }.map_err(|_| "Could not close it.".to_string())
+    pub fn close(h: isize, expected_pid: u32) -> Result<(), String> {
+        let w = hw(h);
+        // SAFETY: queries and a post on a window handle; buffers are sized.
+        unsafe {
+            if !IsWindow(Some(w)).as_bool() {
+                return Err("That window is gone.".to_string());
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(w, Some(&mut pid));
+            let mut cbuf = [0u16; 256];
+            let cn = GetClassNameW(w, &mut cbuf);
+            let class = text_of(&cbuf, cn);
+            if !super::may_close(pid, expected_pid, GetCurrentProcessId(), &class) {
+                return Err("That window is gone.".to_string());
+            }
+            PostMessageW(Some(w), WM_CLOSE, WPARAM(0), LPARAM(0)).map_err(|_| "Could not close it.".to_string())
+        }
     }
 
-    pub fn kill(pid: u32) -> Result<(), String> {
-        // SAFETY: handle is closed below.
+    pub fn kill(pid: u32, expected_exe: &str) -> Result<(), String> {
+        const GONE: &str = "That app is gone.";
+        // SAFETY: the one handle pins the process while it is checked and ended,
+        // and is closed on every path.
         unsafe {
-            if pid == GetCurrentProcessId() {
-                return Err("Not ending Flick itself.".to_string());
+            let own = GetCurrentProcessId();
+            if pid == own {
+                return Err(GONE.to_string());
             }
-            let h = OpenProcess(PROCESS_TERMINATE, false, pid).map_err(|_| "Could not end it.".to_string())?;
-            let r = TerminateProcess(h, 1);
+            let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                .map_err(|_| GONE.to_string())?;
+            let r = match image_of(h) {
+                Some(live) if super::may_terminate(&live, expected_exe, pid, own) => {
+                    TerminateProcess(h, 1).map_err(|_| "Could not end it.".to_string())
+                }
+                _ => Err(GONE.to_string()),
+            };
             let _ = CloseHandle(h);
-            r.map_err(|_| "Could not end it.".to_string())
+            r
         }
     }
 }
@@ -299,10 +350,10 @@ impl WindowOps for SystemWindows {
     fn focus(&self, hwnd: isize) -> Result<(), String> {
         sys::focus(hwnd)
     }
-    fn close(&self, hwnd: isize) -> Result<(), String> {
-        sys::close(hwnd)
+    fn close(&self, hwnd: isize, pid: u32) -> Result<(), String> {
+        sys::close(hwnd, pid)
     }
-    fn kill(&self, pid: u32) -> Result<(), String> {
-        sys::kill(pid)
+    fn kill(&self, pid: u32, exe: &str) -> Result<(), String> {
+        sys::kill(pid, exe)
     }
 }
