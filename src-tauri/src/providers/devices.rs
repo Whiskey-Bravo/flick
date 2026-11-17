@@ -258,11 +258,13 @@ impl Provider for DevicesProvider {
     }
 
     /// A stored row (a pin or a direct hotkey), never waiting: the last list
-    /// read decides, and a network missing from it is gone. Before any read
-    /// the row is rebuilt from its id alone (a device keeps the name it had
-    /// before a connect or disconnect cleared the list), and a device read is
-    /// started. A device missing from a list older than [`FRESH`] may be newly
-    /// paired: it is gone only once a re-read (started here) lacks it too.
+    /// read decides, and a network missing from it is gone. Rebuilding a device
+    /// row reads the device list in the background when none is known or the
+    /// one known is older than [`FRESH`], whether the device is in it or not.
+    /// Before any read the row is rebuilt from its id alone (a device keeps the
+    /// name it had before a connect or disconnect cleared the list). A device
+    /// missing from a list older than [`FRESH`] may be newly paired: it is gone
+    /// only once that re-read lacks it too.
     fn item(&self, id: &str) -> Option<ResultItem> {
         if let Some(network) = id.strip_prefix("wifi:") {
             return match self.wifi_list.peek("wifi") {
