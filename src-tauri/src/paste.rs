@@ -51,6 +51,8 @@ pub trait Desktop: Send + Sync {
     fn bring_to_front(&self, hwnd: isize) -> bool;
     fn send_ctrl_v(&self) -> Result<(), String>;
     fn send_win_v(&self) -> Result<(), String>;
+    /// Opens the real Start menu ([`crate::controls::open_start_menu`]).
+    fn open_start_menu(&self) -> Result<(), String>;
     /// Windows' clipboard sequence number: it changes whenever the
     /// clipboard's content does.
     fn clipboard_sequence(&self) -> u32;
@@ -194,6 +196,9 @@ impl Desktop for SystemDesktop {
         use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_LWIN};
         sys::send_chord(VK_LWIN, VIRTUAL_KEY(0x56))
     }
+    fn open_start_menu(&self) -> Result<(), String> {
+        crate::controls::open_start_menu()
+    }
     fn clipboard_sequence(&self) -> u32 {
         clipboard_sequence()
     }
@@ -324,6 +329,10 @@ impl Desktop for FakeDesktop {
     }
     fn send_win_v(&self) -> Result<(), String> {
         self.log("win_v");
+        Ok(())
+    }
+    fn open_start_menu(&self) -> Result<(), String> {
+        self.log("start_menu");
         Ok(())
     }
     fn clipboard_sequence(&self) -> u32 {

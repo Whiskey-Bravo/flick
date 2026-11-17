@@ -607,6 +607,12 @@ impl WinKey {
     fn running(&self) -> bool {
         self.hook.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
+
+    /// The worker thread couldn't be started, so no hook ever will be: say so
+    /// in Settings when the setting is on.
+    fn no_worker(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Starts and stops the Win-key hook as [`WinKey::want`] asks. While the hook
@@ -1053,7 +1059,10 @@ fn setup(app: &AppHandle) {
             .name("flick-winkey-control".into())
             .spawn(move || win_key_worker(worker, win_key_rx))
             .map(drop)
-            .unwrap_or_else(|e| eprintln!("could not start the Win key worker: {e}"));
+            .unwrap_or_else(|e| {
+                eprintln!("could not start the Win key worker: {e}");
+                state.win_key.no_worker();
+            });
         if loaded.config.win_key {
             state.win_key.want(true);
         }
@@ -2527,6 +2536,26 @@ mod tests {
     }
 
     #[test]
+    fn the_start_menu_row_tops_startup_apps_and_taskbar() {
+        let r = rig(vec![], vec![]);
+        for text in ["start", "start m", "start menu"] {
+            let res = r.engine.query(text, None);
+            assert_eq!((res[0].provider, res[0].id.as_str()), ("system", "startmenu"), "{text}: {:?}", titles(&res));
+            assert!(res.iter().any(|i| i.provider == "settings" && i.title == "Taskbar"), "{text}: {:?}", titles(&res));
+        }
+        let res = r.engine.query("start", None);
+        assert!(res.iter().any(|i| i.title == "Startup apps"), "{:?}", titles(&res));
+        // Picking Taskbar often does not lift it above the exact words.
+        let taskbar = res.iter().find(|i| i.title == "Taskbar").unwrap().id.clone();
+        for _ in 0..30 {
+            r.ranking.record("settings", &taskbar);
+        }
+        assert_eq!(r.engine.query("start menu", None)[0].id, "startmenu");
+        // `startup` is still Startup apps.
+        assert_eq!(r.engine.query("startup", None)[0].title, "Startup apps");
+    }
+
+    #[test]
     fn hiding_the_bar_forgets_what_was_read() {
         let r = clip_rig();
         query_capture(&r, "v");
@@ -2933,5 +2962,14 @@ mod tests {
         assert!(flags.may_take());
         flags.set_on(false);
         assert!(!flags.may_take(), "switched off before the hook has stopped");
+    }
+
+    #[test]
+    fn a_missing_worker_shows_as_unhealthy() {
+        let (tx, _rx) = mpsc::channel();
+        let win = WinKey::new(tx);
+        assert!(win.healthy(), "nothing asked yet");
+        win.no_worker();
+        assert!(!win.healthy(), "the status line must show");
     }
 }

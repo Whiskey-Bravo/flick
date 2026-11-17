@@ -84,9 +84,9 @@ Ctrl+Shift+Enter works for apps only, both Start-menu shortcuts and Store apps. 
 Flick can take over the Win key: tap it on its own and the bar opens instead of the Start menu; tap it again to close the bar. It is off by default. Switch it on in Settings, General (Win key opens Flick), or set `win_key = true` in the config. It applies at once, with no restart.
 
 - Win combinations keep working as before: Win+E, Win+D, Win+V, Win+Shift+S and the rest. Holding Win and clicking or scrolling counts as a combination too, so the bar stays closed.
-- The Start menu is still there: press Ctrl+Esc, or type `start` in the bar and pick the Start menu row.
+- The Start menu is still there: press Ctrl+Esc, or type `start` in the bar and pick the Start menu row. The row can't open Start when a window running as administrator was in front (Windows blocks Flick's keys there); Ctrl+Esc typed by hand still works.
 - Windows keeps the Win key while a window running as administrator is in front, while an exclusive full-screen game is running, and while Settings is waiting for you to press a hotkey. A tap then opens Start as usual.
-- If Windows doesn't let Flick watch the Win key, Settings says "The Win key isn't available right now; Alt+Space still works." (with your bar hotkey). The bar hotkey always works, whether this is on or off.
+- If Windows doesn't let Flick watch the Win key, Settings says "The Win key isn't available right now; Alt+Space still works." (with your bar hotkey). The bar hotkey is not affected by this setting.
 
 ## Icons and the mouse
 
