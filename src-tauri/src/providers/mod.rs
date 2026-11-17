@@ -9,6 +9,7 @@ mod files_scan;
 pub mod flick;
 pub mod games;
 pub mod history;
+pub mod devices;
 pub mod path;
 pub mod power;
 pub mod qr;
