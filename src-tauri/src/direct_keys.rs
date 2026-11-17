@@ -71,6 +71,8 @@ struct Work {
     defs: Vec<DirectHotkeyDef>,
     /// Normalized combos registered now.
     registered: Vec<String>,
+    /// Released while Settings captures keys; `apply` then only remembers.
+    paused: bool,
 }
 
 /// What presses and the status read. Only ever held briefly, never across a
@@ -95,10 +97,22 @@ impl DirectKeys {
     }
 
     /// Releases every combo registered before, then registers `defs` in order,
-    /// skipping the bar's combo, weak combos and repeats. Never on the main thread.
+    /// skipping the bar's combo, weak combos and repeats. While paused it only
+    /// remembers `bar` and `defs` for the resume. Never on the main thread.
     pub fn apply(&self, bar: &str, defs: &[DirectHotkeyDef]) {
         let mut work = self.work.lock().unwrap_or_else(|e| e.into_inner());
-        self.release(&mut work);
+        if work.paused {
+            work.bar = bar.to_string();
+            work.defs = defs.to_vec();
+            return;
+        }
+        self.apply_locked(&mut work, bar, defs);
+    }
+
+    /// `apply` under the caller's `work` guard, so no other apply can slip in
+    /// between reading the remembered set and registering it.
+    fn apply_locked(&self, work: &mut Work, bar: &str, defs: &[DirectHotkeyDef]) {
+        self.release(work);
         let bar_combo = normalize_combo(bar);
         let mut seen: Vec<String> = Vec::new();
         let mut rows = Vec::with_capacity(defs.len());
@@ -143,15 +157,16 @@ impl DirectKeys {
 
     /// Releases every combo while Settings captures keys (`true`), or applies the
     /// remembered set again (`false`). Never on the main thread.
+    /// A resume when not paused does nothing.
     pub fn pause(&self, paused: bool) {
+        let mut work = self.work.lock().unwrap_or_else(|e| e.into_inner());
         if paused {
-            self.release_all();
-        } else {
-            let (bar, defs) = {
-                let work = self.work.lock().unwrap_or_else(|e| e.into_inner());
-                (work.bar.clone(), work.defs.clone())
-            };
-            self.apply(&bar, &defs);
+            work.paused = true;
+            self.release(&mut work);
+        } else if work.paused {
+            work.paused = false;
+            let (bar, defs) = (work.bar.clone(), work.defs.clone());
+            self.apply_locked(&mut work, &bar, &defs);
         }
     }
 
@@ -203,11 +218,15 @@ impl PluginKeys {
 impl KeyRegistry for PluginKeys {
     fn register(&self, keys: &str) -> Result<(), RegisterError> {
         let shortcut = shortcut(keys)?;
+        let gs = self.app.global_shortcut();
+        // Our own leftover from a release that failed: free it, or it would read
+        // as taken by another program. (The bar's combo never gets here: Clash.)
+        if gs.is_registered(shortcut) {
+            self.unregister(keys);
+        }
         let on_press = self.on_press;
         let keys = keys.to_string();
-        self.app
-            .global_shortcut()
-            .on_shortcut(shortcut, move |app, _, e| {
+        gs.on_shortcut(shortcut, move |app, _, e| {
                 if e.state == ShortcutState::Pressed {
                     on_press(app, &keys)
                 }
@@ -217,9 +236,17 @@ impl KeyRegistry for PluginKeys {
 
     fn unregister(&self, keys: &str) {
         if let Ok(shortcut) = shortcut(keys) {
-            let _ = self.app.global_shortcut().unregister(shortcut);
+            if let Err(e) = self.app.global_shortcut().unregister(shortcut) {
+                eprintln!("could not release direct hotkey {keys}: {}", error_kind(&e));
+            }
         }
     }
+}
+
+/// The error's kind only (its variant name), never any text it carries.
+fn error_kind(e: &tauri_plugin_global_shortcut::Error) -> String {
+    let debug = format!("{e:?}");
+    debug.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default().to_string()
 }
 
 /// What a press acts on. `open` may block; never called on the main thread.
@@ -234,6 +261,8 @@ pub trait PressTarget: Send + Sync {
 pub const REPEAT_GATE: Duration = Duration::from_millis(500);
 
 /// Drops repeats of one combo while it is held (each repeat restarts the window).
+/// Presses of one combo less than `REPEAT_GATE` apart are dropped on purpose,
+/// even deliberate ones: a held key must open its item once, not again and again.
 pub struct PressGate {
     window: Duration,
     last: Mutex<HashMap<String, Instant>>,
@@ -414,6 +443,23 @@ mod tests {
         assert_eq!(reg.calls().last().map(String::as_str), Some("unregister ctrl+alt+t"));
         keys.release_all();
         assert_eq!(reg.calls().len(), 4);
+    }
+
+    #[test]
+    fn apply_while_paused_registers_nothing_and_resume_registers_the_new_set() {
+        let (reg, keys) = keys_with(FakeRegistry::default());
+        keys.apply("Alt+Space", &[def("Ctrl+Alt+T", "t")]);
+        keys.pause(true);
+        keys.apply("Ctrl+Alt+E", &[def("Ctrl+Alt+E", "e"), def("Win+N", "n")]);
+        assert_eq!(reg.calls(), ["register ctrl+alt+t", "unregister ctrl+alt+t"]);
+        assert_eq!(keys.item_for("Ctrl+Alt+T"), None);
+        keys.pause(false);
+        assert_eq!(reg.calls(), ["register ctrl+alt+t", "unregister ctrl+alt+t", "register super+n"]);
+        assert_eq!(states(&keys), [("Ctrl+Alt+E".to_string(), KeyState::Clash), ("Win+N".to_string(), KeyState::Ok)]);
+        assert_eq!(keys.item_for("Win+N"), Some(item("n")));
+        keys.pause(false);
+        assert_eq!(reg.calls().len(), 3, "a second resume neither releases nor registers again");
+        assert_eq!(keys.item_for("Win+N"), Some(item("n")));
     }
 
     #[test]
