@@ -286,7 +286,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
                 onInput={(e) => set("icon", e.currentTarget.value)}
               />
               <button onClick={pickIcon}>Browse...</button>
-              <button onClick={() => setAppIcon(!appIcon)}>Use an app's icon</button>
+              <button onClick={() => setAppIcon(!appIcon)}>From an app...</button>
               <button disabled={form.icon === ""} onClick={() => set("icon", "")}>
                 Clear
               </button>
