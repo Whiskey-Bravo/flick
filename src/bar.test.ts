@@ -36,6 +36,49 @@ describe("bar", () => {
     expect(entered.queued).toBe("none");
   });
 
+  it("rows still waiting for the empty bar's answer are not kept", () => {
+    // Typed, cleared and closed before the empty query answered: the rows are for `x`.
+    const s = run(
+      initial,
+      { type: "shown" },
+      { type: "results", items: [item("a")] },
+      { type: "input", text: "x" },
+      { type: "results", items: [item("x")] },
+      { type: "input", text: "" },
+      { type: "hidden" },
+    ).state;
+    expect(s.awaiting).toBe(true);
+    expect(run(s, { type: "shown" }).state.items).toEqual([]);
+  });
+
+  it("an Enter on a kept row runs only if the fresh rows still have that row", () => {
+    const a: Item = { ...item("a"), origin: "recent" };
+    const b: Item = { ...item("b"), origin: "recent" };
+    const closed = run(initial, { type: "shown" }, { type: "results", items: [a, item("c")] }, { type: "hidden" }).state;
+    const entered = run(closed, { type: "shown" }, key("Enter")).state;
+    expect([entered.kept, entered.queued, entered.items[entered.selected].id]).toEqual([true, "none", "a"]);
+    // Still there, though no longer first: it runs, not the new top row.
+    const still = run(entered, { type: "results", items: [b, a] });
+    expect(still.effects.map((e) => e.type)).toEqual(["activate"]);
+    expect(still.state.items[still.state.selected].id).toBe("a");
+    // Gone: nothing runs, and the fresh rows show.
+    const gone = run(entered, { type: "results", items: [b, item("c")] });
+    expect(gone.effects).toEqual([]);
+    expect([gone.state.queued, gone.state.kept, gone.state.items[gone.state.selected].id]).toEqual([null, false, "b"]);
+  });
+
+  it("a kept row the user moved to stays selected when the fresh rows arrive", () => {
+    const a: Item = { ...item("a"), origin: "recent" };
+    const closed = run(initial, { type: "shown" }, { type: "results", items: [a, item("b"), item("c")] }, { type: "hidden" }).state;
+    const moved = run(closed, { type: "shown" }, key("ArrowDown"), key("ArrowDown")).state;
+    expect(moved.items[moved.selected].id).toBe("c");
+    const fresh = run(moved, { type: "results", items: [a, item("c"), item("d")] }).state;
+    expect(fresh.items[fresh.selected].id).toBe("c");
+    // Not moved: the fresh rows open on the latest recent launch as usual.
+    const untouched = run(closed, { type: "shown" }, { type: "results", items: [item("z"), a] }).state;
+    expect(untouched.items[untouched.selected].id).toBe("a");
+  });
+
   it("a direct hotkey's row is not kept, even once its arm is gone", () => {
     const armed = run(initial, { type: "armed", item: item("x", true) }, { type: "blurred" }, { type: "hidden" }).state;
     expect(armed.armed).toBeNull();

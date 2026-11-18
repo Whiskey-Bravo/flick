@@ -44,9 +44,29 @@ pub fn toggle(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
     if w.is_visible().unwrap_or(false) {
         hide(app);
-    } else if hotkey_may_show(notification_state()) {
+    } else if hotkey_may_show(screen_state()) {
         show(app);
     }
+}
+
+/// Whether Sticky Keys is switched on (a tap of Win then latches it for the
+/// next key). False when it can't be read.
+pub fn sticky_keys_on() -> bool {
+    use windows::Win32::UI::Accessibility::{SKF_STICKYKEYSON, STICKYKEYS};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETSTICKYKEYS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut keys = STICKYKEYS { cbSize: std::mem::size_of::<STICKYKEYS>() as u32, dwFlags: Default::default() };
+    // SAFETY: a read into a correctly sized STICKYKEYS.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETSTICKYKEYS,
+            keys.cbSize,
+            Some(&mut keys as *mut STICKYKEYS as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && keys.dwFlags.0 & SKF_STICKYKEYSON.0 != 0
 }
 
 /// Win-key path ([`toggle`] for a lone Win press). The press was held back
@@ -60,7 +80,7 @@ pub fn toggle_from_win_key(app: &AppHandle) {
         hide(app);
         return;
     }
-    if !hotkey_may_show(notification_state()) {
+    if !hotkey_may_show(screen_state()) {
         return;
     }
     show(app);
@@ -113,9 +133,69 @@ fn may_attach(front_thread: u32, me: u32, hung: bool) -> bool {
 }
 
 /// `None` when the state cannot be read; that never blocks showing.
-pub(crate) fn notification_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
+fn notification_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
     // SAFETY: no pointers or preconditions; the wrapper owns the out-parameter.
     unsafe { SHQueryUserNotificationState() }.ok()
+}
+
+/// The notification state as the hotkey and the Win key read it: exclusive
+/// full-screen counts only while a full-screen window is in front.
+pub(crate) fn screen_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
+    in_front_only(notification_state(), full_screen_in_front)
+}
+
+/// Windows goes on reporting exclusive full-screen while the game is
+/// minimised or behind other windows; it is then not in the way, so the
+/// state reads as unknown (which never blocks). `in_front` is asked only
+/// for that state.
+fn in_front_only(
+    state: Option<QUERY_USER_NOTIFICATION_STATE>,
+    in_front: impl FnOnce() -> bool,
+) -> Option<QUERY_USER_NOTIFICATION_STATE> {
+    if state == Some(QUNS_RUNNING_D3D_FULL_SCREEN) && !in_front() {
+        return None;
+    }
+    state
+}
+
+/// Whether the window in front fills its whole monitor. The desktop itself
+/// doesn't count. True when the window can't be measured: Windows said
+/// full-screen, so stay out of the way.
+fn full_screen_in_front() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, GetShellWindow, GetWindowRect, IsIconic};
+    // SAFETY: plain reads on window and monitor handles; every result is checked.
+    unsafe {
+        let front = GetForegroundWindow();
+        if front.is_invalid() || front == GetShellWindow() || IsIconic(front).as_bool() {
+            return false;
+        }
+        // The desktop's other window (the icons live in a WorkerW after the
+        // wallpaper has been changed).
+        let mut worker = FindWindowExW(None, None, w!("WorkerW"), None).unwrap_or_default();
+        while !worker.is_invalid() {
+            if worker == front {
+                return false;
+            }
+            worker = FindWindowExW(None, Some(worker), w!("WorkerW"), None).unwrap_or_default();
+        }
+        let mut window = RECT::default();
+        let mut monitor = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetWindowRect(front, &mut window).is_err()
+            || !GetMonitorInfoW(MonitorFromWindow(front, MONITOR_DEFAULTTONEAREST), &mut monitor).as_bool()
+        {
+            return true;
+        }
+        let m = monitor.rcMonitor;
+        fills((window.left, window.top, window.right, window.bottom), (m.left, m.top, m.right, m.bottom))
+    }
+}
+
+/// Whether `window` covers all of `monitor` (each left, top, right, bottom).
+fn fills(window: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) -> bool {
+    window.0 <= monitor.0 && window.1 <= monitor.1 && window.2 >= monitor.2 && window.3 >= monitor.3
 }
 
 /// Only exclusive full-screen blocks the hotkey. Borderless full-screen and
@@ -290,6 +370,32 @@ mod tests {
         assert!(!may_attach(20, 10, true), "the front window is hung");
         assert!(!may_attach(0, 10, false), "no front window");
         assert!(!may_attach(10, 10, false), "the bar's own thread");
+    }
+
+    #[test]
+    fn a_minimised_full_screen_game_does_not_block() {
+        use windows::Win32::UI::Shell::QUNS_BUSY;
+        let game = Some(QUNS_RUNNING_D3D_FULL_SCREEN);
+        // The game is in front: blocked.
+        assert!(!hotkey_may_show(in_front_only(game, || true)));
+        // Minimised or behind another window: Windows still reports it, Flick opens.
+        assert!(hotkey_may_show(in_front_only(game, || false)));
+        // Other states are passed on untouched, and the front window isn't asked.
+        assert_eq!(in_front_only(Some(QUNS_BUSY), || panic!("not asked")), Some(QUNS_BUSY));
+        assert_eq!(in_front_only(None, || panic!("not asked")), None);
+    }
+
+    #[test]
+    fn a_window_fills_a_monitor_only_when_it_covers_all_of_it() {
+        let monitor = (0, 0, 1920, 1080);
+        assert!(fills((0, 0, 1920, 1080), monitor));
+        assert!(fills((-8, -8, 1928, 1088), monitor));
+        // Maximised: stops at the taskbar.
+        assert!(!fills((-8, -8, 1928, 1040), monitor));
+        assert!(!fills((100, 100, 900, 700), monitor));
+        // On a second monitor to the left.
+        assert!(fills((-1920, 0, 0, 1080), (-1920, 0, 0, 1080)));
+        assert!(!fills((0, 0, 1920, 1080), (-1920, 0, 0, 1080)));
     }
 
     #[test]

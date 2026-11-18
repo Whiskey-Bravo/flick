@@ -6,10 +6,13 @@
 //!
 //! The two talk in lines over the helper's stdin and stdout:
 //! - Flick to helper: `take 1` / `take 0`, whenever whether a lone press may
-//!   open Flick changes. The helper ends when its stdin closes, so it never
-//!   outlives Flick.
+//!   open Flick changes, and `ack` once Flick has acted on a `lone`. The
+//!   helper ends when its stdin closes, so it never outlives Flick.
 //! - Helper to Flick: `ready` or `unavailable <reason>` once, then `lone` for
 //!   each taken press and `healthy 1` / `healthy 0` when that changes.
+//!
+//! A `lone` left without an `ack` for [`ANSWER_WAIT_MS`] means Flick is stuck:
+//! the helper leaves the Win key to Windows until the `ack` comes.
 //!
 //! Tests cover only the line format: they never start the helper.
 
@@ -17,27 +20,27 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::windows::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::winkey::WinKeyHook;
+use crate::winkey::{WinKeyHook, UNAVAILABLE};
 
 /// The argument that starts flick.exe as the helper.
 pub const HELPER_ARG: &str = "--win-key-helper";
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// How often Flick checks whether the take state changed.
-const TAKE_POLL: Duration = Duration::from_millis(50);
-/// How often the helper checks its hook's health.
-const HEALTH_POLL: Duration = Duration::from_millis(500);
 /// The longest wait for the helper's first line (installing can retry for 3 s).
 const READY_WAIT: Duration = Duration::from_secs(10);
-/// The longest wait for the helper to end once its stdin is closed.
-const EXIT_WAIT: Duration = Duration::from_secs(2);
-
-const UNAVAILABLE: &str = "Windows wouldn't let Flick watch the Win key.";
+/// The longest wait for the helper to end once its stdin is closed. It ends
+/// at once (a thread of its own reads stdin), so this only bounds a stuck one.
+const EXIT_WAIT: Duration = Duration::from_millis(500);
+/// How long Flick may take to answer a `lone` before the helper stops taking
+/// the Win key.
+const ANSWER_WAIT_MS: u64 = 2_000;
+/// Flick's answer to a `lone`.
+const ACK_LINE: &str = "ack";
 
 /// A line from the helper.
 #[derive(Debug, PartialEq, Eq)]
@@ -84,25 +87,66 @@ fn parse_take(line: &str) -> Option<bool> {
     }
 }
 
+fn is_ack(line: &str) -> bool {
+    line.trim_end_matches(['\r', '\n']) == ACK_LINE
+}
+
+/// Whether Flick still answers: no `lone` is waiting for its `ack`
+/// (`pending_since_ms` 0), or the oldest one has waited less than
+/// [`ANSWER_WAIT_MS`].
+fn flick_answers(pending_since_ms: u64, now_ms: u64) -> bool {
+    pending_since_ms == 0 || now_ms.saturating_sub(pending_since_ms) < ANSWER_WAIT_MS
+}
+
+/// What wakes the thread that writes to the helper.
+enum Wake {
+    /// What `may_take` answers may have changed.
+    Changed,
+    /// Flick acted on a `lone`.
+    Ack,
+    Stop,
+}
+
+/// Wakes the thread that writes to a helper. Outliving the helper is fine:
+/// the calls then do nothing.
+#[derive(Clone)]
+pub struct Waker(mpsc::Sender<Wake>);
+
+impl Waker {
+    /// What `may_take` answers may have changed: ask it and tell the helper.
+    pub fn changed(&self) {
+        let _ = self.0.send(Wake::Changed);
+    }
+
+    /// Flick acted on the `lone` this came with.
+    pub fn ack(&self) {
+        let _ = self.0.send(Wake::Ack);
+    }
+}
+
 /// The running helper, as Flick sees it. Stopping it (or dropping it) closes
 /// the helper's stdin, so it removes its hooks and ends.
 pub struct WinKeyHelper {
     child: Child,
-    stop: Arc<AtomicBool>,
+    wake: mpsc::Sender<Wake>,
     writer: Option<JoinHandle<()>>,
     reader: Option<JoinHandle<()>>,
     healthy: Arc<AtomicBool>,
+    /// The helper's output has closed: it has ended.
+    ended: Arc<AtomicBool>,
 }
 
 impl WinKeyHelper {
     /// Starts the helper and waits until its hook is installed (up to 10 s).
     ///
-    /// `may_take` is polled every 50 ms on a thread of its own and must return
-    /// at once. `on_lone` runs on the thread reading the helper; it must not
-    /// wait on the thread that calls [`WinKeyHelper::stop`].
+    /// `may_take` is asked once now and again after each [`Waker::changed`],
+    /// on a thread of its own; it must return at once. `on_lone` runs on the
+    /// thread reading the helper; it must not wait on the thread that calls
+    /// [`WinKeyHelper::stop`], and whoever acts on the press calls
+    /// [`Waker::ack`] on the waker it is given when done.
     pub fn start(
         may_take: Box<dyn Fn() -> bool + Send + Sync>,
-        on_lone: Box<dyn Fn() + Send + Sync>,
+        on_lone: Box<dyn Fn(Waker) + Send + Sync>,
     ) -> Result<WinKeyHelper, String> {
         let exe = std::env::current_exe().map_err(|_| UNAVAILABLE.to_string())?;
         let mut child = Command::new(exe)
@@ -120,11 +164,10 @@ impl WinKeyHelper {
             return Err(UNAVAILABLE.to_string());
         };
 
-        let stop = Arc::new(AtomicBool::new(false));
-        let writer_stop = stop.clone();
+        let (wake, woken) = mpsc::channel::<Wake>();
         let writer = std::thread::Builder::new()
             .name("flick-winkey-take".into())
-            .spawn(move || write_take(stdin, may_take, writer_stop));
+            .spawn(move || write_take(stdin, may_take, woken));
         let writer = match writer {
             Ok(w) => w,
             Err(_) => {
@@ -136,12 +179,15 @@ impl WinKeyHelper {
 
         let healthy = Arc::new(AtomicBool::new(true));
         let reader_healthy = healthy.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let reader_ended = ended.clone();
+        let reader_waker = Waker(wake.clone());
         let (first_tx, first_rx) = mpsc::channel::<Report>();
         let reader = std::thread::Builder::new()
             .name("flick-winkey-lone".into())
-            .spawn(move || read_reports(stdout, first_tx, on_lone, reader_healthy));
+            .spawn(move || read_reports(stdout, first_tx, on_lone, reader_waker, reader_healthy, reader_ended));
 
-        let mut helper = WinKeyHelper { child, stop, writer: Some(writer), reader: reader.ok(), healthy };
+        let mut helper = WinKeyHelper { child, wake, writer: Some(writer), reader: reader.ok(), healthy, ended };
         if helper.reader.is_none() {
             return Err(UNAVAILABLE.to_string());
         }
@@ -162,11 +208,21 @@ impl WinKeyHelper {
     pub fn healthy(&self) -> bool {
         self.healthy.load(Ordering::Relaxed)
     }
+
+    /// The helper process has ended on its own (crashed or was ended).
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+    }
+
+    /// For telling the helper that `may_take` changed.
+    pub fn waker(&self) -> Waker {
+        Waker(self.wake.clone())
+    }
 }
 
 impl Drop for WinKeyHelper {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        let _ = self.wake.send(Wake::Stop);
         let me = std::thread::current().id();
         // The writer drops the helper's stdin as it ends: the helper's signal to quit.
         if let Some(w) = self.writer.take() {
@@ -193,19 +249,28 @@ impl Drop for WinKeyHelper {
     }
 }
 
-/// Flick's side: sends the take state whenever it changes, until told to stop
-/// or the helper is gone.
-fn write_take(mut stdin: ChildStdin, may_take: Box<dyn Fn() -> bool + Send + Sync>, stop: Arc<AtomicBool>) {
+/// Flick's side: sends the take state whenever it changes and each `ack`,
+/// until told to stop or the helper is gone. Sleeps between wake-ups.
+fn write_take(mut stdin: ChildStdin, may_take: Box<dyn Fn() -> bool + Send + Sync>, woken: mpsc::Receiver<Wake>) {
+    let mut say = |line: &str| writeln!(stdin, "{line}").and_then(|()| stdin.flush()).is_ok();
     let mut sent: Option<bool> = None;
-    while !stop.load(Ordering::SeqCst) {
+    loop {
         let take = catch_unwind(AssertUnwindSafe(|| may_take())).unwrap_or(false);
         if sent != Some(take) {
-            if writeln!(stdin, "{}", take_line(take)).and_then(|()| stdin.flush()).is_err() {
+            if !say(take_line(take)) {
                 return;
             }
             sent = Some(take);
         }
-        std::thread::sleep(TAKE_POLL);
+        match woken.recv() {
+            Ok(Wake::Changed) => {}
+            Ok(Wake::Ack) => {
+                if !say(ACK_LINE) {
+                    return;
+                }
+            }
+            Ok(Wake::Stop) | Err(_) => return,
+        }
     }
 }
 
@@ -213,8 +278,10 @@ fn write_take(mut stdin: ChildStdin, may_take: Box<dyn Fn() -> bool + Send + Syn
 fn read_reports(
     stdout: std::process::ChildStdout,
     first: mpsc::Sender<Report>,
-    on_lone: Box<dyn Fn() + Send + Sync>,
+    on_lone: Box<dyn Fn(Waker) + Send + Sync>,
+    waker: Waker,
     healthy: Arc<AtomicBool>,
+    ended: Arc<AtomicBool>,
 ) {
     let mut first = Some(first);
     for line in BufReader::new(stdout).lines() {
@@ -224,13 +291,13 @@ fn read_reports(
             let ready = report == Report::Ready;
             let _ = tx.send(report);
             if !ready {
-                return;
+                break;
             }
             continue;
         }
         match report {
             Report::Lone => {
-                let _ = catch_unwind(AssertUnwindSafe(|| on_lone()));
+                let _ = catch_unwind(AssertUnwindSafe(|| on_lone(waker.clone())));
             }
             Report::Healthy(h) => healthy.store(h, Ordering::Relaxed),
             Report::Ready | Report::Unavailable(_) => {}
@@ -238,6 +305,7 @@ fn read_reports(
     }
     // The helper ended: there's no hook any more.
     healthy.store(false, Ordering::Relaxed);
+    ended.store(true, Ordering::Relaxed);
 }
 
 /// The helper's side: runs the hook until Flick closes our stdin. `parent` is
@@ -257,10 +325,18 @@ pub fn helper_main(parent: u32) {
 
     let take = Arc::new(AtomicBool::new(false));
     let stdin_take = take.clone();
+    // When the oldest `lone` without an `ack` was sent (see `clock`); 0: none.
+    let pending = Arc::new(AtomicU64::new(0));
+    let stdin_pending = pending.clone();
+    let started = Instant::now();
+    // Milliseconds since the helper started; never 0.
+    let clock = move || started.elapsed().as_millis() as u64 + 1;
     let watch = std::thread::Builder::new().name("flick-helper-stdin".into()).spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
-            if let Some(t) = parse_take(&line) {
+            if is_ack(&line) {
+                stdin_pending.store(0, Ordering::SeqCst);
+            } else if let Some(t) = parse_take(&line) {
                 stdin_take.store(t, Ordering::SeqCst);
             }
         }
@@ -273,15 +349,21 @@ pub fn helper_main(parent: u32) {
         return;
     }
 
-    let may_take: Box<dyn Fn() -> bool + Send + Sync> = Box::new(move || take.load(Ordering::SeqCst));
+    let take_pending = pending.clone();
+    let may_take: Box<dyn Fn() -> bool + Send + Sync> = Box::new(move || {
+        take.load(Ordering::SeqCst) && flick_answers(take_pending.load(Ordering::SeqCst), clock())
+    });
     let lone_send = send.clone();
     let on_lone: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+        // Only the oldest unanswered press counts.
+        let _ = pending.compare_exchange(0, clock(), Ordering::SeqCst, Ordering::SeqCst);
         // SAFETY: a plain Win32 call; failing only means Flick falls back to
         // its own way of taking the foreground.
         let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(parent) };
         lone_send(Report::Lone);
     });
-    let hook = match WinKeyHook::start(may_take, on_lone) {
+    let (health_tx, health) = mpsc::channel();
+    let _hook = match WinKeyHook::start(may_take, on_lone, health_tx) {
         Ok(hook) => hook,
         Err(reason) => {
             send(Report::Unavailable(reason));
@@ -289,14 +371,10 @@ pub fn helper_main(parent: u32) {
         }
     };
     send(Report::Ready);
-    let mut told = true;
-    loop {
-        std::thread::sleep(HEALTH_POLL);
-        let h = hook.healthy();
-        if h != told {
-            told = h;
-            send(Report::Healthy(h));
-        }
+    // Sleeps until the hook's health changes. The channel closes only if the
+    // hook thread has ended: then so does the helper, and Flick starts another.
+    for healthy in health {
+        send(Report::Healthy(healthy));
     }
 }
 
@@ -335,6 +413,38 @@ mod tests {
     fn take_lines_round_trip_with_windows_line_ends() {
         assert_eq!(parse_take(&format!("{}\r\n", take_line(true))), Some(true));
         assert_eq!(parse_take(take_line(false)), Some(false));
+    }
+
+    #[test]
+    fn an_ack_is_not_a_take_line() {
+        assert!(is_ack("ack"));
+        assert!(is_ack("ack\r\n"));
+        assert!(!is_ack("take 1"));
+        assert_eq!(parse_take(ACK_LINE), None);
+    }
+
+    #[test]
+    fn an_unanswered_lone_stops_the_taking_after_two_seconds() {
+        assert!(flick_answers(0, 99_999), "nothing waiting");
+        assert!(flick_answers(1_000, 1_000));
+        assert!(flick_answers(1_000, 2_999));
+        assert!(!flick_answers(1_000, 3_000), "Flick is stuck: Win goes to Windows");
+    }
+
+    #[test]
+    fn the_writer_tells_changes_and_acks_then_stops() {
+        // A pipe-free check of the wake-ups: the waker only queues messages.
+        let (tx, rx) = mpsc::channel();
+        let waker = Waker(tx);
+        waker.changed();
+        waker.ack();
+        assert!(matches!(rx.try_recv(), Ok(Wake::Changed)));
+        assert!(matches!(rx.try_recv(), Ok(Wake::Ack)));
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        // The helper is gone: still harmless.
+        waker.changed();
+        waker.ack();
     }
 
     #[test]

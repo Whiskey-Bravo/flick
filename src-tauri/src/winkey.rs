@@ -24,8 +24,7 @@
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,13 +35,10 @@ use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, VIRTUAL_KEY,
+    GetAsyncKeyState, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY,
     VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
-use windows::Win32::UI::Input::{
-    GetRegisteredRawInputDevices, RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK,
-    RIDEV_REMOVE,
-};
+use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     KillTimer, PeekMessageW, PostThreadMessageW, RegisterClassW, SetTimer, SetWindowsHookExW,
@@ -53,7 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::controls::key_input;
-use crate::winkey_logic::{hold_is_stale, is_late, step, Ev, Held, Press, Step, Verdict, Watchdog};
+use crate::winkey_logic::{fresh_press, hold_is_stale, is_late, step, Ev, Held, Press, Step, Verdict, Watchdog};
 
 /// Tag on the input Flick sends itself ("FLWK"); one value shared with controls.rs.
 pub const FLICK_TAG: usize = crate::controls::FLICK_INPUT_TAG;
@@ -73,16 +69,15 @@ const WATCHDOG_MS: u32 = 5_000;
 const RETRY_MS: u32 = 3_000;
 
 /// Shown when the keyboard hook can't be installed.
-const UNAVAILABLE: &str = "Windows wouldn't let Flick watch the Win key.";
+pub const UNAVAILABLE: &str = "Windows wouldn't let Flick watch the Win key.";
 
-/// The running Win-key hook. Stopping it (or dropping it) removes both hooks
-/// and ends its threads.
+/// The running Win-key hook. Dropping it removes both hooks and ends its
+/// threads.
 pub struct WinKeyHook {
     thread_id: u32,
     thread: Option<JoinHandle<()>>,
     /// Runs `on_lone`; ends when the hook thread drops its sender.
     worker: Option<JoinHandle<()>>,
-    healthy: Arc<AtomicBool>,
 }
 
 impl WinKeyHook {
@@ -94,10 +89,13 @@ impl WinKeyHook {
     /// return at once (atomics only; no locks the UI thread may hold, no
     /// waiting). `on_lone` runs on a worker thread of its own after a taken
     /// press, never on the hook thread; it must not wait on the thread that
-    /// calls [`WinKeyHook::stop`].
+    /// drops the hook. `health` gets `false` once reinstalling the keyboard
+    /// hook has failed twice in a row and `true` after the next successful
+    /// install; it disconnects when the hook thread ends.
     pub fn start(
         may_take: Box<dyn Fn() -> bool + Send + Sync>,
         on_lone: Box<dyn Fn() + Send + Sync>,
+        health: mpsc::Sender<bool>,
     ) -> Result<WinKeyHook, String> {
         let (lone_tx, lone_rx) = mpsc::channel::<()>();
         let worker = std::thread::Builder::new()
@@ -108,13 +106,11 @@ impl WinKeyHook {
                 }
             })
             .map_err(|_| UNAVAILABLE.to_string())?;
-        let healthy = Arc::new(AtomicBool::new(true));
         let (ready_tx, ready_rx) = mpsc::channel();
-        let thread_healthy = healthy.clone();
         // On failure here `lone_tx` is dropped with the closure, ending the worker.
         let thread = match std::thread::Builder::new()
             .name("flick-winkey".into())
-            .spawn(move || run(may_take, lone_tx, thread_healthy, ready_tx))
+            .spawn(move || run(may_take, lone_tx, health, ready_tx))
         {
             Ok(thread) => thread,
             Err(_) => {
@@ -127,7 +123,6 @@ impl WinKeyHook {
                 thread_id,
                 thread: Some(thread),
                 worker: Some(worker),
-                healthy,
             }),
             failed => {
                 // The hook thread has ended (or is ending) and drops `lone_tx`.
@@ -136,12 +131,6 @@ impl WinKeyHook {
                 Err(failed.ok().and_then(Result::err).unwrap_or_else(|| UNAVAILABLE.to_string()))
             }
         }
-    }
-
-    /// False once reinstalling the keyboard hook has failed twice in a row;
-    /// true again after the next successful install.
-    pub fn healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
     }
 }
 
@@ -193,13 +182,16 @@ struct Hooked {
     /// The Win key whose down is held back from Windows, if any, and
     /// `GetTickCount64` at its last event (the down or an auto-repeat).
     held: Option<(u16, u64)>,
+    /// The last Win key seen going down (not Flick's own) and when, to tell
+    /// an auto-repeat from a fresh press (see [`fresh_press`]).
+    last_down: Option<(u16, u64)>,
 }
 
 type MayTake = Box<dyn Fn() -> bool + Send + Sync>;
 
 thread_local! {
     static MAY_TAKE: OnceCell<MayTake> = const { OnceCell::new() };
-    static HOOKED: RefCell<Hooked> = RefCell::new(Hooked { press: Press::new(), generation: 0, held: None });
+    static HOOKED: RefCell<Hooked> = RefCell::new(Hooked { press: Press::new(), generation: 0, held: None, last_down: None });
     /// `GetTickCount64` at the keyboard hook's last event, for the watchdog.
     static LAST_EVENT_MS: Cell<u64> = const { Cell::new(0) };
     /// `GetTickCount64` at the last raw keyboard input (`WM_INPUT`); 0 if none.
@@ -211,7 +203,7 @@ thread_local! {
 fn run(
     may_take: MayTake,
     lone: mpsc::Sender<()>,
-    healthy: Arc<AtomicBool>,
+    health: mpsc::Sender<bool>,
     ready: mpsc::Sender<Result<u32, String>>,
 ) {
     // SAFETY: plain Win32 calls on this thread. PeekMessageW creates the
@@ -244,6 +236,14 @@ fn run(
     let mut mouse: Option<HHOOK> = None;
     let mut watchdog = Watchdog::new();
     let mut failures = 0u32;
+    // What `health` was last told; it hears changes only.
+    let mut told_healthy = true;
+    let mut tell = |healthy: bool| {
+        if healthy != told_healthy {
+            told_healthy = healthy;
+            let _ = health.send(healthy);
+        }
+    };
     let mut retry_timer = 0usize;
     // SAFETY: a thread timer (no window); WM_TIMER comes to this queue.
     let tick_timer = unsafe { SetTimer(None, 0, WATCHDOG_MS, None) };
@@ -296,14 +296,14 @@ fn run(
                 if attempt {
                     if reinstall(&mut keyboard, &mut mouse) {
                         failures = 0;
-                        healthy.store(true, Ordering::Relaxed);
+                        tell(true);
                     } else {
                         failures += 1;
                         if failures == 1 {
                             // SAFETY: a thread timer (no window).
                             retry_timer = unsafe { SetTimer(None, 0, RETRY_MS, None) };
                         } else {
-                            healthy.store(false, Ordering::Relaxed);
+                            tell(false);
                         }
                     }
                 }
@@ -324,19 +324,17 @@ fn run(
     set_mouse(&mut mouse, false);
     // SAFETY: a hook this thread installed.
     let _ = unsafe { UnhookWindowsHookEx(keyboard) };
-    if let Some((hwnd, previous)) = raw_window {
-        // Hand the process's keyboard registration back to whoever had it
-        // (tao's event loop), or remove it if nobody did.
-        let restore = previous.unwrap_or(RAWINPUTDEVICE {
+    if let Some(hwnd) = raw_window {
+        let remove = RAWINPUTDEVICE {
             usUsagePage: KEYBOARD_PAGE,
             usUsage: KEYBOARD_USAGE,
             dwFlags: RIDEV_REMOVE,
             hwndTarget: HWND::default(),
-        });
+        };
         // SAFETY: one valid device entry; then destroying the window this
         // thread made.
         unsafe {
-            let _ = RegisterRawInputDevices(&[restore], RAW_DEVICE_SIZE);
+            let _ = RegisterRawInputDevices(&[remove], RAW_DEVICE_SIZE);
             let _ = DestroyWindow(hwnd);
         }
     }
@@ -348,33 +346,10 @@ const KEYBOARD_PAGE: u16 = 1;
 const KEYBOARD_USAGE: u16 = 6;
 const RAW_DEVICE_SIZE: u32 = std::mem::size_of::<RAWINPUTDEVICE>() as u32;
 
-/// The process's current raw keyboard registration, if any. Raw input allows
-/// one target per device type per process, so registering takes it over.
-fn registered_keyboard() -> Option<RAWINPUTDEVICE> {
-    let mut count = 0u32;
-    // SAFETY: a count query (null buffer), then a buffer of that many entries.
-    unsafe {
-        GetRegisteredRawInputDevices(None, &mut count, RAW_DEVICE_SIZE);
-        if count == 0 {
-            return None;
-        }
-        let mut devices = vec![RAWINPUTDEVICE::default(); count as usize];
-        let got = GetRegisteredRawInputDevices(Some(devices.as_mut_ptr()), &mut count, RAW_DEVICE_SIZE);
-        if got == u32::MAX {
-            return None;
-        }
-        devices.truncate(got as usize);
-        devices.into_iter().find(|d| d.usUsagePage == KEYBOARD_PAGE && d.usUsage == KEYBOARD_USAGE)
-    }
-}
-
 /// A message-only window on this thread that receives raw keyboard input
-/// even when Flick isn't in front, and the registration it replaced. `None`
-/// if Windows refuses either step.
-///
-/// Taking over the registration means tao gets no keyboard `DeviceEvent`s
-/// while the hook runs (Flick uses none); it gets them back at stop.
-fn raw_keyboard_window() -> Option<(HWND, Option<RAWINPUTDEVICE>)> {
+/// whatever window is in front. `None` if Windows refuses either step. The
+/// helper process has no other raw input, so nothing is taken over.
+fn raw_keyboard_window() -> Option<HWND> {
     let class = w!("FlickWinKeyRawInput");
     let wc = WNDCLASSW { lpfnWndProc: Some(raw_proc), hInstance: instance(), lpszClassName: class, ..Default::default() };
     // SAFETY: a valid class description; registering twice (a second start)
@@ -397,7 +372,6 @@ fn raw_keyboard_window() -> Option<(HWND, Option<RAWINPUTDEVICE>)> {
         )
     }
     .ok()?;
-    let previous = registered_keyboard();
     let device = RAWINPUTDEVICE {
         usUsagePage: KEYBOARD_PAGE,
         usUsage: KEYBOARD_USAGE,
@@ -406,7 +380,7 @@ fn raw_keyboard_window() -> Option<(HWND, Option<RAWINPUTDEVICE>)> {
     };
     // SAFETY: one valid device entry for a window this thread owns.
     match unsafe { RegisterRawInputDevices(&[device], RAW_DEVICE_SIZE) } {
-        Ok(()) => Some((hwnd, previous)),
+        Ok(()) => Some(hwnd),
         Err(_) => {
             // SAFETY: the window just made on this thread.
             let _ = unsafe { DestroyWindow(hwnd) };
@@ -515,7 +489,21 @@ fn on_key(k: &KBDLLHOOKSTRUCT) -> bool {
     if is_win(vk) && !up && holding_key(now_ms()).is_some_and(|win| win != vk as u16) {
         forget_hold();
     }
-    let held = if is_win(vk) && !up && k.dwExtraInfo != FLICK_TAG { held_now(vk) } else { Held::default() };
+    let mut held = if is_win(vk) && !up && k.dwExtraInfo != FLICK_TAG { held_now(vk) } else { Held::default() };
+    if is_win(vk) && !up && k.dwExtraInfo != FLICK_TAG {
+        let now = now_ms();
+        let last = HOOKED.with(|h| h.try_borrow_mut().ok().and_then(|mut h| h.last_down.replace((vk as u16, now))));
+        let last_same = last.and_then(|(win, at)| (win == vk as u16).then_some(at));
+        if held.win_already_down && fresh_press(now, last_same) {
+            // Windows still counts this Win key as down from a press whose up
+            // the hook never saw (Win+L, an administrator window). Release it
+            // first (it lands before this event), then treat this as the new
+            // press it is.
+            // SAFETY: a valid slice of one initialised INPUT.
+            unsafe { SendInput(&[tagged_win_up(vk as u16)], std::mem::size_of::<INPUT>() as i32) };
+            held.win_already_down = false;
+        }
+    }
     let Some(ev) = key_event(vk, up, injected, k.dwExtraInfo, held) else { return false };
     let button_held = ev == Ev::WinUp && any_button_down();
     // SAFETY: no arguments.
@@ -641,6 +629,14 @@ fn tagged_win_down(win: u16) -> INPUT {
     let mut i = key_input(VIRTUAL_KEY(win), false);
     // A down: no other flags.
     i.Anonymous.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+    i.Anonymous.ki.dwExtraInfo = FLICK_TAG;
+    i
+}
+
+/// A Win-up tagged as Flick's own, to clear a key Windows wrongly counts as down.
+fn tagged_win_up(win: u16) -> INPUT {
+    let mut i = key_input(VIRTUAL_KEY(win), true);
+    i.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
     i.Anonymous.ki.dwExtraInfo = FLICK_TAG;
     i
 }
