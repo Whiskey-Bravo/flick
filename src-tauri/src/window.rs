@@ -293,6 +293,67 @@ fn reveal_window(w: &WebviewWindow) {
     let _ = w.set_focus();
 }
 
+/// The bar window's size as the config file gives it (logical pixels).
+const BAR_WIDTH: f64 = 680.0;
+const BAR_HEIGHT: f64 = 420.0;
+/// The Glass theme's corner radius (logical pixels), as in styles.css.
+const GLASS_RADIUS: f64 = 18.0;
+/// Glass is on: the window is blurred behind and shaped to the panel.
+static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switches the Glass theme's window treatment on or off: Windows blurs what
+/// is behind the bar window, and the window is cut to the panel's shape
+/// ([`shape`]) so nothing outside the panel is blurred. Off puts the window
+/// back as every other theme has it.
+pub fn set_glass(app: &AppHandle, on: bool) {
+    use tauri::window::{Effect, EffectsBuilder};
+    let was = GLASS.swap(on, Ordering::SeqCst);
+    let Some(w) = bar(app) else { return };
+    if on {
+        let _ = w.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).build());
+    } else if was {
+        let _ = w.set_effects(None);
+        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, BAR_HEIGHT));
+        if let Ok(h) = w.hwnd() {
+            // SAFETY: removing the region of this app's own window.
+            unsafe { windows::Win32::Graphics::Gdi::SetWindowRgn(HWND(h.0 as _), None, true) };
+        }
+    }
+}
+
+/// The height the bar window takes for a panel `wanted` logical pixels tall.
+fn glass_height(wanted: f64) -> f64 {
+    if wanted.is_finite() {
+        wanted.clamp(2.0 * GLASS_RADIUS, BAR_HEIGHT)
+    } else {
+        BAR_HEIGHT
+    }
+}
+
+/// Glass only: the page says how tall the panel is (logical pixels), and the
+/// window is resized and rounded to it. Ignored under every other theme.
+#[tauri::command]
+pub fn bar_shape(app: AppHandle, height: f64) {
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+    if !GLASS.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(w) = bar(&app) else { return };
+    let height = glass_height(height);
+    let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
+    let scale = w.scale_factor().unwrap_or(1.0);
+    let px = |v: f64| (v * scale).round() as i32;
+    if let Ok(h) = w.hwnd() {
+        // SAFETY: a region for this app's own window; the window owns the
+        // region once it is set.
+        unsafe {
+            let corner = px(2.0 * GLASS_RADIUS);
+            let region = CreateRoundRectRgn(0, 0, px(BAR_WIDTH) + 1, px(height) + 1, corner, corner);
+            SetWindowRgn(HWND(h.0 as _), Some(region), true);
+        }
+    }
+}
+
 /// Tells the weather store whether the bar is hidden (memory only).
 fn set_weather_hidden(app: &AppHandle, hidden: bool) {
     if let Some(state) = app.try_state::<crate::AppState>() {
@@ -370,6 +431,17 @@ mod tests {
         assert!(!may_attach(20, 10, true), "the front window is hung");
         assert!(!may_attach(0, 10, false), "no front window");
         assert!(!may_attach(10, 10, false), "the bar's own thread");
+    }
+
+    #[test]
+    fn the_glass_window_is_never_taller_than_the_bar_or_flatter_than_its_corners() {
+        assert_eq!(glass_height(57.0), 57.0);
+        assert_eq!(glass_height(409.4), 409.4);
+        assert_eq!(glass_height(900.0), BAR_HEIGHT);
+        assert_eq!(glass_height(0.0), 36.0);
+        assert_eq!(glass_height(-5.0), 36.0);
+        assert_eq!(glass_height(f64::NAN), BAR_HEIGHT);
+        assert_eq!(glass_height(f64::INFINITY), BAR_HEIGHT);
     }
 
     #[test]

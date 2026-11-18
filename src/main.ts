@@ -257,6 +257,7 @@ function render() {
   // Invisible while hidden (medium and high levels), so the next open starts
   // from nothing; anything that brings the bar back clears it.
   panel.classList.toggle("closed", state.hidden);
+  reportShape();
 }
 
 function dispatch(event: Event) {
@@ -432,9 +433,26 @@ listen("update:changed", () => dispatch({ type: "updateChanged" })).catch(listen
 listen("bar:hidden", () => dispatch({ type: "hidden" })).catch(listenFailed);
 listen<string | null>("config:error", (e) => dispatch({ type: "configError", message: e.payload })).catch(listenFailed);
 
+// Glass only: the back end cuts the window to the panel, so it is told the
+// panel's height whenever that changes (and the menu's, which may reach
+// below the panel).
+let glass = false;
+let shapeSent = -1;
+const reportShape = () => {
+  if (!glass) return;
+  const below = menuEl.hidden ? 0 : menuEl.getBoundingClientRect().bottom + 6;
+  const height = Math.ceil(Math.max(panel.getBoundingClientRect().bottom, below));
+  if (height === shapeSent) return;
+  shapeSent = height;
+  invoke("bar_shape", { height }).catch(() => {});
+};
+new ResizeObserver(reportShape).observe(panel);
+
 // The theme and animation level: asked once, then pushed on every change.
 const themed = (a: Appearance) => {
   applyAppearance(a, a.colors, document.documentElement);
+  glass = a.glass;
+  shapeSent = -1;
   if (a.colors.text !== iconInk) {
     iconInk = a.colors.text;
     svgUrls.clear();

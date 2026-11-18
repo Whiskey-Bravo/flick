@@ -1038,6 +1038,7 @@ pub fn run() {
             direct_keys::settings_hotkey_status,
             settings::settings_win_key_status,
             appearance,
+            window::bar_shape,
             updates::settings_update_status,
             updates::settings_check_now,
             updates::settings_install_update
@@ -1162,6 +1163,7 @@ fn setup(app: &AppHandle) {
     // The Win key: its worker starts the hook when the setting is on.
     {
         let state = app.state::<AppState>();
+        window::set_glass(app, current_appearance(&state).glass);
         state.win_key.flags.set_bar_ready(app.get_webview_window(window::LABEL).is_some());
         let worker = app.clone();
         std::thread::Builder::new()
@@ -1485,7 +1487,9 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     // read on this is fresh. It carries nothing, so its order needs no lock.
     let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
     // Both pages repaint with the theme and animation level now in force.
-    let _ = app.emit("appearance:changed", current_appearance(&state));
+    let appearance = current_appearance(&state);
+    window::set_glass(app, appearance.glass);
+    let _ = app.emit("appearance:changed", appearance);
 }
 
 /// The theme and animation level of the config in force.
