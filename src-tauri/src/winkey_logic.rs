@@ -165,8 +165,22 @@ pub enum Step {
     Drop,
 }
 
+/// How long a held-back Win may go without an event before it counts as
+/// released. While it's physically down it auto-repeats at least every 400 ms
+/// (the slowest repeat rate, after at most a 1 s delay); silence means its up
+/// went where the hook can't see (an administrator window, the secure desktop)
+/// or Windows dropped the hook.
+pub const HOLD_STALE_MS: u64 = 1_500;
+
+/// Whether a hold whose last event was at `last_ms` is stale at `now_ms`
+/// (`GetTickCount64` milliseconds). A stale hold is dropped, never replayed.
+pub fn hold_is_stale(now_ms: u64, last_ms: u64) -> bool {
+    now_ms.saturating_sub(last_ms) > HOLD_STALE_MS
+}
+
 /// Decides the [`Step`] for `ev`, after [`Press::on`] gave `verdict`. `take`
-/// is [`take_lone`]'s answer now; `late` whether the event reached the hook
+/// is [`take_lone`]'s answer now (asked again at the Win-up, so a pause or a
+/// full-screen app that started meanwhile wins); `late` whether the event reached the hook
 /// late (only a Win-down's lateness matters: Windows may already have passed it).
 pub fn step(held: bool, ev: Ev, verdict: Verdict, take: bool, late: bool) -> Step {
     match ev {
@@ -179,7 +193,7 @@ pub fn step(held: bool, ev: Ev, verdict: Verdict, take: bool, late: bool) -> Ste
             }
         }
         Ev::WinUp if held => {
-            if verdict == Verdict::Lone {
+            if verdict == Verdict::Lone && take {
                 Step::Open
             } else {
                 Step::Drop
@@ -501,6 +515,21 @@ mod tests {
         assert_eq!(step(false, down, Verdict::ArmMouse, true, true), Step::Pass, "late");
         assert_eq!(step(false, down, Verdict::Pass, true, false), Step::Pass, "combination from the start");
         assert_eq!(step(false, Ev::WinUp, Verdict::Lone, true, false), Step::Pass, "Start opens");
+    }
+
+    #[test]
+    fn a_lone_tap_flick_may_no_longer_take_is_dropped() {
+        // Windows never saw the press, so dropping its up opens nothing.
+        assert_eq!(step(true, Ev::WinUp, Verdict::Lone, false, false), Step::Drop);
+    }
+
+    #[test]
+    fn a_hold_without_events_for_over_1_5_s_is_stale() {
+        assert!(!hold_is_stale(1_000, 1_000));
+        assert!(!hold_is_stale(2_500, 1_000));
+        assert!(hold_is_stale(2_501, 1_000));
+        // A stamp ahead of the clock is not stale.
+        assert!(!hold_is_stale(1_000, 2_000));
     }
 
     #[test]

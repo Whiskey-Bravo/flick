@@ -36,6 +36,12 @@ describe("bar", () => {
     expect(entered.queued).toBe("none");
   });
 
+  it("a direct hotkey's row is not kept, even once its arm is gone", () => {
+    const armed = run(initial, { type: "armed", item: item("x", true) }, { type: "blurred" }, { type: "hidden" }).state;
+    expect(armed.armed).toBeNull();
+    expect(run(armed, { type: "shown" }).state.items).toEqual([]);
+  });
+
   it("a bar closed with text or in a pick list opens empty", () => {
     const typed = run(withItems(item("a")), { type: "input", text: "x" }, { type: "results", items: [item("x")] }).state;
     expect(run(typed, { type: "shown" }).state.items).toEqual([]);

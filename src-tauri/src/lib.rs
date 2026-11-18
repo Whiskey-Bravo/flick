@@ -589,8 +589,8 @@ impl WinKey {
         WinKey { flags: Arc::default(), hook: Mutex::new(None), failed: AtomicBool::new(false), wanted }
     }
 
-    /// Asks for the hook on or off. Turning it off takes effect for the next
-    /// press at once, before the hook has stopped.
+    /// Asks for the hook on or off. Turning it off reaches the helper within
+    /// about 50 ms, before the hook has stopped.
     fn want(&self, on: bool) {
         self.flags.set_on(on);
         let _ = self.wanted.send(on);

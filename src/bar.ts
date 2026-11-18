@@ -183,11 +183,13 @@ function step(s: State, e: Event): Result {
         { type: "query", text: "", scope: null },
         { type: "loadPast" },
       ];
-      // Closed as an empty bar: its rows stay up until the fresh ones replace
-      // them, so the list doesn't vanish and come back as the bar opens. An
-      // Enter meanwhile waits for the fresh rows. Otherwise the bar opens with
-      // no rows and an Enter does nothing until they arrive.
-      if (s.text === "" && !s.scope && !s.armed && s.items.length > 0) {
+      // Closed as an empty bar showing the empty query's rows: they stay up
+      // until the fresh ones replace them, so the list doesn't vanish and come
+      // back as the bar opens. An Enter meanwhile waits for the fresh rows.
+      // Otherwise (typed text, a pick list, a direct hotkey's row) the bar
+      // opens with no rows and an Enter does nothing until they arrive.
+      const emptyRows = s.queried?.text === "" && s.queried.scope === null;
+      if (s.text === "" && !s.scope && !s.armed && emptyRows && s.items.length > 0) {
         return done(fit({ ...fresh, items: s.items, selected: emptyBarSelection(s.items), awaiting: true }), effects);
       }
       return done(fresh, effects);

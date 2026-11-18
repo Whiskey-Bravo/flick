@@ -257,7 +257,7 @@ pub fn helper_main(parent: u32) {
 
     let take = Arc::new(AtomicBool::new(false));
     let stdin_take = take.clone();
-    let _ = std::thread::Builder::new().name("flick-helper-stdin".into()).spawn(move || {
+    let watch = std::thread::Builder::new().name("flick-helper-stdin".into()).spawn(move || {
         for line in std::io::stdin().lock().lines() {
             let Ok(line) = line else { break };
             if let Some(t) = parse_take(&line) {
@@ -267,6 +267,11 @@ pub fn helper_main(parent: u32) {
         // Flick closed our stdin or ended: Windows removes the hooks as we exit.
         std::process::exit(0);
     });
+    if watch.is_err() {
+        // Without it the helper would never notice Flick has gone.
+        send(Report::Unavailable(UNAVAILABLE.to_string()));
+        return;
+    }
 
     let may_take: Box<dyn Fn() -> bool + Send + Sync> = Box::new(move || take.load(Ordering::SeqCst));
     let lone_send = send.clone();

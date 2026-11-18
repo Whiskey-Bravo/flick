@@ -53,7 +53,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::controls::key_input;
-use crate::winkey_logic::{is_late, step, Ev, Held, Press, Step, Verdict, Watchdog};
+use crate::winkey_logic::{hold_is_stale, is_late, step, Ev, Held, Press, Step, Verdict, Watchdog};
 
 /// Tag on the input Flick sends itself ("FLWK"); one value shared with controls.rs.
 pub const FLICK_TAG: usize = crate::controls::FLICK_INPUT_TAG;
@@ -190,8 +190,9 @@ struct Hooked {
     /// Bumped whenever the keyboard hook is (re)installed, so mouse-hook
     /// messages posted for an older press are ignored.
     generation: usize,
-    /// The Win key whose down is held back from Windows, if any.
-    held: Option<u16>,
+    /// The Win key whose down is held back from Windows, if any, and
+    /// `GetTickCount64` at its last event (the down or an auto-repeat).
+    held: Option<(u16, u64)>,
 }
 
 type MayTake = Box<dyn Fn() -> bool + Send + Sync>;
@@ -287,7 +288,7 @@ fn run(
                         let last_event = LAST_EVENT_MS.with(|t| t.get());
                         let last_raw = LAST_RAW_KEY_MS.with(|t| t.get());
                         // Never reinstall in the middle of a press.
-                        !win_held() && !holding() && watchdog.should_reinstall(now_ms(), last_event, last_raw)
+                        !win_held() && !holding(now_ms()) && watchdog.should_reinstall(now_ms(), last_event, last_raw)
                     }
                 } else {
                     false
@@ -508,6 +509,12 @@ fn on_key(k: &KBDLLHOOKSTRUCT) -> bool {
     let vk = k.vkCode;
     let up = k.flags.0 & LLKHF_UP.0 != 0;
     let injected = k.flags.0 & LLKHF_INJECTED.0 != 0;
+    // The other Win going down while one is held back: both Win keys together
+    // mean nothing to Windows, and the held one's up may have gone where the
+    // hook can't see. Forget it without replaying, so it can't be left down.
+    if is_win(vk) && !up && holding_key(now_ms()).is_some_and(|win| win != vk as u16) {
+        forget_hold();
+    }
     let held = if is_win(vk) && !up && k.dwExtraInfo != FLICK_TAG { held_now(vk) } else { Held::default() };
     let Some(ev) = key_event(vk, up, injected, k.dwExtraInfo, held) else { return false };
     let button_held = ev == Ev::WinUp && any_button_down();
@@ -522,16 +529,25 @@ fn on_key(k: &KBDLLHOOKSTRUCT) -> bool {
 /// the event's key (used only to remember which Win key is held).
 fn feed(ev: Ev, button_held: bool, late: bool, vk: u16) -> bool {
     // Busy only if a callback re-entered while the loop held it: let it pass.
+    let now = now_ms();
     let Some((verdict, generation, step, replay)) = HOOKED.with(|h| {
         h.try_borrow_mut().ok().map(|mut h| {
+            drop_stale(&mut h, now);
             let verdict = h.press.on(ev, button_held);
-            let take = matches!(ev, Ev::WinDown { .. }) && verdict == Verdict::ArmMouse && may_take();
-            let step = step(h.held.is_some(), ev, verdict, take, late);
-            let replay = h.held;
+            let held = h.held.is_some();
+            let take = match ev {
+                Ev::WinDown { .. } => verdict == Verdict::ArmMouse && may_take(),
+                Ev::WinUp => held && verdict == Verdict::Lone && may_take(),
+                _ => false,
+            };
+            let step = step(held, ev, verdict, take, late);
+            let replay = h.held.map(|(win, _)| win);
             match step {
-                Step::Hold => h.held = Some(vk),
+                Step::Hold => h.held = Some((vk, now)),
+                // An auto-repeat: the key is still down.
+                Step::Swallow => h.held = h.held.map(|(win, _)| (win, now)),
                 Step::ReplayWin | Step::Open | Step::Drop => h.held = None,
-                Step::Pass | Step::Swallow => {}
+                Step::Pass => {}
             }
             (verdict, h.generation, step, replay)
         })
@@ -561,9 +577,50 @@ fn feed(ev: Ev, button_held: bool, late: bool, vk: u16) -> bool {
     }
 }
 
-/// Whether a Win-down is held back from Windows right now.
-fn holding() -> bool {
-    HOOKED.with(|h| h.try_borrow().map(|h| h.held.is_some()).unwrap_or(true))
+/// Forgets a hold that has gone stale (see [`hold_is_stale`]) without
+/// replaying it, and starts the press afresh. With auto-repeat switched off
+/// (FilterKeys, some remote desktops) a Win held alone for over 1.5 s goes
+/// stale too: a key pressed after that arrives without Win. Better than a Win
+/// left down.
+fn drop_stale(h: &mut Hooked, now: u64) {
+    if h.held.is_some_and(|(_, last)| hold_is_stale(now, last)) {
+        reset_hold(h);
+    }
+}
+
+fn reset_hold(h: &mut Hooked) {
+    h.held = None;
+    h.press = Press::new();
+    post(MSG_MOUSE, 0, h.generation);
+}
+
+/// Forgets the held-back Win without replaying it.
+fn forget_hold() {
+    HOOKED.with(|h| {
+        if let Ok(mut h) = h.try_borrow_mut() {
+            reset_hold(&mut h);
+        }
+    });
+}
+
+/// The Win key held back from Windows right now (a stale hold is dropped first).
+fn holding_key(now: u64) -> Option<u16> {
+    HOOKED.with(|h| {
+        h.try_borrow_mut().ok().and_then(|mut h| {
+            drop_stale(&mut h, now);
+            h.held.map(|(win, _)| win)
+        })
+    })
+}
+
+/// Whether a Win-down is held back from Windows right now; busy counts as yes.
+fn holding(now: u64) -> bool {
+    HOOKED.with(|h| {
+        h.try_borrow_mut().map_or(true, |mut h| {
+            drop_stale(&mut h, now);
+            h.held.is_some()
+        })
+    })
 }
 
 fn may_take() -> bool {
