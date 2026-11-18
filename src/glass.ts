@@ -60,6 +60,11 @@ export function lensMap(width: number, height: number, radius: number): Uint8Cla
 // green byte then moves a pixel by `LENS_SHIFT`.
 export const LENS_SCALE = LENS_SHIFT * 2;
 
+// Glass splits light a little: red bends most at the rim and blue least, so
+// edges in the picture get a thin colour fringe there. Each channel's share
+// of `LENS_SCALE`.
+export const LENS_SPREAD: [number, number, number] = [1.42, 1, 0.6];
+
 // Whether a picture is light enough that dark text reads better on it.
 // `mean` is its average brightness, 0 (black) to 255 (white).
 export function inkIsDark(mean: number): boolean {
@@ -84,13 +89,32 @@ export function installLens(panel: HTMLElement, back: HTMLElement, id: string): 
   const image = document.createElementNS(SVG, "feImage");
   image.setAttribute("result", "map");
   image.setAttribute("preserveAspectRatio", "none");
-  const bend = document.createElementNS(SVG, "feDisplacementMap");
-  bend.setAttribute("in", "SourceGraphic");
-  bend.setAttribute("in2", "map");
-  bend.setAttribute("scale", String(LENS_SCALE));
-  bend.setAttribute("xChannelSelector", "R");
-  bend.setAttribute("yChannelSelector", "G");
-  filter.append(image, bend);
+  filter.append(image);
+  // The picture is bent once per colour channel, each by its own amount, and
+  // the three are added back together: where nothing bends they agree, and
+  // at the rim they drift apart into a fringe.
+  const KEEP = ["1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0", "0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0", "0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0"];
+  LENS_SPREAD.forEach((share, channel) => {
+    const bend = document.createElementNS(SVG, "feDisplacementMap");
+    bend.setAttribute("in", "SourceGraphic");
+    bend.setAttribute("in2", "map");
+    bend.setAttribute("scale", String(LENS_SCALE * share));
+    bend.setAttribute("xChannelSelector", "R");
+    bend.setAttribute("yChannelSelector", "G");
+    const keep = document.createElementNS(SVG, "feColorMatrix");
+    keep.setAttribute("type", "matrix");
+    keep.setAttribute("values", KEEP[channel]);
+    keep.setAttribute("result", `c${channel}`);
+    filter.append(bend, keep);
+  });
+  for (const [a, b, result] of [["c0", "c1", "c01"], ["c01", "c2", ""]]) {
+    const add = document.createElementNS(SVG, "feBlend");
+    add.setAttribute("mode", "screen");
+    add.setAttribute("in", a);
+    add.setAttribute("in2", b);
+    if (result) add.setAttribute("result", result);
+    filter.append(add);
+  }
   svg.append(filter);
   document.body.append(svg);
 

@@ -134,7 +134,9 @@ body {
     inset 0 0 0 1px rgb(255 255 255 / 0.26),
     inset 0 1.5px 0 0 rgb(255 255 255 / 0.75),
     inset 0 -1px 0 0 rgb(255 255 255 / 0.22),
-    inset 0 0 14px rgb(255 255 255 / 0.1);
+    inset 0 0 14px rgb(255 255 255 / 0.1),
+    /* Light scattered inside the glass's edge: a soft milky band at the rim. */
+    inset 0 0 26px 3px rgb(255 255 255 / 0.2);
 }
 
 :root[data-glass="true"] .input-row,
