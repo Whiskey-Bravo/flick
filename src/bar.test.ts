@@ -498,7 +498,7 @@ describe("bar", () => {
       expect(s.selected).toBe(0);
     });
 
-    it("after moving down the empty bar's rows, Up moves back up before recalling", () => {
+    it("after moving down the empty bar's rows, Up moves back up and wraps, without recalling", () => {
       const s = run(withPast("b"), { type: "results", items: [item("x"), item("y"), item("z")] }).state;
       const down2 = run(s, key("ArrowDown"), key("ArrowDown")).state;
       expect(down2.selected).toBe(2);
@@ -506,8 +506,9 @@ describe("bar", () => {
       expect([up1.selected, up1.text]).toEqual([1, ""]);
       const top = run(up1, key("ArrowUp")).state;
       expect([top.selected, top.text]).toEqual([0, ""]);
-      // On the top row, Up recalls as before.
-      expect(run(top, key("ArrowUp")).state.text).toBe("b");
+      // On the top row, Up wraps to the last row: no old search appears.
+      const wrapped = run(top, key("ArrowUp")).state;
+      expect([wrapped.selected, wrapped.text]).toEqual([2, ""]);
     });
 
     it("a row picked with the mouse also makes Up move up", () => {
@@ -542,11 +543,30 @@ describe("bar", () => {
       expect(down2.effects).toEqual([queryOf("")]);
     });
 
-    it("Up recalls even when the empty bar has rows, once back on the top row", () => {
+    it("after moving through the rows, Up stays in them and wraps instead of recalling", () => {
       const s = run(withPast("b"), { type: "results", items: [row("a"), row("c")] }, key("ArrowDown")).state;
       const up = run(s, key("ArrowUp")).state;
       expect([up.selected, up.text]).toEqual([0, ""]);
-      expect(run(up, key("ArrowUp")).state.text).toBe("b");
+      // On the top row Up wraps to the last row; no old search appears.
+      const again = run(up, key("ArrowUp")).state;
+      expect([again.selected, again.text, again.recall]).toEqual([1, "", -1]);
+    });
+
+    it("going back up past a pin never drops into old searches", () => {
+      const pin: Item = { ...row("p"), origin: "pin", pinned: true };
+      const recent = (id: string): Item => ({ ...row(id), origin: "recent" });
+      // The empty bar opens on the latest recent launch, below the pin.
+      const open = run(withPast("old"), { type: "results", items: [pin, recent("a"), recent("b")] }).state;
+      expect(open.selected).toBe(1);
+      const walked = run(open, key("ArrowDown"), key("ArrowUp"), key("ArrowUp")).state;
+      expect([walked.selected, walked.text]).toEqual([0, ""]);
+      const past = run(walked, key("ArrowUp")).state;
+      expect([past.selected, past.text]).toEqual([2, ""]);
+      // As the first move on a fresh bar, Up still recalls.
+      expect(run(open, key("ArrowUp")).state.text).toBe("old");
+      // And typing starts over: clearing the box gives recall back.
+      const typed = run(walked, { type: "input", text: "x" }, { type: "input", text: "" }).state;
+      expect(run(typed, key("ArrowUp")).state.text).toBe("old");
     });
 
     it("Up does nothing without past searches", () => {

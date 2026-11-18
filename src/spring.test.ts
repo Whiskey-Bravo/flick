@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { HIGHLIGHT, LIST, settled, stepSpring, stretch, type Spring } from "./spring";
+import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 
 // Runs the spring at 60 frames a second and returns every position on the way.
 function run(from: Spring, target: number, seconds: number, feel = HIGHLIGHT): { path: number[]; end: Spring } {
@@ -63,6 +63,20 @@ describe("spring", () => {
     expect(paused.x).toBeLessThan(100);
     expect(stepSpring({ x: 5, v: 3 }, 100, 0, HIGHLIGHT)).toEqual({ x: 5, v: 3 });
     expect(stepSpring({ x: 5, v: 3 }, 100, -1, HIGHLIGHT)).toEqual({ x: 5, v: 3 });
+  });
+
+  it("is squashed against the first and last row instead of passing them", () => {
+    // Rows of 44 from 5 to 137 (four rows).
+    expect(pressed(60, 5, 137, 44)).toEqual({ at: 60, tall: 1, edge: 0 });
+    expect(pressed(5, 5, 137, 44)).toEqual({ at: 5, tall: 1, edge: 0 });
+    // 11 past the last row: drawn on the last row, a quarter shorter, against the bottom.
+    expect(pressed(148, 5, 137, 44)).toEqual({ at: 137, tall: 0.75, edge: 1 });
+    // 22 above the first row: half height, against the top.
+    expect(pressed(-17, 5, 137, 44)).toEqual({ at: 5, tall: 0.5, edge: -1 });
+    // Never flatter than half, however far the spring swings.
+    expect(pressed(500, 5, 137, 44).tall).toBe(0.5);
+    // A single row: both ends are the same row.
+    expect(pressed(9, 5, 5, 44)).toEqual({ at: 5, tall: 1 - 4 / 44, edge: 1 });
   });
 
   it("stretches with speed, up to a limit", () => {

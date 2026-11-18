@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
 import { inkIsDark, installLens } from "./glass";
-import { HIGHLIGHT, LIST, settled, stepSpring, stretch, type Spring } from "./spring";
+import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
@@ -145,15 +145,26 @@ let highlight: Spring = { x: 5, v: 0 };
 let highlightTo = 5;
 let listTall: Spring = { x: 0, v: 0 };
 let listTallTo = 0;
+// The position of the last row, where the highlight is squashed instead of passing.
+let lastRowAt = 5;
 let frame = 0;
 let lastFrame = 0;
 // The next move is a jump, not a glide: the bar has just opened, or the list has just appeared.
 let jumpNext = true;
 
 function paintSprings() {
-  marker.style.translate = `0 ${highlight.x.toFixed(2)}px`;
-  const s = stretch(highlight.v);
-  marker.style.scale = s === 0 ? "" : `${(1 - s * 0.25).toFixed(4)} ${(1 + s).toFixed(4)}`;
+  // Past the first or last row the highlight is pressed against that edge
+  // and squashed; in between it stretches with its speed.
+  const p = pressed(highlight.x, 5, lastRowAt, ROW);
+  marker.style.translate = `0 ${p.at.toFixed(2)}px`;
+  if (p.edge !== 0) {
+    marker.style.transformOrigin = p.edge < 0 ? "50% 0" : "50% 100%";
+    marker.style.scale = `${(1 + (1 - p.tall) * 0.12).toFixed(4)} ${p.tall.toFixed(4)}`;
+  } else {
+    const s = stretch(highlight.v);
+    marker.style.transformOrigin = "";
+    marker.style.scale = s === 0 ? "" : `${(1 - s * 0.25).toFixed(4)} ${(1 + s).toFixed(4)}`;
+  }
   list.style.height = `${Math.max(0, listTall.x).toFixed(2)}px`;
 }
 
@@ -179,12 +190,14 @@ function moveTo(y: number, rows: number) {
     frame = 0;
     marker.style.translate = `0 ${y}px`;
     marker.style.scale = "";
+    marker.style.transformOrigin = "";
     list.style.height = "";
     highlight = { x: y, v: 0 };
     listTall = { x: rows * ROW + LIST_EDGES, v: 0 };
     return;
   }
   const tall = rows === 0 ? 0 : rows * ROW + LIST_EDGES;
+  lastRowAt = 5 + Math.max(0, rows - 1) * ROW;
   // A list that was empty has no place for the highlight to come from.
   if (jumpNext || listTallTo === 0) highlight = { x: y, v: 0 };
   if (jumpNext) listTall = { x: tall, v: 0 };
