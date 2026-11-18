@@ -25,6 +25,8 @@ export type ThemeInfo = { name: string; colors: Colors; glass: boolean };
 
 export type ItemRef = { provider: string; id: string; title: string };
 export type WorkspaceDef = { name: string; aliases: string[]; items: ItemRef[] };
+/** A text pasted by typing its name. */
+export type SnippetDef = { name: string; text: string };
 export type DirectHotkeyDef = { keys: string; item: ItemRef };
 
 export type PickRow = {
@@ -66,6 +68,7 @@ export type Config = {
   animations: string;
   shortcut: ShortcutDef[];
   workspace: WorkspaceDef[];
+  snippet: SnippetDef[];
   direct_hotkey: DirectHotkeyDef[];
 };
 
@@ -153,6 +156,13 @@ export const settingsSaveWorkspace = (original: string | null, def: WorkspaceDef
 export const settingsCheckWorkspace = (original: string | null, def: WorkspaceDef) =>
   invoke<string | null>("settings_check_workspace", { original, def });
 export const settingsDeleteWorkspace = (name: string) => invoke<void>("settings_delete_workspace", { name });
+
+export const settingsSaveSnippet = (original: string | null, def: SnippetDef) =>
+  invoke<void>("settings_save_snippet", { original, def });
+/** The first problem with the snippet, or null. */
+export const settingsCheckSnippet = (original: string | null, def: SnippetDef) =>
+  invoke<string | null>("settings_check_snippet", { original, def });
+export const settingsDeleteSnippet = (name: string) => invoke<void>("settings_delete_snippet", { name });
 export const settingsSaveHotkey = (original: string | null, def: DirectHotkeyDef) =>
   invoke<void>("settings_save_hotkey", { original, def });
 export const settingsDeleteHotkey = (keys: string) => invoke<void>("settings_delete_hotkey", { keys });

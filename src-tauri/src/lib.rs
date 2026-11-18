@@ -143,6 +143,8 @@ struct Providers {
     qr: Arc<QrProvider>,
     /// `password`, `uuid`, `lorem`, `hash`: made on the spot, forgotten when the bar hides.
     make: Arc<MakeProvider>,
+    /// Saved texts from the config, pasted by name.
+    snippets: Arc<providers::snippets::SnippetsProvider>,
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
@@ -195,6 +197,7 @@ impl Providers {
             clips: capture.clips,
             qr: capture.qr,
             make: capture.make,
+            snippets: capture.snippets,
             shortcuts: {
                 let shortcuts = ShortcutsProvider::new(launcher.clone(), distro);
                 // Looked at again on every reload (`reload_with`).
@@ -416,6 +419,7 @@ struct Capture {
     clips: Arc<ClipsProvider>,
     qr: Arc<QrProvider>,
     make: Arc<MakeProvider>,
+    snippets: Arc<providers::snippets::SnippetsProvider>,
 }
 
 impl Capture {
@@ -444,6 +448,7 @@ impl Capture {
         sequence: paste::Sequence,
     ) -> Self {
         Capture {
+            snippets: Arc::new(providers::snippets::SnippetsProvider::new(clipboard.clone(), sequence.clone())),
             clips: Arc::new(ClipsProvider::new(history, launcher, now, on_ready.clone(), sequence)),
             qr: Arc::new(QrProvider::new(text.clone(), clipboard.clone(), on_ready.clone())),
             make: Arc::new(MakeProvider::new(text, clipboard, Arc::new(providers::make::OsRandom), on_ready)),
@@ -829,6 +834,7 @@ fn build_engine(
         Box::new(p.bookmarks.clone()),
         Box::new(p.workspaces.clone()),
         Box::new(p.shortcuts.clone()),
+        Box::new(p.snippets.clone()),
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
         Box::new(p.system.clone()),
@@ -940,6 +946,7 @@ fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -
     p.words.set_online(new.online);
     p.words.set_languages(&new.tr_languages);
     p.workspaces.set(new.workspaces.clone());
+    p.snippets.set(new.snippets.clone());
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
     let roots_changed = old.file_roots != new.file_roots;
@@ -1042,6 +1049,9 @@ pub fn run() {
             settings::settings_save_workspace,
             settings::settings_check_workspace,
             settings::settings_delete_workspace,
+            settings::settings_save_snippet,
+            settings::settings_check_snippet,
+            settings::settings_delete_snippet,
             settings::settings_save_hotkey,
             settings::settings_delete_hotkey,
             item_search::settings_search_items,
@@ -1128,6 +1138,7 @@ fn setup(app: &AppHandle) {
     providers.words.set_online(loaded.config.online);
     providers.words.set_languages(&loaded.config.tr_languages);
     providers.workspaces.set(loaded.config.workspaces.clone());
+    providers.snippets.set(loaded.config.snippets.clone());
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());
     let ranking = Arc::new(Ranking::load(picks_path()));
@@ -1865,6 +1876,7 @@ mod tests {
             clips: capture.clips,
             qr: capture.qr,
             make: capture.make,
+            snippets: capture.snippets,
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
             welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
@@ -2256,6 +2268,7 @@ mod tests {
                 "snip",
                 "color",
                 "your shortcuts",
+                "your snippets",
                 "> htop -d 10",
                 "bluetooth",
                 "mute / vol 30 / next song / dark mode / wifi off",
@@ -2283,7 +2296,7 @@ mod tests {
                 "Tab",
             ]
         );
-        let flick = &help[36];
+        let flick = &help[37];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -2291,7 +2304,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 44);
+        assert_eq!(r.engine.query("Help", None).len(), 45);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));

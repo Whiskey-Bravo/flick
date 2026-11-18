@@ -26,6 +26,7 @@ Everything you can type in the bar, the keys it understands, and how results are
 | Part of a game's name | Starts the game through its launcher (Steam, Epic, Rockstar, Minecraft) | `hades` |
 | Part of a bookmark's title or site | Opens the Firefox bookmark in your browser | `example` |
 | A workspace's name | Opens every item of the workspace, in order | `work` |
+| A snippet's name | Pastes the snippet's text into the window you were in; Ctrl+Enter only copies it. `snippets` lists them all | `sig` |
 | `timer` and a time | A timer that rings with a Windows notification | `timer 5m` |
 | `remind`, a time and a note | A reminder after a while, at a time today, or tomorrow | `remind 20m pizza`, `remind 18:30 call mum`, `remind tomorrow 9:00 dentist` |
 | `timers` | Your pending timers and reminders; Enter twice cancels one | `timers` |

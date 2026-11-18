@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{value, Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Table, Value};
 
-use crate::config::{self, DirectHotkeyDef, ItemRef, ShortcutDef, WorkspaceDef};
+use crate::config::{self, DirectHotkeyDef, ItemRef, ShortcutDef, SnippetDef, WorkspaceDef};
 
 /// One setting of the Settings window. An empty string or list means "unset" (remove the line).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -258,6 +258,7 @@ fn build_shortcut(def: &ShortcutDef) -> Table {
 const SHORTCUT_KEYS: [&str; 11] =
     ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices", "icon"];
 const WORKSPACE_KEYS: [&str; 3] = ["name", "aliases", "items"];
+const SNIPPET_KEYS: [&str; 2] = ["name", "text"];
 const HOTKEY_KEYS: [&str; 2] = ["keys", "item"];
 
 /// `{ provider = "...", id = "...", title = "..." }`; an empty title is left out.
@@ -444,6 +445,29 @@ fn no_workspace(name: &str) -> String {
     format!("no workspace named \"{name}\"")
 }
 
+fn no_snippet(name: &str) -> String {
+    format!("no snippet named \"{name}\"")
+}
+
+fn build_snippet(def: &SnippetDef) -> Table {
+    let mut t = Table::new();
+    t.insert("name", value(def.name.as_str()));
+    t.insert("text", value(def.text.as_str()));
+    t
+}
+
+/// Adds a snippet at the end (`original` is `None`) or replaces the one named
+/// `original` where it stands, keeping the comments above it.
+pub fn upsert_snippet(text: &str, original: Option<&str>, def: &SnippetDef) -> Result<String, String> {
+    let matcher = original.map(named);
+    let at = matcher.as_ref().zip(original).map(|(m, n)| (m as &dyn Fn(&Table) -> bool, no_snippet(n)));
+    upsert_table(text, "snippet", at, build_snippet(def), &SNIPPET_KEYS)
+}
+
+pub fn delete_snippet(text: &str, name: &str) -> Result<String, String> {
+    delete_table(text, "snippet", &named(name), no_snippet(name))
+}
+
 fn no_hotkey(keys: &str) -> String {
     format!("no hotkey \"{keys}\"")
 }
@@ -571,6 +595,26 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn snippets_are_added_edited_in_place_and_deleted() {
+        let d = |name: &str, text: &str| SnippetDef { name: name.into(), text: text.into() };
+        let start = "# top\nhotkey = \"Alt+Space\"\n\n# my signature\n[[snippet]]\nname = \"sig\"\ntext = \"Bye\"\n\n[[shortcut]]\nname = \"s1\"\nopen = \"x\"\n";
+        // Line breaks, quotes and backslashes survive the round trip.
+        let tricky = d("addr", "1 \"Main\" Street\nC:\\Users\tend");
+        let added = upsert_snippet(start, None, &tricky).unwrap();
+        let c = config::parse(&added).unwrap();
+        assert_eq!(c.snippets, [d("sig", "Bye"), tricky.clone()]);
+        assert_eq!(c.shortcuts.len(), 1);
+        let edited = upsert_snippet(&added, Some("sig"), &d("signature", "Best regards")).unwrap();
+        assert_eq!(config::parse(&edited).unwrap().snippets, [d("signature", "Best regards"), tricky.clone()]);
+        assert!(edited.contains("# my signature\n[[snippet]]\nname = \"signature\""), "{edited}");
+        assert!(upsert_snippet(start, Some("nope"), &d("x", "y")).is_err());
+        let gone = delete_snippet(&delete_snippet(&edited, "signature").unwrap(), "addr").unwrap();
+        assert!(config::parse(&gone).unwrap().snippets.is_empty());
+        assert!(!gone.contains("snippet") || gone.contains("# my signature"), "{gone}");
+        assert!(delete_snippet(start, "nope").is_err());
     }
 
     #[test]

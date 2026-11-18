@@ -7,6 +7,7 @@ import { General } from "./General";
 import { Search } from "./Search";
 import { Hotkeys } from "./Hotkeys";
 import { Shortcuts, type LeaveGuard } from "./Shortcuts";
+import { Snippets } from "./Snippets";
 import { Updates } from "./Updates";
 import { Workspaces } from "./Workspaces";
 import { TABS, TAB_LABELS, nextTab, type Tab } from "./tabs";
@@ -17,10 +18,12 @@ export function App() {
   const [tab, setTab] = useState<Tab>("general");
   // Each editing tab sets its guard while it is open; it asks Save / Discard / Stay.
   const shortcutsGuard: LeaveGuard = useRef(null);
+  const snippetsGuard: LeaveGuard = useRef(null);
   const workspacesGuard: LeaveGuard = useRef(null);
   const hotkeysGuard: LeaveGuard = useRef(null);
   const guards: Partial<Record<Tab, LeaveGuard>> = {
     shortcuts: shortcutsGuard,
+    snippets: snippetsGuard,
     workspaces: workspacesGuard,
     hotkeys: hotkeysGuard,
   };
@@ -126,6 +129,7 @@ export function App() {
         {state !== null && tab === "search" && <Search state={state} />}
         {state !== null && tab === "answers" && <Answers state={state} />}
         {state !== null && tab === "shortcuts" && <Shortcuts state={state} guard={shortcutsGuard} />}
+        {state !== null && tab === "snippets" && <Snippets state={state} guard={snippetsGuard} />}
         {state !== null && tab === "workspaces" && <Workspaces state={state} guard={workspacesGuard} />}
         {state !== null && tab === "hotkeys" && <Hotkeys state={state} guard={hotkeysGuard} />}
         {tab === "updates" && <Updates />}

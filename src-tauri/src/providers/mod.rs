@@ -18,6 +18,7 @@ pub mod recent;
 pub mod screen;
 pub mod settings;
 pub mod shortcuts;
+pub mod snippets;
 pub mod status;
 pub mod system;
 pub mod timers;

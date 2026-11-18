@@ -110,6 +110,20 @@ pub fn remove_workspace(path: &Path, name: &str) -> Result<(), String> {
     write(path, &config_edit::delete_workspace(&text, name)?)
 }
 
+/// Adds a snippet (`original` is `None`) or replaces the one named `original`.
+pub fn save_snippet(path: &Path, original: Option<&str>, def: &config::SnippetDef) -> Result<(), String> {
+    let (text, config) = read_config(path)?;
+    // The original was removed from the file meanwhile: keep the edit and add it as a new one.
+    let original = original.filter(|name| config.snippets.iter().any(|s| s.name == *name));
+    config::check_snippet_in(&config, original, def)?;
+    write(path, &config_edit::upsert_snippet(&text, original, def)?)
+}
+
+pub fn remove_snippet(path: &Path, name: &str) -> Result<(), String> {
+    let (text, _) = read_config(path)?;
+    write(path, &config_edit::delete_snippet(&text, name)?)
+}
+
 /// Adds a direct hotkey (`original` is `None`) or replaces the one with the keys `original`.
 /// The bar's own combo and a weak combo are refused before the file is read.
 pub fn save_direct_hotkey(
@@ -287,6 +301,33 @@ pub fn settings_check_workspace(original: Option<String>, def: WorkspaceDef, sta
 pub fn settings_delete_workspace(name: String, app: AppHandle) -> Result<(), String> {
     let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     remove_workspace(&config::config_path(), &name)?;
+    reload_config(&app);
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub fn settings_save_snippet(original: Option<String>, def: config::SnippetDef, app: AppHandle) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    save_snippet(&config::config_path(), original.as_deref(), &def)?;
+    reload_config(&app);
+    Ok(())
+}
+
+/// Against the last good config, in memory only.
+#[tauri::command(async)]
+pub fn settings_check_snippet(
+    original: Option<String>,
+    def: config::SnippetDef,
+    state: State<AppState>,
+) -> Option<String> {
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    config::check_snippet_in(&config, original.as_deref(), &def).err()
+}
+
+#[tauri::command(async)]
+pub fn settings_delete_snippet(name: String, app: AppHandle) -> Result<(), String> {
+    let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+    remove_snippet(&config::config_path(), &name)?;
     reload_config(&app);
     Ok(())
 }
@@ -536,6 +577,24 @@ mod tests {
         assert!(save_direct_hotkey(&path, None, &hk("Ctrl+Alt+T"), "Alt+Space").is_err());
         assert!(remove_direct_hotkey(&path, "Ctrl+Alt+T").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hotkey = ");
+    }
+
+    #[test]
+    fn save_snippet_then_remove_round_trips() {
+        let (_d, path) = file(FILE);
+        let d = |name: &str| config::SnippetDef { name: name.into(), text: "Best regards,\nSam".into() };
+        save_snippet(&path, None, &d("sig")).unwrap();
+        save_snippet(&path, Some("sig"), &d("bye")).unwrap();
+        // The original vanished meanwhile: added as a new one.
+        save_snippet(&path, Some("gone"), &d("other")).unwrap();
+        assert_eq!(save_snippet(&path, None, &d("BYE")), Err("name is already used".to_string()));
+        assert!(save_snippet(&path, None, &d("two words")).is_err());
+        let config = config::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(config.snippets, [d("bye"), d("other")]);
+        remove_snippet(&path, "bye").unwrap();
+        remove_snippet(&path, "other").unwrap();
+        assert!(remove_snippet(&path, "bye").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FILE);
     }
 
     #[test]

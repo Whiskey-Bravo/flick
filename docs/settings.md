@@ -12,6 +12,7 @@ Open the Settings window from the tray menu (Settings), by typing `settings` in 
 - **Search**: the folders to search (add or remove them) and your pins, which you can reorder or unpin.
 - **Quick answers**: going online, your home city, currency and temperature unit, and the search engine.
 - **Shortcuts**: your list of shortcuts, with an editor that checks each one as you type.
+- **Snippets**: texts you use often, each with a one-word name (see [Snippets](shortcuts.md#snippets)).
 - **Workspaces**: your workspaces and their items (see [Workspaces and hotkeys](shortcuts.md#workspaces-and-hotkeys)).
 - **Hotkeys**: your hotkeys, each with whether it works (see [Workspaces and hotkeys](shortcuts.md#workspaces-and-hotkeys)).
 - **Updates**: the installed version, Check automatically, Check now, and the update waiting for you, if any.
@@ -70,6 +71,7 @@ open = "https://docs.rs"
 - `tab_completion`: set to `true` for a grey preview of the top result that Tab completes (see [Tab completion](typing.md#tab-completion)). The default is `false`.
 - `win_key`: set to `true` to open the bar with the Win key on its own (see [Win key](windows.md#win-key)). The default is `false`.
 - `[[shortcut]]`: see Shortcuts.
+- `[[snippet]]`: a `name` (one word) and a `text` (see [Snippets](shortcuts.md#snippets)). Settings writes them for you.
 - `[[workspace]]` and `[[direct_hotkey]]`: your workspaces and hotkeys (see [Workspaces and hotkeys](shortcuts.md#workspaces-and-hotkeys)). Settings writes them for you.
 
 <details>

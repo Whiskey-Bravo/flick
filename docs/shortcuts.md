@@ -160,6 +160,20 @@ Results you pick often move up, a file you pick often even above apps. Power act
 
 </details>
 
+## Snippets
+
+A snippet is a text you use often: an address, a signature, a standard reply. Add them in Settings, on the Snippets tab; each has a one-word name and a text of up to 10,000 characters, line breaks included.
+
+Type the name in the bar and press Enter: Flick puts the text on the clipboard and pastes it into the window you were in. Ctrl+Enter only copies it. `snippets` lists all of them. Only names are searched, never the texts.
+
+Snippets are never counted, kept as recent launches or saved as searches. They are stored as plain text in your config file, so they are not the place for passwords.
+
+```toml
+[[snippet]]
+name = "sig"
+text = "Best regards,\nSam"
+```
+
 ## Workspaces and hotkeys
 
 Both are set up in Settings, on the Workspaces and Hotkeys tabs. You pick their items with the search box there, which finds what the bar finds: apps, files, folders, games, bookmarks, shortcuts, Settings pages, Bluetooth devices and Wi-Fi networks (`connect headphones`, `wifi home`), chores and more. Answers, `tr`/`def` and timers are not offered there, so nothing typed in Settings goes online.

@@ -54,7 +54,7 @@ Let a tap of the Win key open Flick instead of the Start menu. Win+E, Win+D and 
 
 ### Everything in one Settings window
 
-No config file needed, though there is one if you prefer it. Hotkeys for single items, workspaces that open several things at once, and all of the above.
+No config file needed, though there is one if you prefer it. Hotkeys for single items, workspaces that open several things at once, snippets that paste a saved text by name, and all of the above.
 
 ![The Settings window](screenshots/settings.png)
 
