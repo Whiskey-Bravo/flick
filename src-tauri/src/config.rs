@@ -38,6 +38,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## search_engine: the web search behind `? text` and Enter on a weather answer; {arg} is the search text.
 # search_engine = \"https://duckduckgo.com/?q={arg}\"
 ##
+## tr_languages: the two languages tr translates between, yours first (codes such as \"de\", \"en\", \"fr\", \"es\"). Unset: German and English.
+# tr_languages = [\"de\", \"en\"]
+##
 ## check_updates: ask GitHub about once a day whether a new version exists (false: never).
 # check_updates = true
 ##
@@ -98,6 +101,11 @@ pub(crate) const DEFAULT_FILE: &str = "\
 #     { provider = \"bookmarks\", id = \"https://example.com/\", title = \"Example\" },
 # ]
 ##
+## Snippets: type the name and press Enter to paste the text into the window you were in. Set them up in Settings.
+# [[snippet]]
+# name = \"sig\"
+# text = \"Best regards,\\nSam\"
+##
 ## Direct hotkeys: keys that open one item from anywhere, without the bar. Set them up in Settings.
 # [[direct_hotkey]]
 # keys = \"Ctrl+Alt+T\"
@@ -124,6 +132,10 @@ pub struct Config {
     pub temperature_unit: String,
     /// Web search URL with `{arg}`; empty means DuckDuckGo.
     pub search_engine: String,
+    /// The two languages `tr` translates between, yours first; empty means
+    /// German and English.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tr_languages: Vec<String>,
     /// Look for a new version in the background (also needs `online`).
     pub check_updates: bool,
     /// The Win key pressed alone opens the bar instead of the Start menu.
@@ -146,6 +158,9 @@ pub struct Config {
     /// Named sets of items opened together, validated by `validate`.
     #[serde(rename = "workspace")]
     pub workspaces: Vec<WorkspaceDef>,
+    /// Saved texts pasted by name, validated by `validate`.
+    #[serde(rename = "snippet")]
+    pub snippets: Vec<SnippetDef>,
     /// Global key combos that activate one item each (`hotkey` is the bar's own key).
     #[serde(rename = "direct_hotkey")]
     pub direct_hotkeys: Vec<DirectHotkeyDef>,
@@ -163,6 +178,7 @@ impl Default for Config {
             currency: String::new(),
             temperature_unit: String::new(),
             search_engine: String::new(),
+            tr_languages: Vec::new(),
             check_updates: true,
             win_key: false,
             show_taskbar: false,
@@ -172,6 +188,7 @@ impl Default for Config {
             animations: String::new(),
             shortcuts: Vec::new(),
             workspaces: Vec::new(),
+            snippets: Vec::new(),
             direct_hotkeys: Vec::new(),
         }
     }
@@ -198,6 +215,17 @@ pub struct WorkspaceDef {
     #[serde(default)]
     pub items: Vec<ItemRef>,
 }
+
+/// One `[[snippet]]` table: a text pasted by typing its name.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnippetDef {
+    pub name: String,
+    pub text: String,
+}
+
+/// The longest text a snippet may hold (characters).
+pub const SNIPPET_MAX: usize = 10_000;
 
 /// One `[[direct_hotkey]]` table.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -373,6 +401,40 @@ pub fn check_workspace_in(config: &Config, original: Option<&str>, def: &Workspa
     check_workspace(def, &mut used)
 }
 
+/// Checks one snippet; `used` holds the lowercase names taken so far and
+/// grows with this one's.
+fn check_snippet(def: &SnippetDef, used: &mut Vec<String>) -> Result<(), String> {
+    if !one_word(&def.name) {
+        return Err("name must be one word".into());
+    }
+    if def.name.contains(':') {
+        return Err("name cannot contain :".into());
+    }
+    if is_command_word(&def.name) || def.name.eq_ignore_ascii_case(crate::providers::snippets::LIST_WORD) {
+        return Err(COMMAND_NAME.into());
+    }
+    let lower = def.name.to_lowercase();
+    if used.contains(&lower) {
+        return Err("name is already used".into());
+    }
+    used.push(lower);
+    if def.text.trim().is_empty() {
+        return Err("needs a text".into());
+    }
+    if def.text.chars().count() > SNIPPET_MAX {
+        return Err("text is longer than 10,000 characters".into());
+    }
+    Ok(())
+}
+
+/// Checks `def` against the other snippets of `config` (the one named
+/// `original` is left out, as it is being replaced).
+pub fn check_snippet_in(config: &Config, original: Option<&str>, def: &SnippetDef) -> Result<(), String> {
+    let mut used: Vec<String> =
+        config.snippets.iter().filter(|s| Some(s.name.as_str()) != original).map(|s| s.name.to_lowercase()).collect();
+    check_snippet(def, &mut used)
+}
+
 /// Checks one direct hotkey; `used` holds the normalized combos taken so far and grows
 /// with this one's. A weak combo is not an error here (Settings reports it).
 fn check_direct_hotkey(def: &DirectHotkeyDef, used: &mut Vec<String>) -> Result<(), String> {
@@ -513,6 +575,7 @@ pub fn validate(c: &Config) -> Result<(), String> {
         return Err("temperature_unit must be \"c\" or \"f\"".into());
     }
     crate::theme::validate(&c.theme, &c.custom_theme, &c.animations)?;
+    crate::providers::words::validate_languages(&c.tr_languages)?;
     let engine = &c.search_engine;
     let engine_ok = engine.is_empty() || (engine.starts_with("https://") && engine.contains("{arg}"));
     if !engine_ok {
@@ -526,6 +589,10 @@ pub fn validate(c: &Config) -> Result<(), String> {
     let mut used: Vec<String> = Vec::new();
     for w in &c.workspaces {
         check_workspace(w, &mut used).map_err(|e| format!("workspace \"{}\": {e}", w.name))?;
+    }
+    let mut used: Vec<String> = Vec::new();
+    for s in &c.snippets {
+        check_snippet(s, &mut used).map_err(|e| format!("snippet \"{}\": {e}", s.name))?;
     }
     let mut used = Vec::new();
     for h in &c.direct_hotkeys {
@@ -733,6 +800,56 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn snippets_parse_and_wrong_ones_are_errors() {
+        let c = parse("[[snippet]]\nname = \"sig\"\ntext = \"Best regards,\\nSam\"\n\n[[snippet]]\nname = \"addr\"\ntext = \"\"\"\n1 Main Street\nSpringfield\"\"\"\n").unwrap();
+        assert_eq!(c.snippets.len(), 2);
+        assert_eq!(c.snippets[0], SnippetDef { name: "sig".into(), text: "Best regards,\nSam".into() });
+        assert_eq!(c.snippets[1].text, "1 Main Street\nSpringfield");
+        assert!(parse("").unwrap().snippets.is_empty());
+        let one = |name: &str, text: &str| format!("[[snippet]]\nname = \"{name}\"\ntext = \"{text}\"\n");
+        for (bad, why) in [
+            (one("two words", "x"), "name must be one word"),
+            (one("a:b", "x"), "name cannot contain :"),
+            (one("help", "x"), "Flick"),
+            (one("Snippets", "x"), "Flick"),
+            (one("sig", "  "), "needs a text"),
+            (one("sig", &"x".repeat(SNIPPET_MAX + 1)), "longer than"),
+            (format!("{}{}", one("sig", "a"), one("SIG", "b")), "name is already used"),
+            ("[[snippet]]\nname = \"sig\"\ntext = \"x\"\nicon = \"y\"\n".to_string(), "icon"),
+        ] {
+            let e = parse(&bad).unwrap_err();
+            assert!(e.contains(why), "{e}");
+        }
+        // A snippet may share its name with a shortcut: both rows show.
+        assert!(parse("[[shortcut]]\nname = \"sig\"\nopen = \"x\"\n\n[[snippet]]\nname = \"sig\"\ntext = \"x\"\n").is_ok());
+        // The commented example in the default file is a valid one.
+        let example: String =
+            DEFAULT_FILE.lines().skip_while(|l| *l != "# [[snippet]]").take(3).map(|l| format!("{}\n", &l[2..])).collect();
+        assert_eq!(parse(&example).unwrap().snippets, [SnippetDef { name: "sig".into(), text: "Best regards,\nSam".into() }]);
+        // Replacing one may keep its own name, not take another's.
+        let c = parse(&format!("{}{}", one("a", "1"), one("b", "2"))).unwrap();
+        let d = |name: &str| SnippetDef { name: name.into(), text: "t".into() };
+        assert!(check_snippet_in(&c, Some("a"), &d("A")).is_ok());
+        assert_eq!(check_snippet_in(&c, Some("a"), &d("B")), Err("name is already used".to_string()));
+        assert_eq!(check_snippet_in(&c, None, &d("a")), Err("name is already used".to_string()));
+    }
+
+    #[test]
+    fn tr_languages_are_two_different_listed_codes_or_nothing() {
+        assert!(parse("").unwrap().tr_languages.is_empty());
+        assert_eq!(parse("tr_languages = [\"fr\", \"en\"]").unwrap().tr_languages, ["fr", "en"]);
+        assert!(parse("tr_languages = [\"ZH-cn\", \"de\"]").is_ok(), "codes in any case");
+        for bad in [
+            "tr_languages = [\"fr\"]",
+            "tr_languages = [\"fr\", \"fr\"]",
+            "tr_languages = [\"fr\", \"klingon\"]",
+            "tr_languages = [\"fr\", \"en\", \"de\"]",
+        ] {
+            assert!(parse(bad).unwrap_err().contains("tr_languages"), "{bad}");
+        }
+    }
+
     #[test]
     fn tab_completion_defaults_off_and_parses_true() {
         assert!(!Config::default().tab_completion);
@@ -1288,7 +1405,9 @@ item = { provider = \"apps\", id = \"C:/x/Term.lnk\", title = \"Term\" }
         assert_eq!(c.workspaces[0].items[1].id, "https://example.com/");
         assert_eq!(c.direct_hotkeys.len(), 1);
         assert_eq!(c.direct_hotkeys[0].keys, "Ctrl+Alt+T");
-        assert!(DEFAULT_FILE.matches("Set them up in Settings.").count() == 2);
+        assert_eq!(c.snippets.len(), 1);
+        assert_eq!(c.snippets[0].name, "sig");
+        assert!(DEFAULT_FILE.matches("Set them up in Settings.").count() == 3);
     }
 
     #[test]

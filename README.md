@@ -36,7 +36,7 @@ A word of your choice opens a site, runs a command or starts a script, and can t
 
 ### Clipboard, snips and small chores
 
-Type `v` for your clipboard history, `snip` for a screenshot, `color` to pick a colour off the screen, `qr` to turn text into a QR code. Set a `timer 5m`, mute the sound, switch dark mode, connect your headphones, empty the bin.
+Type `v` for your clipboard history, `snip` for a screenshot, `color` to pick a colour off the screen, `qr` to turn text into a QR code, `password` for a fresh random password. Set a `timer 5m`, mute the sound, switch dark mode, connect your headphones, empty the bin.
 
 ![A QR code made from typed text](screenshots/qr.png)
 
@@ -54,7 +54,7 @@ Let a tap of the Win key open Flick instead of the Start menu. Win+E, Win+D and 
 
 ### Everything in one Settings window
 
-No config file needed, though there is one if you prefer it. Hotkeys for single items, workspaces that open several things at once, and all of the above.
+No config file needed, though there is one if you prefer it. Hotkeys for single items, workspaces that open several things at once, snippets that paste a saved text by name, and all of the above.
 
 ![The Settings window](screenshots/settings.png)
 

@@ -299,6 +299,52 @@ fn reveal_window(w: &WebviewWindow) {
     let _ = w.set_focus();
     // After the bar has the focus: the taskbar comes up without taking it.
     crate::taskbar::raise(w.app_handle());
+    watch_focus(w.app_handle());
+}
+
+/// When the bar is looked at again after a show, in milliseconds after it.
+/// The first is past the blur grace.
+const FOCUS_CHECKS_MS: [u64; 3] = [300, 700, 1500];
+
+/// Whether an open bar has to take the keyboard again: it is on screen but
+/// another window is in front, so nothing typed reaches it and no focus loss
+/// will ever hide it. `same_show` is false once the bar has been shown again
+/// (that show has its own checks).
+fn must_refocus(same_show: bool, visible: bool, in_front: bool) -> bool {
+    same_show && visible && !in_front
+}
+
+/// Windows sometimes refuses the bar the foreground (another window took it
+/// while the bar opened, or the window in front would not give it up): the
+/// bar is then visible but deaf. Looks again a few times and takes it.
+fn watch_focus(app: &AppHandle) {
+    let app = app.clone();
+    let show = shows();
+    std::thread::spawn(move || {
+        let mut waited = 0;
+        for at in FOCUS_CHECKS_MS {
+            std::thread::sleep(Duration::from_millis(at - waited));
+            waited = at;
+            if shows() != show {
+                return;
+            }
+            let handle = app.clone();
+            // The window's own thread: `SetFocus` needs it.
+            let _ = app.run_on_main_thread(move || {
+                let Some(w) = bar(&handle) else { return };
+                let Ok(h) = w.hwnd() else { return };
+                let hwnd = HWND(h.0 as _);
+                let visible = w.is_visible().unwrap_or(false);
+                // SAFETY: no arguments.
+                let in_front = unsafe { GetForegroundWindow() } == hwnd;
+                if must_refocus(shows() == show, visible, in_front) {
+                    let _ = w.set_focus();
+                    take_foreground(hwnd);
+                    let _ = w.set_focus();
+                }
+            });
+        }
+    });
 }
 
 /// Glass is on: a picture of what is behind the bar is taken at each show.
@@ -412,6 +458,17 @@ fn bar_position(origin: (i32, i32), size: (u32, u32), width: u32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_open_bar_that_is_not_in_front_takes_the_keyboard_again() {
+        assert!(must_refocus(true, true, false), "on screen, another window in front");
+        assert!(!must_refocus(true, true, true), "it has the keyboard");
+        assert!(!must_refocus(true, false, false), "hidden: nothing to take");
+        assert!(!must_refocus(false, true, false), "shown again since: that show checks itself");
+        // The first look comes after the grace in which a focus loss is ignored.
+        assert!(Duration::from_millis(FOCUS_CHECKS_MS[0]) > BLUR_GRACE);
+        assert!(FOCUS_CHECKS_MS.windows(2).all(|w| w[0] < w[1]));
+    }
 
     #[test]
     fn never_attaches_to_a_hung_missing_or_own_thread() {

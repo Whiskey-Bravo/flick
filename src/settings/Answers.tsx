@@ -6,6 +6,13 @@ import { useSaver } from "./saver";
 export function Answers({ state }: { state: SettingsState }) {
   const { config } = state;
   const { errors, save } = useSaver(state);
+  // The two languages of `tr`: German and English unless the config says otherwise.
+  const [mine, other] = config.tr_languages?.length === 2 ? config.tr_languages : ["de", "en"];
+  const setPair = (a: string, b: string) => {
+    if (a === b) return;
+    // The default pair is left out of the config.
+    void save("tr_languages", { key: "tr_languages", value: a === "de" && b === "en" ? [] : [a, b] });
+  };
   const [currencies, setCurrencies] = useState<string[]>([]);
   const [city, setCity] = useState(config.weather_city);
   const [cityNote, setCityNote] = useState<{ ok: boolean; text: string } | null>(null);
@@ -117,6 +124,32 @@ export function Answers({ state }: { state: SettingsState }) {
           ))}
         </select>
         {errors.temperature_unit && <p class="error">{errors.temperature_unit}</p>}
+      </div>
+
+      <div class="field">
+        <label for="tr-mine">Translate between</label>
+        <div class="row">
+          <select id="tr-mine" aria-label="Your language" value={mine} onChange={(e) => setPair(e.currentTarget.value, other)}>
+            {state.languages.map(([code, name]) => (
+              <option key={code} value={code} disabled={code === other}>
+                {name}
+              </option>
+            ))}
+          </select>
+          <span>and</span>
+          <select aria-label="The other language" value={other} onChange={(e) => setPair(mine, e.currentTarget.value)}>
+            {state.languages.map(([code, name]) => (
+              <option key={code} value={code} disabled={code === mine}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <p class="hint">
+          tr translates text in other languages into the first, and text in the first into the second. For a one-off,
+          type tr &gt;fr and the text.
+        </p>
+        {errors.tr_languages && <p class="error">{errors.tr_languages}</p>}
       </div>
 
       <div class="field">

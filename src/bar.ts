@@ -169,10 +169,19 @@ export const highlighted = (s: State): boolean => !s.tabCompletion || s.browsed 
 // text) when that starts with what is typed, whatever the case; the bar shows
 // the part not typed yet in grey. Nothing is offered once a row is
 // highlighted: Tab then opens that row's menu, as without the setting.
+// The providers whose rows are found by their name: typing the title finds
+// the row again. Elsewhere the title is an answer ("Timer 30 min, rings at
+// 22:09" for `timer 30`), which is nothing to type.
+const NAMED = new Set([
+  "apps", "files", "games", "bookmarks", "settings", "power", "system", "chores",
+  "snippets", "windows", "recent", "downloads", "flick",
+]);
+
 export function completion(s: State): string | null {
   if (!s.tabCompletion || highlighted(s) || s.text === "" || s.recall >= 0) return null;
   const top = s.items[s.selected];
   if (!top) return null;
+  if (top.complete === "" && !NAMED.has(top.provider)) return null;
   const whole = top.complete !== "" ? top.complete : top.title;
   return whole.length > s.text.length && whole.toLowerCase().startsWith(s.text.toLowerCase()) ? whole : null;
 }

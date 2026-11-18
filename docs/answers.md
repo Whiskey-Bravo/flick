@@ -29,6 +29,7 @@ A currency or weather answer needs the internet. The row says `Getting rates…`
 | You type | Searches |
 |---|---|
 | `? text` (also `?text`) | Your search engine (DuckDuckGo unless you set `search_engine`) |
+| `? https://example.com` | Opens the link itself instead of searching for it (a word starting `http://`, `https://` or `www.`) |
 | `g text` | Google |
 | `yt text` | YouTube |
 | `gh text` | GitHub |
@@ -65,4 +66,6 @@ Flick must be running for a timer or reminder to ring. It starts at login, so a 
 
 ## Translate and define
 
-`tr guten Morgen` translates between German and English (whichever way fits the text) through MyMemory; `def serendipity` shows up to three meanings per language from English Wiktionary, for English and German words. Enter copies the row. A lookup starts only once you pause typing, and only while `online` is on; with it off the row says `Online answers are off` and Enter opens Settings. Answers are kept in memory only, until Flick quits.
+`tr guten Morgen` translates between two languages through MyMemory: German and English unless you pick another pair in Settings, Quick answers (or `tr_languages = ["fr", "en"]` in the config, your language first). Text in another language is translated into your language, and text in your language into the second one; with any pair other than German and English that second case takes two requests. For a one-off, `tr >fr good morning` translates into French whatever the pair is. About 28 languages are offered.
+
+`def serendipity` shows up to three meanings per language from English Wiktionary, for English and German words. Enter copies the row. A lookup starts only once you pause typing, and only while `online` is on; with it off the row says `Online answers are off` and Enter opens Settings. Answers are kept in memory only, until Flick quits.

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{value, Array, ArrayOfTables, Decor, DocumentMut, InlineTable, Item, Table, Value};
 
-use crate::config::{self, DirectHotkeyDef, ItemRef, ShortcutDef, WorkspaceDef};
+use crate::config::{self, DirectHotkeyDef, ItemRef, ShortcutDef, SnippetDef, WorkspaceDef};
 
 /// One setting of the Settings window. An empty string or list means "unset" (remove the line).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -14,6 +14,8 @@ pub enum Setting {
     Hotkey(String),
     WslDistro(String),
     FileRoots(Vec<PathBuf>),
+    /// The two languages of `tr`; empty removes the line (German and English).
+    TrLanguages(Vec<String>),
     History(bool),
     Online(bool),
     WeatherCity(String),
@@ -185,6 +187,10 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
             (!roots.is_empty())
                 .then(|| Value::Array(roots.iter().map(|p| p.to_string_lossy().into_owned()).collect())),
         ),
+        Setting::TrLanguages(pair) => (
+            "tr_languages",
+            (!pair.is_empty()).then(|| Value::Array(pair.iter().map(String::as_str).collect())),
+        ),
         Setting::History(b) => ("history", Some(Value::from(*b))),
         Setting::Online(b) => ("online", Some(Value::from(*b))),
         Setting::WeatherCity(s) => ("weather_city", text_value(s)),
@@ -252,6 +258,7 @@ fn build_shortcut(def: &ShortcutDef) -> Table {
 const SHORTCUT_KEYS: [&str; 11] =
     ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices", "icon"];
 const WORKSPACE_KEYS: [&str; 3] = ["name", "aliases", "items"];
+const SNIPPET_KEYS: [&str; 2] = ["name", "text"];
 const HOTKEY_KEYS: [&str; 2] = ["keys", "item"];
 
 /// `{ provider = "...", id = "...", title = "..." }`; an empty title is left out.
@@ -438,6 +445,29 @@ fn no_workspace(name: &str) -> String {
     format!("no workspace named \"{name}\"")
 }
 
+fn no_snippet(name: &str) -> String {
+    format!("no snippet named \"{name}\"")
+}
+
+fn build_snippet(def: &SnippetDef) -> Table {
+    let mut t = Table::new();
+    t.insert("name", value(def.name.as_str()));
+    t.insert("text", value(def.text.as_str()));
+    t
+}
+
+/// Adds a snippet at the end (`original` is `None`) or replaces the one named
+/// `original` where it stands, keeping the comments above it.
+pub fn upsert_snippet(text: &str, original: Option<&str>, def: &SnippetDef) -> Result<String, String> {
+    let matcher = original.map(named);
+    let at = matcher.as_ref().zip(original).map(|(m, n)| (m as &dyn Fn(&Table) -> bool, no_snippet(n)));
+    upsert_table(text, "snippet", at, build_snippet(def), &SNIPPET_KEYS)
+}
+
+pub fn delete_snippet(text: &str, name: &str) -> Result<String, String> {
+    delete_table(text, "snippet", &named(name), no_snippet(name))
+}
+
 fn no_hotkey(keys: &str) -> String {
     format!("no hotkey \"{keys}\"")
 }
@@ -565,6 +595,35 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn snippets_are_added_edited_in_place_and_deleted() {
+        let d = |name: &str, text: &str| SnippetDef { name: name.into(), text: text.into() };
+        let start = "# top\nhotkey = \"Alt+Space\"\n\n# my signature\n[[snippet]]\nname = \"sig\"\ntext = \"Bye\"\n\n[[shortcut]]\nname = \"s1\"\nopen = \"x\"\n";
+        // Line breaks, quotes and backslashes survive the round trip.
+        let tricky = d("addr", "1 \"Main\" Street\nC:\\Users\tend");
+        let added = upsert_snippet(start, None, &tricky).unwrap();
+        let c = config::parse(&added).unwrap();
+        assert_eq!(c.snippets, [d("sig", "Bye"), tricky.clone()]);
+        assert_eq!(c.shortcuts.len(), 1);
+        let edited = upsert_snippet(&added, Some("sig"), &d("signature", "Best regards")).unwrap();
+        assert_eq!(config::parse(&edited).unwrap().snippets, [d("signature", "Best regards"), tricky.clone()]);
+        assert!(edited.contains("# my signature\n[[snippet]]\nname = \"signature\""), "{edited}");
+        assert!(upsert_snippet(start, Some("nope"), &d("x", "y")).is_err());
+        let gone = delete_snippet(&delete_snippet(&edited, "signature").unwrap(), "addr").unwrap();
+        assert!(config::parse(&gone).unwrap().snippets.is_empty());
+        assert!(!gone.contains("snippet") || gone.contains("# my signature"), "{gone}");
+        assert!(delete_snippet(start, "nope").is_err());
+    }
+
+    #[test]
+    fn tr_languages_are_written_and_removed() {
+        let out = set("", &Setting::TrLanguages(vec!["fr".into(), "en".into()])).unwrap();
+        assert_eq!(config::parse(&out).unwrap().tr_languages, ["fr", "en"]);
+        let out = set(&out, &Setting::TrLanguages(vec![])).unwrap();
+        assert!(config::parse(&out).unwrap().tr_languages.is_empty());
+        assert!(!out.contains("tr_languages"), "{out}");
     }
 
     #[test]

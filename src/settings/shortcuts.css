@@ -25,6 +25,7 @@
   padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); color: var(--text); font: inherit;
 }
+.sc textarea.sn-text { resize: vertical; min-height: 120px; line-height: 1.4; }
 .sc-radio, .sc-check { display: flex; align-items: center; gap: 6px; font-weight: 400; }
 .sc-pick { display: flex; gap: 8px; }
 .sc-pick input { flex: 1; min-width: 0; }

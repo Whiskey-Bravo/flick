@@ -15,6 +15,10 @@ Everything you can type in the bar, the keys it understands, and how results are
 | `recent` | Files and folders you opened recently, from Windows' own Recent list | `recent` |
 | `v`, then text to filter | Your clipboard history (Win+V); Enter pastes the item | `v`, `v invoice` |
 | `qr`, or `qr` and some text | Shows the clipboard text, or the typed text, as a QR code | `qr`, `qr some text` |
+| `password`, or `password` and a length | Makes a random password (20 characters, or 8 to 64); Enter copies it | `password`, `password 32` |
+| `uuid` | Makes a random UUID; Enter copies it | `uuid` |
+| `lorem`, or `lorem` and a number | Filler text, 1 to 10 paragraphs; Enter copies it | `lorem`, `lorem 3` |
+| `hash` | The SHA-256 of the clipboard text; Enter copies it | `hash` |
 | `snip` (also `screenshot`) | Opens Windows' snip tool | `snip` |
 | `color` (also `colour`, `picker`) | Picks a colour on screen and copies it as `#RRGGBB` | `color` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
@@ -22,10 +26,11 @@ Everything you can type in the bar, the keys it understands, and how results are
 | Part of a game's name | Starts the game through its launcher (Steam, Epic, Rockstar, Minecraft) | `hades` |
 | Part of a bookmark's title or site | Opens the Firefox bookmark in your browser | `example` |
 | A workspace's name | Opens every item of the workspace, in order | `work` |
+| A snippet's name | Pastes the snippet's text into the window you were in; Ctrl+Enter only copies it. `snippets` lists them all | `sig` |
 | `timer` and a time | A timer that rings with a Windows notification | `timer 5m` |
 | `remind`, a time and a note | A reminder after a while, at a time today, or tomorrow | `remind 20m pizza`, `remind 18:30 call mum`, `remind tomorrow 9:00 dentist` |
 | `timers` | Your pending timers and reminders; Enter twice cancels one | `timers` |
-| `tr` and some text | Translates between German and English (online) | `tr guten Morgen` |
+| `tr` and some text | Translates between two languages, German and English unless you pick others (online) | `tr guten Morgen`, `tr >fr good morning` |
 | `def` and a word | Definitions from Wiktionary (online) | `def serendipity` |
 | `connect` or `disconnect`, and a device | Connects or disconnects a paired Bluetooth audio device | `connect headphones` |
 | `wifi` and a network | Joins a saved Wi-Fi network | `wifi home` |

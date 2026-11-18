@@ -16,7 +16,7 @@ pub fn open(app: &AppHandle) {
     let built = WebviewWindowBuilder::new(app, WINDOW, WebviewUrl::App("settings.html".into()))
         .title("Flick Settings")
         .inner_size(820.0, 560.0)
-        .min_inner_size(640.0, 440.0)
+        .min_inner_size(800.0, 440.0)
         .decorations(true)
         .resizable(true)
         .skip_taskbar(false)

@@ -25,6 +25,8 @@ export type ThemeInfo = { name: string; colors: Colors; glass: boolean };
 
 export type ItemRef = { provider: string; id: string; title: string };
 export type WorkspaceDef = { name: string; aliases: string[]; items: ItemRef[] };
+/** A text pasted by typing its name. */
+export type SnippetDef = { name: string; text: string };
 export type DirectHotkeyDef = { keys: string; item: ItemRef };
 
 export type PickRow = {
@@ -46,6 +48,8 @@ export type Config = {
   hotkey: string;
   wsl_distro: string;
   file_roots: string[];
+  /** The two languages of `tr`, yours first; left out while it is German and English. */
+  tr_languages?: string[];
   history: boolean;
   online: boolean;
   weather_city: string;
@@ -64,6 +68,7 @@ export type Config = {
   animations: string;
   shortcut: ShortcutDef[];
   workspace: WorkspaceDef[];
+  snippet: SnippetDef[];
   direct_hotkey: DirectHotkeyDef[];
 };
 
@@ -78,6 +83,8 @@ export type SettingsState = {
   version: string;
   /** Every theme with its colours, in display order. */
   themes: ThemeInfo[];
+  /** The languages `tr` knows, as [code, name]. */
+  languages: [string, string][];
 };
 
 /** One setting; an empty string or list means "unset". */
@@ -85,6 +92,7 @@ export type Setting =
   | { key: "hotkey"; value: string }
   | { key: "wsl_distro"; value: string }
   | { key: "file_roots"; value: string[] }
+  | { key: "tr_languages"; value: string[] }
   | { key: "history"; value: boolean }
   | { key: "online"; value: boolean }
   | { key: "weather_city"; value: string }
@@ -148,6 +156,13 @@ export const settingsSaveWorkspace = (original: string | null, def: WorkspaceDef
 export const settingsCheckWorkspace = (original: string | null, def: WorkspaceDef) =>
   invoke<string | null>("settings_check_workspace", { original, def });
 export const settingsDeleteWorkspace = (name: string) => invoke<void>("settings_delete_workspace", { name });
+
+export const settingsSaveSnippet = (original: string | null, def: SnippetDef) =>
+  invoke<void>("settings_save_snippet", { original, def });
+/** The first problem with the snippet, or null. */
+export const settingsCheckSnippet = (original: string | null, def: SnippetDef) =>
+  invoke<string | null>("settings_check_snippet", { original, def });
+export const settingsDeleteSnippet = (name: string) => invoke<void>("settings_delete_snippet", { name });
 export const settingsSaveHotkey = (original: string | null, def: DirectHotkeyDef) =>
   invoke<void>("settings_save_hotkey", { original, def });
 export const settingsDeleteHotkey = (keys: string) => invoke<void>("settings_delete_hotkey", { keys });

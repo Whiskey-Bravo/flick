@@ -12,7 +12,8 @@ Flick can switch to a window, close apps, and steer the PC without the mouse. Ro
 |---|---|
 | Part of a window title or app name | Lists the matching open windows; Enter brings one to the front |
 | `close chrome` | Closes all windows of that app politely (they may ask to save) |
-| `kill chrome` | Forces the app to end (press Enter twice); unsaved work is lost |
+| `kill chrome` | Forces the app to end, with all its processes (press Enter twice); unsaved work is lost |
+| `kill node` | The same for a program that runs without a window, by its file name |
 | `quit all` | Closes every open window except Explorer (press Enter twice) |
 | `vol 30`, `vol up`, `vol down` | Sets or steps the volume |
 | `mute`, `unmute` | Mutes or unmutes the sound |
