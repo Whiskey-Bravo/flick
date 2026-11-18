@@ -88,6 +88,9 @@ pub struct Appearance {
     pub glass: bool,
     /// One of [`ANIMATIONS`].
     pub animations: String,
+    /// The bar's `tab_completion` setting; it travels with the look so the
+    /// page learns both at once. [`resolve`] leaves it off: the caller sets it.
+    pub tab_completion: bool,
 }
 
 fn colors(c: [&str; 8]) -> Colors {
@@ -199,7 +202,13 @@ pub fn resolve(theme: &str, custom: &CustomTheme, animations: &str) -> Appearanc
     };
     let animations = animation_name(animations);
     let animations = if ANIMATIONS.contains(&animations) { animations } else { "minimal" };
-    Appearance { theme: name.to_string(), glass: name == "glass", colors, animations: animations.to_string() }
+    Appearance {
+        theme: name.to_string(),
+        glass: name == "glass",
+        colors,
+        animations: animations.to_string(),
+        tab_completion: false,
+    }
 }
 
 /// The channels of a `#rrggbb` colour, 0 to 255.

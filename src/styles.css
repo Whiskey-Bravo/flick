@@ -180,6 +180,35 @@ body {
   white-space: nowrap;
 }
 
+.input-wrap {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+}
+
+/* Tab completion's preview: the typed text, unseen, then the rest in grey. */
+.ghost {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  font-size: 20px;
+  white-space: pre;
+  color: var(--faint);
+  pointer-events: none;
+}
+
+.ghost[hidden] {
+  display: none;
+}
+
+.ghost-typed {
+  visibility: hidden;
+}
+
 input {
   flex: 1;
   min-width: 0;

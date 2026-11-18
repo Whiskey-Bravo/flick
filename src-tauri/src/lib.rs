@@ -1501,7 +1501,10 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
 /// The theme and animation level of the config in force.
 fn current_appearance(state: &AppState) -> theme::Appearance {
     let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-    theme::resolve(&config.theme, &config.custom_theme, &config.animations)
+    theme::Appearance {
+        tab_completion: config.tab_completion,
+        ..theme::resolve(&config.theme, &config.custom_theme, &config.animations)
+    }
 }
 
 /// What a page applies when it loads: the theme's colours and the animation

@@ -47,6 +47,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## show_taskbar: a taskbar that hides by itself comes up while Flick is open, with a Flick button on it (true: on).
 # show_taskbar = false
 ##
+## tab_completion: the rest of the top result's name shows in grey as you type and Tab takes it; no row is highlighted until you press Down (true: on).
+# tab_completion = false
+##
 ## theme: dark, light, midnight, frost, ember, ocean, forest, grape, rose, sand, mint, sakura, glass or custom (your own colours, below).
 # theme = \"dark\"
 ## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
@@ -127,6 +130,9 @@ pub struct Config {
     pub win_key: bool,
     /// An auto-hidden taskbar is brought up while the bar is open.
     pub show_taskbar: bool,
+    /// The bar previews the top result's name in grey; Tab takes it, and no
+    /// row is highlighted until the rows are moved through.
+    pub tab_completion: bool,
     /// The bar's look: one of [`crate::theme::THEMES`]; empty means dark.
     pub theme: String,
     /// The colours of `theme = "custom"`.
@@ -160,6 +166,7 @@ impl Default for Config {
             check_updates: true,
             win_key: false,
             show_taskbar: false,
+            tab_completion: false,
             theme: String::new(),
             custom_theme: crate::theme::CustomTheme::default(),
             animations: String::new(),
@@ -726,6 +733,13 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn tab_completion_defaults_off_and_parses_true() {
+        assert!(!Config::default().tab_completion);
+        assert!(!parse("").unwrap().tab_completion);
+        assert!(parse("tab_completion = true").unwrap().tab_completion);
+    }
+
     #[test]
     fn show_taskbar_defaults_off_and_parses_true() {
         assert!(!Config::default().show_taskbar);
