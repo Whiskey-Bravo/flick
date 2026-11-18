@@ -8,7 +8,7 @@ import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } f
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
-  panelItem, type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  panelItem, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -330,6 +330,23 @@ function renderQr(item: Item) {
   qrCaption.textContent = item.title;
 }
 
+// Live rows (the clock) ask again at the start of each wall-clock second. One
+// timer at most; it clears itself once no live row shows.
+let tickTimer: number | null = null;
+
+function scheduleTick() {
+  if (!wantsTick(state)) {
+    if (tickTimer !== null) clearTimeout(tickTimer);
+    tickTimer = null;
+    return;
+  }
+  if (tickTimer !== null) return;
+  tickTimer = window.setTimeout(() => {
+    tickTimer = null;
+    dispatch({ type: "answersReady" });
+  }, 1000 - (Date.now() % 1000) + 5);
+}
+
 function render() {
   if (input.value !== state.text) {
     input.value = state.text;
@@ -370,6 +387,7 @@ function render() {
     thumb.style.top = `${(state.top / len) * 100}%`;
   }
   renderMenu();
+  scheduleTick();
   // Invisible while hidden (medium and high levels), so the next open starts
   // from nothing; anything that brings the bar back clears it.
   panel.classList.toggle("closed", state.hidden);

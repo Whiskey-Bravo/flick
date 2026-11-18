@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
+import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, wantsTick, type Effect, type Event, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
-  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "",
+  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false,
 });
 const run = (s: State, ...events: Event[]) => {
   let state = s;
@@ -1018,6 +1018,39 @@ describe("mouse and menu", () => {
       const typed = run(initial, { type: "shown" }, { type: "input", text: "a" }, { type: "results", items: [item("a")] });
       expect(run(typed.state, { type: "updateChanged" }).effects).toEqual([]);
       expect(run(empty.state, { type: "hidden" }, { type: "updateChanged" }).effects).toEqual([]);
+    });
+  });
+
+  describe("live rows", () => {
+    const clock: Item = { ...item("now:local"), provider: "answers", actions: ["copy"], live: true };
+    const shown = (...items: Item[]) =>
+      run(initial, { type: "shown" }, { type: "input", text: "time" }, { type: "results", items }).state;
+
+    it("wants_a_tick_only_while_a_live_row_shows", () => {
+      expect(wantsTick(shown(clock))).toBe(true);
+      expect(wantsTick(run(shown(clock), { type: "hidden" }).state)).toBe(false);
+      expect(wantsTick(shown(item("a")))).toBe(false);
+      expect(wantsTick(initial)).toBe(false);
+    });
+
+    it("a_tick_requeries_and_keeps_the_selected_live_row", () => {
+      const r = run(shown(clock, item("a")), { type: "answersReady" });
+      expect(r.effects).toEqual([{ type: "query", text: "time", scope: null, keepSelection: true }]);
+      expect(r.state.keep).toEqual({ provider: "answers", id: "now:local" });
+    });
+
+    it("a_tick_leaves_the_menu_and_the_armed_row_alone", () => {
+      const open = run(shown(clock), key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      expect(run(open, { type: "answersReady" }).state.menu).toEqual(open.menu);
+      const u = { ...item("u"), actions: ["uninstall" as const] };
+      const armed = run(shown(clock, u), key("ArrowDown"), key("Tab"), { type: "menuPick", action: "uninstall" }).state;
+      expect(armed.armed).toBe("u");
+      expect(run(armed, { type: "answersReady" }).state.armed).toBe("u");
+    });
+
+    it("no_tick_effect_once_hidden", () => {
+      expect(run(shown(clock), { type: "hidden" }, { type: "answersReady" }).effects).toEqual([]);
     });
   });
 

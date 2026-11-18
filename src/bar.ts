@@ -12,6 +12,7 @@ export type Item = {
   actions: Action[]; // what the row's actions menu offers, in order
   complete: string; // text Tab puts in the bar, "" = none
   panel: string; // SVG markup from Flick's backend to show large instead of the list, "" = none
+  live: boolean; // the row changes by itself: ask again every second while it shows
 };
 export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
@@ -26,6 +27,11 @@ export function menuActions(item: Item): MenuAction[] {
 }
 
 // The row shown as a panel (a QR code): the only item, with markup.
+/** True while the bar shows a row that changes by itself (the clock). */
+export function wantsTick(s: State): boolean {
+  return !s.hidden && s.items.some((i) => i.live);
+}
+
 export function panelItem(s: State): Item | null {
   return s.items.length === 1 && s.items[0].panel !== "" ? s.items[0] : null;
 }

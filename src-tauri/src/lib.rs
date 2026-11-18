@@ -2017,7 +2017,7 @@ mod tests {
         fn date(&self, d: jiff::civil::Date, _long: bool) -> String {
             d.to_string()
         }
-        fn time(&self, t: jiff::civil::Time) -> String {
+        fn time_seconds(&self, t: jiff::civil::Time) -> String {
             t.to_string()
         }
         fn fahrenheit(&self) -> bool {

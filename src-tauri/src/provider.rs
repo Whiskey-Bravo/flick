@@ -69,6 +69,8 @@ pub struct ResultItem {
     /// SVG markup the bar shows in place of the list ("" = none). Built only
     /// by Rust code (QR module positions), never from user text.
     pub panel: String,
+    /// The row changes by itself: the bar asks again every second while it shows.
+    pub live: bool,
     /// A computed answer: in plain queries the engine puts it above every other row.
     #[serde(skip)]
     pub top: bool,
