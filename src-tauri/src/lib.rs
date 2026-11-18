@@ -548,7 +548,7 @@ pub(crate) struct WinKeyFlags {
     paused: AtomicBool,
     /// The bar window exists.
     bar_ready: AtomicBool,
-    /// An exclusive full-screen app is running; read every [`WIN_KEY_POLL`]
+    /// An exclusive full-screen app is in front; read every [`WIN_KEY_POLL`]
     /// off the hook thread, since the hook callback must not call the shell.
     full_screen: AtomicBool,
     /// Sticky Keys is on: a tap of Win latches it, so it stays with Windows.
@@ -606,7 +606,7 @@ impl WinKeyFlags {
 
     /// Reads what only Windows knows: full-screen and Sticky Keys.
     fn read_desktop(&self) {
-        self.note_screen(window::notification_state());
+        self.note_screen(window::screen_state());
         self.note_sticky_keys(window::sticky_keys_on());
     }
 
