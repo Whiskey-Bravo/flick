@@ -271,6 +271,7 @@ const MENU_LABELS: Record<MenuAction, string> = {
   close: "Close",
   close_window: "Close window",
   copy: "Copy",
+  save_picture: "Save as picture",
 };
 /// Where the right-click happened, in window coordinates.
 let menuAt: Point = { x: 0, y: 0 };
@@ -298,7 +299,11 @@ function renderMenu() {
     // Under the selected row, past its icon.
     const li = list.querySelector<HTMLElement>("li.result.selected");
     const icon = li?.querySelector<HTMLElement>(".icon");
-    if (li) {
+    if (panelItem(state) && !li) {
+      // The QR panel has no row: under the panel's box.
+      const box = qrPanel.getBoundingClientRect();
+      at = { x: box.left, y: box.bottom };
+    } else if (li) {
       const box = li.getBoundingClientRect();
       at = { x: box.left + (icon?.offsetWidth ?? 0), y: box.bottom };
     }
@@ -465,6 +470,10 @@ const SWALLOWED = ["Tab", "F1", "F5"];
 const SWALLOWED_CTRL = ["p", "f", "r"];
 document.addEventListener("keydown", (e) => {
   if (SWALLOWED.includes(e.key) || (e.ctrlKey && SWALLOWED_CTRL.includes(e.key.toLowerCase()))) e.preventDefault();
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "s" && !e.repeat) {
+    e.preventDefault();
+    dispatch({ type: "savePanel" });
+  }
 });
 const rowIndex = (e: Event_): number | null => {
   const li = (e.target as Element | null)?.closest<HTMLElement>("li.result");
@@ -472,6 +481,11 @@ const rowIndex = (e: Event_): number | null => {
 };
 document.addEventListener("contextmenu", (e) => {
   e.preventDefault();
+  if ((e.target as Element | null)?.closest(".qr-panel") && panelItem(state)) {
+    menuAt = { x: e.clientX, y: e.clientY };
+    dispatch({ type: "menu", index: 0 });
+    return;
+  }
   const index = rowIndex(e);
   if (index === null) {
     if (state.menu) dispatch({ type: "menuClose" });

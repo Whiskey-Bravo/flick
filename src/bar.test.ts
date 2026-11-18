@@ -1165,6 +1165,21 @@ describe("mouse and menu", () => {
     expect(panelItem(withItems(item("a")))).toBeNull();
   });
 
+  it("save_panel_acts_on_the_panel_row_only_when_it_offers_saving", () => {
+    const qr = { ...item("q"), panel: "<svg/>", actions: ["save_picture" as const] };
+    const r = run(withItems(qr), { type: "savePanel" });
+    expect(r.effects).toEqual([{ type: "act", item: qr, action: "save_picture" }]);
+    expect(run(withItems(item("a")), { type: "savePanel" }).effects).toEqual([]);
+    expect(run(withItems({ ...qr, actions: [] }), { type: "savePanel" }).effects).toEqual([]);
+    expect(run(withItems(qr, item("b")), { type: "savePanel" }).effects).toEqual([]);
+  });
+
+  it("tab_on_the_panel_row_opens_a_menu_with_save_picture", () => {
+    const qr = { ...item("q"), panel: "<svg/>", actions: ["save_picture" as const] };
+    const r = run(withItems(qr), key("Tab"));
+    expect(r.state.menu).toEqual({ index: 0, actions: ["save_picture"], selected: 0, at: "row" });
+  });
+
   it("enter_on_a_panel_row_activates_it", () => {
     const qr = { ...item("q"), panel: "<svg/>" };
     const r = run(withItems(qr), key("Enter"));

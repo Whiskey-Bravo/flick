@@ -1085,6 +1085,18 @@ pub fn run() {
         });
 }
 
+/// The Save window for a QR code, with no parent (the bar is hidden by then).
+/// Blocks until the window closes, so it runs only on the follow-up's thread.
+fn save_qr_window(app: AppHandle, notifier: Arc<dyn Notifier>) -> impl Fn(&str) + Send + Sync + 'static {
+    move |text: &str| {
+        use tauri_plugin_dialog::DialogExt;
+        let ask = |name: &str| {
+            app.dialog().file().add_filter("PNG picture", &["png"]).set_file_name(name).blocking_save_file()?.into_path().ok()
+        };
+        providers::qr::save_qr(text, &ask, notifier.as_ref());
+    }
+}
+
 /// Startup order: config → providers and engine → background index threads →
 /// hotkey → tray → config watcher. Nothing here may stop startup, and nothing
 /// here scans the disk: every index is built on a background thread.
@@ -1108,6 +1120,7 @@ fn setup(app: &AppHandle) {
     // Reminders that ring and direct hotkeys that fail say so in a notification.
     let notifier: Arc<dyn Notifier> = Arc::new(SystemNotifier);
     app.manage(notifier.clone());
+    let saved_notifier = notifier.clone();
     let fire: Fire = Arc::new(move |body: &str| {
         let _ = notifier.show(TITLE, body);
     });
@@ -1122,6 +1135,7 @@ fn setup(app: &AppHandle) {
         launcher: launcher.clone(),
         previous: paste::previous,
         pick_color: Box::new(|| picker::start(Arc::new(picker::GdiScreen), Arc::new(WindowsClipboard))),
+        save_qr: Box::new(save_qr_window(app.clone(), saved_notifier)),
         settle: after_hide::settle,
         shows: window::shows,
     }));

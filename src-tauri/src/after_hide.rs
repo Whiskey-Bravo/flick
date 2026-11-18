@@ -18,6 +18,9 @@ pub struct FollowUps {
     /// The window that was in front before the bar opened.
     pub previous: fn() -> Option<isize>,
     pub pick_color: Box<dyn Fn() + Send + Sync>,
+    /// Asks where to save the QR code for the text, then saves it. Blocks on
+    /// the Save window, so it only runs on the follow-up's own thread.
+    pub save_qr: Box<dyn Fn(&str) + Send + Sync>,
     /// Waits until the hidden bar is off the screen.
     pub settle: fn(),
     /// How many times the bar has been shown (`window::shows`).
@@ -47,6 +50,10 @@ impl AfterHide for FollowUps {
             Then::PickColor => {
                 (self.settle)();
                 (self.pick_color)();
+            }
+            Then::SaveQr { text } => {
+                (self.settle)();
+                (self.save_qr)(&text);
             }
             Then::StartMenu => {
                 (self.settle)();
@@ -93,6 +100,8 @@ mod tests {
         let launcher = Arc::new(RecordingLauncher::default());
         let picks = Arc::new(AtomicUsize::new(0));
         let counter = picks.clone();
+        let saved = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saved_in = saved.clone();
         let follow = FollowUps {
             desktop: desktop.clone(),
             launcher: launcher.clone(),
@@ -100,6 +109,7 @@ mod tests {
             pick_color: Box::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
+            save_qr: Box::new(move |text| saved_in.lock().unwrap().push(text.to_string())),
             settle: count_settle,
             shows: || 3,
         };
@@ -126,6 +136,10 @@ mod tests {
         assert_eq!(keys(&desktop, "start_menu"), 1);
         assert_eq!(settles(), 4);
 
+        follow.run(Then::SaveQr { text: "hi".into() }, 3);
+        assert_eq!(*saved.lock().unwrap(), ["hi"]);
+        assert_eq!(settles(), 5);
+
         // Nothing reached a part it should not have.
         assert_eq!(keys(&desktop, "ctrl_v"), 1);
         assert_eq!(keys(&desktop, "win_v"), 1);
@@ -140,6 +154,7 @@ mod tests {
             launcher: Arc::new(RecordingLauncher::default()),
             previous: || Some(7),
             pick_color: Box::new(|| {}),
+            save_qr: Box::new(|_| {}),
             settle: count_settle,
             shows: || 3,
         }
