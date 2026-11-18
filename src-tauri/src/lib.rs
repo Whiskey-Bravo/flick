@@ -17,6 +17,7 @@ mod fuzzy;
 mod games;
 mod history;
 mod hotkey;
+mod hotkey_notice;
 mod icon;
 mod item_search;
 mod launch;
@@ -1120,6 +1121,7 @@ fn setup(app: &AppHandle) {
     // Reminders that ring and direct hotkeys that fail say so in a notification.
     let notifier: Arc<dyn Notifier> = Arc::new(SystemNotifier);
     app.manage(notifier.clone());
+    app.manage(hotkey_notice::HotkeyNotice::default());
     let saved_notifier = notifier.clone();
     let fire: Fire = Arc::new(move |body: &str| {
         let _ = notifier.show(TITLE, body);
@@ -1228,7 +1230,7 @@ fn setup(app: &AppHandle) {
     if first_run && !cfg!(debug_assertions) {
         let _ = app.autolaunch().enable();
     }
-    let _ = tray::build(app, &tooltip(hotkey_error.as_deref()), |app| {
+    let _ = tray::build(app, hotkey_error.as_deref(), |app| {
         let app = app.clone();
         // Off the main thread: all of these can block. Config first, so a
         // slow PowerShell or file scan never delays it.
@@ -1336,7 +1338,8 @@ fn load_answer_stores(app: &AppHandle, p: &Providers) {
     });
 }
 
-/// Registers `accelerator`, records the result and updates the tray tooltip.
+/// Registers `accelerator`, records the result and tells the tray and the user
+/// when it did not work.
 /// Returns the user-facing error text on failure.
 pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
     let result = hotkey::apply(app, accelerator);
@@ -1346,8 +1349,22 @@ pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String>
         *state.bar_hotkey.lock().unwrap_or_else(|e| e.into_inner()) = Some(accelerator.to_string());
     }
     let error = result.err();
-    tray::set_tooltip(app, &tooltip(error.as_deref()));
+    tray::set_error(app, error.as_deref());
+    announce_hotkey_error(app, accelerator, error.as_deref());
     error
+}
+
+/// Says in a notification that the bar hotkey does not work, once per distinct
+/// error. Shown on its own thread (the toast can take a moment), and a failure
+/// to show it changes nothing.
+fn announce_hotkey_error(app: &AppHandle, accelerator: &str, error: Option<&str>) {
+    let Some(notice) = app.try_state::<hotkey_notice::HotkeyNotice>() else { return };
+    let Some((title, body)) = notice.update(accelerator, error) else { return };
+    let Some(notifier) = app.try_state::<Arc<dyn Notifier>>() else { return };
+    let notifier = notifier.inner().clone();
+    std::thread::spawn(move || {
+        let _ = notifier.show(&title, &body);
+    });
 }
 
 /// The bar hotkey registered now, or `configured` when none has registered
@@ -1441,14 +1458,6 @@ fn quit_cleanup(reminders: Option<&Reminders>) {
         reminders.flush();
     }
     notifications::remove_balloons();
-}
-
-/// Tray tooltip: "Flick", or "Flick — <hotkey error>".
-fn tooltip(error: Option<&str>) -> String {
-    match error {
-        Some(e) => format!("{} \u{2014} {e}", tray::DEFAULT_TOOLTIP),
-        None => tray::DEFAULT_TOOLTIP.to_string(),
-    }
 }
 
 /// Reload with last-good fallback; push a successfully loaded config into the
@@ -2559,15 +2568,6 @@ mod tests {
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
         push_distro_now(&r.providers, &config, &WslState::NoWsl);
         assert!(r.engine.query("> ls", None).is_empty());
-    }
-
-    #[test]
-    fn tooltip_prefixes_errors_with_flick() {
-        assert_eq!(tooltip(None), "Flick");
-        assert_eq!(
-            tooltip(Some("hotkey \"X\" is not a valid shortcut")),
-            "Flick \u{2014} hotkey \"X\" is not a valid shortcut"
-        );
     }
 
     #[test]

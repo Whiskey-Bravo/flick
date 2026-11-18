@@ -46,6 +46,8 @@ pub fn toggle(app: &AppHandle) {
         hide(app);
     } else if hotkey_may_show(screen_state()) {
         show(app);
+    } else {
+        crate::tray::set_ignored(app, true);
     }
 }
 
@@ -81,6 +83,7 @@ pub fn toggle_from_win_key(app: &AppHandle) {
         return;
     }
     if !hotkey_may_show(screen_state()) {
+        crate::tray::set_ignored(app, true);
         return;
     }
     show(app);
@@ -282,6 +285,8 @@ fn show_as(app: &AppHandle, shown: Shown) {
         state.providers.refresh_on_show();
         let _ = app.emit_to(LABEL, "config:error", state.config_error());
     }
+    // After the bar is up: a shown bar means the last press is no longer ignored.
+    crate::tray::set_ignored(app, false);
 }
 
 /// Show and focus where it was, without `bar:shown`, so the page keeps its
