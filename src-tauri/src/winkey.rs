@@ -1,4 +1,5 @@
 //! The Win32 side of the Win key: a low-level keyboard hook on its own thread.
+//! It runs in the helper process (winkey_helper.rs), never in Flick itself.
 //!
 //! The hook thread installs `WH_KEYBOARD_LL`, turns each event into an [`Ev`]
 //! and asks [`Press`] (winkey_logic.rs) what to do. The callback never blocks:
@@ -6,13 +7,14 @@
 //! posted to the thread's own message loop and done after the callback returns;
 //! opening Flick is handed on again to a worker thread, so the hook thread only
 //! ever runs the loop and the callbacks.
-//! The only event ever swallowed is the Win-up of a lone press Flick takes; it
-//! is re-sent at once as `[mask down, mask up, Win up]`, tagged as Flick's own.
-//!
-//! Known, accepted gap: `SendInput` reports UIPI blocking as success. If an
-//! elevated window takes the foreground in the microseconds between the hook
-//! seeing a taken Win-up and the re-send, Windows drops the re-sent Win-up and
-//! Win stays logically down until the next physical Win press.
+//! A Win-down Flick may take is held back from Windows (swallowed). If another
+//! key, click or wheel follows, the hook sends the Win-down (tagged as
+//! Flick's own) from inside that event's callback, which Windows handles
+//! before the event itself, so the combination works as usual. If Win comes
+//! up alone, its up is swallowed too: Windows never saw the press, so Start
+//! can't open, and Flick opens. Nothing is ever left down: the only key held
+//! back is a Win-down Windows hasn't seen. (Masking a lone press with a dummy
+//! key instead left Start opening now and then on Windows 11.)
 //!
 //! The watchdog's signal is keyboard-only raw input (`RIDEV_INPUTSINK` on a
 //! message-only window on the hook thread): raw input keeps arriving after
@@ -34,7 +36,7 @@ use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    GetAsyncKeyState, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, VIRTUAL_KEY,
     VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
 };
 use windows::Win32::UI::Input::{
@@ -51,14 +53,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::controls::key_input;
-use crate::winkey_logic::{is_late, Ev, Held, Press, Verdict, Watchdog};
+use crate::winkey_logic::{is_late, step, Ev, Held, Press, Step, Verdict, Watchdog};
 
 /// Tag on the input Flick sends itself ("FLWK"); one value shared with controls.rs.
 pub const FLICK_TAG: usize = crate::controls::FLICK_INPUT_TAG;
-
-/// The unassigned key sent between the swallowed Win down and its re-sent up,
-/// so Windows sees a Win combination and doesn't open Start.
-const MASK_VK: u16 = 0xE8;
 
 const VK_LWIN: u32 = 0x5B;
 const VK_RWIN: u32 = 0x5C;
@@ -140,9 +138,6 @@ impl WinKeyHook {
         }
     }
 
-    /// Removes both hooks and ends the thread (the same as dropping it).
-    pub fn stop(self) {}
-
     /// False once reinstalling the keyboard hook has failed twice in a row;
     /// true again after the next successful install.
     pub fn healthy(&self) -> bool {
@@ -195,13 +190,15 @@ struct Hooked {
     /// Bumped whenever the keyboard hook is (re)installed, so mouse-hook
     /// messages posted for an older press are ignored.
     generation: usize,
+    /// The Win key whose down is held back from Windows, if any.
+    held: Option<u16>,
 }
 
 type MayTake = Box<dyn Fn() -> bool + Send + Sync>;
 
 thread_local! {
     static MAY_TAKE: OnceCell<MayTake> = const { OnceCell::new() };
-    static HOOKED: RefCell<Hooked> = RefCell::new(Hooked { press: Press::new(), generation: 0 });
+    static HOOKED: RefCell<Hooked> = RefCell::new(Hooked { press: Press::new(), generation: 0, held: None });
     /// `GetTickCount64` at the keyboard hook's last event, for the watchdog.
     static LAST_EVENT_MS: Cell<u64> = const { Cell::new(0) };
     /// `GetTickCount64` at the last raw keyboard input (`WM_INPUT`); 0 if none.
@@ -290,7 +287,7 @@ fn run(
                         let last_event = LAST_EVENT_MS.with(|t| t.get());
                         let last_raw = LAST_RAW_KEY_MS.with(|t| t.get());
                         // Never reinstall in the middle of a press.
-                        !win_held() && watchdog.should_reinstall(now_ms(), last_event, last_raw)
+                        !win_held() && !holding() && watchdog.should_reinstall(now_ms(), last_event, last_raw)
                     }
                 } else {
                     false
@@ -450,6 +447,7 @@ fn reinstall(keyboard: &mut HHOOK, mouse: &mut Option<HHOOK>) -> bool {
         let mut h = h.borrow_mut();
         h.press = Press::new();
         h.generation = h.generation.wrapping_add(1);
+        h.held = None;
     });
     set_mouse(mouse, false);
     LAST_EVENT_MS.with(|t| t.set(now_ms()));
@@ -497,8 +495,8 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         // SAFETY: for HC_ACTION, lparam points at an MSLLHOOKSTRUCT.
         let m = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         if let Some(ev) = mouse_event(wparam.0 as u32, m.dwExtraInfo) {
-            // A mouse event is never lone, so this never swallows.
-            feed(ev, false, 0, false);
+            // Never swallowed: a mouse event at most replays the held Win first.
+            let _ = feed(ev, false, false, 0);
         }
     }
     // SAFETY: passing the event on unchanged.
@@ -514,41 +512,58 @@ fn on_key(k: &KBDLLHOOKSTRUCT) -> bool {
     let Some(ev) = key_event(vk, up, injected, k.dwExtraInfo, held) else { return false };
     let button_held = ev == Ev::WinUp && any_button_down();
     // SAFETY: no arguments.
-    let late = ev == Ev::WinUp && is_late(unsafe { GetTickCount() }, k.time);
-    feed(ev, button_held, vk, late)
+    let late = is_win(vk) && !up && is_late(unsafe { GetTickCount() }, k.time);
+    feed(ev, button_held, late, vk as u16)
 }
 
-/// Feeds the state machine and acts on its verdict; true swallows the event.
-/// `win_vk` is the Win key whose up this is and `late` whether that Win-up
-/// reached the hook too late to take (both used only for `Lone`): Windows may
-/// already have timed the hook out and passed the real Win-up, opening Start.
-fn feed(ev: Ev, button_held: bool, win_vk: u32, late: bool) -> bool {
+/// Feeds the state machine, acts on its verdict and on the [`Step`]; true
+/// swallows the event. `late`: the event reached the hook too late to hold
+/// back (Windows may already have timed the hook out and passed it). `vk` is
+/// the event's key (used only to remember which Win key is held).
+fn feed(ev: Ev, button_held: bool, late: bool, vk: u16) -> bool {
     // Busy only if a callback re-entered while the loop held it: let it pass.
-    let Some((verdict, generation)) = HOOKED.with(|h| {
-        h.try_borrow_mut().ok().map(|mut h| (h.press.on(ev, button_held), h.generation))
+    let Some((verdict, generation, step, replay)) = HOOKED.with(|h| {
+        h.try_borrow_mut().ok().map(|mut h| {
+            let verdict = h.press.on(ev, button_held);
+            let take = matches!(ev, Ev::WinDown { .. }) && verdict == Verdict::ArmMouse && may_take();
+            let step = step(h.held.is_some(), ev, verdict, take, late);
+            let replay = h.held;
+            match step {
+                Step::Hold => h.held = Some(vk),
+                Step::ReplayWin | Step::Open | Step::Drop => h.held = None,
+                Step::Pass | Step::Swallow => {}
+            }
+            (verdict, h.generation, step, replay)
+        })
     }) else {
         return false;
     };
     match verdict {
-        Verdict::Pass => false,
-        Verdict::ArmMouse => {
-            post(MSG_MOUSE, 1, generation);
-            false
-        }
-        Verdict::DisarmMouse => {
-            post(MSG_MOUSE, 0, generation);
-            false
-        }
-        Verdict::Lone => {
-            post(MSG_MOUSE, 0, generation);
-            if late || !may_take() {
-                return false;
+        Verdict::Pass => {}
+        Verdict::ArmMouse => post(MSG_MOUSE, 1, generation),
+        Verdict::DisarmMouse | Verdict::Lone => post(MSG_MOUSE, 0, generation),
+    }
+    match step {
+        Step::Pass => false,
+        Step::Hold | Step::Swallow | Step::Drop => true,
+        Step::ReplayWin => {
+            if let Some(win) = replay {
+                // Windows handles it before the event this callback is on.
+                // SAFETY: a valid slice of one initialised INPUT.
+                unsafe { SendInput(&[tagged_win_down(win)], std::mem::size_of::<INPUT>() as i32) };
             }
-            resend_win_up(win_vk as u16);
+            false
+        }
+        Step::Open => {
             post(MSG_LONE, 0, 0);
             true
         }
     }
+}
+
+/// Whether a Win-down is held back from Windows right now.
+fn holding() -> bool {
+    HOOKED.with(|h| h.try_borrow().map(|h| h.held.is_some()).unwrap_or(true))
 }
 
 fn may_take() -> bool {
@@ -563,40 +578,12 @@ fn post(message: u32, wparam: usize, lparam: usize) {
     };
 }
 
-/// Re-sends the swallowed Win-up behind the mask key. If Windows inserts
-/// fewer than all three, sends `[mask up, Win up]` so no key is left down.
-fn resend_win_up(win_vk: u16) {
-    let size = std::mem::size_of::<INPUT>() as i32;
-    let batch = resend_batch(win_vk);
-    // SAFETY: valid slices of fully initialised INPUTs.
-    unsafe {
-        if SendInput(&batch, size) < batch.len() as u32 {
-            SendInput(&fallback_batch(win_vk), size);
-        }
-    }
-}
-
-/// `[mask down, mask up, Win up]`, all tagged as Flick's own.
-fn resend_batch(win_vk: u16) -> [INPUT; 3] {
-    [tagged_mask(false), tagged_mask(true), tagged_win_up(win_vk)]
-}
-
-/// `[mask up, Win up]`, both tagged: what follows a partly inserted
-/// [`resend_batch`]. A key-up for a key that isn't down is harmless.
-fn fallback_batch(win_vk: u16) -> [INPUT; 2] {
-    [tagged_mask(true), tagged_win_up(win_vk)]
-}
-
-fn tagged_mask(up: bool) -> INPUT {
-    let mut i = key_input(VIRTUAL_KEY(MASK_VK), up);
-    i.Anonymous.ki.dwExtraInfo = FLICK_TAG;
-    i
-}
-
-fn tagged_win_up(win_vk: u16) -> INPUT {
-    let mut i = key_input(VIRTUAL_KEY(win_vk), true);
-    // Both Win keys are extended keys, like the real event.
-    i.Anonymous.ki.dwFlags = KEYEVENTF_KEYUP | KEYEVENTF_EXTENDEDKEY;
+/// The held-back Win-down, tagged as Flick's own. Both Win keys are extended
+/// keys, like the real event.
+fn tagged_win_down(win: u16) -> INPUT {
+    let mut i = key_input(VIRTUAL_KEY(win), false);
+    // A down: no other flags.
+    i.Anonymous.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
     i.Anonymous.ki.dwExtraInfo = FLICK_TAG;
     i
 }
@@ -710,27 +697,15 @@ mod tests {
     }
 
     #[test]
-    fn resend_batch_is_mask_then_win_up_all_tagged() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD;
-        let batch = resend_batch(VK_RWIN as u16);
-        // SAFETY: every entry is a keyboard INPUT.
-        let keys: Vec<_> = batch.iter().map(|i| (i.r#type, unsafe { i.Anonymous.ki })).collect();
-        assert!(keys.iter().all(|(t, k)| *t == INPUT_KEYBOARD && k.dwExtraInfo == FLICK_TAG));
-        assert_eq!(keys.iter().map(|(_, k)| k.wVk.0).collect::<Vec<_>>(), [0xE8, 0xE8, 0x5C]);
-        let up = |k: &windows::Win32::UI::Input::KeyboardAndMouse::KEYBDINPUT| k.dwFlags.contains(KEYEVENTF_KEYUP);
-        assert_eq!(keys.iter().map(|(_, k)| up(k)).collect::<Vec<_>>(), [false, true, true]);
-        assert!(keys[2].1.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
-    }
-
-    #[test]
-    fn fallback_batch_releases_the_mask_and_win_all_tagged() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::INPUT_KEYBOARD;
-        let batch = fallback_batch(VK_LWIN as u16);
-        // SAFETY: every entry is a keyboard INPUT.
-        let keys: Vec<_> = batch.iter().map(|i| (i.r#type, unsafe { i.Anonymous.ki })).collect();
-        assert!(keys.iter().all(|(t, k)| *t == INPUT_KEYBOARD && k.dwExtraInfo == FLICK_TAG));
-        assert_eq!(keys.iter().map(|(_, k)| k.wVk.0).collect::<Vec<_>>(), [0xE8, 0x5B]);
-        assert!(keys.iter().all(|(_, k)| k.dwFlags.contains(KEYEVENTF_KEYUP)));
-        assert!(keys[1].1.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+    fn the_replayed_win_down_is_a_tagged_extended_down() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT_KEYBOARD, KEYEVENTF_KEYUP};
+        let i = tagged_win_down(VK_RWIN as u16);
+        assert_eq!(i.r#type, INPUT_KEYBOARD);
+        // SAFETY: a keyboard INPUT.
+        let k = unsafe { i.Anonymous.ki };
+        assert_eq!(k.wVk.0, 0x5C);
+        assert_eq!(k.dwExtraInfo, FLICK_TAG);
+        assert!(k.dwFlags.contains(KEYEVENTF_EXTENDEDKEY));
+        assert!(!k.dwFlags.contains(KEYEVENTF_KEYUP));
     }
 }

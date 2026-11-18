@@ -40,6 +40,7 @@ mod uninstall;
 mod window;
 mod winkey;
 mod winkey_logic;
+mod winkey_helper;
 mod winlist;
 mod wsl_detect;
 
@@ -577,7 +578,7 @@ impl WinKeyFlags {
 /// starting can block for seconds, so it never runs on the main thread.
 pub(crate) struct WinKey {
     pub(crate) flags: Arc<WinKeyFlags>,
-    hook: Mutex<Option<winkey::WinKeyHook>>,
+    hook: Mutex<Option<winkey_helper::WinKeyHelper>>,
     /// The last start failed, so there is no hook to ask.
     failed: AtomicBool,
     wanted: mpsc::Sender<bool>,
@@ -683,7 +684,7 @@ fn win_key_apply(app: &AppHandle, win: &WinKey, want: bool) -> bool {
         let app = handle.clone();
         let _ = handle.run_on_main_thread(move || window::toggle_from_win_key(&app));
     });
-    match winkey::WinKeyHook::start(may_take, on_lone) {
+    match winkey_helper::WinKeyHelper::start(may_take, on_lone) {
         Ok(hook) => {
             *win.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
             win.failed.store(false, Ordering::SeqCst);
@@ -882,6 +883,19 @@ fn weather_path() -> PathBuf {
 
 fn reminders_path() -> PathBuf {
     config::config_path().with_file_name("reminders.json")
+}
+
+/// Runs the Win-key helper when this process was started as one (see
+/// winkey_helper.rs) and returns true; false for a normal start.
+pub fn run_helper_if_asked() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    match winkey_helper::helper_parent(&args) {
+        Some(parent) => {
+            winkey_helper::helper_main(parent);
+            true
+        }
+        None => false,
+    }
 }
 
 pub fn run() {

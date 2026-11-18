@@ -136,13 +136,70 @@ impl Default for Press {
     }
 }
 
-/// Whether a lone press opens Flick (and is swallowed) or is left to Windows.
+/// Whether a lone press opens Flick (held back from Windows, so Start stays
+/// shut) or is left to Windows.
 pub fn take_lone(setting_on: bool, paused: bool, bar_ready: bool, full_screen: bool) -> bool {
     setting_on && !paused && bar_ready && !full_screen
 }
 
-/// A Win-up older than this when the hook sees it is left to Windows.
+/// A Win-down older than this when the hook sees it is left to Windows.
 const LATE_MS: u32 = 150;
+
+/// What the hook does with one event, given whether it is holding a Win-down
+/// back from Windows (`held`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// Pass it on.
+    Pass,
+    /// Swallow this Win-down and hold it: the press may be lone.
+    Hold,
+    /// Swallow it (an auto-repeat of the held Win key).
+    Swallow,
+    /// The press is a combination: send the held Win-down first (it lands
+    /// before this event), then pass this event on.
+    ReplayWin,
+    /// Swallow this Win-up and open Flick: Windows never saw the press.
+    Open,
+    /// Swallow this Win-up and do nothing: the press wasn't lone, but nothing
+    /// that needs Win reached Windows either.
+    Drop,
+}
+
+/// Decides the [`Step`] for `ev`, after [`Press::on`] gave `verdict`. `take`
+/// is [`take_lone`]'s answer now; `late` whether the event reached the hook
+/// late (only a Win-down's lateness matters: Windows may already have passed it).
+pub fn step(held: bool, ev: Ev, verdict: Verdict, take: bool, late: bool) -> Step {
+    match ev {
+        Ev::WinDown { physical: true, .. } if held => Step::Swallow,
+        Ev::WinDown { physical: true, .. } => {
+            if verdict == Verdict::ArmMouse && take && !late {
+                Step::Hold
+            } else {
+                Step::Pass
+            }
+        }
+        Ev::WinUp if held => {
+            if verdict == Verdict::Lone {
+                Step::Open
+            } else {
+                Step::Drop
+            }
+        }
+        Ev::WinUp => Step::Pass,
+        Ev::KeyDown { flick: true } | Ev::MouseDown { flick: true } | Ev::Wheel { flick: true } => Step::Pass,
+        Ev::WinDown { physical: false, .. }
+        | Ev::KeyDown { flick: false }
+        | Ev::MouseDown { flick: false }
+        | Ev::Wheel { flick: false }
+        | Ev::OtherWinDown => {
+            if held {
+                Step::ReplayWin
+            } else {
+                Step::Pass
+            }
+        }
+    }
+}
 
 /// Whether an event stamped `event_ms` (the hook's `time`, `GetTickCount`
 /// clock) is too late to take at `now_ms`: Windows may already have timed the
@@ -396,6 +453,60 @@ mod tests {
     fn defaults_are_new() {
         assert_eq!(format!("{:?}", Press::default()), format!("{:?}", Press::new()));
         assert_eq!(format!("{:?}", Watchdog::default()), format!("{:?}", Watchdog::new()));
+    }
+
+    #[test]
+    fn a_lone_tap_is_held_back_then_opens_flick() {
+        let mut p = Press::new();
+        let down = Ev::WinDown { physical: true, held: Held::default() };
+        let v = p.on(down, false);
+        assert_eq!(step(false, down, v, true, false), Step::Hold);
+        let v = p.on(Ev::WinUp, false);
+        assert_eq!(step(true, Ev::WinUp, v, true, false), Step::Open);
+    }
+
+    #[test]
+    fn auto_repeat_of_the_held_win_is_swallowed() {
+        let down = Ev::WinDown { physical: true, held: Held::default() };
+        assert_eq!(step(true, down, Verdict::Pass, true, false), Step::Swallow);
+    }
+
+    #[test]
+    fn a_combination_replays_win_before_the_second_key() {
+        for ev in [
+            Ev::KeyDown { flick: false },
+            Ev::MouseDown { flick: false },
+            Ev::Wheel { flick: false },
+            Ev::OtherWinDown,
+            Ev::WinDown { physical: false, held: Held::default() },
+        ] {
+            assert_eq!(step(true, ev, Verdict::DisarmMouse, true, false), Step::ReplayWin, "{ev:?}");
+            // Once replayed, nothing is held: the rest passes, Win-up too.
+            assert_eq!(step(false, ev, Verdict::Pass, true, false), Step::Pass, "{ev:?}");
+        }
+        assert_eq!(step(false, Ev::WinUp, Verdict::Pass, true, false), Step::Pass);
+    }
+
+    #[test]
+    fn flicks_own_input_never_replays() {
+        for ev in [Ev::KeyDown { flick: true }, Ev::MouseDown { flick: true }, Ev::Wheel { flick: true }] {
+            assert_eq!(step(true, ev, Verdict::Pass, true, false), Step::Pass, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn a_press_flick_may_not_take_is_left_to_windows() {
+        let down = Ev::WinDown { physical: true, held: Held::default() };
+        assert_eq!(step(false, down, Verdict::ArmMouse, false, false), Step::Pass, "not taken");
+        assert_eq!(step(false, down, Verdict::ArmMouse, true, true), Step::Pass, "late");
+        assert_eq!(step(false, down, Verdict::Pass, true, false), Step::Pass, "combination from the start");
+        assert_eq!(step(false, Ev::WinUp, Verdict::Lone, true, false), Step::Pass, "Start opens");
+    }
+
+    #[test]
+    fn a_held_press_that_isnt_lone_is_dropped() {
+        // A mouse button held at Win-up: not lone, and Windows saw no Win.
+        assert_eq!(step(true, Ev::WinUp, Verdict::Pass, true, false), Step::Drop);
     }
 
     #[test]

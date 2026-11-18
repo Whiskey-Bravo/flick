@@ -49,10 +49,10 @@ pub fn toggle(app: &AppHandle) {
     }
 }
 
-/// Win-key path ([`toggle`] for a lone Win press). The hook has just sent
-/// Flick's own input (the mask batch), which lets this process take the
-/// foreground; if Windows still keeps another window in front, the bar's
-/// thread joins that window's input queue for a moment and takes it from there.
+/// Win-key path ([`toggle`] for a lone Win press). The press was held back
+/// from Windows, so it gave Flick no right to take the foreground; if
+/// Windows keeps another window in front, the bar's thread joins that
+/// window's input queue for a moment and takes it from there.
 /// Main thread only (the bar's window thread, for `SetFocus`).
 pub fn toggle_from_win_key(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
