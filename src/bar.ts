@@ -57,6 +57,7 @@ export type State = {
   hidden: boolean; // the bar was hidden (Esc, focus loss) and not shown or typed into since
   queried: { text: string; scope: string | null } | null; // what the last query asked for
   keep: { provider: string; id: string } | null; // row to stay on when the re-query's results arrive
+  browsed: boolean; // the rows were moved through (arrows or mouse) since the bar opened or the text changed
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -117,6 +118,7 @@ export const initial: State = {
   hidden: false,
   queried: null,
   keep: null,
+  browsed: false,
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -247,7 +249,7 @@ function step(s: State, e: Event): Result {
       return done({ ...s, menu: null });
     case "hover":
       if (s.menu || !s.items[e.index] || e.index === s.selected) return done(s);
-      return done(fit({ ...s, selected: e.index, armed: null }));
+      return done(fit({ ...s, selected: e.index, armed: null, browsed: true }));
     case "click": {
       if (s.menu) return done({ ...s, menu: null });
       if (!s.items[e.index]) return done(s);
@@ -297,6 +299,7 @@ function step(s: State, e: Event): Result {
           ...s,
           text: e.text,
           recall: -1,
+          browsed: false,
           menu: null,
           selected: 0,
           top: 0,
@@ -389,13 +392,16 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
   switch (e.key) {
     case "ArrowUp":
     case "ArrowDown": {
-      if (s.past.length > 0 && !s.scope && (s.text === "" || s.recall >= 0) && (e.key === "ArrowUp" || s.recall >= 0)) {
+      // Up on the empty bar recalls past searches, unless the rows were moved
+      // through: then it goes back up them first, and recalls from the top row.
+      const backUp = e.key === "ArrowUp" && s.recall < 0 && s.browsed && s.selected > 0;
+      if (!backUp && s.past.length > 0 && !s.scope && (s.text === "" || s.recall >= 0) && (e.key === "ArrowUp" || s.recall >= 0)) {
         return recallStep(s, e.key === "ArrowUp" ? 1 : -1);
       }
       const n = s.items.length;
       if (n === 0) return done({ ...s, armed: null });
       const step = e.key === "ArrowDown" ? 1 : n - 1;
-      return done(fit({ ...s, selected: (s.selected + step) % n, armed: null }));
+      return done(fit({ ...s, selected: (s.selected + step) % n, armed: null, browsed: true }));
     }
     case "p": {
       const item = s.items[s.selected];
