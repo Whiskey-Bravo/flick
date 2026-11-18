@@ -12,6 +12,7 @@ pub mod history;
 pub mod devices;
 pub mod path;
 pub mod power;
+pub mod make;
 pub mod qr;
 pub mod recent;
 pub mod screen;

@@ -91,6 +91,7 @@ use providers::recent::{DownloadsProvider, RecentProvider};
 use dirs::{DirEntry, FileSystem, Loader, SystemFolders, KnownFolders, Links, ShellLinks, SystemFs};
 use providers::history::HistoryProvider;
 use providers::power::{PowerProvider, PowerRunner, SystemPower};
+use providers::make::MakeProvider;
 use providers::qr::QrProvider;
 use providers::screen::{ColorProvider, SnipProvider};
 use providers::settings::SettingsProvider;
@@ -140,6 +141,8 @@ struct Providers {
     clips: Arc<ClipsProvider>,
     /// `qr`: the clipboard text, held until the bar hides.
     qr: Arc<QrProvider>,
+    /// `password`, `uuid`, `lorem`, `hash`: made on the spot, forgotten when the bar hides.
+    make: Arc<MakeProvider>,
     shortcuts: Arc<ShortcutsProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
@@ -191,6 +194,7 @@ impl Providers {
             recent: browse.recent,
             clips: capture.clips,
             qr: capture.qr,
+            make: capture.make,
             shortcuts: {
                 let shortcuts = ShortcutsProvider::new(launcher.clone(), distro);
                 // Looked at again on every reload (`reload_with`).
@@ -223,6 +227,7 @@ impl Providers {
     pub(crate) fn on_hide(&self) {
         self.clips.forget();
         self.qr.forget();
+        self.make.forget();
         self.words.hide();
     }
 }
@@ -410,6 +415,7 @@ impl Browse {
 struct Capture {
     clips: Arc<ClipsProvider>,
     qr: Arc<QrProvider>,
+    make: Arc<MakeProvider>,
 }
 
 impl Capture {
@@ -439,7 +445,8 @@ impl Capture {
     ) -> Self {
         Capture {
             clips: Arc::new(ClipsProvider::new(history, launcher, now, on_ready.clone(), sequence)),
-            qr: Arc::new(QrProvider::new(text, clipboard, on_ready)),
+            qr: Arc::new(QrProvider::new(text.clone(), clipboard.clone(), on_ready.clone())),
+            make: Arc::new(MakeProvider::new(text, clipboard, Arc::new(providers::make::OsRandom), on_ready)),
         }
     }
 }
@@ -815,6 +822,7 @@ fn build_engine(
         Box::new(p.recent.clone()),
         Box::new(p.clips.clone()),
         Box::new(p.qr.clone()),
+        Box::new(p.make.clone()),
         Box::new(SnipProvider),
         Box::new(ColorProvider),
         Box::new(p.games.clone()),
@@ -1856,6 +1864,7 @@ mod tests {
             recent: browse.recent,
             clips: capture.clips,
             qr: capture.qr,
+            make: capture.make,
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
             welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
@@ -2242,6 +2251,8 @@ mod tests {
                 "recent",
                 "v / v invoice",
                 "qr / qr some text",
+                "password / password 32",
+                "uuid / lorem / hash",
                 "snip",
                 "color",
                 "your shortcuts",
@@ -2272,7 +2283,7 @@ mod tests {
                 "Tab",
             ]
         );
-        let flick = &help[34];
+        let flick = &help[36];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -2280,7 +2291,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 42);
+        assert_eq!(r.engine.query("Help", None).len(), 44);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));

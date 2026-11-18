@@ -15,6 +15,10 @@ Everything you can type in the bar, the keys it understands, and how results are
 | `recent` | Files and folders you opened recently, from Windows' own Recent list | `recent` |
 | `v`, then text to filter | Your clipboard history (Win+V); Enter pastes the item | `v`, `v invoice` |
 | `qr`, or `qr` and some text | Shows the clipboard text, or the typed text, as a QR code | `qr`, `qr some text` |
+| `password`, or `password` and a length | Makes a random password (20 characters, or 8 to 64); Enter copies it | `password`, `password 32` |
+| `uuid` | Makes a random UUID; Enter copies it | `uuid` |
+| `lorem`, or `lorem` and a number | Filler text, 1 to 10 paragraphs; Enter copies it | `lorem`, `lorem 3` |
+| `hash` | The SHA-256 of the clipboard text; Enter copies it | `hash` |
 | `snip` (also `screenshot`) | Opens Windows' snip tool | `snip` |
 | `color` (also `colour`, `picker`) | Picks a colour on screen and copies it as `#RRGGBB` | `color` |
 | A Settings page | Opens that Windows Settings page | `bluetooth`, `installed apps` |
