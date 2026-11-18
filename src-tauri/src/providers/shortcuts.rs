@@ -66,6 +66,28 @@ pub fn builtin_shortcuts(search_engine: &str, claude_app: bool) -> Vec<ShortcutD
     ]
 }
 
+/// The built-in web search's name.
+const SEARCH: &str = "?";
+
+/// The address to open when what follows `?` is a web link rather than
+/// something to search for: one word starting `http://`, `https://` or
+/// `www.` (which gets `https://`). Nothing else is ever opened this way.
+pub fn web_link(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.contains(char::is_whitespace) || text.contains(char::is_control) {
+        return None;
+    }
+    let lower = text.to_ascii_lowercase();
+    let host_of = |rest: &str| rest.split(['/', '?', '#']).next().is_some_and(|h| h.len() > 2 && h.contains('.'));
+    if let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) {
+        return host_of(rest).then(|| text.to_string());
+    }
+    if let Some(rest) = lower.strip_prefix("www.") {
+        return host_of(rest).then(|| format!("https://{text}"));
+    }
+    None
+}
+
 /// `defs` plus the built-in searches whose name no definition uses as a name or alias.
 fn with_builtins(
     mut defs: Vec<ShortcutDef>,
@@ -599,7 +621,12 @@ impl Provider for ShortcutsProvider {
             }
             match k {
                 Kind::Plain => {}
-                Kind::Arg => push(item(def, format!("arg:{n}:{rest}"), format!("{n} {rest}"), about(), 1000 + BONUS)),
+                Kind::Arg => {
+                    // A link after the built-in `?` is opened, not searched for.
+                    let link = n == SEARCH && st.builtin.contains(SEARCH) && web_link(rest).is_some();
+                    let subtitle = if link { "Open link".to_string() } else { about() };
+                    push(item(def, format!("arg:{n}:{rest}"), format!("{n} {rest}"), subtitle, 1000 + BONUS))
+                }
                 Kind::Pick => {
                     if let Some(Ok(entries)) = st.entries.get(n) {
                         for (e, score) in matching(entries, rest) {
@@ -657,6 +684,15 @@ impl Provider for ShortcutsProvider {
         let (def, distro, entry) = {
             let st = self.state.read().unwrap_or_else(|e| e.into_inner());
             let Some(def) = find(&st.defs, name, want) else { return gone() };
+            // A link after the built-in `?`: open it instead of searching for it.
+            let link = (prefix == "arg" && name == SEARCH && st.builtin.contains(SEARCH))
+                .then(|| value.and_then(web_link))
+                .flatten();
+            if let Some(link) = link {
+                drop(st);
+                self.launcher.open(&link)?;
+                return Ok(Outcome::Hide);
+            }
             let entry: Option<Result<Option<Entry>, String>> = st.entries.get(name).map(|r| match r {
                 Ok(list) => Ok(value.and_then(|v| list.iter().find(|e| e.name == v).cloned())),
                 Err(e) => Err(e.clone()),
@@ -1450,6 +1486,38 @@ mod tests {
 
     fn open_row(p: &ShortcutsProvider, text: &str) -> ResultItem {
         p.query(&q(text)).into_iter().find(|i| i.id.starts_with("arg:")).expect("an argument row")
+    }
+
+    #[test]
+    fn a_link_after_the_search_mark_is_opened_not_searched_for() {
+        assert_eq!(web_link("https://example.com/a?b=c#d").as_deref(), Some("https://example.com/a?b=c#d"));
+        assert_eq!(web_link(" HTTP://Example.com ").as_deref(), Some("HTTP://Example.com"));
+        assert_eq!(web_link("www.example.com/x").as_deref(), Some("https://www.example.com/x"));
+        for not in ["rust lang", "https://example.com and more", "example.com", "node.js", "https://", "https://x", "file:///C:/x", "javascript:alert(1)", "www.", ""] {
+            assert_eq!(web_link(not), None, "{not}");
+        }
+        let (p, rec) = setup(vec![]);
+        for text in ["? https://example.com/page?x=1", "?https://example.com/page?x=1"] {
+            let row = open_row(&p, text);
+            assert_eq!(row.subtitle, "Open link");
+            assert_eq!(p.activate(&row.id, Modifier::None), Ok(Outcome::Hide));
+        }
+        p.activate(&open_row(&p, "? www.example.com").id, Modifier::None).unwrap();
+        let calls = opened(&rec).join("
+");
+        assert_eq!(calls.matches("https://example.com/page?x=1").count(), 2, "{calls}");
+        assert!(calls.contains("https://www.example.com"), "{calls}");
+        assert!(!calls.contains("duckduckgo"), "{calls}");
+        // Words are still searched for, and the other searches search for a link too.
+        assert_eq!(open_row(&p, "? example").subtitle, "Web search");
+        p.activate(&open_row(&p, "g https://example.com").id, Modifier::None).unwrap();
+        assert!(opened(&rec).join("
+").contains("google.com/search?q=https%3A%2F%2Fexample.com"));
+        // Your own shortcut named `?` does what you wrote.
+        let (p, rec) = setup(vec![open("?", "https://mine.example/find?q={arg}")]);
+        p.activate(&open_row(&p, "? https://example.com").id, Modifier::None).unwrap();
+        assert!(opened(&rec).join("
+").contains("mine.example/find?q=https%3A%2F%2Fexample.com"));
     }
 
     #[test]

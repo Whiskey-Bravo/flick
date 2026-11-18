@@ -29,6 +29,7 @@ A currency or weather answer needs the internet. The row says `Getting rates…`
 | You type | Searches |
 |---|---|
 | `? text` (also `?text`) | Your search engine (DuckDuckGo unless you set `search_engine`) |
+| `? https://example.com` | Opens the link itself instead of searching for it (a word starting `http://`, `https://` or `www.`) |
 | `g text` | Google |
 | `yt text` | YouTube |
 | `gh text` | GitHub |
