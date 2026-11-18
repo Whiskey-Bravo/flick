@@ -99,12 +99,26 @@ fn with_png(mut path: PathBuf) -> PathBuf {
     path
 }
 
+/// Writes `bytes` to `<path>.tmp`, then renames it over `path`, so a failed
+/// write never leaves a cut-off file where a good one was. The temp file is
+/// removed on failure.
+fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let temp = path.with_file_name(name);
+    let result = std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Asks where to save the code for `text` (`ask` gets [`SUGGESTED_NAME`]) and
 /// writes it; says so when it cannot. Cancelling does nothing. Blocks on `ask`.
 pub fn save_qr(text: &str, ask: &dyn Fn(&str) -> Option<PathBuf>, notify: &dyn Notifier) {
     let Some(path) = ask(SUGGESTED_NAME) else { return };
     let path = with_png(path);
-    let saved = qr_png(text).is_some_and(|png| std::fs::write(&path, png).is_ok());
+    let saved = qr_png(text).is_some_and(|png| write_whole(&path, &png).is_ok());
     if !saved {
         let _ = notify.show(TITLE, COULD_NOT_SAVE);
     }
@@ -516,6 +530,28 @@ mod tests {
         let notes = crate::notifications::FakeNotifier::default();
         save_qr("hi", &|_| None, &notes);
         assert!(notes.shown().is_empty());
+    }
+
+    #[test]
+    fn a_save_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| Some(dir.path().join("out.png")), &notes);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["out.png"]);
+    }
+
+    #[test]
+    fn a_failed_overwrite_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.png");
+        std::fs::write(&target, b"old picture").unwrap();
+        // The temp path is a directory: the write cannot happen.
+        std::fs::create_dir(dir.path().join("out.png.tmp")).unwrap();
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| Some(target.clone()), &notes);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old picture");
+        assert_eq!(notes.shown().len(), 1);
     }
 
     #[test]

@@ -1196,7 +1196,7 @@ fn setup(app: &AppHandle) {
 
     let keys = Arc::new(DirectKeys::new(Arc::new(PluginKeys::new(app.clone(), on_direct_press))));
     app.manage(keys.clone());
-    let hotkey_error = apply_hotkey(app, &loaded.config.hotkey);
+    let hotkey_error = apply_hotkey(app, &loaded.config.hotkey, true);
     // After the bar hotkey, against the one that registered: it always wins.
     keys.apply(&registered_bar(app, &loaded.config.hotkey), &loaded.config.direct_hotkeys);
 
@@ -1339,9 +1339,9 @@ fn load_answer_stores(app: &AppHandle, p: &Providers) {
 }
 
 /// Registers `accelerator`, records the result and tells the tray and the user
-/// when it did not work.
+/// when it did not work (`announce` false: not for a Settings attempt that was refused).
 /// Returns the user-facing error text on failure.
-pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
+pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str, announce: bool) -> Option<String> {
     let result = hotkey::apply(app, accelerator);
     let state = app.state::<AppState>();
     *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then(|| accelerator.to_string());
@@ -1349,9 +1349,18 @@ pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String>
         *state.bar_hotkey.lock().unwrap_or_else(|e| e.into_inner()) = Some(accelerator.to_string());
     }
     let error = result.err();
-    tray::set_error(app, error.as_deref());
-    announce_hotkey_error(app, accelerator, error.as_deref());
+    if reports_hotkey(announce, error.as_deref()) {
+        tray::set_error(app, error.as_deref());
+        announce_hotkey_error(app, accelerator, error.as_deref());
+    }
     error
+}
+
+/// Whether a hotkey result goes to the tray and the notification. A refused
+/// attempt from the Settings window (`announce` false) does not: the window
+/// shows the error itself and the old hotkey is back in use.
+fn reports_hotkey(announce: bool, error: Option<&str>) -> bool {
+    announce || error.is_none()
 }
 
 /// Says in a notification that the bar hotkey does not work, once per distinct
@@ -1522,7 +1531,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
         &old,
         &config,
         hotkey_needs_apply(applied.as_deref(), &config.hotkey),
-        |accelerator| apply_hotkey(app, accelerator),
+        |accelerator| apply_hotkey(app, accelerator, true),
         || registered_bar(app, &config.hotkey),
     );
     // Under the config lock, so concurrent reloads report in order.
@@ -1622,7 +1631,7 @@ pub(crate) fn change_bar_hotkey(app: &AppHandle, wanted: &str) -> Result<(), Str
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let keys = app.state::<Arc<DirectKeys>>();
     settings::set_hotkey(&config::config_path(), applied.as_deref(), wanted, |h| {
-        swap_bar_hotkey(&keys, h, &config.direct_hotkeys, |a| apply_hotkey(app, a), || registered_bar(app, &config.hotkey))
+        swap_bar_hotkey(&keys, h, &config.direct_hotkeys, |a| apply_hotkey(app, a, false), || registered_bar(app, &config.hotkey))
             .map_or(Ok(()), Err)
     })
 }
@@ -2568,6 +2577,14 @@ mod tests {
         assert_eq!(r.engine.query("hello", None)[0].provider, "shortcuts");
         push_distro_now(&r.providers, &config, &WslState::NoWsl);
         assert!(r.engine.query("> ls", None).is_empty());
+    }
+
+    #[test]
+    fn a_refused_settings_attempt_is_not_reported_but_a_good_one_is() {
+        assert!(reports_hotkey(true, Some("in use")));
+        assert!(reports_hotkey(true, None));
+        assert!(!reports_hotkey(false, Some("in use")));
+        assert!(reports_hotkey(false, None));
     }
 
     #[test]

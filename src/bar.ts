@@ -373,7 +373,11 @@ function step(s: State, e: Event): Result {
         const k = s.keep;
         const at = e.items.findIndex((i) => i.provider === k.provider && i.id === k.id);
         const armed = at >= 0 && s.armed === k.id ? s.armed : null;
-        return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu: null, keep: null }));
+        // A menu opened after the tick was sent stays when its row is still at that place.
+        const was = s.menu ? s.items[s.menu.index] : undefined;
+        const now = s.menu ? e.items[s.menu.index] : undefined;
+        const menu = s.menu && was && now && was.provider === now.provider && was.id === now.id ? s.menu : null;
+        return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu, keep: null }));
       }
       if (s.text === "" && !s.scope) selected = emptyBarSelection(e.items);
       // Rows kept from the last show were on screen: a row the user moved to

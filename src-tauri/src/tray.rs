@@ -17,6 +17,8 @@ struct LoginItem(CheckMenuItem<tauri::Wry>);
 struct UpdateItem {
     menu: Menu<tauri::Wry>,
     item: Mutex<Option<MenuItem<tauri::Wry>>>,
+    /// The version last asked for; `item` follows it on the main thread.
+    wanted: Mutex<Option<String>>,
 }
 
 const TRAY_ID: &str = "flick";
@@ -46,7 +48,7 @@ pub fn build(
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(app, &[&open, &settings, &edit, &reload, &login, &separator, &quit])?;
 
-    app.manage(UpdateItem { menu: menu.clone(), item: Mutex::new(None) });
+    app.manage(UpdateItem { menu: menu.clone(), item: Mutex::new(None), wanted: Mutex::new(None) });
 
     let base = app.default_window_icon();
     let plain = base.map(|icon| Image::new_owned(icon.rgba().to_vec(), icon.width(), icon.height()));
@@ -57,7 +59,11 @@ pub fn build(
         menu: menu.clone(),
         plain,
         dotted,
-        now: Mutex::new(Now { error: error.map(str::to_string), ignored: false, item: None }),
+        want: Mutex::new(Want { error: error.map(str::to_string), ignored: false }),
+        applied: Mutex::new(Applied {
+            shown: Shown { dotted: error.is_some(), line: false, tooltip: tooltip_text(error, false) },
+            item: None,
+        }),
     });
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
@@ -109,14 +115,38 @@ pub fn set_login_checked(app: &AppHandle, on: bool) {
     }
 }
 
-/// The tray tooltip: what is wrong with the hotkey, and whether the last press was ignored.
+/// Windows shows at most this many UTF-16 units of a tray tooltip.
+const TOOLTIP_MAX: usize = 127;
+
+/// The tray tooltip: what is wrong with the hotkey, and whether the last press
+/// was ignored. At most 127 UTF-16 units, ending in an ellipsis when cut.
 pub fn tooltip_text(error: Option<&str>, ignored: bool) -> String {
-    match (error, ignored) {
+    let text = match (error, ignored) {
         (None, false) => DEFAULT_TOOLTIP.to_string(),
         (Some(e), false) => format!("{DEFAULT_TOOLTIP} \u{2014} {e}"),
         (None, true) => format!("{DEFAULT_TOOLTIP}: {IGNORED_TOOLTIP}"),
-        (Some(e), true) => format!("{DEFAULT_TOOLTIP} \u{2014} {e}; {IGNORED_TOOLTIP}"),
+        (Some(e), true) => format!("{DEFAULT_TOOLTIP}: {IGNORED_TOOLTIP}; {e}"),
+    };
+    cut_utf16(&text, TOOLTIP_MAX)
+}
+
+/// `text` as is when it fits in `max` UTF-16 units, else cut (between
+/// characters) to end in `…` within `max`.
+fn cut_utf16(text: &str, max: usize) -> String {
+    if text.encode_utf16().count() <= max {
+        return text.to_string();
     }
+    let mut out = String::new();
+    let mut used = 1; // the ellipsis
+    for c in text.chars() {
+        used += c.len_utf16();
+        if used > max {
+            break;
+        }
+        out.push(c);
+    }
+    out.push('\u{2026}');
+    out
 }
 
 /// A copy of the RGBA icon with a filled amber circle (40 % of the width
@@ -139,41 +169,121 @@ pub fn with_dot(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-/// Tray state that changes at run time, in managed state.
+/// What the user should see, as the hotkey and the full-screen check last said.
+#[derive(Clone, Default)]
+struct Want {
+    error: Option<String>,
+    ignored: bool,
+}
+
+/// What the tray shows now.
+#[derive(Clone, PartialEq, Debug)]
+struct Shown {
+    /// The dotted icon is on.
+    dotted: bool,
+    /// The "Last press ignored" menu line is in.
+    line: bool,
+    tooltip: String,
+}
+
+/// What to change on the tray to get from `Shown` to `Want`; `None` leaves it.
+#[derive(PartialEq, Debug, Default)]
+struct Changes {
+    /// Swap the icon: dotted or plain.
+    icon: Option<bool>,
+    /// Put the menu line in (`true`) or take it out.
+    line: Option<bool>,
+    tooltip: Option<String>,
+}
+
+fn plan(shown: &Shown, want: &Want) -> Changes {
+    let dotted = want.error.is_some();
+    let tooltip = tooltip_text(want.error.as_deref(), want.ignored);
+    Changes {
+        icon: (shown.dotted != dotted).then_some(dotted),
+        line: (shown.line != want.ignored).then_some(want.ignored),
+        tooltip: (shown.tooltip != tooltip).then_some(tooltip),
+    }
+}
+
+/// Tray state that changes at run time, in managed state. `want` is changed
+/// from any thread and only ever held for a field write; `applied` is used by
+/// [`apply`] alone, on the main thread. No lock is held across a tray call.
 struct TrayState {
     menu: Menu<tauri::Wry>,
     plain: Option<Image<'static>>,
     dotted: Option<Image<'static>>,
-    now: Mutex<Now>,
+    want: Mutex<Want>,
+    applied: Mutex<Applied>,
 }
 
-struct Now {
-    error: Option<String>,
-    ignored: bool,
-    /// The "Last press ignored" menu item while one is shown.
+struct Applied {
+    shown: Shown,
+    /// The "Last press ignored" menu item while one is in.
     item: Option<MenuItem<tauri::Wry>>,
 }
 
-/// Puts the tooltip and the icon in line with `now`. No-op until the tray exists.
-fn refresh(app: &AppHandle, state: &TrayState, now: &Now) {
+/// Brings the tray in line with `want`. Main thread only. No-op until the tray exists.
+fn apply(app: &AppHandle) {
+    let Some(state) = app.try_state::<TrayState>() else { return };
     let Some(tray) = app.tray_by_id(TRAY_ID) else { return };
-    let _ = tray.set_tooltip(Some(tooltip_text(now.error.as_deref(), now.ignored)));
-    let icon = if now.error.is_some() { state.dotted.clone() } else { state.plain.clone() };
-    if let Some(icon) = icon {
-        let _ = tray.set_icon(Some(icon));
+    let want = state.want.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (mut shown, mut item) = {
+        let applied = state.applied.lock().unwrap_or_else(|e| e.into_inner());
+        (applied.shown.clone(), applied.item.clone())
+    };
+    let changes = plan(&shown, &want);
+    match changes.line {
+        Some(true) => {
+            if let Ok(new) = MenuItem::with_id(app, "ignored", IGNORED_ITEM, false, None::<&str>) {
+                if state.menu.insert(&new, 0).is_ok() {
+                    item = Some(new);
+                    shown.line = true;
+                }
+            }
+        }
+        Some(false) => {
+            if let Some(old) = item.take() {
+                let _ = state.menu.remove(&old);
+            }
+            shown.line = false;
+        }
+        None => {}
     }
+    if let Some(dotted) = changes.icon {
+        let icon = if dotted { state.dotted.clone() } else { state.plain.clone() };
+        if let Some(icon) = icon {
+            let _ = tray.set_icon(Some(icon));
+        }
+        shown.dotted = dotted;
+    }
+    if let Some(text) = changes.tooltip {
+        let _ = tray.set_tooltip(Some(text.as_str()));
+        shown.tooltip = text;
+    }
+    let mut applied = state.applied.lock().unwrap_or_else(|e| e.into_inner());
+    applied.shown = shown;
+    applied.item = item;
+}
+
+/// Hands the tray work to the main thread without waiting for it.
+fn schedule(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || apply(&handle));
 }
 
 /// The hotkey's error (the tooltip says it, the icon gets a dot), or `None`
 /// when it registered. No-op until the tray exists.
 pub fn set_error(app: &AppHandle, error: Option<&str>) {
     let Some(state) = app.try_state::<TrayState>() else { return };
-    let mut now = state.now.lock().unwrap_or_else(|e| e.into_inner());
-    if now.error.as_deref() == error {
-        return;
+    {
+        let mut want = state.want.lock().unwrap_or_else(|e| e.into_inner());
+        if want.error.as_deref() == error {
+            return;
+        }
+        want.error = error.map(str::to_string);
     }
-    now.error = error.map(str::to_string);
-    refresh(app, &state, &now);
+    schedule(app);
 }
 
 /// Whether the last press of the hotkey was ignored because a full-screen app
@@ -182,45 +292,46 @@ pub fn set_error(app: &AppHandle, error: Option<&str>) {
 /// the tray exists.
 pub fn set_ignored(app: &AppHandle, ignored: bool) {
     let Some(state) = app.try_state::<TrayState>() else { return };
-    let mut now = state.now.lock().unwrap_or_else(|e| e.into_inner());
-    if now.ignored == ignored {
-        return;
-    }
-    now.ignored = ignored;
-    if ignored {
-        if let Ok(item) = MenuItem::with_id(app, "ignored", IGNORED_ITEM, false, None::<&str>) {
-            if state.menu.insert(&item, 0).is_ok() {
-                now.item = Some(item);
-            }
+    {
+        let mut want = state.want.lock().unwrap_or_else(|e| e.into_inner());
+        if want.ignored == ignored {
+            return;
         }
-    } else if let Some(item) = now.item.take() {
-        let _ = state.menu.remove(&item);
+        want.ignored = ignored;
     }
-    refresh(app, &state, &now);
+    schedule(app);
 }
 
 /// Puts "Update to <version>" at the top of the menu, or takes it out on `None`.
-/// No-op until the tray exists.
+/// The menu work runs on the main thread, never waited for and never under a
+/// lock. No-op until the tray exists.
 pub fn set_update(app: &AppHandle, version: Option<&str>) {
     let Some(holder) = app.try_state::<UpdateItem>() else { return };
-    let mut current = holder.item.lock().unwrap_or_else(|e| e.into_inner());
-    match version {
-        Some(v) => {
-            let text = format!("Update to {v}");
-            if let Some(item) = current.as_ref() {
-                let _ = item.set_text(text);
-            } else if let Ok(item) = MenuItem::with_id(app, "update", text, true, None::<&str>) {
-                if holder.menu.insert(&item, 0).is_ok() {
-                    *current = Some(item);
-                }
-            }
+    *holder.wanted.lock().unwrap_or_else(|e| e.into_inner()) = version.map(str::to_string);
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || apply_update(&handle));
+}
+
+/// Main thread only: puts the update line in line with the version last asked for.
+fn apply_update(app: &AppHandle) {
+    let Some(holder) = app.try_state::<UpdateItem>() else { return };
+    let wanted = holder.wanted.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let current = holder.item.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let now = match (wanted, current) {
+        (Some(v), Some(item)) => {
+            let _ = item.set_text(format!("Update to {v}"));
+            Some(item)
         }
-        None => {
-            if let Some(item) = current.take() {
-                let _ = holder.menu.remove(&item);
-            }
+        (Some(v), None) => MenuItem::with_id(app, "update", format!("Update to {v}"), true, None::<&str>)
+            .ok()
+            .filter(|item| holder.menu.insert(item, 0).is_ok()),
+        (None, Some(item)) => {
+            let _ = holder.menu.remove(&item);
+            None
         }
-    }
+        (None, None) => None,
+    };
+    *holder.item.lock().unwrap_or_else(|e| e.into_inner()) = now;
 }
 
 #[cfg(test)]
@@ -240,8 +351,79 @@ mod tests {
         );
         assert_eq!(
             tooltip_text(Some("hotkey \"X\" is in use"), true),
-            "Flick \u{2014} hotkey \"X\" is in use; last press ignored, a full-screen app was in front"
+            "Flick: last press ignored, a full-screen app was in front; hotkey \"X\" is in use"
         );
+    }
+
+    #[test]
+    fn a_long_tooltip_is_cut_to_127_units_with_an_ellipsis() {
+        let long = "x".repeat(300);
+        let cut = tooltip_text(Some(&long), true);
+        assert_eq!(cut.encode_utf16().count(), 127);
+        assert!(cut.ends_with('\u{2026}'));
+        assert!(cut.starts_with("Flick: last press ignored"));
+        // Exactly 127 units is left alone.
+        let exact = "y".repeat(127 - "Flick \u{2014} ".encode_utf16().count());
+        assert_eq!(tooltip_text(Some(&exact), false).encode_utf16().count(), 127);
+        assert!(!tooltip_text(Some(&exact), false).ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_cut_never_splits_a_surrogate_pair() {
+        // Two units each: a cut by units would land inside one.
+        for pad in 0..3 {
+            let error = format!("{}{}", "x".repeat(pad), "\u{1F355}".repeat(100));
+            let cut = tooltip_text(Some(&error), false);
+            assert!(cut.encode_utf16().count() <= 127);
+            assert!(cut.ends_with('\u{2026}'));
+        }
+    }
+
+    fn shown(dotted: bool, line: bool, error: Option<&str>, ignored: bool) -> Shown {
+        Shown { dotted, line, tooltip: tooltip_text(error, ignored) }
+    }
+
+    fn want(error: Option<&str>, ignored: bool) -> Want {
+        Want { error: error.map(str::to_string), ignored }
+    }
+
+    #[test]
+    fn nothing_changed_changes_nothing() {
+        assert_eq!(plan(&shown(false, false, None, false), &want(None, false)), Changes::default());
+        assert_eq!(plan(&shown(true, true, Some("e"), true), &want(Some("e"), true)), Changes::default());
+    }
+
+    #[test]
+    fn only_ignored_changing_leaves_the_icon_alone() {
+        let c = plan(&shown(false, false, None, false), &want(None, true));
+        assert_eq!(c.icon, None);
+        assert_eq!(c.line, Some(true));
+        assert_eq!(c.tooltip, Some(tooltip_text(None, true)));
+        let back = plan(&shown(false, true, None, true), &want(None, false));
+        assert_eq!((back.icon, back.line), (None, Some(false)));
+    }
+
+    #[test]
+    fn an_error_appearing_changes_icon_and_tooltip_not_the_menu() {
+        let c = plan(&shown(false, false, None, false), &want(Some("e"), false));
+        assert_eq!(c, Changes { icon: Some(true), line: None, tooltip: Some(tooltip_text(Some("e"), false)) });
+        let gone = plan(&shown(true, false, Some("e"), false), &want(None, false));
+        assert_eq!(gone, Changes { icon: Some(false), line: None, tooltip: Some("Flick".to_string()) });
+    }
+
+    #[test]
+    fn error_and_ignored_flipping_together_change_everything() {
+        let c = plan(&shown(false, false, None, false), &want(Some("e"), true));
+        assert_eq!(c.icon, Some(true));
+        assert_eq!(c.line, Some(true));
+        assert_eq!(c.tooltip, Some(tooltip_text(Some("e"), true)));
+    }
+
+    #[test]
+    fn a_new_error_text_changes_only_the_tooltip() {
+        let c = plan(&shown(true, false, Some("a"), false), &want(Some("b"), false));
+        assert_eq!((c.icon, c.line), (None, None));
+        assert_eq!(c.tooltip, Some(tooltip_text(Some("b"), false)));
     }
 
     fn pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
@@ -257,7 +439,9 @@ mod tests {
         assert_eq!(pixel(&dotted, 32, 25, 25), [0xF5, 0xA5, 0x24, 0xFF]);
         assert_eq!(pixel(&dotted, 32, 0, 0), [0, 0, 0, 0]);
         assert_eq!(pixel(&dotted, 32, 10, 25), [0, 0, 0, 0]);
-        // Touches the corner: the pixel under the circle's far edge is amber, the very corner is not.
+        // Touches the right and bottom edges; the square's very corner is outside the circle.
+        assert_eq!(pixel(&dotted, 32, 31, 25), [0xF5, 0xA5, 0x24, 0xFF]);
+        assert_eq!(pixel(&dotted, 32, 25, 31), [0xF5, 0xA5, 0x24, 0xFF]);
         assert_eq!(pixel(&dotted, 32, 31, 31), [0, 0, 0, 0]);
     }
 

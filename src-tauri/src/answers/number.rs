@@ -140,6 +140,12 @@ fn plain_time_seconds(t: Time) -> String {
     format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second())
 }
 
+/// Whether `formatted` shows the seconds of `t` as two ASCII digits. A format
+/// without seconds (or with other digits) would make a ticking row look still.
+fn shows_seconds(formatted: &str, t: Time) -> bool {
+    formatted.contains(&format!("{:02}", t.second()))
+}
+
 /// The user's Windows locale, read once.
 pub struct WindowsFormats {
     decimal: char,
@@ -230,7 +236,12 @@ impl Formats for WindowsFormats {
         if n <= 1 {
             return plain_time_seconds(t);
         }
-        String::from_utf16_lossy(&buf[..n as usize - 1])
+        let text = String::from_utf16_lossy(&buf[..n as usize - 1]);
+        if shows_seconds(&text, t) {
+            text
+        } else {
+            plain_time_seconds(t)
+        }
     }
 
     fn fahrenheit(&self) -> bool {
@@ -341,7 +352,19 @@ mod tests {
         let f = TestFormats { decimal: ',', group: '.' };
         assert_eq!(f.time_seconds(Time::constant(12, 5, 9, 0)), "12:05:09");
         let w = WindowsFormats::new();
+        // Whatever the machine's format is, the seconds show.
         assert!(w.time_seconds(Time::constant(12, 5, 9, 0)).contains("09"));
+    }
+
+    #[test]
+    fn a_time_without_seconds_falls_back_to_plain() {
+        let t = Time::constant(12, 5, 9, 0);
+        assert!(shows_seconds("12:05:09", t));
+        assert!(shows_seconds("12:05:09 PM", t));
+        assert!(!shows_seconds("12:05", t));
+        assert!(!shows_seconds("12:05 PM", t));
+        // Not ASCII digits: the tick would not be readable as seconds.
+        assert!(!shows_seconds("\u{0661}\u{0662}:\u{0660}\u{0665}:\u{0660}\u{0669}", t));
     }
 
     #[test]

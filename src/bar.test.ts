@@ -1064,6 +1064,21 @@ describe("mouse and menu", () => {
       expect(run(armed, { type: "answersReady" }).state.armed).toBe("u");
     });
 
+    it("a_menu_opened_after_the_tick_survives_its_reply_when_the_row_is_the_same", () => {
+      const ticked = run(shown(clock, item("a")), { type: "answersReady" }).state;
+      const open = run(ticked, key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      const after = run(open, { type: "results", items: [clock, item("a")] }).state;
+      expect(after.menu).toEqual(open.menu);
+    });
+
+    it("a_menu_opened_after_the_tick_closes_when_its_row_is_gone", () => {
+      const ticked = run(shown(clock, item("a")), { type: "answersReady" }).state;
+      const open = run(ticked, key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      expect(run(open, { type: "results", items: [item("a"), clock] }).state.menu).toBeNull();
+    });
+
     it("no_tick_effect_once_hidden", () => {
       expect(run(shown(clock), { type: "hidden" }, { type: "answersReady" }).effects).toEqual([]);
     });
