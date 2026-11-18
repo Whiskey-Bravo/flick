@@ -6,6 +6,34 @@
   --muted: #a4a4b0;
   --accent: #6d8bff;
   --error: #ff7b7b;
+  --scroll: #44444e;
+  /* Native controls (selects, checkboxes, scrollbars) in their dark form. */
+  color-scheme: dark;
+}
+
+/* Slim scrollbars in the window's own colours, with no arrow buttons. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid var(--bg);
+  border-radius: 5px;
+  background: var(--scroll);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+}
+
+::-webkit-scrollbar-button {
+  display: none;
 }
 
 html,
@@ -90,13 +118,23 @@ button {
   cursor: pointer;
 }
 
+/* A column: a page whose content is taller scrolls as a whole, while a page
+   with a list and an editor (`.sc`) gives them the room left under the
+   heading, so only they scroll and the page never does. */
 .page {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   margin: 0;
   padding: 16px 24px;
   border: 0;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.page > * {
+  flex: none;
 }
 
 .page:disabled {

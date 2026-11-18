@@ -1,5 +1,7 @@
-.sc { display: flex; gap: 20px; height: 100%; min-height: 0; }
-.sc-list { flex: none; width: 220px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; }
+.page > .sc { flex: 1 1 0; }
+.sc { display: flex; gap: 20px; min-height: 0; }
+.sc-list { flex: none; width: 240px; display: flex; flex-direction: column; gap: 4px; overflow-y: auto; padding-right: 4px; }
+.sc-list > * { flex: none; }
 .sc-add, .sc-row, .sc-actions button, .sc-pick button, .sc-ask button {
   padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px;
   background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
@@ -14,7 +16,8 @@
 .sc-name { font-weight: 600; }
 .sc-about { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sc-hint, .sc-empty { color: var(--muted); }
-.sc-editor { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; padding-right: 4px; }
+.sc-editor { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 12px; overflow-y: auto; padding-right: 10px; }
+.sc-editor > * { flex: none; }
 .sc-field { display: flex; flex-direction: column; gap: 4px; }
 .sc-field > span { font-weight: 600; }
 .sc-field small, .sc-check small, .sc-radio small { color: var(--muted); }
@@ -24,14 +27,19 @@
 }
 .sc-radio, .sc-check { display: flex; align-items: center; gap: 6px; font-weight: 400; }
 .sc-pick { display: flex; gap: 8px; }
-.sc-pick input { flex: 1; }
+.sc-pick input { flex: 1; min-width: 0; }
+.sc-pick button { flex: none; white-space: nowrap; }
 .sc-more { display: flex; flex-direction: column; gap: 10px; }
 .sc-more > summary { cursor: pointer; color: var(--muted); margin-bottom: 10px; }
 .sc-error { margin: 0; color: var(--error); }
 .sc-note { margin: 0; color: var(--muted); }
 .sc-ask { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--accent); border-radius: 8px; }
 .sc-ask span { flex: 1; }
-.sc-actions { display: flex; align-items: center; gap: 8px; }
+/* Stays at the bottom of the editor, so Save is always in reach. */
+.sc-actions {
+  display: flex; align-items: center; gap: 8px;
+  position: sticky; bottom: 0; margin-top: auto; padding: 10px 0 2px; background: var(--bg);
+}
 .sc-actions .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .sc-actions .danger { color: var(--error); border-color: var(--error); }
 .sc button:disabled { opacity: 0.45; cursor: default; }
