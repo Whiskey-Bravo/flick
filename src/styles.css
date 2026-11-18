@@ -286,3 +286,102 @@ input::placeholder {
 .menu-item.selected {
   background: var(--menu-row);
 }
+
+/* ---- Animations --------------------------------------------------------
+   `data-motion` on the root is minimal, medium or high (src/appearance.ts).
+   Minimal is everything above, unchanged. Nothing here delays a key: the
+   page is already in its final state while a transition plays. With
+   Windows' animation effects off, none of this applies. */
+
+.sel-marker {
+  display: none;
+  position: absolute;
+  top: 0;
+  left: 6px;
+  right: 6px;
+  height: 44px;
+  border-radius: 8px;
+  background: var(--row);
+  pointer-events: none;
+}
+
+@keyframes fl-fade {
+  from { opacity: 0; }
+}
+
+@keyframes fl-rise {
+  from { opacity: 0; transform: translateY(8px) scale(0.985); }
+}
+
+@keyframes fl-pop {
+  from { opacity: 0; transform: scale(0.96); }
+}
+
+@keyframes fl-row {
+  from { opacity: 0; transform: translateY(4px); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* Hidden while closed, so the next open starts from nothing. */
+  :root:not([data-motion="minimal"]) .panel.closed {
+    opacity: 0;
+  }
+
+  :root[data-motion="medium"] .panel.opening {
+    animation: fl-fade 120ms ease-out;
+  }
+
+  :root[data-motion="high"] .panel.opening {
+    animation: fl-rise 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    transform-origin: 50% 0;
+  }
+
+  /* One highlight that moves, instead of each row painting its own. */
+  :root:not([data-motion="minimal"]) .sel-marker {
+    display: block;
+  }
+
+  :root:not([data-motion="minimal"]) .result {
+    position: relative;
+  }
+
+  :root:not([data-motion="minimal"]) .result.selected {
+    background: transparent;
+  }
+
+  :root[data-motion="medium"] .sel-marker {
+    transition: transform 90ms ease-out;
+  }
+
+  :root[data-motion="high"] .sel-marker {
+    transition: transform 140ms cubic-bezier(0.3, 1.45, 0.5, 1);
+  }
+
+  /* The list eases to its new height (`--rows` is set by the page). */
+  :root:not([data-motion="minimal"]) .results {
+    height: calc(var(--rows, 0) * 44px + 9px);
+    overflow: hidden;
+  }
+
+  :root[data-motion="medium"] .results {
+    transition: height 120ms ease-out;
+  }
+
+  :root[data-motion="high"] .results {
+    transition: height 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  :root[data-motion="high"] .result.fresh {
+    animation: fl-row 140ms ease-out backwards;
+    animation-delay: calc(var(--at, 0) * 15ms);
+  }
+
+  :root[data-motion="medium"] .menu:not([hidden]) {
+    animation: fl-fade 100ms ease-out;
+  }
+
+  :root[data-motion="high"] .menu:not([hidden]) {
+    animation: fl-pop 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    transform-origin: 0 0;
+  }
+}

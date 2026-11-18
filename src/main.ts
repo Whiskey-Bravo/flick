@@ -38,7 +38,11 @@ track.className = "scroll-track";
 const thumb = document.createElement("div");
 thumb.className = "scroll-thumb";
 track.append(thumb);
-listWrap.append(list, track);
+// The moving highlight of the medium and high animation levels; under
+// Minimal it is hidden and each selected row paints its own background.
+const marker = document.createElement("div");
+marker.className = "sel-marker";
+listWrap.append(marker, list, track);
 const menuEl = document.createElement("div");
 menuEl.className = "menu";
 menuEl.setAttribute("role", "menu");
@@ -114,10 +118,18 @@ function renderIcon(item: Item): HTMLSpanElement {
   return box;
 }
 
-function renderItem(item: Item, index: number): HTMLLIElement {
+// Rows on screen at the last render, so only rows that are new fade in.
+let shownRows = new Set<string>();
+const rowKey = (item: Item): string => `${item.provider}\u0000${item.id}`;
+
+function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "result";
   li.dataset.index = String(index);
+  if (fresh) {
+    li.classList.add("fresh");
+    li.style.setProperty("--at", String(index - state.top));
+  }
   if (index === state.selected) li.classList.add("selected");
   const armed = state.armed === item.id;
   if (armed) li.classList.add("armed");
@@ -227,7 +239,13 @@ function render() {
   qrPanel.hidden = !qr;
   if (qr) renderQr(qr);
   listWrap.hidden = rows.length === 0 || !!qr;
-  list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i)));
+  list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i, !shownRows.has(rowKey(item)))));
+  shownRows = new Set(rows.map(rowKey));
+  list.style.setProperty("--rows", String(rows.length));
+  // 5px: the list's top border and padding. Out of view: parked on the nearest edge.
+  const at = Math.max(0, Math.min(state.selected - state.top, Math.max(0, rows.length - 1)));
+  marker.style.transform = `translateY(${5 + at * 44}px)`;
+  marker.hidden = rows.length === 0;
   const cap = capOf(state);
   const len = state.items.length;
   track.hidden = len <= cap;
@@ -236,6 +254,9 @@ function render() {
     thumb.style.top = `${(state.top / len) * 100}%`;
   }
   renderMenu();
+  // Invisible while hidden (medium and high levels), so the next open starts
+  // from nothing; anything that brings the bar back clears it.
+  panel.classList.toggle("closed", state.hidden);
 }
 
 function dispatch(event: Event) {
@@ -390,6 +411,11 @@ const afterShow = (event: Event) => {
   querySeq++; // drop answers to queries from before this show
   dispatch(event);
   input.focus();
+  // The opening animation of the medium and high levels, played from its
+  // start on every show (a no-op under Minimal).
+  panel.classList.remove("opening");
+  void panel.offsetWidth;
+  panel.classList.add("opening");
 };
 const shownListener = listen("bar:shown", () => afterShow({ type: "shown" }));
 // A direct hotkey's item needs a second Enter: the bar opens with it armed.
