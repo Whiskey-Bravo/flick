@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
 import { inkIsDark, installLens } from "./glass";
+import { HIGHLIGHT, LIST, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
@@ -128,6 +129,73 @@ function renderIcon(item: Item): HTMLSpanElement {
   }
   box.append(img);
   return box;
+}
+
+// ---- Wobble: the highlight and the list's height as weights on springs ----
+// Under the Wobble level these two are simulated (spring.ts) instead of
+// eased: each move starts from the current speed, so quick moves carry their
+// momentum, and the highlight stretches with its speed. Every other level
+// leaves both to CSS.
+const wobbling = (): boolean =>
+  document.documentElement.dataset.motion === "wobble" && !matchMedia("(prefers-reduced-motion: reduce)").matches;
+const ROW = 44;
+// The list's border and padding around its rows.
+const LIST_EDGES = 9;
+let highlight: Spring = { x: 5, v: 0 };
+let highlightTo = 5;
+let listTall: Spring = { x: 0, v: 0 };
+let listTallTo = 0;
+let frame = 0;
+let lastFrame = 0;
+// The next move is a jump, not a glide: the bar has just opened, or the list has just appeared.
+let jumpNext = true;
+
+function paintSprings() {
+  marker.style.translate = `0 ${highlight.x.toFixed(2)}px`;
+  const s = stretch(highlight.v);
+  marker.style.scale = s === 0 ? "" : `${(1 - s * 0.25).toFixed(4)} ${(1 + s).toFixed(4)}`;
+  list.style.height = `${Math.max(0, listTall.x).toFixed(2)}px`;
+}
+
+function onFrame(now: number) {
+  const seconds = (now - lastFrame) / 1000;
+  lastFrame = now;
+  highlight = stepSpring(highlight, highlightTo, seconds, HIGHLIGHT);
+  listTall = stepSpring(listTall, listTallTo, seconds, LIST);
+  if (settled(highlight, highlightTo) && settled(listTall, listTallTo)) {
+    highlight = { x: highlightTo, v: 0 };
+    listTall = { x: listTallTo, v: 0 };
+    frame = 0;
+  } else {
+    frame = requestAnimationFrame(onFrame);
+  }
+  paintSprings();
+}
+
+// Sends the highlight to `y` and the list to the height of `rows` rows.
+function moveTo(y: number, rows: number) {
+  if (!wobbling()) {
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    marker.style.translate = `0 ${y}px`;
+    marker.style.scale = "";
+    list.style.height = "";
+    highlight = { x: y, v: 0 };
+    listTall = { x: rows * ROW + LIST_EDGES, v: 0 };
+    return;
+  }
+  const tall = rows === 0 ? 0 : rows * ROW + LIST_EDGES;
+  // A list that was empty has no place for the highlight to come from.
+  if (jumpNext || listTallTo === 0) highlight = { x: y, v: 0 };
+  if (jumpNext) listTall = { x: tall, v: 0 };
+  jumpNext = false;
+  highlightTo = y;
+  listTallTo = tall;
+  if (!frame && !(settled(highlight, y) && settled(listTall, tall))) {
+    lastFrame = performance.now();
+    frame = requestAnimationFrame(onFrame);
+  }
+  paintSprings();
 }
 
 // Rows on screen at the last render, so only rows that are new fade in.
@@ -256,16 +324,7 @@ function render() {
   list.style.setProperty("--rows", String(rows.length));
   // 5px: the list's top border and padding. Out of view: parked on the nearest edge.
   const at = Math.max(0, Math.min(state.selected - state.top, Math.max(0, rows.length - 1)));
-  const markerAt = `0 ${5 + at * 44}px`;
-  if (marker.style.translate !== markerAt) {
-    marker.style.translate = markerAt;
-    // Wobble only (a no-op elsewhere): the highlight squashes and stretches
-    // on each move, played from its start, and the icon it lands on hops.
-    marker.classList.remove("moved");
-    void marker.offsetWidth;
-    marker.classList.add("moved");
-    list.children[at]?.classList.add("landed");
-  }
+  moveTo(5 + at * 44, rows.length);
   marker.hidden = rows.length === 0;
   const cap = capOf(state);
   const len = state.items.length;
@@ -430,6 +489,7 @@ const listenFailed = (err: unknown) => dispatch({ type: "failed", message: `Even
 const afterShow = (event: Event) => {
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
+  jumpNext = true; // nothing glides in from where it was when the bar closed
   dispatch(event);
   input.focus();
   // The opening animation of the medium and high levels, played from its

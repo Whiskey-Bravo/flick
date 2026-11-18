@@ -336,22 +336,23 @@ kbd {
   }
 }
 
-/* Wobble: content springs in, and a pressed button dips and springs back. */
+/* Wobble: content settles in on a soft spring, and a pressed button dips
+   slightly and comes back. */
 @keyframes st-wob {
-  from { opacity: 0; transform: translateY(14px) scale(0.97); }
-  30% { opacity: 1; }
+  from { opacity: 0; transform: translateY(8px); }
+  40% { opacity: 1; }
 }
 
 @media (prefers-reduced-motion: no-preference) {
   :root[data-motion="wobble"] .page > :not(h1),
   :root[data-motion="wobble"] .sc-editor {
-    animation: st-wob 620ms linear(0, 0.032, 0.117, 0.237, 0.376, 0.521, 0.662, 0.791, 0.903, 0.994, 1.065, 1.115, 1.146, 1.161, 1.162, 1.153, 1.137, 1.116, 1.092, 1.069, 1.046, 1.026, 1.01, 0.996, 0.986, 0.979, 0.975, 0.973, 0.974, 0.976, 0.979, 0.983, 0.986, 0.99, 0.994, 0.997, 1);
+    animation: st-wob 400ms linear(0, 0.025, 0.089, 0.177, 0.277, 0.382, 0.484, 0.581, 0.668, 0.744, 0.81, 0.865, 0.91, 0.946, 0.974, 0.994, 1.009, 1.019, 1.025, 1.028, 1.028, 1.028, 1.026, 1.023, 1.02, 1.017, 1.015, 1.012, 1.009, 1.007, 1);
   }
 
   :root[data-motion="wobble"] .tab,
   :root[data-motion="wobble"] .page button {
     transition:
-      scale 560ms linear(0, 0.088, 0.314, 0.61, 0.912, 1.167, 1.342, 1.423, 1.415, 1.338, 1.219, 1.087, 0.968, 0.878, 0.827, 0.817, 0.839, 0.885, 0.94, 0.995, 1.039, 1.068, 1.079, 1.074, 1.058, 1.035, 1.011, 0.99, 0.975, 0.967, 0.967, 0.972, 0.981, 0.991, 1.001, 1.009, 1),
+      scale 260ms cubic-bezier(0.3, 1.3, 0.5, 1),
       background-color 110ms ease-out,
       border-color 110ms ease-out,
       color 110ms ease-out;
@@ -359,7 +360,7 @@ kbd {
 
   :root[data-motion="wobble"] .tab:active,
   :root[data-motion="wobble"] .page button:active {
-    scale: 0.93;
+    scale: 0.97;
     transition-duration: 60ms;
   }
 }

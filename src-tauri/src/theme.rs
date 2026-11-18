@@ -12,8 +12,8 @@ pub const THEMES: [&str; 14] = [
     "dark", "light", "midnight", "frost", "ember", "ocean", "forest", "grape", "rose", "sand", "mint", "sakura",
     "glass", "custom",
 ];
-/// The animation levels, calmest first. `wobble` is springy: things overshoot
-/// and settle with a couple of rebounds.
+/// The animation levels, calmest first. `wobble` moves things as weights on
+/// springs, with inertia.
 pub const ANIMATIONS: [&str; 4] = ["minimal", "medium", "high", "wobble"];
 
 /// A theme's colours as `#rrggbb`.

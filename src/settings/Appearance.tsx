@@ -42,7 +42,7 @@ const ANIMATIONS: [string, string, string][] = [
   ["minimal", "Minimal", "Nothing moves: the bar and its rows change at once."],
   ["medium", "Medium", "The bar fades in, the highlight glides, the list eases to its new height."],
   ["high", "High", "The bar rises into place, the highlight glides with a little bounce, new rows fade in one after another."],
-  ["wobble", "Wobble", "Springy: the bar pops in and settles, the highlight stretches as it jumps, rows and the list bounce into place."],
+  ["wobble", "Wobble", "Motion with weight: the highlight and the list carry their speed from one move to the next and settle softly."],
 ];
 
 /** A small picture of the bar in a theme's colours. */

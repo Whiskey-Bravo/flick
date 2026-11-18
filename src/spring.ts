@@ -1,0 +1,53 @@
+// The Wobble level's motion: a weight on a damped spring, stepped frame by
+// frame. Because a move starts from the weight's current speed, quick moves
+// one after another carry their momentum instead of each starting from rest.
+// Pure maths; main.ts drives it from requestAnimationFrame.
+
+export type Spring = {
+  // Where the weight is, and how fast it moves (units per second).
+  x: number;
+  v: number;
+};
+
+export type Feel = {
+  // How hard the spring pulls towards the target (per second squared).
+  stiffness: number;
+  // How strongly speed is braked (per second).
+  damping: number;
+};
+
+// Brisk, with a small overshoot (damping ratio about 0.72): the highlight.
+export const HIGHLIGHT: Feel = { stiffness: 380, damping: 28 };
+// A little softer and heavier (about 0.8): the list's height.
+export const LIST: Feel = { stiffness: 260, damping: 26 };
+
+// The longest stretch of time one call simulates: after a pause (a hidden
+// window, a stalled frame) the weight carries on from where it was instead
+// of leaping.
+const LONGEST = 0.064;
+// The simulation's own step: small enough to stay stable for the feels above.
+const STEP = 0.004;
+
+// The spring `seconds` later, pulled towards `target`.
+export function stepSpring(s: Spring, target: number, seconds: number, feel: Feel): Spring {
+  let { x, v } = s;
+  let left = Math.min(Math.max(seconds, 0), LONGEST);
+  while (left > 1e-9) {
+    const h = Math.min(left, STEP);
+    v += (-feel.stiffness * (x - target) - feel.damping * v) * h;
+    x += v * h;
+    left -= h;
+  }
+  return { x, v };
+}
+
+// Close enough to the target and slow enough to stop simulating.
+export function settled(s: Spring, target: number): boolean {
+  return Math.abs(s.x - target) < 0.05 && Math.abs(s.v) < 1;
+}
+
+// How much the highlight stretches along its direction of travel, as a
+// share of its height: nothing at rest, growing with speed up to `most`.
+export function stretch(v: number, most = 0.07, fullAt = 1800): number {
+  return Math.min(most, (Math.abs(v) / fullAt) * most);
+}
