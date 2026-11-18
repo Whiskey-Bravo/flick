@@ -299,10 +299,12 @@ function renderMenu() {
     // Under the selected row, past its icon.
     const li = list.querySelector<HTMLElement>("li.result.selected");
     const icon = li?.querySelector<HTMLElement>(".icon");
-    if (panelItem(state) && !li) {
-      // The QR panel has no row: under the panel's box.
+    if (panelItem(state)) {
+      // The QR panel stands in for its row (which is rendered but hidden, so
+      // it has no box): the menu opens in the panel's top-left corner, clear
+      // of the input.
       const box = qrPanel.getBoundingClientRect();
-      at = { x: box.left, y: box.bottom };
+      at = { x: box.left + 12, y: box.top + 12 };
     } else if (li) {
       const box = li.getBoundingClientRect();
       at = { x: box.left + (icon?.offsetWidth ?? 0), y: box.bottom };
