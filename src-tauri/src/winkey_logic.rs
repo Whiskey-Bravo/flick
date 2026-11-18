@@ -138,8 +138,10 @@ impl Default for Press {
 
 /// Whether a lone press opens Flick (held back from Windows, so Start stays
 /// shut) or is left to Windows.
-pub fn take_lone(setting_on: bool, paused: bool, bar_ready: bool, full_screen: bool) -> bool {
-    setting_on && !paused && bar_ready && !full_screen
+/// `sticky_keys`: with Sticky Keys on, a tap of Win latches it for the next
+/// key, so the tap belongs to Windows.
+pub fn take_lone(setting_on: bool, paused: bool, bar_ready: bool, full_screen: bool, sticky_keys: bool) -> bool {
+    setting_on && !paused && bar_ready && !full_screen && !sticky_keys
 }
 
 /// A Win-down older than this when the hook sees it is left to Windows.
@@ -176,6 +178,14 @@ pub const HOLD_STALE_MS: u64 = 1_500;
 /// (`GetTickCount64` milliseconds). A stale hold is dropped, never replayed.
 pub fn hold_is_stale(now_ms: u64, last_ms: u64) -> bool {
     now_ms.saturating_sub(last_ms) > HOLD_STALE_MS
+}
+
+/// Whether a Win-down that Windows reports as "already down" is really a new
+/// press: an auto-repeat follows the same key's last down within
+/// [`HOLD_STALE_MS`] (`last_same_ms`), so without one the "down" is left over
+/// from a press whose up went where the hook can't see.
+pub fn fresh_press(now_ms: u64, last_same_ms: Option<u64>) -> bool {
+    last_same_ms.map_or(true, |last| hold_is_stale(now_ms, last))
 }
 
 /// Decides the [`Step`] for `ev`, after [`Press::on`] gave `verdict`. `take`
@@ -451,12 +461,14 @@ mod tests {
             for paused in [false, true] {
                 for bar_ready in [false, true] {
                     for full_screen in [false, true] {
-                        let want = on && !paused && bar_ready && !full_screen;
-                        assert_eq!(
-                            take_lone(on, paused, bar_ready, full_screen),
-                            want,
-                            "{on} {paused} {bar_ready} {full_screen}"
-                        );
+                        for sticky in [false, true] {
+                            let want = on && !paused && bar_ready && !full_screen && !sticky;
+                            assert_eq!(
+                                take_lone(on, paused, bar_ready, full_screen, sticky),
+                                want,
+                                "{on} {paused} {bar_ready} {full_screen} {sticky}"
+                            );
+                        }
                     }
                 }
             }
@@ -521,6 +533,17 @@ mod tests {
     fn a_lone_tap_flick_may_no_longer_take_is_dropped() {
         // Windows never saw the press, so dropping its up opens nothing.
         assert_eq!(step(true, Ev::WinUp, Verdict::Lone, false, false), Step::Drop);
+    }
+
+    #[test]
+    fn already_down_without_a_recent_down_is_a_fresh_press() {
+        // Never seen going down: the state is left over (Win+L).
+        assert!(fresh_press(5_000, None));
+        // An auto-repeat follows the last down closely.
+        assert!(!fresh_press(5_000, Some(4_970)));
+        assert!(!fresh_press(5_000, Some(3_500)));
+        // Long after the last down: a new press.
+        assert!(fresh_press(5_001, Some(3_500)));
     }
 
     #[test]

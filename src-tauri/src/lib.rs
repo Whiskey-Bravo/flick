@@ -525,12 +525,21 @@ impl AppState {
     }
 }
 
-/// How often the full-screen state (and the hook's health) is read while the
-/// Win-key hook runs.
+/// How often the full-screen and Sticky Keys state (and the hook's health)
+/// is read while the Win-key hook runs.
 const WIN_KEY_POLL: Duration = Duration::from_millis(500);
+/// The wait before the helper is started again after it failed to start or
+/// ended on its own.
+const WIN_KEY_RETRY: Duration = Duration::from_secs(10);
 
-/// What decides whether a lone Win press opens Flick. Read inside the hook
-/// callback on every lone press, so atomics only; each is set elsewhere.
+/// Whether the worker starts the helper now, without being asked: the
+/// setting is on, no helper runs, and the last start is long enough ago.
+fn win_key_start_due(on: bool, running: bool, since_last_start: Option<Duration>) -> bool {
+    on && !running && since_last_start.map_or(true, |d| d >= WIN_KEY_RETRY)
+}
+
+/// What decides whether a lone Win press opens Flick. Each is set elsewhere;
+/// a change wakes the thread that tells the helper.
 #[derive(Default)]
 pub(crate) struct WinKeyFlags {
     /// The `win_key` setting.
@@ -542,6 +551,10 @@ pub(crate) struct WinKeyFlags {
     /// An exclusive full-screen app is running; read every [`WIN_KEY_POLL`]
     /// off the hook thread, since the hook callback must not call the shell.
     full_screen: AtomicBool,
+    /// Sticky Keys is on: a tap of Win latches it, so it stays with Windows.
+    sticky_keys: AtomicBool,
+    /// Wakes the running helper's writer; `None` while no helper runs.
+    waker: Mutex<Option<winkey_helper::Waker>>,
 }
 
 impl WinKeyFlags {
@@ -551,31 +564,63 @@ impl WinKeyFlags {
             self.paused.load(Ordering::SeqCst),
             self.bar_ready.load(Ordering::SeqCst),
             self.full_screen.load(Ordering::SeqCst),
+            self.sticky_keys.load(Ordering::SeqCst),
         )
     }
 
+    /// Stores `value` and, if that changed it, has the helper told.
+    fn set(&self, flag: &AtomicBool, value: bool) {
+        if flag.swap(value, Ordering::SeqCst) != value {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        if let Some(waker) = &*self.waker.lock().unwrap_or_else(|e| e.into_inner()) {
+            waker.changed();
+        }
+    }
+
+    /// The running helper's waker (or `None` once it is gone). The helper is
+    /// told the current state at once, in case it changed while starting.
+    fn set_waker(&self, waker: Option<winkey_helper::Waker>) {
+        *self.waker.lock().unwrap_or_else(|e| e.into_inner()) = waker;
+        self.wake();
+    }
+
     fn set_on(&self, on: bool) {
-        self.on.store(on, Ordering::SeqCst);
+        self.set(&self.on, on);
     }
 
     pub(crate) fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::SeqCst);
+        self.set(&self.paused, paused);
     }
 
     fn set_bar_ready(&self, ready: bool) {
-        self.bar_ready.store(ready, Ordering::SeqCst);
+        self.set(&self.bar_ready, ready);
+    }
+
+    fn note_sticky_keys(&self, on: bool) {
+        self.set(&self.sticky_keys, on);
+    }
+
+    /// Reads what only Windows knows: full-screen and Sticky Keys.
+    fn read_desktop(&self) {
+        self.note_screen(window::notification_state());
+        self.note_sticky_keys(window::sticky_keys_on());
     }
 
     /// Records the shell's notification state: only exclusive full-screen
     /// (the state that stops the bar hotkey) leaves Win to Windows.
     fn note_screen(&self, state: Option<windows::Win32::UI::Shell::QUERY_USER_NOTIFICATION_STATE>) {
-        self.full_screen.store(!window::hotkey_may_show(state), Ordering::SeqCst);
+        self.set(&self.full_screen, !window::hotkey_may_show(state));
     }
 }
 
 /// The Win-key hook as the app runs it. One worker thread ([`win_key_worker`])
 /// starts and stops the hook, in order, with the last wanted state winning:
-/// starting can block for seconds, so it never runs on the main thread.
+/// starting can block for seconds, so it never runs on the main thread. The
+/// same thread starts it again when a start failed or the helper ended.
 pub(crate) struct WinKey {
     pub(crate) flags: Arc<WinKeyFlags>,
     hook: Mutex<Option<winkey_helper::WinKeyHelper>>,
@@ -589,8 +634,8 @@ impl WinKey {
         WinKey { flags: Arc::default(), hook: Mutex::new(None), failed: AtomicBool::new(false), wanted }
     }
 
-    /// Asks for the hook on or off. Turning it off reaches the helper within
-    /// about 50 ms, before the hook has stopped.
+    /// Asks for the hook on or off. Turning it off reaches the helper at
+    /// once, before the hook has stopped.
     fn want(&self, on: bool) {
         self.flags.set_on(on);
         let _ = self.wanted.send(on);
@@ -609,6 +654,23 @@ impl WinKey {
         self.hook.lock().unwrap_or_else(|e| e.into_inner()).is_some()
     }
 
+    /// Clears away a helper that ended on its own (crashed, or was ended in
+    /// Task Manager). True when there was one; the hook then counts as failed
+    /// until the next start.
+    fn reap(&self) -> bool {
+        let old = {
+            let mut hook = self.hook.lock().unwrap_or_else(|e| e.into_inner());
+            if !hook.as_ref().is_some_and(|h| h.ended()) {
+                return false;
+            }
+            hook.take()
+        };
+        self.flags.set_waker(None);
+        self.failed.store(true, Ordering::SeqCst);
+        drop(old);
+        true
+    }
+
     /// The worker thread couldn't be started, so no hook ever will be: say so
     /// in Settings when the setting is on.
     fn no_worker(&self) {
@@ -617,36 +679,53 @@ impl WinKey {
 }
 
 /// Starts and stops the Win-key hook as [`WinKey::want`] asks. While the hook
-/// runs it also reads the full-screen state and tells Settings when the
-/// hook's health changes.
+/// runs it also reads the full-screen and Sticky Keys state and tells
+/// Settings when the hook's health changes. A helper that failed to start or
+/// ended on its own is started again, at most every [`WIN_KEY_RETRY`].
 fn win_key_worker(app: AppHandle, wanted: mpsc::Receiver<bool>) {
     let state = app.state::<AppState>();
     let win = &state.win_key;
     let mut told_healthy = true;
+    // The last state asked for, and when a start was last tried.
+    let mut on = false;
+    let mut last_start: Option<Instant> = None;
     loop {
-        let next = if win.running() {
-            match wanted.recv_timeout(WIN_KEY_POLL) {
+        let wait = if win.running() {
+            Some(WIN_KEY_POLL)
+        } else if on {
+            // No helper although the setting is on: try again later.
+            Some(WIN_KEY_RETRY)
+        } else {
+            None
+        };
+        let next = match wait {
+            Some(wait) => match wanted.recv_timeout(wait) {
                 Ok(on) => Some(on),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-        } else {
-            match wanted.recv() {
+            },
+            None => match wanted.recv() {
                 Ok(on) => Some(on),
                 Err(_) => return,
-            }
+            },
         };
-        let mut tell = false;
-        if let Some(on) = next {
-            let mut want = on;
+        let mut tell = win.reap();
+        if let Some(asked) = next {
+            on = asked;
             // Only the last of a burst counts.
-            while let Ok(on) = wanted.try_recv() {
-                want = on;
+            while let Ok(asked) = wanted.try_recv() {
+                on = asked;
             }
-            tell = win_key_apply(&app, win, want);
+            if on && !win.running() {
+                last_start = Some(Instant::now());
+            }
+            tell |= win_key_apply(&app, win, on);
+        } else if win_key_start_due(on, win.running(), last_start.map(|at| at.elapsed())) {
+            last_start = Some(Instant::now());
+            tell |= win_key_apply(&app, win, true);
         }
         if win.running() {
-            win.flags.note_screen(window::notification_state());
+            win.flags.read_desktop();
         }
         let healthy = win.healthy();
         if healthy != told_healthy {
@@ -664,6 +743,7 @@ fn win_key_worker(app: AppHandle, wanted: mpsc::Receiver<bool>) {
 fn win_key_apply(app: &AppHandle, win: &WinKey, want: bool) -> bool {
     if !want {
         let old = win.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
+        win.flags.set_waker(None);
         let was_failed = win.failed.swap(false, Ordering::SeqCst);
         let changed = old.is_some() || was_failed;
         if let Some(hook) = old {
@@ -675,18 +755,25 @@ fn win_key_apply(app: &AppHandle, win: &WinKey, want: bool) -> bool {
         return false;
     }
     // Read before the first press, not 500 ms after it.
-    win.flags.note_screen(window::notification_state());
+    win.flags.read_desktop();
     let flags = win.flags.clone();
     let may_take: Box<dyn Fn() -> bool + Send + Sync> = Box::new(move || flags.may_take());
     let handle = app.clone();
-    // Runs on the hook's worker thread: hand off to the main thread and return.
-    let on_lone: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+    // Runs on the thread reading the helper: hand off to the main thread and
+    // return. The answer goes back once the main thread has acted, so a
+    // stuck main thread shows as no answer and the helper stops taking Win.
+    let on_lone: Box<dyn Fn(winkey_helper::Waker) + Send + Sync> = Box::new(move |answer| {
         let app = handle.clone();
-        let _ = handle.run_on_main_thread(move || window::toggle_from_win_key(&app));
+        let _ = handle.run_on_main_thread(move || {
+            window::toggle_from_win_key(&app);
+            answer.ack();
+        });
     });
     match winkey_helper::WinKeyHelper::start(may_take, on_lone) {
         Ok(hook) => {
+            let waker = hook.waker();
             *win.hook.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+            win.flags.set_waker(Some(waker));
             win.failed.store(false, Ordering::SeqCst);
         }
         Err(reason) => {
@@ -1286,8 +1373,8 @@ impl PressTarget for AppPress {
 pub(crate) fn on_exit(app: &AppHandle) {
     let state = app.try_state::<AppState>();
     quit_cleanup(state.as_ref().map(|s| s.providers.reminders.as_ref()));
-    // Unhooks and gives the keyboard's raw input back. Quick: stopping only
-    // waits for the hook threads, never for this one.
+    // Ends the helper, and with it the hook. Stopping waits for the helper
+    // process to go: it ends at once, and a stuck one is ended after 0.5 s.
     if let Some(state) = state {
         state.win_key.flags.set_on(false);
         let hook = state.win_key.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1364,8 +1451,8 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
         state.updates.set_enabled(config.check_updates);
     }
     // Under the config lock, so the worker gets the switches in config order.
-    // Its own thread starts or stops the hook (and retries a failed start)
-    // and emits `settings:changed` when that is done.
+    // Its own thread starts or stops the hook (asking again also retries a
+    // failed start at once) and emits `settings:changed` when that is done.
     state.win_key.want(config.win_key);
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     // Under the config lock, so two reloads never apply hotkeys interleaved.
@@ -2976,6 +3063,25 @@ mod tests {
         assert!(flags.may_take());
         flags.set_on(false);
         assert!(!flags.may_take(), "switched off before the hook has stopped");
+    }
+
+    #[test]
+    fn sticky_keys_leave_win_to_windows() {
+        let flags = win_flags_ready();
+        flags.note_sticky_keys(true);
+        assert!(!flags.may_take(), "a tap of Win latches it for the next key");
+        flags.note_sticky_keys(false);
+        assert!(flags.may_take());
+    }
+
+    #[test]
+    fn the_helper_is_started_again_but_not_in_a_tight_loop() {
+        let s = Duration::from_secs;
+        assert!(win_key_start_due(true, false, None), "never tried");
+        assert!(!win_key_start_due(true, false, Some(s(3))), "it just failed or ended: wait");
+        assert!(win_key_start_due(true, false, Some(WIN_KEY_RETRY)));
+        assert!(!win_key_start_due(true, true, Some(s(60))), "it runs");
+        assert!(!win_key_start_due(false, false, Some(s(60))), "the setting is off");
     }
 
     #[test]

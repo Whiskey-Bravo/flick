@@ -49,6 +49,26 @@ pub fn toggle(app: &AppHandle) {
     }
 }
 
+/// Whether Sticky Keys is switched on (a tap of Win then latches it for the
+/// next key). False when it can't be read.
+pub fn sticky_keys_on() -> bool {
+    use windows::Win32::UI::Accessibility::{SKF_STICKYKEYSON, STICKYKEYS};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETSTICKYKEYS, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    };
+    let mut keys = STICKYKEYS { cbSize: std::mem::size_of::<STICKYKEYS>() as u32, dwFlags: Default::default() };
+    // SAFETY: a read into a correctly sized STICKYKEYS.
+    let read = unsafe {
+        SystemParametersInfoW(
+            SPI_GETSTICKYKEYS,
+            keys.cbSize,
+            Some(&mut keys as *mut STICKYKEYS as *mut std::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    read.is_ok() && keys.dwFlags.0 & SKF_STICKYKEYSON.0 != 0
+}
+
 /// Win-key path ([`toggle`] for a lone Win press). The press was held back
 /// from Windows, so it gave Flick no right to take the foreground; if
 /// Windows keeps another window in front, the bar's thread joins that

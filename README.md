@@ -85,8 +85,9 @@ Flick can take over the Win key: tap it on its own and the bar opens instead of 
 
 - Win combinations keep working as before: Win+E, Win+D, Win+V, Win+Shift+S and the rest. Holding Win and clicking or scrolling counts as a combination too, so the bar stays closed.
 - The Start menu is still there: press Ctrl+Esc, or type `start` in the bar and pick the Start menu row. The row can't open Start when a window running as administrator was in front (Windows blocks Flick's keys there); Ctrl+Esc typed by hand still works.
-- Windows keeps the Win key while a window running as administrator is in front, while an exclusive full-screen game is running, and while Settings is waiting for you to press a hotkey. A tap then opens Start as usual.
-- While it's on, Task Manager shows a second flick.exe: it watches the Win key, and ends when you switch the setting off or quit Flick.
+- Windows keeps the Win key while a window running as administrator is in front, while an exclusive full-screen game is running, while Sticky Keys is on (a tap of Win then holds it for the next key), and while Settings is waiting for you to press a hotkey. A tap then opens Start as usual.
+- While it's on, Task Manager shows a second flick.exe: it watches the Win key, and ends when you switch the setting off or quit Flick. If it ends some other way, Flick starts it again within about 10 seconds.
+- If Flick itself stops responding, the Win key goes back to Windows after 2 seconds, so Start is never out of reach.
 - If Windows doesn't let Flick watch the Win key, Settings says "The Win key isn't available right now; Alt+Space still works." (with your bar hotkey). The bar hotkey is not affected by this setting.
 
 ## Icons and the mouse

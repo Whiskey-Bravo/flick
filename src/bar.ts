@@ -58,6 +58,7 @@ export type State = {
   queried: { text: string; scope: string | null } | null; // what the last query asked for
   keep: { provider: string; id: string } | null; // row to stay on when the re-query's results arrive
   browsed: boolean; // the rows were moved through (arrows or mouse) since the bar opened or the text changed
+  kept: boolean; // `items` are the last show's empty-bar rows, on screen until the fresh ones arrive
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -119,6 +120,7 @@ export const initial: State = {
   queried: null,
   keep: null,
   browsed: false,
+  kept: false,
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -187,12 +189,17 @@ function step(s: State, e: Event): Result {
       ];
       // Closed as an empty bar showing the empty query's rows: they stay up
       // until the fresh ones replace them, so the list doesn't vanish and come
-      // back as the bar opens. An Enter meanwhile waits for the fresh rows.
-      // Otherwise (typed text, a pick list, a direct hotkey's row) the bar
-      // opens with no rows and an Enter does nothing until they arrive.
-      const emptyRows = s.queried?.text === "" && s.queried.scope === null;
+      // back as the bar opens. An Enter meanwhile waits for the fresh rows and
+      // runs only if the row it was pressed on is still there (see "results").
+      // Otherwise (typed text, a pick list, a direct hotkey's row, rows still
+      // waiting for the empty query's answer) the bar opens with no rows and
+      // an Enter does nothing until they arrive.
+      const emptyRows = s.queried?.text === "" && s.queried.scope === null && !s.awaiting;
       if (s.text === "" && !s.scope && !s.armed && emptyRows && s.items.length > 0) {
-        return done(fit({ ...fresh, items: s.items, selected: emptyBarSelection(s.items), awaiting: true }), effects);
+        return done(
+          fit({ ...fresh, items: s.items, selected: emptyBarSelection(s.items), awaiting: true, kept: true }),
+          effects,
+        );
       }
       return done(fresh, effects);
     }
@@ -300,6 +307,7 @@ function step(s: State, e: Event): Result {
           text: e.text,
           recall: -1,
           browsed: false,
+          kept: false,
           menu: null,
           selected: 0,
           top: 0,
@@ -322,9 +330,29 @@ function step(s: State, e: Event): Result {
         return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu: null, keep: null }));
       }
       if (s.text === "" && !s.scope) selected = emptyBarSelection(e.items);
-      const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null, menu: null, keep: null });
-      // An Enter pressed before these results arrived acts on them now.
-      return s.queued ? enter(next, s.queued) : done(next);
+      // Rows kept from the last show were on screen: a row the user moved to
+      // or pressed Enter on stays selected if the fresh rows still have it.
+      let gone = false;
+      if (s.kept && (s.browsed || s.queued)) {
+        const was = s.items[s.selected];
+        const at = was ? e.items.findIndex((i) => i.provider === was.provider && i.id === was.id) : -1;
+        if (at >= 0) selected = at;
+        else gone = true;
+      }
+      const next: State = fit({
+        ...s,
+        items: e.items,
+        selected,
+        top: 0,
+        awaiting: false,
+        queued: null,
+        menu: null,
+        keep: null,
+        kept: false,
+      });
+      // An Enter pressed before these results arrived acts on them now, unless
+      // it was pressed on a kept row that is no longer there.
+      return s.queued && !gone ? enter(next, s.queued) : done(next);
     }
     case "past":
       return done({ ...s, past: e.items });
@@ -360,6 +388,7 @@ function step(s: State, e: Event): Result {
           pending: false,
           awaiting: true,
           queued: null,
+          kept: false,
         },
         [{ type: "query", text: "", scope }],
       );
@@ -466,6 +495,7 @@ function recallStep(s: State, by: 1 | -1): Result {
       error: s.configError,
       awaiting: true,
       queued: null,
+      kept: false,
     }),
     [{ type: "query", text, scope: null }],
   );
@@ -486,6 +516,7 @@ function fill(s: State, text: string): Result {
     failure: null,
     error: s.configError,
     awaiting: true,
+    kept: false,
   };
   return done(next, [{ type: "query", text, scope: s.scope?.name ?? null }]);
 }
