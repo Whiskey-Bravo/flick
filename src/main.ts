@@ -463,6 +463,8 @@ document.addEventListener("contextmenu", (e) => {
   dispatch({ type: "menu", index });
 });
 window.addEventListener("blur", () => dispatch({ type: "blurred" }));
+// The window got the keyboard (back): typing goes to the input again.
+window.addEventListener("focus", () => input.focus());
 
 input.addEventListener("keydown", (e) => {
   const key = KEYS.find((k) => k === (e.key.length === 1 ? e.key.toLowerCase() : e.key));
