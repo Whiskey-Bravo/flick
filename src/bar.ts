@@ -154,10 +154,12 @@ const fit = (s: State): State => {
   return top === s.top && selected === s.selected ? s : { ...s, selected, top };
 };
 
-// The empty unscoped bar opens on the latest recent launch, unless a welcome
-// row is shown: that stays on top.
+// The empty unscoped bar opens on your first pin, or without pins on the
+// latest recent launch, so Down walks every pin and then the recent ones. A
+// row above those (an update waiting) is never what Enter opens unasked. A
+// welcome row stays on top.
 const emptyBarSelection = (items: Item[]): number =>
-  items.some((i) => i.provider === "welcome") ? 0 : Math.max(0, items.findIndex((i) => i.origin === "recent"));
+  items.some((i) => i.provider === "welcome") ? 0 : Math.max(0, items.findIndex((i) => i.origin === "pin" || i.origin === "recent"));
 
 // Whether a row is shown highlighted. With tab completion on, none is until
 // the rows are moved through (arrows or mouse), a row is armed, or a row's

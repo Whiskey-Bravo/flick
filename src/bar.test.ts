@@ -573,9 +573,17 @@ describe("bar", () => {
       expect(run(reopened, { type: "past", items: ["new"] }, key("ArrowUp")).state.text).toBe("new");
     });
 
-    it("empty bar selects the latest recent launch", () => {
-      const s = shownWith(row("pin", { origin: "pin" }), row("r1", { origin: "recent" }), row("r2", { origin: "recent" }));
-      expect(s.selected).toBe(1);
+    it("empty bar selects the first pin, or without pins the latest recent launch", () => {
+      const pinned = shownWith(row("pin", { origin: "pin" }), row("pin2", { origin: "pin" }), row("r1", { origin: "recent" }));
+      expect(pinned.selected).toBe(0);
+      // Down from there walks the pins, then the recent launches: none is skipped.
+      expect(run(pinned, key("ArrowDown")).state.selected).toBe(1);
+      expect(run(pinned, key("ArrowDown"), key("ArrowDown")).state.selected).toBe(2);
+      // A row above them (an update waiting) is not what Enter opens unasked.
+      const update = shownWith(row("u", { provider: "update" }), row("pin", { origin: "pin" }), row("r1", { origin: "recent" }));
+      expect(update.selected).toBe(1);
+      const none = shownWith(row("u", { provider: "update" }), row("r1", { origin: "recent" }), row("r2", { origin: "recent" }));
+      expect(none.selected).toBe(1);
     });
 
     it("welcome rows keep the selection on top", () => {
@@ -645,10 +653,10 @@ describe("bar", () => {
     it("going back up past a pin never drops into old searches", () => {
       const pin: Item = { ...row("p"), origin: "pin", pinned: true };
       const recent = (id: string): Item => ({ ...row(id), origin: "recent" });
-      // The empty bar opens on the latest recent launch, below the pin.
+      // The empty bar opens on the pin.
       const open = run(withPast("old"), { type: "results", items: [pin, recent("a"), recent("b")] }).state;
-      expect(open.selected).toBe(1);
-      const walked = run(open, key("ArrowDown"), key("ArrowUp"), key("ArrowUp")).state;
+      expect(open.selected).toBe(0);
+      const walked = run(open, key("ArrowDown"), key("ArrowDown"), key("ArrowUp"), key("ArrowUp")).state;
       expect([walked.selected, walked.text]).toEqual([0, ""]);
       const past = run(walked, key("ArrowUp")).state;
       expect([past.selected, past.text]).toEqual([2, ""]);
