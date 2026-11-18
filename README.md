@@ -2,7 +2,7 @@
 
 A fast keyboard launcher for Windows 11. Press **Alt+Space**, type a few letters, press Enter.
 
-![Flick finding an app, working out a sum, finding a file and converting a currency](screenshots/hero.gif)
+![Flick finding an app, working out a sum, finding a file and a Windows setting](screenshots/hero.gif)
 
 Flick finds your apps, files and settings, answers quick questions, runs your own shortcuts, and stays out of the way until you call it. It is small, starts in an instant, and keeps what you do on your PC.
 
@@ -20,13 +20,13 @@ Flick opens once with a welcome and starts at login from then on. Updates arrive
 
 Apps, files, folders, Windows Settings pages, games and browser bookmarks, all from the same box. The things you open most rise to the top, and you can pin favourites.
 
-![Finding an app, a folder and a Windows setting](screenshots/open.gif)
+![Finding an app, a folder, a Windows setting and a shortcut](screenshots/open.gif)
 
 ### Answer without leaving the keyboard
 
 Sums, unit and currency conversions, times around the world, dates and the weather. Enter copies the answer.
 
-![A sum, a currency conversion, a unit conversion and the time in Tokyo](screenshots/answers.gif)
+![A sum, a unit conversion and the time in Tokyo](screenshots/answers.gif)
 
 ### Your own shortcuts, with their own icons
 
