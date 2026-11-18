@@ -6,8 +6,11 @@
   --muted: #a4a4b0;
   --accent: #6d8bff;
   --error: #ff7b7b;
-  --scroll: #44444e;
-  /* Native controls (selects, checkboxes, scrollbars) in their dark form. */
+  --surface: var(--panel);
+  --warning: #f2b441;
+  --scroll: color-mix(in srgb, var(--text) 22%, var(--bg));
+  /* Native controls (selects, checkboxes, scrollbars) in their dark form;
+     a light theme switches this (src/appearance.ts). */
   color-scheme: dark;
 }
 
@@ -104,7 +107,7 @@ button {
   padding: 10px 14px;
   border: 1px solid var(--error);
   border-radius: 8px;
-  background: rgba(255, 123, 123, 0.08);
+  background: color-mix(in srgb, var(--error) 8%, transparent);
   color: var(--error);
 }
 
