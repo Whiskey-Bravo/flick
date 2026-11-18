@@ -36,6 +36,7 @@ mod settings;
 mod settings_window;
 mod status;
 mod updates;
+mod taskbar;
 mod theme;
 mod tray;
 mod uninstall;

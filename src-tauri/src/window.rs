@@ -297,6 +297,8 @@ fn reveal_window(w: &WebviewWindow) {
     *LAST_SHOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     let _ = w.show();
     let _ = w.set_focus();
+    // After the bar has the focus: the taskbar comes up without taking it.
+    crate::taskbar::raise(w.app_handle());
 }
 
 /// Glass is on: a picture of what is behind the bar is taken at each show.
@@ -356,6 +358,7 @@ pub fn hide(app: &AppHandle) {
     if let Some(w) = bar(app) {
         let _ = w.hide();
     }
+    crate::taskbar::lower(app);
     // The picture of what was behind the bar is held only while it is open.
     crate::backdrop::clear();
 }

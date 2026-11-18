@@ -54,6 +54,7 @@ export type Config = {
   search_engine: string;
   check_updates: boolean;
   win_key: boolean;
+  show_taskbar: boolean;
   /** "" is dark. */
   theme: string;
   /** Left out of the config while it has no colours. */
@@ -91,6 +92,7 @@ export type Setting =
   | { key: "search_engine"; value: string }
   | { key: "check_updates"; value: boolean }
   | { key: "win_key"; value: boolean }
+  | { key: "show_taskbar"; value: boolean }
   | { key: "theme"; value: string }
   | { key: "animations"; value: string }
   | { key: "custom_theme"; value: CustomTheme };

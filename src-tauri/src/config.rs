@@ -44,6 +44,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## win_key: the Win key alone opens Flick instead of the Start menu; Win combinations keep working, Ctrl+Esc still opens Start (true: on).
 # win_key = false
 ##
+## show_taskbar: a taskbar that hides by itself comes up while Flick is open, with a Flick button on it (true: on).
+# show_taskbar = false
+##
 ## theme: dark, light, midnight, frost, ember, ocean, forest, grape, rose, sand, mint, sakura, glass or custom (your own colours, below).
 # theme = \"dark\"
 ## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
@@ -122,6 +125,8 @@ pub struct Config {
     pub check_updates: bool,
     /// The Win key pressed alone opens the bar instead of the Start menu.
     pub win_key: bool,
+    /// An auto-hidden taskbar is brought up while the bar is open.
+    pub show_taskbar: bool,
     /// The bar's look: one of [`crate::theme::THEMES`]; empty means dark.
     pub theme: String,
     /// The colours of `theme = "custom"`.
@@ -154,6 +159,7 @@ impl Default for Config {
             search_engine: String::new(),
             check_updates: true,
             win_key: false,
+            show_taskbar: false,
             theme: String::new(),
             custom_theme: crate::theme::CustomTheme::default(),
             animations: String::new(),
@@ -701,6 +707,13 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn show_taskbar_defaults_off_and_parses_true() {
+        assert!(!Config::default().show_taskbar);
+        assert!(!parse("").unwrap().show_taskbar);
+        assert!(parse("show_taskbar = true").unwrap().show_taskbar);
+    }
+
     #[test]
     fn theme_settings_parse_and_wrong_ones_are_errors() {
         let c = parse("").unwrap();
