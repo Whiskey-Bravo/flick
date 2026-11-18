@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ShortcutDef } from "./api";
-import { disabledReasons, emptyForm, isDirty, toDef, toForm } from "./shortcutForm";
+import { disabledReasons, emptyForm, iconFromRow, isDirty, toDef, toForm } from "./shortcutForm";
 
 const base: ShortcutDef = { name: "w", aliases: [], about: "", admin: false, choices: [] };
 
@@ -12,8 +12,24 @@ describe("shortcutForm", () => {
       { ...base, wsl: "htop", terminal: true },
       { ...base, open: "{path}", pick: "C:/Projects" },
       { ...base, run: "code {name}", choices: ["a", "b c"] },
+      { ...base, open: "claude://claude.ai/new?q={arg}", icon: "shell:AppsFolder\\A!b" },
     ];
     for (const d of defs) expect(toDef(toForm(d))).toEqual(d);
+  });
+
+  it("an icon is kept trimmed, and a blank one is no icon", () => {
+    const f = { ...emptyForm(), name: "w", target: "x" };
+    expect(toDef({ ...f, icon: "  C:/i/a.png " }).icon).toBe("C:/i/a.png");
+    expect("icon" in toDef({ ...f, icon: "   " })).toBe(false);
+    expect(toForm({ name: "w", aliases: [], about: "", admin: false, choices: [], open: "x" }).icon).toBe("");
+  });
+
+  it("only a picked row with an icon of its own gives an icon", () => {
+    expect(iconFromRow("file:C:\\p\\a.lnk")).toBe("C:\\p\\a.lnk");
+    expect(iconFromRow("file:shell:AppsFolder\\A!b")).toBe("shell:AppsFolder\\A!b");
+    expect(iconFromRow("builtin:web")).toBeNull();
+    expect(iconFromRow("file:")).toBeNull();
+    expect(iconFromRow("")).toBeNull();
   });
 
   it("maps the kind to the target key and the list mode to pick or choices", () => {

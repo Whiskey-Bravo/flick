@@ -48,6 +48,7 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
 ## are the choices) or choices (a list of texts), {name} is the picked entry and {path} its full path.
+## icon (optional): a program, shortcut or .ico file (the row shows its icon) or a .png file (its picture).
 ##
 ## A plain link:
 # [[shortcut]]
@@ -401,6 +402,10 @@ pub struct ShortcutDef {
     pub pick: Option<PathBuf>,
     #[serde(default)]
     pub choices: Vec<String>,
+    /// The row's icon: a file (a program, shortcut or `.ico` shows its icon,
+    /// a `.png` the picture) or a Store app, `shell:AppsFolder\<id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 pub struct Loaded {
@@ -801,7 +806,7 @@ name = \"{name}\"
         assert_eq!(c.direct_hotkeys.len(), 1);
         let base = ShortcutDef {
             name: String::new(), aliases: vec![], about: String::new(), run: None, wsl: None,
-            open: None, terminal: None, admin: false, pick: None, choices: vec![],
+            open: None, terminal: None, admin: false, pick: None, choices: vec![], icon: None,
         };
         assert_eq!(c.shortcuts[0], ShortcutDef {
             name: "docs".into(), about: "Rust documentation".into(),
@@ -1070,7 +1075,7 @@ search_engine = \"https://www.google.com/search?q={arg}\"").unwrap();
     fn def(name: &str) -> ShortcutDef {
         ShortcutDef {
             name: name.into(), aliases: vec![], about: String::new(), run: None, wsl: None,
-            open: Some("x".into()), terminal: None, admin: false, pick: None, choices: vec![],
+            open: Some("x".into()), terminal: None, admin: false, pick: None, choices: vec![], icon: None,
         }
     }
 

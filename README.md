@@ -156,6 +156,8 @@ A currency or weather answer needs the internet. The row says `Getting rates…`
 | `yt text` | YouTube |
 | `gh text` | GitHub |
 
+**Ask Claude.** `claude text` opens the Claude app in a new chat that starts with your text. Without the app it opens claude.ai in your browser instead. Flick looks for the app when it starts, so after installing Claude, restart Flick once. A shortcut of your own named `claude` replaces this one.
+
 To add another engine, add a shortcut that opens its search page with `{arg}` where the text goes (see Shortcuts):
 
 ```toml
@@ -264,6 +266,8 @@ Results you pick often move up, a file you pick often even above apps. Power act
 
 Shortcuts are your own commands, defined in the config as `[[shortcut]]` tables. Type the shortcut's name (or one of its aliases) and press Enter. Each shortcut has exactly one of `run` (a Windows command), `wsl` (a command in WSL) or `open` (a file, folder, program or URL).
 
+A shortcut can have its own icon: add `icon = "..."` with the path of a program, a shortcut file or an `.ico` file (the row shows that file's icon) or of a `.png` file up to 1 MB (the row shows the picture). In Settings, the Icon field also lets you pick an app and use its icon. An icon that can't be read falls back to the usual one.
+
 Search the web with what you type (`search rust traits`):
 
 ```toml
@@ -357,7 +361,7 @@ terminal = true
 <details>
 <summary>Limits of placeholders</summary>
 
-In `run` and `wsl` shortcuts, what you type is never pasted into the command. Flick passes each value as a variable (`FLICK_ARG`, `FLICK_NAME`, `FLICK_PATH`) and the command refers to that variable, so `&`, `|`, `;` or `$( )` in what you type are just text. To keep that safe, some commands cannot take placeholders; Flick reports this when it reads the config. `open` shortcuts insert the text into the target itself (no shell is involved), percent-encoded for web links.
+In `run` and `wsl` shortcuts, what you type is never pasted into the command. Flick passes each value as a variable (`FLICK_ARG`, `FLICK_NAME`, `FLICK_PATH`) and the command refers to that variable, so `&`, `|`, `;` or `$( )` in what you type are just text. To keep that safe, some commands cannot take placeholders; Flick reports this when it reads the config. `open` shortcuts insert the text into the target itself (no shell is involved), percent-encoded for links (`https://…` and app links such as `claude://…` or `obsidian://…`).
 
 - `run` shortcuts: a value containing `"` or `%` is refused ("cannot pass text containing " or % to this command"). A command cannot combine a placeholder with `!` or `^`.
 - `run` shortcuts whose program is a `.bat` or `.cmd` file (such as `code`, VS Code's launcher) read their arguments a second time as command text; `&`, `|` or `^` in a value may then not arrive exactly as typed.

@@ -12,6 +12,8 @@ export type ShortcutDef = {
   admin: boolean;
   pick?: string;
   choices: string[];
+  /** A file whose icon (or, for a .png, picture) the row shows, or `shell:AppsFolder\<id>`. */
+  icon?: string;
 };
 
 export type ItemRef = { provider: string; id: string; title: string };
@@ -102,6 +104,7 @@ export const settingsDeleteShortcut = (name: string) => invoke<void>("settings_d
 export const settingsSetStartAtLogin = (on: boolean) => invoke<boolean>("settings_set_start_at_login", { on });
 export const settingsClearHistory = () => invoke<void>("settings_clear_history");
 export const settingsPickFolder = () => invoke<string | null>("settings_pick_folder");
+export const settingsPickIcon = () => invoke<string | null>("settings_pick_icon");
 export const settingsPins = () => invoke<PinRow[]>("settings_pins");
 export const settingsMovePin = (provider: string, id: string, up: boolean) =>
   invoke<void>("settings_move_pin", { provider, id, up });

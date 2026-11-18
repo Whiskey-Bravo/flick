@@ -1,16 +1,37 @@
 import { useEffect, useRef, useState } from "preact/hooks";
+import { serverUrl } from "../icons";
 import {
   settingsCheckShortcut,
   settingsDeleteShortcut,
   settingsPickFolder,
+  settingsPickIcon,
   settingsSaveShortcut,
   type FieldError,
   type SettingsState,
   type ShortcutDef,
   type ShortcutField,
 } from "./api";
-import { disabledReasons, emptyForm, isDirty, toDef, toForm, type Form, type Kind } from "./shortcutForm";
+import { ItemPicker } from "./ItemPicker";
+import { disabledReasons, emptyForm, iconFromRow, isDirty, toDef, toForm, type Form, type Kind } from "./shortcutForm";
 import "./shortcuts.css";
+
+/** A shortcut's own icon; nothing shows while it is empty or can't be read. */
+function OwnIcon({ icon }: { icon: string }) {
+  const value = icon.trim();
+  if (value === "") return <span class="sc-icon" />;
+  return (
+    <img
+      // A new value is a new image: a hidden one (unreadable) must not stay hidden.
+      key={value}
+      class="sc-icon"
+      src={serverUrl(`file:${value}`, window.devicePixelRatio || 1)}
+      alt=""
+      onError={(e) => {
+        e.currentTarget.style.visibility = "hidden";
+      }}
+    />
+  );
+}
 
 /** Asks the editor whether the tab may be left; resolves false when the user chose Stay. */
 export type LeaveGuard = { current: (() => Promise<boolean>) | null };
@@ -45,6 +66,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
   const [changedNote, setChangedNote] = useState(false);
   const [asking, setAsking] = useState<((c: Choice) => void) | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [appIcon, setAppIcon] = useState(false);
   const askRef = useRef<HTMLDivElement>(null);
   // The question can sit above the scrolled editor: bring it into view.
   useEffect(() => {
@@ -137,6 +159,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
     setForm(f);
     setCheck(null);
     setSaveError(null);
+    setAppIcon(false);
     setChangedNote(false);
     setConfirmDelete(false);
   };
@@ -190,6 +213,14 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
     );
   };
 
+  const pickIcon = () => {
+    settingsPickIcon().then(
+      (p) => p && set("icon", p),
+      () => {},
+    );
+  };
+  const someIcon = defs.some((d) => (d.icon ?? "").trim() !== "");
+
   return (
     <div class="sc">
       <div class="sc-list">
@@ -202,8 +233,11 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
             class={open && original === d.name ? "sc-row active" : "sc-row"}
             onClick={() => select(d)}
           >
-            <span class="sc-name">{d.name}</span>
-            <span class="sc-about">{d.about || d.run || d.wsl || d.open}</span>
+            {someIcon && <OwnIcon icon={d.icon ?? ""} />}
+            <span class="sc-text">
+              <span class="sc-name">{d.name}</span>
+              <span class="sc-about">{d.about || d.run || d.wsl || d.open}</span>
+            </span>
           </button>
         ))}
         {defs.length === 0 && <p class="sc-hint">No shortcuts yet.</p>}
@@ -240,6 +274,37 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
             <span>Description</span>
             <input value={form.about} onInput={(e) => set("about", e.currentTarget.value)} />
           </label>
+
+          <div class="sc-field">
+            <span>Icon</span>
+            <div class="sc-pick">
+              <OwnIcon icon={form.icon} />
+              <input
+                aria-label="Icon"
+                value={form.icon}
+                placeholder="None: the usual icon"
+                onInput={(e) => set("icon", e.currentTarget.value)}
+              />
+              <button onClick={pickIcon}>Browse...</button>
+              <button onClick={() => setAppIcon(!appIcon)}>Use an app's icon</button>
+              <button disabled={form.icon === ""} onClick={() => set("icon", "")}>
+                Clear
+              </button>
+            </div>
+            {appIcon && (
+              <ItemPicker
+                forWorkspace={false}
+                placeholder="Search for the app whose icon to use"
+                only={(row) => iconFromRow(row.icon) !== null}
+                onPick={(row) => {
+                  const icon = iconFromRow(row.icon);
+                  if (icon !== null) set("icon", icon);
+                  setAppIcon(false);
+                }}
+              />
+            )}
+            <small>A program, a shortcut, or an .ico or .png file.</small>
+          </div>
 
           <div class="sc-field" role="radiogroup" aria-label="What it does">
             <span>What it does</span>
