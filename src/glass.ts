@@ -11,7 +11,7 @@ export const LENS_SHIFT = 30;
 // vertical one, 128 meaning none; a pixel at the rim is shifted towards the
 // panel's middle by `LENS_SHIFT`, easing to nothing `LENS_EDGE` px in. So the
 // rim shows what lies a little further inside, stretched: a magnifying edge.
-export function lensMap(width: number, height: number, radius: number): Uint8ClampedArray {
+export function lensMap(width: number, height: number, radius: number, edge: number = LENS_EDGE): Uint8ClampedArray {
   const w = Math.max(1, Math.round(width));
   const h = Math.max(1, Math.round(height));
   const out = new Uint8ClampedArray(w * h * 4);
@@ -44,7 +44,7 @@ export function lensMap(width: number, height: number, radius: number): Uint8Cla
         ny = 1;
       }
       // 1 at the rim, 0 from `LENS_EDGE` px in; squared for a soft start.
-      const t = Math.min(1, Math.max(0, 1 - depth / LENS_EDGE));
+      const t = Math.min(1, Math.max(0, 1 - depth / edge));
       const bend = t * t;
       const i = (y * w + x) * 4;
       out[i] = 128 - Math.sign(px) * nx * bend * 127;
@@ -76,7 +76,12 @@ const SVG = "http://www.w3.org/2000/svg";
 // Keeps an SVG filter in step with `panel`'s size and applies it to `back`
 // (the layer holding the picture), while the Glass theme is on. Call the
 // returned function when the theme changes; resizes are followed by itself.
-export function installLens(panel: HTMLElement, back: HTMLElement, id: string): () => void {
+export function installLens(
+  panel: HTMLElement,
+  back: HTMLElement,
+  id: string,
+  lens: { edge: number; shift: number; spread: [number, number, number] } = { edge: LENS_EDGE, shift: LENS_SHIFT, spread: LENS_SPREAD },
+): () => void {
   const svg = document.createElementNS(SVG, "svg");
   svg.setAttribute("width", "0");
   svg.setAttribute("height", "0");
@@ -94,11 +99,11 @@ export function installLens(panel: HTMLElement, back: HTMLElement, id: string): 
   // the three are added back together: where nothing bends they agree, and
   // at the rim they drift apart into a fringe.
   const KEEP = ["1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0", "0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0", "0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0"];
-  LENS_SPREAD.forEach((share, channel) => {
+  lens.spread.forEach((share, channel) => {
     const bend = document.createElementNS(SVG, "feDisplacementMap");
     bend.setAttribute("in", "SourceGraphic");
     bend.setAttribute("in2", "map");
-    bend.setAttribute("scale", String(LENS_SCALE * share));
+    bend.setAttribute("scale", String(lens.shift * 2 * share));
     bend.setAttribute("xChannelSelector", "R");
     bend.setAttribute("yChannelSelector", "G");
     const keep = document.createElementNS(SVG, "feColorMatrix");
@@ -136,7 +141,7 @@ export function installLens(panel: HTMLElement, back: HTMLElement, id: string): 
     canvas.height = h;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.putImageData(new ImageData(lensMap(w, h, radius), w, h), 0, 0);
+    ctx.putImageData(new ImageData(lensMap(w, h, radius, lens.edge), w, h), 0, 0);
     for (const el of [filter, image]) {
       el.setAttribute("x", "0");
       el.setAttribute("y", "0");
