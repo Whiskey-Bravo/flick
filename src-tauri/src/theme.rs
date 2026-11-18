@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 /// The built-in themes, in the order Settings shows them. `custom` uses the
 /// config's `[custom_theme]`.
-pub const THEMES: [&str; 7] = ["dark", "light", "midnight", "frost", "ember", "glass", "custom"];
+pub const THEMES: [&str; 14] = [
+    "dark", "light", "midnight", "frost", "ember", "ocean", "forest", "grape", "rose", "sand", "mint", "sakura",
+    "glass", "custom",
+];
 /// The animation levels, calmest first.
 pub const ANIMATIONS: [&str; 3] = ["minimal", "medium", "high"];
 
@@ -100,6 +103,13 @@ pub fn builtin(name: &str) -> Option<Colors> {
         "midnight" => ["#000000", "#17181d", "#26272e", "#f2f2f5", "#9a9ba6", "#8aa2ff", "#f0717a", "#f2b441"],
         "frost" => ["#2e3440", "#3b4252", "#434c5e", "#eceff4", "#b4bccb", "#88c0d0", "#f08c95", "#ebcb8b"],
         "ember" => ["#24201c", "#332c25", "#3d352d", "#f1e9df", "#b8ab9b", "#f2a65a", "#f0717a", "#f2c14e"],
+        "ocean" => ["#0f1c2e", "#1a2c45", "#233a59", "#e6eef8", "#9fb3cc", "#4fc3f7", "#ff8a93", "#ffcc66"],
+        "forest" => ["#16211a", "#223128", "#2c3f33", "#e8f1ea", "#a3b8a8", "#6fcf7f", "#f58a8a", "#e9c46a"],
+        "grape" => ["#1e1830", "#2d2447", "#3a2f5a", "#efeaf8", "#b3a8cc", "#b48cff", "#ff8fa3", "#f5c56b"],
+        "rose" => ["#2a1820", "#3c232e", "#4c2d3a", "#f8e9ee", "#cfa9b6", "#ff7aa8", "#ff9a8f", "#f3c969"],
+        "sand" => ["#f5efe4", "#e8dfd0", "#d9cdb9", "#2b241b", "#6a5e4e", "#b3541e", "#b3261e", "#7a5200"],
+        "mint" => ["#eef7f1", "#dcebe1", "#c8ddd0", "#18261d", "#516457", "#1f8a4c", "#b3261e", "#775400"],
+        "sakura" => ["#fbf0f3", "#f1dde4", "#e6cad3", "#2a1a20", "#735560", "#c2255c", "#b3261e", "#7a5200"],
         "glass" => ["#14161c", "#ffffff", "#ffffff", "#ffffff", "#d0d3dc", "#9db4ff", "#ff9aa2", "#ffd479"],
         _ => return None,
     }))
@@ -253,6 +263,7 @@ mod tests {
         assert!(validate("", &none, "").is_ok());
         assert!(validate("frost", &none, "medium").is_ok());
         assert!(validate("neon", &none, "").unwrap_err().starts_with("theme must be one of dark, light"));
+        assert!(validate("ocean", &none, "").is_ok() && validate("sakura", &none, "").is_ok());
         assert!(validate("dark", &none, "wild").unwrap_err().starts_with("animations must be one of minimal"));
         // Names are exact: no other case.
         assert!(validate("Dark", &none, "").is_err());
@@ -302,7 +313,9 @@ mod tests {
 
     #[test]
     fn every_solid_theme_is_readable() {
-        for name in ["dark", "light", "midnight", "frost", "ember"] {
+        let solid: Vec<&str> = THEMES.iter().copied().filter(|n| !matches!(*n, "glass" | "custom")).collect();
+        assert_eq!(solid.len(), 12);
+        for name in solid {
             let c = builtin(name).unwrap();
             for (what, color, least) in [
                 ("text", &c.text, 7.0),

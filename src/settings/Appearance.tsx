@@ -16,6 +16,13 @@ const THEME_LABELS: Record<string, string> = {
   midnight: "Midnight",
   frost: "Frost",
   ember: "Ember",
+  ocean: "Ocean",
+  forest: "Forest",
+  grape: "Grape",
+  rose: "Rose",
+  sand: "Sand",
+  mint: "Mint",
+  sakura: "Sakura",
   glass: "Glass",
   custom: "Custom",
 };
