@@ -386,6 +386,14 @@ mod tests {
     }
 
     #[test]
+    fn place_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for p in PLACES {
+            assert!(seen.insert(p.name.to_lowercase()), "duplicate place name {}", p.name);
+        }
+    }
+
+    #[test]
     fn local_time() {
         assert!(matches!(parse_clock("time", jiff::civil::date(2026, 7, 1)), Some(ClockAsk::LocalTime)));
     }

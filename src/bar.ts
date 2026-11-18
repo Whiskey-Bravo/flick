@@ -26,12 +26,13 @@ export function menuActions(item: Item): MenuAction[] {
   return actions;
 }
 
-// The row shown as a panel (a QR code): the only item, with markup.
-/** True while the bar shows a row that changes by itself (the clock). */
+/** True while the bar shows a row that changes by itself (the clock). No ticks
+ *  while the actions menu is open: the answers' re-query would close it. */
 export function wantsTick(s: State): boolean {
-  return !s.hidden && s.items.some((i) => i.live);
+  return !s.hidden && !s.menu && s.items.some((i) => i.live);
 }
 
+// The row shown as a panel (a QR code): the only item, with markup.
 export function panelItem(s: State): Item | null {
   return s.items.length === 1 && s.items[0].panel !== "" ? s.items[0] : null;
 }

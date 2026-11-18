@@ -1033,6 +1033,21 @@ describe("mouse and menu", () => {
       expect(wantsTick(initial)).toBe(false);
     });
 
+    it("no_tick_while_the_menu_is_open", () => {
+      const open = run(shown(clock), key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      expect(wantsTick(open)).toBe(false);
+      expect(wantsTick(run(open, { type: "menuClose" }).state)).toBe(true);
+    });
+
+    it("a_full_tick_keeps_an_armed_live_row_armed_and_selected", () => {
+      const u = { ...item("now:u"), provider: "answers", actions: ["uninstall" as const], live: true };
+      const armed = run(shown(item("a"), u), key("ArrowDown"), key("Tab"), { type: "menuPick", action: "uninstall" }).state;
+      expect([armed.armed, armed.selected]).toEqual(["now:u", 1]);
+      const after = run(armed, { type: "answersReady" }, { type: "results", items: [item("a"), u] }).state;
+      expect([after.armed, after.selected]).toEqual(["now:u", 1]);
+    });
+
     it("a_tick_requeries_and_keeps_the_selected_live_row", () => {
       const r = run(shown(clock, item("a")), { type: "answersReady" });
       expect(r.effects).toEqual([{ type: "query", text: "time", scope: null, keepSelection: true }]);

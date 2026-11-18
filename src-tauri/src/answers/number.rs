@@ -218,7 +218,15 @@ impl Formats for WindowsFormats {
         let st = systemtime(Date::constant(2000, 1, 1), t);
         let mut buf = [0u16; 64];
         // SAFETY: st and buf outlive the call; null locale = user default.
-        let n = unsafe { GetTimeFormatEx(PCWSTR::null(), TIME_FORMAT_FLAGS(0), Some(&st), PCWSTR::null(), Some(&mut buf)) };
+        let n = unsafe {
+            GetTimeFormatEx(
+                PCWSTR::null(),
+                TIME_FORMAT_FLAGS(0),
+                Some(&st),
+                PCWSTR::null(),
+                Some(&mut buf),
+            )
+        };
         if n <= 1 {
             return plain_time_seconds(t);
         }
