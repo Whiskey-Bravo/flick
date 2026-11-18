@@ -14,6 +14,8 @@ export function serverUrl(icon: string, dpr: number): string {
 export function fallbackName(item: Pick<Item, "icon" | "provider">): string {
   if (item.icon === "folder") return "folder";
   if (item.icon.startsWith("ext:")) return "file";
+  // A shortcut's own icon that can't be read: the plain shortcut icon.
+  if (item.icon.startsWith("file:") && item.provider === "shortcuts") return "shortcut";
   if (item.icon.startsWith("file:")) return item.provider === "files" ? "file" : "app";
   return "file";
 }

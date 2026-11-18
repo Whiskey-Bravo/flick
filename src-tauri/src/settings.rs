@@ -314,6 +314,18 @@ pub fn settings_pick_folder(app: AppHandle) -> Option<String> {
     Some(path.to_string_lossy().into_owned())
 }
 
+/// A file picker for a shortcut's icon, over the Settings window; `None`
+/// when cancelled.
+#[tauri::command(async)]
+pub fn settings_pick_icon(app: AppHandle) -> Option<String> {
+    let mut dialog = app.dialog().file().add_filter("Icons, pictures and programs", &["ico", "png", "exe", "lnk"]);
+    if let Some(window) = app.get_webview_window(WINDOW) {
+        dialog = dialog.set_parent(&window);
+    }
+    let path = dialog.blocking_pick_file()?.into_path().ok()?;
+    Some(path.to_string_lossy().into_owned())
+}
+
 #[derive(Serialize)]
 pub struct PinRow {
     provider: String,
@@ -377,6 +389,7 @@ mod tests {
             admin: false,
             pick: None,
             choices: vec![],
+            icon: None,
         }
     }
 

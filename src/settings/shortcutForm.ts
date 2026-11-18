@@ -16,6 +16,8 @@ export type Form = {
   pick: string;
   /** One per line. */
   choices: string;
+  /** "" = none: the built-in icon of the kind. */
+  icon: string;
 };
 
 export const emptyForm = (): Form => ({
@@ -29,6 +31,7 @@ export const emptyForm = (): Form => ({
   listMode: "none",
   pick: "",
   choices: "",
+  icon: "",
 });
 
 export function toForm(def: ShortcutDef): Form {
@@ -45,6 +48,7 @@ export function toForm(def: ShortcutDef): Form {
     listMode,
     pick: def.pick ?? "",
     choices: def.choices.join("\n"),
+    icon: def.icon ?? "",
   };
 }
 
@@ -60,6 +64,8 @@ export function toDef(f: Form): ShortcutDef {
   if (f.terminal !== null && f.kind !== "open") def.terminal = f.terminal;
   const pick = f.pick.trim();
   if (f.listMode === "pick" && pick !== "") def.pick = pick;
+  const icon = f.icon.trim();
+  if (icon !== "") def.icon = icon;
   return def;
 }
 
@@ -83,6 +89,11 @@ export function disabledReasons(f: Form, wsl: boolean): Partial<Record<DisabledF
   }
   if (!wsl) out.wsl = "WSL is not installed";
   return out;
+}
+
+/** The icon key of a row found in the item picker as a shortcut's `icon`, or null when the row has no icon of its own. */
+export function iconFromRow(rowIcon: string): string | null {
+  return rowIcon.startsWith("file:") && rowIcon.length > 5 ? rowIcon.slice(5) : null;
 }
 
 /** `saved` is null for a shortcut not yet created (compared with a blank form). */

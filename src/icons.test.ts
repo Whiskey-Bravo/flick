@@ -16,6 +16,8 @@ describe("icons", () => {
     expect(fallbackName({ icon: "ext:.txt", provider: "files" })).toBe("file");
     expect(fallbackName({ icon: "file:C:\\a.exe", provider: "apps" })).toBe("app");
     expect(fallbackName({ icon: "file:C:\\a.txt", provider: "files" })).toBe("file");
+    // A shortcut's own icon that can't be read.
+    expect(fallbackName({ icon: "file:C:\\gone.png", provider: "shortcuts" })).toBe("shortcut");
   });
   it("picks the icon source from what is known about the url", () => {
     const loaded = new Set(["a"]);

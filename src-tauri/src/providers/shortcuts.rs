@@ -26,9 +26,19 @@ const BUILTIN_MAX: u32 = 100;
 const GONE: &str = "shortcut no longer exists";
 const CHOICE_GONE: &str = "choice no longer exists";
 
-/// The web searches every install has: `?` (the configured engine, or
-/// DuckDuckGo when `search_engine` is empty), `g`, `yt` and `gh`.
-pub fn builtin_shortcuts(search_engine: &str) -> Vec<ShortcutDef> {
+/// The Claude desktop app's link for a new chat that starts with the typed text.
+const CLAUDE_APP_LINK: &str = "claude://claude.ai/new?q={arg}";
+/// The same in the browser, for a PC without the app.
+const CLAUDE_WEB_LINK: &str = "https://claude.ai/new?q={arg}";
+/// The Store app whose icon the `claude` row shows. A Claude installed some
+/// other way has no such app: the row then shows the built-in link icon.
+const CLAUDE_APP_ICON: &str = r"shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude";
+
+/// The shortcuts every install has: the web searches `?` (the configured
+/// engine, or DuckDuckGo when `search_engine` is empty), `g`, `yt` and `gh`,
+/// and `claude`, which asks Claude in its app when this PC opens `claude:`
+/// links (`claude_app`), else in the browser.
+pub fn builtin_shortcuts(search_engine: &str, claude_app: bool) -> Vec<ShortcutDef> {
     let engine = if search_engine.is_empty() { DUCKDUCKGO } else { search_engine };
     let web = |name: &str, about: &str, url: &str| ShortcutDef {
         name: name.into(),
@@ -41,21 +51,31 @@ pub fn builtin_shortcuts(search_engine: &str) -> Vec<ShortcutDef> {
         admin: false,
         pick: None,
         choices: vec![],
+        icon: None,
     };
     vec![
         web("?", "Web search", engine),
         web("g", "Search Google", "https://www.google.com/search?q={arg}"),
         web("yt", "Search YouTube", "https://www.youtube.com/results?search_query={arg}"),
         web("gh", "Search GitHub", "https://github.com/search?q={arg}"),
+        if claude_app {
+            ShortcutDef { icon: Some(CLAUDE_APP_ICON.into()), ..web("claude", "Ask Claude", CLAUDE_APP_LINK) }
+        } else {
+            web("claude", "Ask Claude", CLAUDE_WEB_LINK)
+        },
     ]
 }
 
 /// `defs` plus the built-in searches whose name no definition uses as a name or alias.
-fn with_builtins(mut defs: Vec<ShortcutDef>, search_engine: &str) -> (Vec<ShortcutDef>, HashSet<String>) {
+fn with_builtins(
+    mut defs: Vec<ShortcutDef>,
+    search_engine: &str,
+    claude_app: bool,
+) -> (Vec<ShortcutDef>, HashSet<String>) {
     let taken: HashSet<String> =
         defs.iter().flat_map(|d| std::iter::once(&d.name).chain(&d.aliases)).map(|w| w.to_lowercase()).collect();
     let added: Vec<ShortcutDef> =
-        builtin_shortcuts(search_engine).into_iter().filter(|b| !taken.contains(&b.name.to_lowercase())).collect();
+        builtin_shortcuts(search_engine, claude_app).into_iter().filter(|b| !taken.contains(&b.name.to_lowercase())).collect();
     let names = added.iter().map(|b| b.name.to_lowercase()).collect();
     defs.extend(added);
     (defs, names)
@@ -125,10 +145,14 @@ pub(crate) fn encode_url_component(v: &str) -> String {
     out
 }
 
-/// An `http://` or `https://` target (any case).
-fn is_web_url(target: &str) -> bool {
-    let lower = target.get(..8).unwrap_or(target).to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
+/// A link: a scheme (a letter, then letters, digits, `+`, `-` or `.`) followed
+/// by `://`, such as `https://…` or `claude://…`. A path (`C:\x`) or a
+/// scheme without `//` (`mailto:x`) is not one.
+fn is_link(target: &str) -> bool {
+    let Some((scheme, _)) = target.split_once("://") else { return false };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
 }
 
 /// Bind the values of `sub` into `def`'s command. Pure: starts nothing.
@@ -136,7 +160,7 @@ fn is_web_url(target: &str) -> bool {
 /// - `wsl`: `{path}` is converted to `/mnt/...`, values go in a leading
 ///   assignment of the script;
 /// - `open`: values are inserted as text (no shell), percent-encoded when the
-///   target is an `http(s)://` URL.
+///   target is a link (`https://…`, `claude://…`).
 ///
 /// `run` and `open` with `admin` take no values. A placeholder with no value
 /// (config validation prevents this) is an error.
@@ -192,7 +216,7 @@ pub fn prepare(def: &ShortcutDef, sub: &Substitution, distro: &str) -> Result<Pr
         if def.admin && !values.is_empty() {
             return Err("admin commands cannot take arguments".into());
         }
-        if is_web_url(template) {
+        if is_link(template) {
             for (_, value) in &mut values {
                 *value = encode_url_component(value);
             }
@@ -325,6 +349,8 @@ pub struct ShortcutsProvider {
     refreshing: Arc<AtomicBool>,
     /// The last [`Staged::ticket`] handed out.
     tickets: AtomicU64,
+    /// This PC opens `claude:` links: the built-in `claude` uses the app.
+    claude_app: AtomicBool,
 }
 
 /// Clears the in-flight flag when the background refresh ends, even by panic.
@@ -339,7 +365,19 @@ impl Drop for InFlight {
 impl ShortcutsProvider {
     pub fn new(launcher: Arc<dyn Launcher>, distro: &str) -> Arc<Self> {
         let state = State { distro: distro.to_string(), ..Default::default() };
-        Arc::new(Self { launcher, state: Arc::new(RwLock::new(state)), refreshing: Arc::default(), tickets: AtomicU64::new(0) })
+        Arc::new(Self {
+            launcher,
+            state: Arc::new(RwLock::new(state)),
+            refreshing: Arc::default(),
+            tickets: AtomicU64::new(0),
+            claude_app: AtomicBool::new(false),
+        })
+    }
+
+    /// Whether this PC opens `claude:` links (the Claude app is installed).
+    /// Counts for definitions staged from now on: set it before the first.
+    pub fn set_claude_app(&self, installed: bool) {
+        self.claude_app.store(installed, Ordering::SeqCst);
     }
 
     /// New definitions from the config (reload thread), with the built-in web
@@ -356,7 +394,7 @@ impl ShortcutsProvider {
     /// then [`apply`](Self::apply) with that lock released.
     pub fn stage(&self, defs: Vec<ShortcutDef>, distro: &str, search_engine: &str) -> Staged {
         let own = defs.len();
-        let (defs, builtin) = with_builtins(defs, search_engine);
+        let (defs, builtin) = with_builtins(defs, search_engine, self.claude_app.load(Ordering::SeqCst));
         let ticket = self.tickets.fetch_add(1, Ordering::SeqCst) + 1;
         Staged { defs, distro: distro.to_string(), builtin, own, ticket }
     }
@@ -427,7 +465,13 @@ fn describe(def: &ShortcutDef) -> String {
     }
 }
 
-fn icon(def: &ShortcutDef) -> &'static str {
+/// The row's icon key: the shortcut's own `icon` (served by the icon server;
+/// the page falls back to a built-in one when it can't be read), else the
+/// built-in icon of its kind.
+fn icon(def: &ShortcutDef) -> String {
+    if let Some(own) = def.icon.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+        return format!("file:{own}");
+    }
     if def.open.is_some() {
         "builtin:web"
     } else if def.wsl.is_some() {
@@ -435,6 +479,7 @@ fn icon(def: &ShortcutDef) -> &'static str {
     } else {
         "builtin:shortcut"
     }
+    .to_string()
 }
 
 /// Only rows that carry no typed text or picked value can be pinned.
@@ -446,7 +491,7 @@ fn item(def: &ShortcutDef, id: String, title: String, subtitle: String, score: u
         title,
         subtitle,
         score,
-        icon: icon(def).into(),
+        icon: icon(def),
         pinnable,
         ..Default::default()
     }
@@ -711,6 +756,7 @@ mod tests {
             admin: false,
             pick: None,
             choices: vec![],
+            icon: None,
         }
     }
 
@@ -1216,7 +1262,7 @@ mod tests {
         p.set(vec![wsl("upgrade", "x"), run("calc", "calc.exe")], "", "");
         assert_eq!(p.query(&Query { text: "upgrade".into(), scope: None })[0].subtitle, "WSL is not installed");
         assert_eq!(p.query(&Query { text: "calc".into(), scope: None })[0].subtitle, "calc.exe");
-        assert_eq!(p.help().len(), 2 + builtin_shortcuts("").len());
+        assert_eq!(p.help().len(), 2 + builtin_shortcuts("", false).len());
         assert_eq!(p.activate("run:upgrade", Modifier::None), Err("WSL is not installed".to_string()));
         assert!(rec.calls().is_empty());
     }
@@ -1393,6 +1439,7 @@ mod tests {
                 line("g <argument>", "Search Google", "g "),
                 line("yt <argument>", "Search YouTube", "yt "),
                 line("gh <argument>", "Search GitHub", "gh "),
+                line("claude <argument>", "Ask Claude", "claude "),
             ]
         );
     }
@@ -1427,6 +1474,74 @@ mod tests {
         assert_eq!(p.query(&q("?"))[0].id, "need:?");
         // Only `?` needs no space.
         assert!(p.query(&q("grust")).iter().all(|i| !i.id.starts_with("arg:")));
+    }
+
+    #[test]
+    fn a_shortcut_with_an_icon_shows_it_and_others_keep_the_builtin() {
+        let own = ShortcutDef { icon: Some(r"C:\icons\docs.png".into()), ..open("docs", "https://example.com") };
+        let app = ShortcutDef { icon: Some(r" shell:AppsFolder\A!b ".into()), ..run("tool", "tool.exe") };
+        let blank = ShortcutDef { icon: Some("  ".into()), ..open("web", "https://example.com") };
+        let (p, _) = setup(vec![own, app, blank, wsl("lin", "ls")]);
+        assert_eq!(p.item("run:docs").unwrap().icon, r"file:C:\icons\docs.png");
+        assert_eq!(p.item("run:tool").unwrap().icon, r"file:shell:AppsFolder\A!b");
+        assert_eq!(p.item("run:web").unwrap().icon, "builtin:web", "a blank icon is no icon");
+        assert_eq!(p.item("run:lin").unwrap().icon, "builtin:wsl");
+    }
+
+    #[test]
+    fn any_scheme_with_two_slashes_is_a_link() {
+        for link in ["https://e.com", "HTTP://e.com", "claude://claude.ai/new", "obsidian://open", "a+b-c.d://x"] {
+            assert!(is_link(link), "{link}");
+        }
+        for not in [r"C:\x\y", "mailto:a@b.c", "spotify:track:1", "://x", "1a://x", "a b://x", "notes", ""] {
+            assert!(!is_link(not), "{not}");
+        }
+    }
+
+    #[test]
+    fn typed_text_is_encoded_for_an_app_link_but_not_for_a_path() {
+        let sub = Substitution { arg: Some("a b & c#d é".into()), ..Default::default() };
+        let link = open("ask", "claude://claude.ai/new?q={arg}");
+        assert_eq!(
+            prepare(&link, &sub, ""),
+            Ok(Prepared::Open { target: "claude://claude.ai/new?q=a%20b%20%26%20c%23d%20%C3%A9".into(), admin: false })
+        );
+        let path = open("note", r"C:\notes\{arg}.txt");
+        assert_eq!(
+            prepare(&path, &sub, ""),
+            Ok(Prepared::Open { target: r"C:\notes\a b & c#d é.txt".into(), admin: false })
+        );
+    }
+
+    #[test]
+    fn claude_opens_the_app_when_installed_and_the_browser_otherwise() {
+        let target = |defs: &[ShortcutDef]| defs.iter().find(|d| d.name == "claude").map(|d| (d.open.clone(), d.icon.clone()));
+        assert_eq!(
+            target(&builtin_shortcuts("", true)),
+            Some((Some("claude://claude.ai/new?q={arg}".into()), Some(CLAUDE_APP_ICON.into())))
+        );
+        assert_eq!(target(&builtin_shortcuts("", false)), Some((Some("https://claude.ai/new?q={arg}".into()), None)));
+
+        let (p, rec) = setup(vec![]);
+        p.set_claude_app(true);
+        p.set(vec![], "Debian", "");
+        let row = p.item("need:claude").unwrap();
+        assert_eq!((row.subtitle.as_str(), row.icon.as_str()), ("type: claude <argument>", r"file:shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude"));
+        let rows = p.query(&q("claude what is a monad?"));
+        p.activate(&rows[0].id, Modifier::None).unwrap();
+        assert!(rec.calls().join("\n").contains("claude://claude.ai/new?q=what%20is%20a%20monad%3F"), "{:?}", rec.calls());
+    }
+
+    #[test]
+    fn a_config_shortcut_named_or_aliased_claude_replaces_the_builtin() {
+        for def in [open("claude", "https://example.com/?q={arg}"), ShortcutDef { aliases: vec!["Claude".into()], ..open("ai", "https://example.com/?q={arg}") }] {
+            let (p, _) = setup(vec![]);
+            p.set_claude_app(true);
+            p.set(vec![def], "Debian", "");
+            let (defs, builtin) = with_builtins(vec![open("claude", "x")], "", true);
+            assert!(!builtin.contains("claude") && defs.iter().filter(|d| d.name == "claude").count() == 1);
+            assert!(p.help().iter().all(|h| !h.about.contains("Ask Claude")), "the built-in is gone");
+        }
     }
 
     #[test]
@@ -1480,7 +1595,7 @@ mod tests {
         let (p, _) = setup(vec![]);
         let h = p.help();
         assert_eq!(h[0].example, "your shortcuts");
-        assert_eq!(h.len(), 1 + builtin_shortcuts("").len());
+        assert_eq!(h.len(), 1 + builtin_shortcuts("", false).len());
         p.set(vec![run("hello", "x")], "Debian", "");
         assert!(p.help().iter().all(|l| l.example != "your shortcuts"));
     }

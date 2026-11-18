@@ -19,8 +19,21 @@ function RowIcon({ icon }: { icon: string }) {
   );
 }
 
-/** A search box that asks the backend which items match, as the bar would. */
-export function ItemPicker({ forWorkspace, onPick }: { forWorkspace: boolean; onPick: (row: PickRow) => void }) {
+/**
+ * A search box that asks the backend which items match, as the bar would.
+ * `only` keeps just the rows it accepts; `placeholder` replaces the hint.
+ */
+export function ItemPicker({
+  forWorkspace,
+  onPick,
+  only,
+  placeholder,
+}: {
+  forWorkspace: boolean;
+  onPick: (row: PickRow) => void;
+  only?: (row: PickRow) => boolean;
+  placeholder?: string;
+}) {
   const [text, setText] = useState("");
   const [rows, setRows] = useState<PickRow[]>([]);
   const [sel, setSel] = useState(0);
@@ -47,7 +60,7 @@ export function ItemPicker({ forWorkspace, onPick }: { forWorkspace: boolean; on
         text,
         (q) => settingsSearchItems(q, forWorkspace),
         (found) => {
-          setRows(found.slice(0, MAX_ROWS));
+          setRows((only ? found.filter(only) : found).slice(0, MAX_ROWS));
           setSel(0);
         },
       );
@@ -87,7 +100,7 @@ export function ItemPicker({ forWorkspace, onPick }: { forWorkspace: boolean; on
       <input
         type="text"
         value={text}
-        placeholder="Search apps, files, games, bookmarks…"
+        placeholder={placeholder ?? "Search apps, files, games, bookmarks…"}
         onInput={(e) => setText(e.currentTarget.value)}
         onKeyDown={onKey}
       />

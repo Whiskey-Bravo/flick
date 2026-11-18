@@ -188,7 +188,12 @@ impl Providers {
             recent: browse.recent,
             clips: capture.clips,
             qr: capture.qr,
-            shortcuts: ShortcutsProvider::new(launcher.clone(), distro),
+            shortcuts: {
+                let shortcuts = ShortcutsProvider::new(launcher.clone(), distro);
+                // Read once, at start: a Claude installed later counts from the next start.
+                shortcuts.set_claude_app(launch::link_scheme_registered("claude"));
+                shortcuts
+            },
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
             update: UpdateProvider::new(updates),
@@ -1015,6 +1020,7 @@ pub fn run() {
             settings::settings_set_start_at_login,
             settings::settings_clear_history,
             settings::settings_pick_folder,
+            settings::settings_pick_icon,
             settings::settings_pins,
             settings::settings_move_pin,
             settings::settings_check_city,
@@ -1928,6 +1934,7 @@ mod tests {
             admin: false,
             pick: None,
             choices: vec![],
+            icon: None,
         }
     }
 

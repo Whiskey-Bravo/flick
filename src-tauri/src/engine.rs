@@ -731,6 +731,7 @@ mod tests {
             admin: false,
             pick: None,
             choices: vec![],
+            icon: None,
         };
         let sc = ShortcutsProvider::new(Arc::new(RecordingLauncher::default()), "");
         sc.set(vec![def("search", "x {arg}"), def("hello", "notepad")], "", "");

@@ -5,7 +5,10 @@
   background: var(--panel); color: var(--text); cursor: pointer; text-align: left;
 }
 .sc-add { color: var(--accent); margin-bottom: 6px; }
-.sc-row { display: flex; flex-direction: column; gap: 2px; background: transparent; border-color: transparent; }
+.sc-row { display: flex; align-items: center; gap: 8px; background: transparent; border-color: transparent; }
+.sc-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sc-icon { flex: none; width: 24px; height: 24px; object-fit: contain; }
+.sc-pick { align-items: center; }
 .sc-row:hover { background: var(--panel); }
 .sc-row.active { background: var(--panel); border-color: var(--accent); }
 .sc-name { font-weight: 600; }

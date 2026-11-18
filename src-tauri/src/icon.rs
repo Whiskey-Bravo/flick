@@ -249,8 +249,37 @@ fn encode_png(rgba: &[u8], px: u32) -> Option<Vec<u8>> {
 /// above 32 px from the 48 px list, so they are not upscaled from 32.
 pub struct ShellIcons;
 
+/// The largest `.png` file served as an icon.
+const PNG_MAX: u64 = 1024 * 1024;
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// A `.png` file is shown itself (a shortcut's own picture), not as the icon
+/// of the program that opens pictures.
+fn is_png_path(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+}
+
+/// `bytes` when they are a PNG no larger than [`PNG_MAX`].
+fn png_picture(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    (bytes.len() as u64 <= PNG_MAX && bytes.starts_with(PNG_SIGNATURE)).then_some(bytes)
+}
+
+/// Reads a `.png` icon; the size is checked before the file is read.
+fn read_png(path: &std::path::Path) -> Option<Vec<u8>> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > PNG_MAX {
+        return None;
+    }
+    png_picture(std::fs::read(path).ok()?)
+}
+
 impl IconSource for ShellIcons {
     fn png(&self, key: &IconKey, px: u32) -> Option<Vec<u8>> {
+        if let IconKey::File(path) = key {
+            if is_png_path(path) {
+                return read_png(path);
+            }
+        }
         let _com = shell::Com::init();
         let icon = shell::icon(key, px)?;
         let drawn = shell::draw(icon, px, 0x00).zip(shell::draw(icon, px, 0xFF));
@@ -452,6 +481,21 @@ mod tests {
             std::thread::sleep(self.delay);
             self.answer.then(|| b"\x89PNG fake".to_vec())
         }
+    }
+
+    #[test]
+    fn only_a_real_png_of_modest_size_is_served_as_a_picture() {
+        assert!(is_png_path(std::path::Path::new(r"C:\i\a.PNG")));
+        assert!(!is_png_path(std::path::Path::new(r"C:\i\a.ico")));
+        assert!(!is_png_path(std::path::Path::new(r"C:\i\png")));
+        let mut ok = PNG_SIGNATURE.to_vec();
+        ok.extend_from_slice(b"rest");
+        assert_eq!(png_picture(ok.clone()), Some(ok.clone()));
+        assert_eq!(png_picture(b"<html>not a picture".to_vec()), None);
+        assert_eq!(png_picture(Vec::new()), None);
+        let mut huge = ok;
+        huge.resize(PNG_MAX as usize + 1, 0);
+        assert_eq!(png_picture(huge), None);
     }
 
     #[test]

@@ -221,10 +221,14 @@ fn build_shortcut(def: &ShortcutDef) -> Table {
     if !def.choices.is_empty() {
         t.insert("choices", value(def.choices.iter().map(String::as_str).collect::<Array>()));
     }
+    if let Some(icon) = def.icon.as_deref().map(str::trim).filter(|i| !i.is_empty()) {
+        t.insert("icon", value(icon));
+    }
     t
 }
 
-const SHORTCUT_KEYS: [&str; 10] = ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices"];
+const SHORTCUT_KEYS: [&str; 11] =
+    ["name", "aliases", "about", "run", "wsl", "open", "terminal", "admin", "pick", "choices", "icon"];
 const WORKSPACE_KEYS: [&str; 3] = ["name", "aliases", "items"];
 const HOTKEY_KEYS: [&str; 2] = ["keys", "item"];
 
@@ -470,7 +474,7 @@ mod tests {
     fn def(name: &str, open: &str) -> ShortcutDef {
         ShortcutDef {
             name: name.into(), aliases: vec![], about: String::new(), run: None, wsl: None,
-            open: Some(open.into()), terminal: None, admin: false, pick: None, choices: vec![],
+            open: Some(open.into()), terminal: None, admin: false, pick: None, choices: vec![], icon: None,
         }
     }
 
@@ -587,12 +591,13 @@ mod tests {
     fn upsert_writes_fields_in_a_fixed_order() {
         let d = ShortcutDef {
             name: "p".into(), aliases: vec!["q".into()], about: "A".into(), run: Some("code {path}".into()),
-            wsl: None, open: None, terminal: Some(true), admin: false, pick: Some(PathBuf::from("C:/p")), choices: vec![],
+            wsl: None, open: None, terminal: Some(true), admin: false, pick: Some(PathBuf::from("C:/p")), choices: vec![], icon: Some("C:/i/p.ico".into()),
         };
         let out = upsert_shortcut("", None, &d).unwrap();
         let pos = |k: &str| out.find(k).unwrap_or_else(|| panic!("{k} in {out}"));
         assert!(pos("name") < pos("aliases") && pos("aliases") < pos("about") && pos("about") < pos("run"));
         assert!(pos("run") < pos("terminal") && pos("terminal") < pos("pick"), "{out}");
+        assert!(pos("pick") < pos("icon"), "{out}");
         assert_eq!(config::parse(&out).unwrap().shortcuts, [d]);
     }
 

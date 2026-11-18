@@ -464,6 +464,16 @@ pub mod testing {
     }
 }
 
+/// Whether Windows knows what opens `<scheme>:` links (an app registered
+/// the scheme). Reads the registry; never called by tests.
+pub fn link_scheme_registered(scheme: &str) -> bool {
+    use windows::core::{w, HSTRING};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
+    // SAFETY: a value read with no out-buffers: only whether it exists.
+    unsafe { RegGetValueW(HKEY_CLASSES_ROOT, &HSTRING::from(scheme), w!("URL Protocol"), RRF_RT_REG_SZ, None, None, None) }
+        .is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
