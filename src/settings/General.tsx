@@ -173,6 +173,22 @@ export function General({ state }: { state: SettingsState }) {
         <label class="check">
           <input
             type="checkbox"
+            checked={config.tab_completion}
+            onChange={(e) => void save("tab_completion", { key: "tab_completion", value: e.currentTarget.checked })}
+          />
+          Tab completion
+        </label>
+        <p class="hint">
+          The rest of the top result's name shows in grey as you type, and Tab takes it. No row is highlighted until you
+          press Down; Enter still opens the top result.
+        </p>
+        {errors.tab_completion && <p class="error">{errors.tab_completion}</p>}
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input
+            type="checkbox"
             checked={config.history}
             onChange={(e) => void save("history", { key: "history", value: e.currentTarget.checked })}
           />

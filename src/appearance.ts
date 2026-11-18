@@ -17,6 +17,8 @@ export type Appearance = {
   colors: Colors;
   glass: boolean;
   animations: string;
+  // The bar's "Tab completion" setting (it travels with the look).
+  tab_completion: boolean;
 };
 
 export const COLOR_NAMES = ["background", "surface", "border", "text", "muted", "accent", "error", "warning"] as const;
@@ -47,7 +49,13 @@ export const GLASS_DARK_INK: Colors = {
   warning: "#7a4e00",
 };
 
-export const DEFAULT_APPEARANCE: Appearance = { theme: "dark", colors: DARK, glass: false, animations: "minimal" };
+export const DEFAULT_APPEARANCE: Appearance = {
+  theme: "dark",
+  colors: DARK,
+  glass: false,
+  animations: "minimal",
+  tab_completion: false,
+};
 
 // The CSS variables a theme sets. Every other shade is derived from these in
 // the stylesheets. `--panel` is the Settings window's older name for `--surface`.

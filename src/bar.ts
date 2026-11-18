@@ -59,6 +59,7 @@ export type State = {
   keep: { provider: string; id: string } | null; // row to stay on when the re-query's results arrive
   browsed: boolean; // the rows were moved through (arrows or mouse) since the bar opened or the text changed: Up no longer recalls
   kept: boolean; // `items` are the last show's empty-bar rows, on screen until the fresh ones arrive
+  tabCompletion: boolean; // the "Tab completion" setting: a grey preview, and no highlight until the rows are moved through
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -97,7 +98,8 @@ export type Event =
     }
   | { type: "failed"; message: string }
   | { type: "queryFailed"; message: string }
-  | { type: "configError"; message: string | null };
+  | { type: "configError"; message: string | null }
+  | { type: "options"; tabCompletion: boolean };
 
 export const initial: State = {
   text: "",
@@ -121,6 +123,7 @@ export const initial: State = {
   keep: null,
   browsed: false,
   kept: false,
+  tabCompletion: false,
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -156,6 +159,24 @@ const fit = (s: State): State => {
 const emptyBarSelection = (items: Item[]): number =>
   items.some((i) => i.provider === "welcome") ? 0 : Math.max(0, items.findIndex((i) => i.origin === "recent"));
 
+// Whether a row is shown highlighted. With tab completion on, none is until
+// the rows are moved through (arrows or mouse), a row is armed, or a row's
+// menu is open; Enter opens `selected` either way.
+export const highlighted = (s: State): boolean => !s.tabCompletion || s.browsed || s.armed !== null || s.menu !== null;
+
+// Tab completion: the whole text Tab would put in the bar, or null when there
+// is nothing to offer. It is the top result's name (or its own completion
+// text) when that starts with what is typed, whatever the case; the bar shows
+// the part not typed yet in grey. Nothing is offered once a row is
+// highlighted: Tab then opens that row's menu, as without the setting.
+export function completion(s: State): string | null {
+  if (!s.tabCompletion || highlighted(s) || s.text === "" || s.recall >= 0) return null;
+  const top = s.items[s.selected];
+  if (!top) return null;
+  const whole = top.complete !== "" ? top.complete : top.title;
+  return whole.length > s.text.length && whole.toLowerCase().startsWith(s.text.toLowerCase()) ? whole : null;
+}
+
 type Result = { state: State; effects: Effect[] };
 const done = (state: State, effects: Effect[] = []): Result => ({ state, effects });
 
@@ -182,7 +203,7 @@ function step(s: State, e: Event): Result {
       // (the first-start welcome). Typing right away supersedes this query. Past
       // searches are reloaded: none are recalled until they arrive (history may
       // have been switched off or cleared since the last show).
-      const fresh: State = { ...initial, configError: s.configError, error: s.configError };
+      const fresh: State = { ...initial, tabCompletion: s.tabCompletion, configError: s.configError, error: s.configError };
       const effects: Effect[] = [
         { type: "query", text: "", scope: null },
         { type: "loadPast" },
@@ -206,7 +227,7 @@ function step(s: State, e: Event): Result {
     case "armed":
       // A direct hotkey pointed at an item that needs a second Enter: it is the
       // only row, armed. No query, so nothing replaces it.
-      return done({ ...initial, configError: s.configError, error: s.configError, items: [e.item], selected: 0, armed: e.item.id }, [
+      return done({ ...initial, tabCompletion: s.tabCompletion, configError: s.configError, error: s.configError, items: [e.item], selected: 0, armed: e.item.id }, [
         { type: "loadPast" },
       ]);
     case "reopen":
@@ -214,7 +235,7 @@ function step(s: State, e: Event): Result {
       // error, which stays through the results and goes at the next input. An
       // empty error (a direct hotkey on an item that needs typing) shows none.
       return done(
-        { ...initial, configError: s.configError, text: e.text, failure: e.error || null, error: e.error || s.configError },
+        { ...initial, tabCompletion: s.tabCompletion, configError: s.configError, text: e.text, failure: e.error || null, error: e.error || s.configError },
         [
           { type: "query", text: e.text, scope: null },
           { type: "loadPast" },
@@ -224,7 +245,7 @@ function step(s: State, e: Event): Result {
       // A direct hotkey on an item that asks to choose: the bar opens in its
       // pick list, as after Enter on its row.
       return done(
-        { ...initial, configError: s.configError, error: s.configError, scope: { name: e.scope, prompt: e.prompt }, awaiting: true },
+        { ...initial, tabCompletion: s.tabCompletion, configError: s.configError, error: s.configError, scope: { name: e.scope, prompt: e.prompt }, awaiting: true },
         [
           { type: "query", text: "", scope: e.scope },
           { type: "loadPast" },
@@ -389,10 +410,13 @@ function step(s: State, e: Event): Result {
           awaiting: true,
           queued: null,
           kept: false,
+          browsed: false,
         },
         [{ type: "query", text: "", scope }],
       );
     }
+    case "options":
+      return done({ ...s, tabCompletion: e.tabCompletion });
     case "key":
       return onKey(s, e);
   }
@@ -431,6 +455,11 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       }
       const n = s.items.length;
       if (n === 0) return done({ ...s, armed: null });
+      // Tab completion: the first arrow only brings the highlight out. Down
+      // shows it on the row Enter would open; Up on the last row.
+      if (!highlighted(s)) {
+        return done(fit({ ...s, selected: e.key === "ArrowDown" ? s.selected : n - 1, browsed: true }));
+      }
       const step = e.key === "ArrowDown" ? 1 : n - 1;
       return done(fit({ ...s, selected: (s.selected + step) % n, armed: null, browsed: true }));
     }
@@ -454,6 +483,13 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       return enter(s, modifier);
     }
     case "Tab": {
+      // Tab completion: take the grey preview. Like F1, not an activation
+      // finishing: `pending` stays.
+      const whole = completion(s);
+      if (whole !== null) {
+        const r = fill(s, whole);
+        return done({ ...r.state, pending: s.pending }, r.effects);
+      }
       const item = s.items[s.selected];
       if (s.awaiting || !item) return done(s);
       if (item.complete !== "") {
@@ -471,7 +507,7 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       if (t.armed) return done({ ...t, armed: null });
       if (t.scope) {
         return done(
-          { ...t, scope: null, text: "", recall: -1, items: [], selected: 0, top: 0, awaiting: true },
+          { ...t, scope: null, text: "", recall: -1, items: [], selected: 0, top: 0, awaiting: true, browsed: false },
           [{ type: "query", text: "", scope: null }],
         );
       }
@@ -519,6 +555,7 @@ function fill(s: State, text: string): Result {
     error: s.configError,
     awaiting: true,
     kept: false,
+    browsed: false,
   };
   return done(next, [{ type: "query", text, scope: s.scope?.name ?? null }]);
 }

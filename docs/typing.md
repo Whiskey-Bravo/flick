@@ -75,6 +75,16 @@ Each result shows the icon of its app, file or folder. Icons load in the backgro
 - A click opens it.
 - A right click (or Tab) opens a menu of the row's own actions: Open file location, Open in Explorer, Copy path, Run as administrator, Uninstall (asks for a second Enter), Close, Close window, Pin or Unpin. Entries that do not apply to that row are left out.
 
+## Tab completion
+
+Switch on **Tab completion** in Settings, General (or set `tab_completion = true`), and the bar finishes names for you:
+
+- As you type, the rest of the top result's name appears in grey: `fir` shows the grey `efox`. Press Tab to take it.
+- It appears only when the top result's name starts with what you typed.
+- No row is highlighted until you press Down (or move the mouse over a row). Enter still opens the top result.
+- Once a row is highlighted, Tab opens that row's menu, as without the setting.
+
+It is off by default.
 ## Pins and recent launches
 
 Pin the things you open every day. Select a row and press Ctrl+P (again to unpin), or use the right-click menu. With an empty bar, Flick shows your pins first, each with a star, and under them your last 5 launches. Pins stay until you unpin them.
@@ -83,7 +93,7 @@ Pin the things you open every day. Select a row and press Ctrl+P (again to unpin
 
 ## Past searches
 
-A search is saved when you open a result from it. Press Up on an empty bar to step back through those searches (the last 50). Press Down to step forward again. Typing anything stops the recall.
+Past searches are off on a new install; switch on "Remember past searches and launches" in Settings, General, to use them. With that on, a search is saved when you open a result from it. Press Up on an empty bar to step back through those searches (the last 50). Press Down to step forward again. Typing anything stops the recall.
 
 Type `clear history` and press Enter twice to forget past searches and recent launches. Pins are kept.
 

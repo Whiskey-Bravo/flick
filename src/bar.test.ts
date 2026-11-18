@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { failureText, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
+import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -14,6 +14,85 @@ const run = (s: State, ...events: Event[]) => {
 const key = (k: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p" | "Tab", ctrl = false, shift = false): Event =>
   ({ type: "key", key: k, ctrl, shift });
 const withItems = (...items: Item[]) => run(initial, { type: "results", items }).state;
+
+describe("tab completion", () => {
+  const on = run(initial, { type: "options", tabCompletion: true }).state;
+  const typed = (text: string, ...items: Item[]) => run(on, { type: "input", text }, { type: "results", items }).state;
+
+  it("is off unless switched on: the first row is highlighted and nothing is offered", () => {
+    const s = run(initial, { type: "input", text: "fir" }, { type: "results", items: [item("Firefox")] }).state;
+    expect(highlighted(s)).toBe(true);
+    expect(completion(s)).toBeNull();
+    // Tab keeps its old job: the row's menu (this row has no actions, so nothing).
+    expect(run(s, key("Tab")).state.text).toBe("fir");
+  });
+
+  it("offers the rest of the top result's name, whatever the case", () => {
+    expect(completion(typed("fir", item("Firefox"), item("Firewall")))).toBe("Firefox");
+    expect(completion(typed("FIRE", item("Firefox")))).toBe("Firefox");
+    // Not a prefix (a fuzzy match), already complete, or nothing there: no offer.
+    expect(completion(typed("vsc", item("Visual Studio Code")))).toBeNull();
+    expect(completion(typed("Firefox", item("Firefox")))).toBeNull();
+    expect(completion(typed("zzz"))).toBeNull();
+    expect(completion(run(on, { type: "results", items: [item("Firefox")] }).state)).toBeNull();
+  });
+
+  it("prefers the row's own completion text over its title", () => {
+    const row: Item = { ...item("claude"), title: "claude", complete: "claude " };
+    expect(completion(typed("cl", row))).toBe("claude ");
+    // The title would match, but the completion text is what Tab fills.
+    const path: Item = { ...item("p"), title: "Documents", complete: "C:\Users\Documents\\" };
+    expect(completion(typed("doc", path))).toBeNull();
+  });
+
+  it("Tab takes the preview and asks again", () => {
+    const s = typed("fir", item("Firefox"), item("Firewall"));
+    const r = run(s, key("Tab"));
+    expect(r.state.text).toBe("Firefox");
+    expect(r.effects).toEqual([{ type: "query", text: "Firefox", scope: null }]);
+    expect(completion(r.state)).toBeNull();
+  });
+
+  it("highlights no row until an arrow or the mouse, and Enter still opens the top one", () => {
+    const s = typed("fir", item("Firefox"), item("Firewall"), item("Fire TV"));
+    expect(highlighted(s)).toBe(false);
+    expect(run(s, key("Enter")).effects.map((e) => e.type)).toEqual(["activate"]);
+    // Down brings the highlight out on the row Enter would open; the next Down moves.
+    const down = run(s, key("ArrowDown")).state;
+    expect([highlighted(down), down.selected]).toEqual([true, 0]);
+    expect(run(down, key("ArrowDown")).state.selected).toBe(1);
+    // Up brings it out on the last row.
+    const up = run(s, key("ArrowUp")).state;
+    expect([highlighted(up), up.selected]).toEqual([true, 2]);
+    // The mouse highlights the row under it.
+    const hover = run(s, { type: "hover", index: 1 }).state;
+    expect([highlighted(hover), hover.selected]).toEqual([true, 1]);
+  });
+
+  it("stops offering once a row is highlighted, and starts again when the text changes", () => {
+    const s = typed("fir", item("Firefox"), item("Firewall"));
+    const down = run(s, key("ArrowDown")).state;
+    expect(completion(down)).toBeNull();
+    const again = run(down, { type: "input", text: "fire" }, { type: "results", items: [item("Firefox")] }).state;
+    expect(highlighted(again)).toBe(false);
+    expect(completion(again)).toBe("Firefox");
+  });
+
+  it("survives the bar closing and opening, and an armed row is always highlighted", () => {
+    const reopened = run(typed("fir", item("Firefox")), { type: "hidden" }, { type: "shown" }).state;
+    expect(reopened.tabCompletion).toBe(true);
+    expect(highlighted(reopened)).toBe(false);
+    const armed = run(on, { type: "armed", item: item("x", true) }).state;
+    expect([armed.tabCompletion, highlighted(armed)]).toEqual([true, true]);
+  });
+
+  it("on the empty bar Up still recalls a past search first", () => {
+    const s = run(on, { type: "past", items: ["old"] }, { type: "results", items: [item("a"), item("b")] }).state;
+    expect(run(s, key("ArrowUp")).state.text).toBe("old");
+    const down = run(s, key("ArrowDown")).state;
+    expect([highlighted(down), down.selected, down.text]).toEqual([true, 0, ""]);
+  });
+});
 
 describe("bar", () => {
   it("shown resets but keeps config error", () => {

@@ -26,7 +26,7 @@ describe("appearance", () => {
 
   it("Settings uses the dark colours under Glass, the theme's otherwise", () => {
     const light = { ...DARK, background: "#f7f7f9", text: "#1c1d22" };
-    const solid: Appearance = { theme: "light", colors: light, glass: false, animations: "minimal" };
+    const solid: Appearance = { theme: "light", colors: light, glass: false, animations: "minimal", tab_completion: false };
     expect(settingsColors(solid)).toBe(light);
     expect(settingsColors({ ...solid, theme: "glass", glass: true })).toBe(DARK);
   });

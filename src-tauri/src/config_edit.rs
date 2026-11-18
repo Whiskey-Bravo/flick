@@ -23,6 +23,7 @@ pub enum Setting {
     CheckUpdates(bool),
     WinKey(bool),
     ShowTaskbar(bool),
+    TabCompletion(bool),
     Theme(String),
     Animations(String),
     /// The custom theme's colours; one with no colours removes the line.
@@ -193,6 +194,7 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
         Setting::CheckUpdates(b) => ("check_updates", Some(Value::from(*b))),
         Setting::WinKey(b) => ("win_key", Some(Value::from(*b))),
         Setting::ShowTaskbar(b) => ("show_taskbar", Some(Value::from(*b))),
+        Setting::TabCompletion(b) => ("tab_completion", Some(Value::from(*b))),
         Setting::Theme(s) => ("theme", text_value(s)),
         Setting::Animations(s) => ("animations", text_value(s)),
         Setting::CustomTheme(custom) => ("custom_theme", (!custom.is_empty()).then(|| custom_theme_value(custom))),
@@ -563,6 +565,13 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn tab_completion_setting_is_written_and_read_back() {
+        let out = set(config::DEFAULT_FILE, &Setting::TabCompletion(true)).unwrap();
+        assert!(config::parse(&out).unwrap().tab_completion);
+        assert!(!config::parse(&set(&out, &Setting::TabCompletion(false)).unwrap()).unwrap().tab_completion);
     }
 
     #[test]

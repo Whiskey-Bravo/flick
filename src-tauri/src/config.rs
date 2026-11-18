@@ -47,6 +47,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## show_taskbar: a taskbar that hides by itself comes up while Flick is open, with a Flick button on it (true: on).
 # show_taskbar = false
 ##
+## tab_completion: the rest of the top result's name shows in grey as you type and Tab takes it; no row is highlighted until you press Down (true: on).
+# tab_completion = false
+##
 ## theme: dark, light, midnight, frost, ember, ocean, forest, grape, rose, sand, mint, sakura, glass or custom (your own colours, below).
 # theme = \"dark\"
 ## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
@@ -127,6 +130,9 @@ pub struct Config {
     pub win_key: bool,
     /// An auto-hidden taskbar is brought up while the bar is open.
     pub show_taskbar: bool,
+    /// The bar previews the top result's name in grey; Tab takes it, and no
+    /// row is highlighted until the rows are moved through.
+    pub tab_completion: bool,
     /// The bar's look: one of [`crate::theme::THEMES`]; empty means dark.
     pub theme: String,
     /// The colours of `theme = "custom"`.
@@ -160,6 +166,7 @@ impl Default for Config {
             check_updates: true,
             win_key: false,
             show_taskbar: false,
+            tab_completion: false,
             theme: String::new(),
             custom_theme: crate::theme::CustomTheme::default(),
             animations: String::new(),
@@ -436,6 +443,23 @@ pub struct Loaded {
     pub error: Option<String>,
 }
 
+/// The `history` lines of [`DEFAULT_FILE`], and what a new install gets instead.
+const HISTORY_DEFAULT: &str = "\
+## history: remember recent searches and launches (false: forget and stop).
+# history = true
+";
+const HISTORY_FIRST: &str = "\
+## history: remember recent searches and launches. Off on a new install; set it to true to switch it on.
+history = false
+";
+
+/// The config file written at the very first start: [`DEFAULT_FILE`] with
+/// past searches switched off. A config that has no `history` line (every
+/// install from before this) keeps them on, so an update changes nothing.
+pub fn first_file() -> String {
+    DEFAULT_FILE.replacen(HISTORY_DEFAULT, HISTORY_FIRST, 1)
+}
+
 /// `%APPDATA%\Flick\config.toml` (falls back to a relative `Flick\config.toml`).
 pub fn config_path() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default();
@@ -641,9 +665,11 @@ pub fn load(path: &Path, last_good: Option<&Config>) -> Loaded {
             let created = path
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| std::fs::write(path, DEFAULT_FILE));
+                .and_then(|_| std::fs::write(path, first_file()));
             match created {
-                Ok(()) => Loaded { config: Config::default(), error: None },
+                // What the file just written says: the defaults, with past
+                // searches switched off.
+                Ok(()) => Loaded { config: Config { history: false, ..Config::default() }, error: None },
                 Err(e) => Loaded {
                     config: fallback(),
                     error: Some(format!("config.toml: could not create: {e}")),
@@ -708,6 +734,13 @@ run = \"notepad\"").unwrap();
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
     #[test]
+    fn tab_completion_defaults_off_and_parses_true() {
+        assert!(!Config::default().tab_completion);
+        assert!(!parse("").unwrap().tab_completion);
+        assert!(parse("tab_completion = true").unwrap().tab_completion);
+    }
+
+    #[test]
     fn show_taskbar_defaults_off_and_parses_true() {
         assert!(!Config::default().show_taskbar);
         assert!(!parse("").unwrap().show_taskbar);
@@ -757,6 +790,21 @@ run = \"notepad\"").unwrap();
         assert!(!parse("check_updates = false").unwrap().check_updates);
     }
     #[test]
+    fn a_new_install_starts_with_past_searches_off_and_nothing_else_changed() {
+        let first = first_file();
+        assert_ne!(first, DEFAULT_FILE, "the history lines were found and replaced");
+        let config = parse(&first).unwrap();
+        assert!(!config.history);
+        assert_eq!(Config { history: true, ..config }, Config::default());
+        // Only those two lines differ.
+        let changed: Vec<(&str, &str)> = DEFAULT_FILE.lines().zip(first.lines()).filter(|(a, b)| a != b).collect();
+        assert_eq!(changed.len(), 2, "{changed:?}");
+        assert_eq!(changed[1], ("# history = true", "history = false"));
+        // A config without the line (an install from before) keeps them on.
+        assert!(parse("hotkey = \"Alt+Space\"").unwrap().history);
+    }
+
+    #[test]
     fn config_history_defaults_on_and_parses_false() {
         assert!(Config::default().history);
         assert!(parse("").unwrap().history);
@@ -800,10 +848,15 @@ run = \"notepad\"").unwrap();
         let p = dir.path().join("nested").join("config.toml");
         let l = load(&p, None);
         assert!(l.error.is_none());
-        assert_eq!(l.config, Config::default());
+        // The defaults, except that a new install does not keep past searches.
+        let first = Config { history: false, ..Config::default() };
+        assert_eq!(l.config, first);
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("hotkey") && text.contains("Alt+Space"));
-        assert_eq!(parse(&text).unwrap(), Config::default());
+        assert_eq!(text, first_file());
+        assert_eq!(parse(&text).unwrap(), first);
+        // The second start reads the same thing back.
+        assert_eq!(load(&p, None).config, first);
     }
 
     #[test]

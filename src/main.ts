@@ -7,7 +7,7 @@ import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
-  capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
+  capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
   panelItem, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
@@ -27,7 +27,20 @@ input.spellcheck = false;
 input.autocomplete = "off";
 input.autofocus = true;
 input.setAttribute("aria-label", "Search");
-row.append(pill, input);
+// Tab completion's grey preview, laid over the input in the same type: the
+// typed text (invisible, to push the rest to the right place) and the part
+// Tab would add.
+const inputWrap = document.createElement("div");
+inputWrap.className = "input-wrap";
+const ghost = document.createElement("div");
+ghost.className = "ghost";
+ghost.setAttribute("aria-hidden", "true");
+const ghostTyped = document.createElement("span");
+ghostTyped.className = "ghost-typed";
+const ghostRest = document.createElement("span");
+ghost.append(ghostTyped, ghostRest);
+inputWrap.append(input, ghost);
+row.append(pill, inputWrap);
 
 const errorLine = document.createElement("div");
 errorLine.className = "error";
@@ -223,7 +236,7 @@ function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
     li.classList.add("fresh");
     li.style.setProperty("--at", String(index - state.top));
   }
-  if (index === state.selected) li.classList.add("selected");
+  if (index === state.selected && highlighted(state)) li.classList.add("selected");
   const armed = state.armed === item.id;
   if (armed) li.classList.add("armed");
   const title = document.createElement("span");
@@ -337,8 +350,18 @@ function render() {
   list.style.setProperty("--rows", String(rows.length));
   // 5px: the list's top border and padding. Out of view: parked on the nearest edge.
   const at = Math.max(0, Math.min(state.selected - state.top, Math.max(0, rows.length - 1)));
+  // Coming out of hiding (tab completion: the first arrow), the highlight
+  // appears on its row instead of gliding there from where it last was.
+  const markerHidden = rows.length === 0 || !highlighted(state);
+  if (marker.hidden && !markerHidden) jumpNext = true;
+  marker.hidden = markerHidden;
   moveTo(5 + at * 44, rows.length);
-  marker.hidden = rows.length === 0;
+  // The grey preview, unless the text is too long to line it up with.
+  const whole = completion(state);
+  const fits = input.scrollWidth <= input.clientWidth;
+  ghost.hidden = whole === null || !fits;
+  ghostTyped.textContent = whole === null ? "" : state.text;
+  ghostRest.textContent = whole === null ? "" : whole.slice(state.text.length);
   const cap = capOf(state);
   const len = state.items.length;
   track.hidden = len <= cap;
@@ -542,6 +565,7 @@ const paint = () => {
 };
 const themed = (a: Appearance) => {
   appearance = a;
+  dispatch({ type: "options", tabCompletion: a.tab_completion });
   paint();
 };
 listen<Appearance>("appearance:changed", (e) => themed(e.payload)).catch(listenFailed);

@@ -55,6 +55,7 @@ export type Config = {
   check_updates: boolean;
   win_key: boolean;
   show_taskbar: boolean;
+  tab_completion: boolean;
   /** "" is dark. */
   theme: string;
   /** Left out of the config while it has no colours. */
@@ -93,6 +94,7 @@ export type Setting =
   | { key: "check_updates"; value: boolean }
   | { key: "win_key"; value: boolean }
   | { key: "show_taskbar"; value: boolean }
+  | { key: "tab_completion"; value: boolean }
   | { key: "theme"; value: string }
   | { key: "animations"; value: string }
   | { key: "custom_theme"; value: CustomTheme };
