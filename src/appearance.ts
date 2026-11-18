@@ -34,6 +34,19 @@ export const DARK: Colors = {
   warning: "#f2b441",
 };
 
+// Glass over a light picture: dark ink, and a white veil instead of a dark
+// one. (Over a dark picture Glass uses the colours the back end gives it.)
+export const GLASS_DARK_INK: Colors = {
+  background: "#ffffff",
+  surface: "#000000",
+  border: "#000000",
+  text: "#14161c",
+  muted: "#3b3f4a",
+  accent: "#2f4fd0",
+  error: "#b3202c",
+  warning: "#7a4e00",
+};
+
 export const DEFAULT_APPEARANCE: Appearance = { theme: "dark", colors: DARK, glass: false, animations: "minimal" };
 
 // The CSS variables a theme sets. Every other shade is derived from these in

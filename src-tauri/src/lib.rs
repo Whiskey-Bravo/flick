@@ -1,5 +1,6 @@
 mod after_hide;
 mod answers;
+mod backdrop;
 mod bookmarks;
 mod clipboard;
 mod cliphistory;
@@ -1038,7 +1039,6 @@ pub fn run() {
             direct_keys::settings_hotkey_status,
             settings::settings_win_key_status,
             appearance,
-            window::bar_shape,
             updates::settings_update_status,
             updates::settings_check_now,
             updates::settings_install_update
@@ -1050,6 +1050,8 @@ pub fn run() {
                 responder.respond(icon::response(status, body));
             });
         })
+        // The Glass theme's picture of what is behind the bar (backdrop.rs).
+        .register_uri_scheme_protocol(backdrop::SCHEME, |_ctx, _request| backdrop::response())
         .setup(|app| {
             setup(app.handle());
             Ok(())
@@ -1163,7 +1165,7 @@ fn setup(app: &AppHandle) {
     // The Win key: its worker starts the hook when the setting is on.
     {
         let state = app.state::<AppState>();
-        window::set_glass(app, current_appearance(&state).glass);
+        window::set_glass(current_appearance(&state).glass);
         state.win_key.flags.set_bar_ready(app.get_webview_window(window::LABEL).is_some());
         let worker = app.clone();
         std::thread::Builder::new()
@@ -1488,7 +1490,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
     // Both pages repaint with the theme and animation level now in force.
     let appearance = current_appearance(&state);
-    window::set_glass(app, appearance.glass);
+    window::set_glass(appearance.glass);
     let _ = app.emit("appearance:changed", appearance);
 }
 

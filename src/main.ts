@@ -2,7 +2,8 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DARK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
+import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
+import { inkIsDark, installLens } from "./glass";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
@@ -55,7 +56,18 @@ const qrPanel = document.createElement("div");
 qrPanel.className = "qr-panel";
 qrPanel.hidden = true;
 qrPanel.append(qrHolder, qrCaption);
-panel.append(row, errorLine, listWrap, qrPanel, menuEl);
+// The Glass theme's layers, under everything else in the panel and shown
+// only by that theme: what is behind the bar (bent near the rim), and a tint
+// with the lit edge that keeps the text readable.
+const glassLayers = ["glass-back", "glass-tint"].map((name) => {
+  const layer = document.createElement("div");
+  layer.className = name;
+  layer.setAttribute("aria-hidden", "true");
+  return layer;
+});
+glassLayers[0].append(document.createElement("i"));
+panel.append(...glassLayers, row, errorLine, listWrap, qrPanel, menuEl);
+const updateLens = installLens(panel, glassLayers[0], "flick-lens");
 
 // Bundled SVGs by name (src/icons/<name>.svg), as text: they are repainted in
 // the theme's text colour and shown as data URLs, made once per theme.
@@ -257,7 +269,6 @@ function render() {
   // Invisible while hidden (medium and high levels), so the next open starts
   // from nothing; anything that brings the bar back clears it.
   panel.classList.toggle("closed", state.hidden);
-  reportShape();
 }
 
 function dispatch(event: Event) {
@@ -433,34 +444,43 @@ listen("update:changed", () => dispatch({ type: "updateChanged" })).catch(listen
 listen("bar:hidden", () => dispatch({ type: "hidden" })).catch(listenFailed);
 listen<string | null>("config:error", (e) => dispatch({ type: "configError", message: e.payload })).catch(listenFailed);
 
-// Glass only: the back end cuts the window to the panel, so it is told the
-// panel's height whenever that changes (and the menu's, which may reach
-// below the panel).
-let glass = false;
-let shapeSent = -1;
-const reportShape = () => {
-  if (!glass) return;
-  const below = menuEl.hidden ? 0 : menuEl.getBoundingClientRect().bottom + 6;
-  const height = Math.ceil(Math.max(panel.getBoundingClientRect().bottom, below));
-  if (height === shapeSent) return;
-  shapeSent = height;
-  invoke("bar_shape", { height }).catch(() => {});
-};
-new ResizeObserver(reportShape).observe(panel);
-
 // The theme and animation level: asked once, then pushed on every change.
-const themed = (a: Appearance) => {
-  applyAppearance(a, a.colors, document.documentElement);
-  glass = a.glass;
-  shapeSent = -1;
-  if (a.colors.text !== iconInk) {
-    iconInk = a.colors.text;
+let appearance: Appearance = DEFAULT_APPEARANCE;
+// Glass over a light picture writes in dark ink.
+let darkInk = false;
+const paint = () => {
+  const colors = appearance.glass && darkInk ? GLASS_DARK_INK : appearance.colors;
+  applyAppearance(appearance, colors, document.documentElement);
+  if (colors.text !== iconInk) {
+    iconInk = colors.text;
     svgUrls.clear();
   }
+  updateLens();
   render();
+};
+const themed = (a: Appearance) => {
+  appearance = a;
+  paint();
 };
 listen<Appearance>("appearance:changed", (e) => themed(e.payload)).catch(listenFailed);
 invoke<Appearance>("appearance").then(themed, () => {});
+
+// Glass only: the back end takes a picture of what is behind the bar just
+// before each show and says so here; the glass layers draw it. It is let go
+// when the bar hides.
+const setBackdrop = (id: number) => {
+  const url = id > 0 ? `url("http://flick-backdrop.localhost/${id}")` : "none";
+  document.documentElement.style.setProperty("--backdrop", url);
+};
+listen<{ id: number; brightness: number }>("bar:backdrop", (e) => {
+  setBackdrop(e.payload.id);
+  const dark = e.payload.id > 0 && inkIsDark(e.payload.brightness);
+  if (dark !== darkInk) {
+    darkInk = dark;
+    paint();
+  }
+}).catch(listenFailed);
+listen("bar:hidden", () => setBackdrop(0)).catch(listenFailed);
 
 render();
 input.focus();

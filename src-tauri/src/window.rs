@@ -251,13 +251,19 @@ fn show_as(app: &AppHandle, shown: Shown) {
     // Before the bar takes focus: `v`'s Enter pastes into this window. When
     // the bar is already up (tray Open, a second launch) the foreground is
     // the bar itself, so the window remembered when it opened stays.
-    if !w.is_visible().unwrap_or(false) {
+    let hidden = !w.is_visible().unwrap_or(false);
+    if hidden {
         crate::paste::remember_foreground();
     }
     SHOWS.fetch_add(1, Ordering::SeqCst);
     set_weather_hidden(app, false);
     if let Some(pos) = placement(app, &w) {
         let _ = w.set_position(pos);
+    }
+    // After the move and before the bar is on screen: Glass shows what is
+    // behind it. An already open bar keeps the picture it has.
+    if hidden {
+        take_backdrop(app, &w);
     }
     reveal_window(&w);
     let _ = match shown {
@@ -293,83 +299,28 @@ fn reveal_window(w: &WebviewWindow) {
     let _ = w.set_focus();
 }
 
-/// The bar window's size as the config file gives it (logical pixels).
-const BAR_WIDTH: f64 = 680.0;
-const BAR_HEIGHT: f64 = 420.0;
-/// The least height of the Glass window: the input row alone.
-const GLASS_MIN_HEIGHT: f64 = 40.0;
-/// Glass is on: the window is blurred behind and shaped to the panel.
+/// Glass is on: a picture of what is behind the bar is taken at each show.
 static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Switches the Glass theme's window treatment on or off: Windows blurs what
-/// is behind the bar window and rounds the window's corners, and the window
-/// is kept at the panel's size ([`bar_shape`]) so nothing outside the panel
-/// is blurred. Off puts the window back as every other theme has it.
-pub fn set_glass(app: &AppHandle, on: bool) {
-    use tauri::window::{Effect, EffectsBuilder};
-    let was = GLASS.swap(on, Ordering::SeqCst);
-    let Some(w) = bar(app) else { return };
-    if on {
-        // A plain blur with no tint of its own: the page tints it.
-        let _ = w.set_effects(EffectsBuilder::new().effect(Effect::Blur).build());
-        round_corners(&w, true);
-    } else if was {
-        let _ = w.set_effects(None);
-        round_corners(&w, false);
-        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, BAR_HEIGHT));
+/// Switches the Glass theme's backdrop on or off (see backdrop.rs).
+pub fn set_glass(on: bool) {
+    GLASS.store(on, Ordering::SeqCst);
+    if !on {
+        crate::backdrop::clear();
     }
 }
 
-/// Has Windows round the window's corners (Windows 11; a no-op before) and
-/// leave out its own one-pixel border, or puts both back.
-fn round_corners(w: &WebviewWindow, on: bool) {
-    use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-    };
-    /// `DWMWA_COLOR_NONE` and `DWMWA_COLOR_DEFAULT`.
-    const NO_BORDER: u32 = 0xFFFF_FFFE;
-    const DEFAULT_BORDER: u32 = 0xFFFF_FFFF;
-    let Ok(h) = w.hwnd() else { return };
-    let hwnd = HWND(h.0 as _);
-    let corner = if on { DWMWCP_ROUND } else { DWMWCP_DONOTROUND };
-    let border = if on { NO_BORDER } else { DEFAULT_BORDER };
-    // SAFETY: attribute writes on this app's own window, each with a value
-    // of the size the attribute takes.
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            std::ptr::from_ref(&corner).cast(),
-            std::mem::size_of_val(&corner) as u32,
-        );
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            std::ptr::from_ref(&border).cast(),
-            std::mem::size_of_val(&border) as u32,
-        );
-    }
-}
-
-/// The height the bar window takes for a panel `wanted` logical pixels tall.
-fn glass_height(wanted: f64) -> f64 {
-    if wanted.is_finite() {
-        wanted.clamp(GLASS_MIN_HEIGHT, BAR_HEIGHT)
-    } else {
-        BAR_HEIGHT
-    }
-}
-
-/// Glass only: the page says how tall the panel is (logical pixels), and the
-/// window is resized to it. Ignored under every other theme.
-#[tauri::command]
-pub fn bar_shape(app: AppHandle, height: f64) {
+/// Glass only, and only while the bar is still hidden: takes the picture of
+/// the screen where the bar window is about to appear and tells the page
+/// about it (id 0: none could be taken).
+fn take_backdrop(app: &AppHandle, w: &WebviewWindow) {
     if !GLASS.load(Ordering::SeqCst) {
         return;
     }
-    if let Some(w) = bar(&app) {
-        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, glass_height(height)));
-    }
+    let taken = w.outer_position().ok().zip(w.outer_size().ok()).and_then(|(at, size)| {
+        crate::backdrop::take(at.x, at.y, size.width, size.height)
+    });
+    let _ = app.emit_to(LABEL, "bar:backdrop", taken.unwrap_or_default());
 }
 
 /// Tells the weather store whether the bar is hidden (memory only).
@@ -391,6 +342,8 @@ pub fn hide(app: &AppHandle) {
     if let Some(w) = bar(app) {
         let _ = w.hide();
     }
+    // The picture of what was behind the bar is held only while it is open.
+    crate::backdrop::clear();
 }
 
 /// Hide on focus loss; turn close requests (Alt+F4) into hides so the window
@@ -449,17 +402,6 @@ mod tests {
         assert!(!may_attach(20, 10, true), "the front window is hung");
         assert!(!may_attach(0, 10, false), "no front window");
         assert!(!may_attach(10, 10, false), "the bar's own thread");
-    }
-
-    #[test]
-    fn the_glass_window_is_never_taller_than_the_bar_or_flatter_than_its_corners() {
-        assert_eq!(glass_height(57.0), 57.0);
-        assert_eq!(glass_height(409.4), 409.4);
-        assert_eq!(glass_height(900.0), BAR_HEIGHT);
-        assert_eq!(glass_height(0.0), 40.0);
-        assert_eq!(glass_height(-5.0), 40.0);
-        assert_eq!(glass_height(f64::NAN), BAR_HEIGHT);
-        assert_eq!(glass_height(f64::INFINITY), BAR_HEIGHT);
     }
 
     #[test]
