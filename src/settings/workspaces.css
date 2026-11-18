@@ -23,6 +23,8 @@
 .ip-title { flex: none; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ip-sub { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* Wider than the other lists: a combination and its Remove button share a row. */
+.sc-list.hk-list { width: 320px; }
 .hk-row { flex-direction: row; align-items: center; gap: 6px; padding: 0; }
 .hk-main {
   flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 6px 10px;
