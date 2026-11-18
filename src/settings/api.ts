@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { Colors } from "../appearance";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type ShortcutDef = {
@@ -15,6 +16,12 @@ export type ShortcutDef = {
   /** A file whose icon (or, for a .png, picture) the row shows, or `shell:AppsFolder\<id>`. */
   icon?: string;
 };
+
+/** The colours of the custom theme; one left out is taken from the dark theme. */
+export type CustomTheme = Partial<Colors>;
+
+/** A theme as Settings shows it: `custom` carries the colours it has now. */
+export type ThemeInfo = { name: string; colors: Colors; glass: boolean };
 
 export type ItemRef = { provider: string; id: string; title: string };
 export type WorkspaceDef = { name: string; aliases: string[]; items: ItemRef[] };
@@ -48,6 +55,12 @@ export type Config = {
   check_updates: boolean;
   win_key: boolean;
   show_taskbar: boolean;
+  /** "" is dark. */
+  theme: string;
+  /** Left out of the config while it has no colours. */
+  custom_theme?: CustomTheme;
+  /** "" is minimal. */
+  animations: string;
   shortcut: ShortcutDef[];
   workspace: WorkspaceDef[];
   direct_hotkey: DirectHotkeyDef[];
@@ -62,6 +75,8 @@ export type SettingsState = {
   distros: string[] | null;
   start_at_login: boolean;
   version: string;
+  /** Every theme with its colours, in display order. */
+  themes: ThemeInfo[];
 };
 
 /** One setting; an empty string or list means "unset". */
@@ -77,7 +92,10 @@ export type Setting =
   | { key: "search_engine"; value: string }
   | { key: "check_updates"; value: boolean }
   | { key: "win_key"; value: boolean }
-  | { key: "show_taskbar"; value: boolean };
+  | { key: "show_taskbar"; value: boolean }
+  | { key: "theme"; value: string }
+  | { key: "animations"; value: string }
+  | { key: "custom_theme"; value: CustomTheme };
 
 export type ShortcutField = "name" | "aliases" | "target" | "terminal" | "admin" | "pick" | "choices";
 

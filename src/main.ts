@@ -2,6 +2,8 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
+import { inkIsDark, installLens } from "./glass";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
@@ -37,7 +39,11 @@ track.className = "scroll-track";
 const thumb = document.createElement("div");
 thumb.className = "scroll-thumb";
 track.append(thumb);
-listWrap.append(list, track);
+// The moving highlight of the medium and high animation levels; under
+// Minimal it is hidden and each selected row paints its own background.
+const marker = document.createElement("div");
+marker.className = "sel-marker";
+listWrap.append(marker, list, track);
 const menuEl = document.createElement("div");
 menuEl.className = "menu";
 menuEl.setAttribute("role", "menu");
@@ -50,11 +56,33 @@ const qrPanel = document.createElement("div");
 qrPanel.className = "qr-panel";
 qrPanel.hidden = true;
 qrPanel.append(qrHolder, qrCaption);
-panel.append(row, errorLine, listWrap, qrPanel, menuEl);
+// The Glass theme's layers, under everything else in the panel and shown
+// only by that theme: what is behind the bar (bent near the rim), and a tint
+// with the lit edge that keeps the text readable.
+const glassLayers = ["glass-back", "glass-tint"].map((name) => {
+  const layer = document.createElement("div");
+  layer.className = name;
+  layer.setAttribute("aria-hidden", "true");
+  return layer;
+});
+glassLayers[0].append(document.createElement("i"));
+panel.append(...glassLayers, row, errorLine, listWrap, qrPanel, menuEl);
+const updateLens = installLens(panel, glassLayers[0], "flick-lens");
 
-// Bundled SVGs by name (src/icons/<name>.svg), resolved to URLs by Vite.
-const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?url", import: "default" });
-const svgUrl = (name: string): string => svgs[`./icons/${name}.svg`] ?? svgs["./icons/file.svg"];
+// Bundled SVGs by name (src/icons/<name>.svg), as text: they are repainted in
+// the theme's text colour and shown as data URLs, made once per theme.
+const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?raw", import: "default" });
+let iconInk = DARK.text;
+const svgUrls = new Map<string, string>();
+const svgUrl = (name: string): string => {
+  let url = svgUrls.get(name);
+  if (url === undefined) {
+    const raw = svgs[`./icons/${name}.svg`] ?? svgs["./icons/file.svg"];
+    url = svgDataUrl(themedSvg(raw, iconInk));
+    svgUrls.set(name, url);
+  }
+  return url;
+};
 
 let state: State = initial;
 let querySeq = 0;
@@ -102,10 +130,18 @@ function renderIcon(item: Item): HTMLSpanElement {
   return box;
 }
 
-function renderItem(item: Item, index: number): HTMLLIElement {
+// Rows on screen at the last render, so only rows that are new fade in.
+let shownRows = new Set<string>();
+const rowKey = (item: Item): string => `${item.provider}\u0000${item.id}`;
+
+function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "result";
   li.dataset.index = String(index);
+  if (fresh) {
+    li.classList.add("fresh");
+    li.style.setProperty("--at", String(index - state.top));
+  }
   if (index === state.selected) li.classList.add("selected");
   const armed = state.armed === item.id;
   if (armed) li.classList.add("armed");
@@ -215,7 +251,13 @@ function render() {
   qrPanel.hidden = !qr;
   if (qr) renderQr(qr);
   listWrap.hidden = rows.length === 0 || !!qr;
-  list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i)));
+  list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i, !shownRows.has(rowKey(item)))));
+  shownRows = new Set(rows.map(rowKey));
+  list.style.setProperty("--rows", String(rows.length));
+  // 5px: the list's top border and padding. Out of view: parked on the nearest edge.
+  const at = Math.max(0, Math.min(state.selected - state.top, Math.max(0, rows.length - 1)));
+  marker.style.transform = `translateY(${5 + at * 44}px)`;
+  marker.hidden = rows.length === 0;
   const cap = capOf(state);
   const len = state.items.length;
   track.hidden = len <= cap;
@@ -224,6 +266,9 @@ function render() {
     thumb.style.top = `${(state.top / len) * 100}%`;
   }
   renderMenu();
+  // Invisible while hidden (medium and high levels), so the next open starts
+  // from nothing; anything that brings the bar back clears it.
+  panel.classList.toggle("closed", state.hidden);
 }
 
 function dispatch(event: Event) {
@@ -378,6 +423,11 @@ const afterShow = (event: Event) => {
   querySeq++; // drop answers to queries from before this show
   dispatch(event);
   input.focus();
+  // The opening animation of the medium and high levels, played from its
+  // start on every show (a no-op under Minimal).
+  panel.classList.remove("opening");
+  void panel.offsetWidth;
+  panel.classList.add("opening");
 };
 const shownListener = listen("bar:shown", () => afterShow({ type: "shown" }));
 // A direct hotkey's item needs a second Enter: the bar opens with it armed.
@@ -393,6 +443,44 @@ listen("update:changed", () => dispatch({ type: "updateChanged" })).catch(listen
 // The back end hid the bar (Esc, focus loss, an activation): no live updates until it is shown again.
 listen("bar:hidden", () => dispatch({ type: "hidden" })).catch(listenFailed);
 listen<string | null>("config:error", (e) => dispatch({ type: "configError", message: e.payload })).catch(listenFailed);
+
+// The theme and animation level: asked once, then pushed on every change.
+let appearance: Appearance = DEFAULT_APPEARANCE;
+// Glass over a light picture writes in dark ink.
+let darkInk = false;
+const paint = () => {
+  const colors = appearance.glass && darkInk ? GLASS_DARK_INK : appearance.colors;
+  applyAppearance(appearance, colors, document.documentElement);
+  if (colors.text !== iconInk) {
+    iconInk = colors.text;
+    svgUrls.clear();
+  }
+  updateLens();
+  render();
+};
+const themed = (a: Appearance) => {
+  appearance = a;
+  paint();
+};
+listen<Appearance>("appearance:changed", (e) => themed(e.payload)).catch(listenFailed);
+invoke<Appearance>("appearance").then(themed, () => {});
+
+// Glass only: the back end takes a picture of what is behind the bar just
+// before each show and says so here; the glass layers draw it. It is let go
+// when the bar hides.
+const setBackdrop = (id: number) => {
+  const url = id > 0 ? `url("http://flick-backdrop.localhost/${id}")` : "none";
+  document.documentElement.style.setProperty("--backdrop", url);
+};
+listen<{ id: number; brightness: number }>("bar:backdrop", (e) => {
+  setBackdrop(e.payload.id);
+  const dark = e.payload.id > 0 && inkIsDark(e.payload.brightness);
+  if (dark !== darkInk) {
+    darkInk = dark;
+    paint();
+  }
+}).catch(listenFailed);
+listen("bar:hidden", () => setBackdrop(0)).catch(listenFailed);
 
 render();
 input.focus();

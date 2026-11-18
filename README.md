@@ -98,6 +98,24 @@ If your taskbar hides by itself, Flick can bring it up while the bar is open, th
 - Closing the bar removes the button, and the taskbar hides again about half a second later. Clicking the button closes the bar, like a click anywhere else.
 - No Windows setting is changed, and it does nothing when the taskbar doesn't hide by itself.
 
+## Appearance
+
+Settings has an Appearance tab for how the bar looks and moves. The same choices are `theme`, `custom_theme` and `animations` in the config.
+
+**Themes.** Dark is the default. The others are Light, Midnight, Frost, Ember, Ocean, Forest, Grape, Rose, Sand, Mint, Sakura and Glass. The Settings window follows the theme.
+
+**Your own colours.** Pick Custom and set eight colours with the colour pickers: background, selected row, border, text, muted text, accent, error and warning. "Start from" copies a built-in theme to begin with. Settings warns when text would be hard to read. In the config: `theme = "custom"` and `custom_theme = { background = "#101418", text = "#e8eef4", accent = "#4fd1c5" }`; a colour you leave out is taken from Dark.
+
+**Glass.** The bar looks like a pane of glass: what is behind it shows through, softened, and bends at the rim. To do that, Flick takes a picture of the screen area behind the bar each time the bar opens.
+
+- Only that rectangle is read. The picture is kept in memory while the bar is open and dropped when it closes; it is never saved or sent anywhere. Other themes take no picture.
+- The picture is still: a video playing behind the bar is frozen inside the pane until you close the bar.
+- The text is dark over a light background and white over a dark one.
+- The Settings window uses the Dark colours under Glass.
+
+**Animations.** Minimal (the default) changes everything at once. Medium fades the bar in, glides the highlight between rows and eases the list to its new height. High also lets the bar rise into place, gives the highlight a little bounce and fades new rows in one after another. Closing is instant at every level, and typing is never held up. If Windows' animation effects are switched off, nothing moves whatever is chosen.
+
+A wrong `theme`, `animations` or colour is a config error like any other: Flick says so and keeps the last working config.
 ## Icons and the mouse
 
 Each result shows the icon of its app, file or folder. Icons load in the background, so the text always appears first.

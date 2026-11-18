@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useRef, useState } from "preact/hooks";
 import { onSettingsChanged, settingsOpenFile, settingsState, type SettingsState } from "./api";
 import { Answers } from "./Answers";
+import { Appearance } from "./Appearance";
 import { General } from "./General";
 import { Search } from "./Search";
 import { Hotkeys } from "./Hotkeys";
@@ -121,6 +122,7 @@ export function App() {
       <fieldset class="page" disabled={broken}>
         <h1>{TAB_LABELS[tab]}</h1>
         {state !== null && tab === "general" && <General state={state} />}
+        {state !== null && tab === "appearance" && <Appearance state={state} />}
         {state !== null && tab === "search" && <Search state={state} />}
         {state !== null && tab === "answers" && <Answers state={state} />}
         {state !== null && tab === "shortcuts" && <Shortcuts state={state} guard={shortcutsGuard} />}

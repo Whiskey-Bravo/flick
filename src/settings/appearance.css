@@ -1,0 +1,45 @@
+.ap-wide { max-width: 760px; }
+.ap-themes { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+.page .ap-theme {
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  border: 1px solid var(--border); border-radius: 10px; background: transparent; text-align: left;
+}
+.page .ap-theme:hover { background: var(--panel); }
+.page .ap-theme.active { border-color: var(--accent); background: var(--panel); }
+.ap-name { font-weight: 600; }
+
+/* A small bar in the theme's own colours (set inline). */
+.ap-swatch {
+  display: flex; flex-direction: column; border: 1px solid; border-radius: 8px;
+  overflow: hidden; font-size: 11px; line-height: 16px;
+}
+.ap-line { padding: 5px 8px; border-bottom: 1px solid; font-size: 12px; }
+.ap-row { display: flex; align-items: center; gap: 6px; margin: 2px 3px; padding: 3px 5px; border-radius: 5px; }
+.ap-row:last-child { margin-bottom: 3px; }
+.ap-dot { flex: none; width: 10px; height: 10px; border-radius: 3px; }
+.ap-sub { margin-left: auto; font-size: 10px; }
+/* Glass, hinted at: a see-through panel over something colourful. */
+.ap-glass {
+  background:
+    linear-gradient(rgba(20, 22, 28, 0.5), rgba(20, 22, 28, 0.5)),
+    linear-gradient(120deg, #3d5a80 0%, #3d5a80 45%, #ee9b5a 45%, #ee9b5a 70%, #7a5cc7 70%);
+  border-color: rgba(255, 255, 255, 0.35) !important;
+}
+
+.ap-colors { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 8px 20px; margin-top: 12px; }
+.ap-color { display: flex; align-items: center; gap: 8px; }
+.ap-color input[type="color"] {
+  flex: none; width: 36px; height: 30px; padding: 2px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--panel); cursor: pointer;
+}
+.page .ap-hex {
+  flex: none; width: 92px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel); color: var(--text); font: inherit; font-family: Consolas, monospace;
+}
+.page .ap-hex.invalid { border-color: var(--error); }
+.ap-what { display: flex; flex-direction: column; min-width: 0; }
+.ap-what small, .ap-motion small { color: var(--muted); font-size: 12px; }
+.ap-warning { margin: 8px 0 0; color: var(--warning); font-size: 12px; }
+.ap-motion { align-items: flex-start; margin-bottom: 8px; }
+.ap-motion input { margin-top: 3px; }
+.ap-motion span { display: flex; flex-direction: column; }

@@ -174,6 +174,27 @@ pub struct SettingsState {
     distros: Option<Vec<String>>,
     start_at_login: bool,
     version: String,
+    /// Every theme with its colours, in display order; `custom` carries the
+    /// colours the config gives it now.
+    themes: Vec<ThemeInfo>,
+}
+
+#[derive(Serialize)]
+pub struct ThemeInfo {
+    name: &'static str,
+    colors: crate::theme::Colors,
+    glass: bool,
+}
+
+/// The themes as Settings shows them.
+fn theme_infos(custom: &crate::theme::CustomTheme) -> Vec<ThemeInfo> {
+    crate::theme::THEMES
+        .iter()
+        .map(|&name| {
+            let resolved = crate::theme::resolve(name, custom, "");
+            ThemeInfo { name, colors: resolved.colors, glass: resolved.glass }
+        })
+        .collect()
 }
 
 #[tauri::command(async)]
@@ -184,6 +205,7 @@ pub fn settings_state(app: AppHandle, state: State<AppState>) -> SettingsState {
         WslState::Unknown | WslState::NoWsl => None,
     };
     SettingsState {
+        themes: theme_infos(&config.custom_theme),
         config,
         file_error: read_config(&config::config_path()).err(),
         distros,
@@ -564,6 +586,16 @@ mod tests {
         assert_eq!(check_city(false, &fetch, "London"), Err("Online answers are off".to_string()));
         assert!(check_city(true, &fetch, "  ").is_err());
         assert!(fetch.urls().is_empty());
+    }
+
+    #[test]
+    fn settings_lists_every_theme_with_the_custom_colours_in_force() {
+        let custom = crate::theme::CustomTheme { background: Some("#101418".into()), ..Default::default() };
+        let infos = theme_infos(&custom);
+        assert_eq!(infos.iter().map(|t| t.name).collect::<Vec<_>>(), crate::theme::THEMES);
+        assert_eq!(infos.iter().filter(|t| t.glass).map(|t| t.name).collect::<Vec<_>>(), ["glass"]);
+        let own = infos.iter().find(|t| t.name == "custom").unwrap();
+        assert_eq!((own.colors.background.as_str(), own.colors.text.as_str()), ("#101418", "#ececf1"));
     }
 
     #[test]

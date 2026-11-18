@@ -251,13 +251,19 @@ fn show_as(app: &AppHandle, shown: Shown) {
     // Before the bar takes focus: `v`'s Enter pastes into this window. When
     // the bar is already up (tray Open, a second launch) the foreground is
     // the bar itself, so the window remembered when it opened stays.
-    if !w.is_visible().unwrap_or(false) {
+    let hidden = !w.is_visible().unwrap_or(false);
+    if hidden {
         crate::paste::remember_foreground();
     }
     SHOWS.fetch_add(1, Ordering::SeqCst);
     set_weather_hidden(app, false);
     if let Some(pos) = placement(app, &w) {
         let _ = w.set_position(pos);
+    }
+    // After the move and before the bar is on screen: Glass shows what is
+    // behind it. An already open bar keeps the picture it has.
+    if hidden {
+        take_backdrop(app, &w);
     }
     reveal_window(&w);
     let _ = match shown {
@@ -295,6 +301,44 @@ fn reveal_window(w: &WebviewWindow) {
     crate::taskbar::raise(w.app_handle());
 }
 
+/// Glass is on: a picture of what is behind the bar is taken at each show.
+static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The bar window's size (logical pixels): as the config file gives it, and
+/// under Glass, whose panel sits a little lower and casts a shadow, so a
+/// full list needs more room than the plain window has.
+const BAR_WIDTH: f64 = 680.0;
+const BAR_HEIGHT: f64 = 420.0;
+const GLASS_BAR_HEIGHT: f64 = 460.0;
+
+/// Switches the Glass theme's backdrop on or off (see backdrop.rs) and gives
+/// the window the height that theme needs.
+pub fn set_glass(app: &AppHandle, on: bool) {
+    let was = GLASS.swap(on, Ordering::SeqCst);
+    if !on {
+        crate::backdrop::clear();
+    }
+    if on != was {
+        if let Some(w) = bar(app) {
+            let height = if on { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
+            let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
+        }
+    }
+}
+
+/// Glass only, and only while the bar is still hidden: takes the picture of
+/// the screen where the bar window is about to appear and tells the page
+/// about it (id 0: none could be taken).
+fn take_backdrop(app: &AppHandle, w: &WebviewWindow) {
+    if !GLASS.load(Ordering::SeqCst) {
+        return;
+    }
+    let taken = w.outer_position().ok().zip(w.outer_size().ok()).and_then(|(at, size)| {
+        crate::backdrop::take(at.x, at.y, size.width, size.height)
+    });
+    let _ = app.emit_to(LABEL, "bar:backdrop", taken.unwrap_or_default());
+}
+
 /// Tells the weather store whether the bar is hidden (memory only).
 fn set_weather_hidden(app: &AppHandle, hidden: bool) {
     if let Some(state) = app.try_state::<crate::AppState>() {
@@ -315,6 +359,8 @@ pub fn hide(app: &AppHandle) {
         let _ = w.hide();
     }
     crate::taskbar::lower(app);
+    // The picture of what was behind the bar is held only while it is open.
+    crate::backdrop::clear();
 }
 
 /// Hide on focus loss; turn close requests (Alt+F4) into hides so the window
