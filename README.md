@@ -42,7 +42,7 @@ Type `v` for your clipboard history, `snip` for a screenshot, `color` to pick a 
 
 ### Make it yours
 
-Fourteen themes, your own colours, and three levels of animation. **Glass** turns the bar into a pane that shows what is behind it.
+Fourteen themes, your own colours, and four levels of animation, from none at all to a springy wobble. **Glass** turns the bar into a pane that shows what is behind it.
 
 ![The bar in several themes](screenshots/themes.png)
 

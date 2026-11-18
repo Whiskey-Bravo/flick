@@ -335,3 +335,31 @@ kbd {
       color 110ms ease-out;
   }
 }
+
+/* Wobble: content springs in, and a pressed button dips and springs back. */
+@keyframes st-wob {
+  from { opacity: 0; transform: translateY(14px) scale(0.97); }
+  30% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  :root[data-motion="wobble"] .page > :not(h1),
+  :root[data-motion="wobble"] .sc-editor {
+    animation: st-wob 620ms linear(0, 0.032, 0.117, 0.237, 0.376, 0.521, 0.662, 0.791, 0.903, 0.994, 1.065, 1.115, 1.146, 1.161, 1.162, 1.153, 1.137, 1.116, 1.092, 1.069, 1.046, 1.026, 1.01, 0.996, 0.986, 0.979, 0.975, 0.973, 0.974, 0.976, 0.979, 0.983, 0.986, 0.99, 0.994, 0.997, 1);
+  }
+
+  :root[data-motion="wobble"] .tab,
+  :root[data-motion="wobble"] .page button {
+    transition:
+      scale 560ms linear(0, 0.088, 0.314, 0.61, 0.912, 1.167, 1.342, 1.423, 1.415, 1.338, 1.219, 1.087, 0.968, 0.878, 0.827, 0.817, 0.839, 0.885, 0.94, 0.995, 1.039, 1.068, 1.079, 1.074, 1.058, 1.035, 1.011, 0.99, 0.975, 0.967, 0.967, 0.972, 0.981, 0.991, 1.001, 1.009, 1),
+      background-color 110ms ease-out,
+      border-color 110ms ease-out,
+      color 110ms ease-out;
+  }
+
+  :root[data-motion="wobble"] .tab:active,
+  :root[data-motion="wobble"] .page button:active {
+    scale: 0.93;
+    transition-duration: 60ms;
+  }
+}

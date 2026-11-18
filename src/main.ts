@@ -256,7 +256,16 @@ function render() {
   list.style.setProperty("--rows", String(rows.length));
   // 5px: the list's top border and padding. Out of view: parked on the nearest edge.
   const at = Math.max(0, Math.min(state.selected - state.top, Math.max(0, rows.length - 1)));
-  marker.style.transform = `translateY(${5 + at * 44}px)`;
+  const markerAt = `0 ${5 + at * 44}px`;
+  if (marker.style.translate !== markerAt) {
+    marker.style.translate = markerAt;
+    // Wobble only (a no-op elsewhere): the highlight squashes and stretches
+    // on each move, played from its start, and the icon it lands on hops.
+    marker.classList.remove("moved");
+    void marker.offsetWidth;
+    marker.classList.add("moved");
+    list.children[at]?.classList.add("landed");
+  }
   marker.hidden = rows.length === 0;
   const cap = capOf(state);
   const len = state.items.length;

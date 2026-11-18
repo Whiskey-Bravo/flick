@@ -429,11 +429,11 @@ input::placeholder {
   }
 
   :root[data-motion="medium"] .sel-marker {
-    transition: transform 90ms ease-out;
+    transition: translate 90ms ease-out;
   }
 
   :root[data-motion="high"] .sel-marker {
-    transition: transform 140ms cubic-bezier(0.3, 1.45, 0.5, 1);
+    transition: translate 140ms cubic-bezier(0.3, 1.45, 0.5, 1);
   }
 
   /* The list eases to its new height (`--rows` is set by the page). */
@@ -462,5 +462,76 @@ input::placeholder {
   :root[data-motion="high"] .menu:not([hidden]) {
     animation: fl-pop 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
     transform-origin: 0 0;
+  }
+}
+
+/* ---- Wobble ---------------------------------------------------------------
+   The fourth level: spring motion. Things overshoot where they are going and
+   settle with a couple of soft rebounds, and the highlight squashes and
+   stretches as it jumps. The curves are damped springs sampled into
+   `linear()` (damping ratio 0.34, 0.26 and 0.5). Like the other levels it
+   never holds up a key, and Windows' animation effects off turns it off. */
+:root {
+  --spring-wobble: linear(0, 0.066, 0.234, 0.46, 0.702, 0.927, 1.11, 1.237, 1.306, 1.32, 1.291, 1.232, 1.157, 1.08, 1.01, 0.955, 0.918, 0.899, 0.898, 0.91, 0.93, 0.955, 0.979, 1.001, 1.018, 1.028, 1.033, 1.032, 1.028, 1.021, 1.013, 1.005, 0.998, 0.993, 0.99, 0.989, 1);
+  --spring-jelly: linear(0, 0.088, 0.314, 0.61, 0.912, 1.167, 1.342, 1.423, 1.415, 1.338, 1.219, 1.087, 0.968, 0.878, 0.827, 0.817, 0.839, 0.885, 0.94, 0.995, 1.039, 1.068, 1.079, 1.074, 1.058, 1.035, 1.011, 0.99, 0.975, 0.967, 0.967, 0.972, 0.981, 0.991, 1.001, 1.009, 1);
+  --spring-soft: linear(0, 0.032, 0.117, 0.237, 0.376, 0.521, 0.662, 0.791, 0.903, 0.994, 1.065, 1.115, 1.146, 1.161, 1.162, 1.153, 1.137, 1.116, 1.092, 1.069, 1.046, 1.026, 1.01, 0.996, 0.986, 0.979, 0.975, 0.973, 0.974, 0.976, 0.979, 0.983, 0.986, 0.99, 0.994, 0.997, 1);
+}
+
+@keyframes fl-wob-in {
+  from { transform: translateY(16px) scale(0.86); }
+}
+
+@keyframes fl-wob-row {
+  from { opacity: 0; transform: translateY(12px) scale(0.94); }
+  35% { opacity: 1; }
+}
+
+@keyframes fl-wob-pop {
+  from { opacity: 0; transform: scale(0.7); }
+  30% { opacity: 1; }
+}
+
+/* The highlight on the move: thinner and taller, then flatter, then itself. */
+@keyframes fl-squash {
+  0% { scale: 1 1; }
+  22% { scale: 0.975 1.22; }
+  48% { scale: 1.012 0.9; }
+  72% { scale: 0.996 1.05; }
+  100% { scale: 1 1; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  :root[data-motion="wobble"] .panel.opening {
+    animation:
+      fl-fade 130ms ease-out,
+      fl-wob-in 720ms var(--spring-wobble);
+    transform-origin: 50% 0;
+  }
+
+  :root[data-motion="wobble"] .sel-marker {
+    transition: translate 660ms var(--spring-jelly);
+  }
+
+  :root[data-motion="wobble"] .sel-marker.moved {
+    animation: fl-squash 420ms ease-out;
+  }
+
+  :root[data-motion="wobble"] .results {
+    transition: height 600ms var(--spring-soft);
+  }
+
+  :root[data-motion="wobble"] .result.fresh {
+    animation: fl-wob-row 600ms var(--spring-soft) backwards;
+    animation-delay: calc(var(--at, 0) * 24ms);
+  }
+
+  :root[data-motion="wobble"] .menu:not([hidden]) {
+    animation: fl-wob-pop 660ms var(--spring-jelly);
+    transform-origin: 0 0;
+  }
+
+  /* The icon of the row the highlight lands on gives a small hop. */
+  :root[data-motion="wobble"] .result.landed .icon {
+    animation: fl-wob-pop 600ms var(--spring-jelly);
   }
 }

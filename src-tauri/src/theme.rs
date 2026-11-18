@@ -12,8 +12,9 @@ pub const THEMES: [&str; 14] = [
     "dark", "light", "midnight", "frost", "ember", "ocean", "forest", "grape", "rose", "sand", "mint", "sakura",
     "glass", "custom",
 ];
-/// The animation levels, calmest first.
-pub const ANIMATIONS: [&str; 3] = ["minimal", "medium", "high"];
+/// The animation levels, calmest first. `wobble` is springy: things overshoot
+/// and settle with a couple of rebounds.
+pub const ANIMATIONS: [&str; 4] = ["minimal", "medium", "high", "wobble"];
 
 /// A theme's colours as `#rrggbb`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -262,6 +263,8 @@ mod tests {
         let none = CustomTheme::default();
         assert!(validate("", &none, "").is_ok());
         assert!(validate("frost", &none, "medium").is_ok());
+        assert!(validate("", &none, "wobble").is_ok());
+        assert_eq!(resolve("", &none, "wobble").animations, "wobble");
         assert!(validate("neon", &none, "").unwrap_err().starts_with("theme must be one of dark, light"));
         assert!(validate("ocean", &none, "").is_ok() && validate("sakura", &none, "").is_ok());
         assert!(validate("dark", &none, "wild").unwrap_err().starts_with("animations must be one of minimal"));

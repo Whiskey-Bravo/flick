@@ -51,7 +51,7 @@ pub(crate) const DEFAULT_FILE: &str = "\
 # theme = \"dark\"
 ## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
 # custom_theme = { background = \"#101418\", surface = \"#1c232b\", border = \"#26303a\", text = \"#e8eef4\", muted = \"#9fb0c0\", accent = \"#4fd1c5\", error = \"#f0717a\", warning = \"#f2b441\" }
-## animations: minimal, medium or high.
+## animations: minimal, medium, high or wobble (springy).
 # animations = \"minimal\"
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
