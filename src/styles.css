@@ -20,6 +20,7 @@
   --menu-border: color-mix(in srgb, var(--text) 15%, var(--bg));
   --menu-row: color-mix(in srgb, var(--text) 12%, var(--bg));
   --radius: 12px;
+  --row-radius: 8px;
 }
 
 /* Glass: the panel is see-through. Its colours tint it; rows and the menu
@@ -33,6 +34,8 @@
   --menu-border: color-mix(in srgb, var(--text) 24%, transparent);
   --menu-row: color-mix(in srgb, var(--text) 16%, transparent);
   --radius: 22px;
+  /* Rows sit 6px inside the panel: their corners follow its curve. */
+  --row-radius: 16px;
 }
 
 html,
@@ -113,7 +116,7 @@ body {
 .glass-back > i {
   position: absolute;
   inset: -12px;
-  background: var(--backdrop, none) 0 4px / 680px 420px no-repeat;
+  background: var(--backdrop, none) 0 4px / 680px 460px no-repeat;
   filter: blur(6px) saturate(1.8) brightness(1.04);
 }
 
@@ -278,7 +281,7 @@ input {
   gap: 12px;
   height: 44px;
   padding: 0 14px;
-  border-radius: 8px;
+  border-radius: var(--row-radius);
 }
 
 .result.selected {
@@ -376,7 +379,7 @@ input::placeholder {
   left: 6px;
   right: 6px;
   height: 44px;
-  border-radius: 8px;
+  border-radius: var(--row-radius);
   background: var(--row);
   pointer-events: none;
 }

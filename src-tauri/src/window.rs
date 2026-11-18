@@ -302,11 +302,25 @@ fn reveal_window(w: &WebviewWindow) {
 /// Glass is on: a picture of what is behind the bar is taken at each show.
 static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Switches the Glass theme's backdrop on or off (see backdrop.rs).
-pub fn set_glass(on: bool) {
-    GLASS.store(on, Ordering::SeqCst);
+/// The bar window's size (logical pixels): as the config file gives it, and
+/// under Glass, whose panel sits a little lower and casts a shadow, so a
+/// full list needs more room than the plain window has.
+const BAR_WIDTH: f64 = 680.0;
+const BAR_HEIGHT: f64 = 420.0;
+const GLASS_BAR_HEIGHT: f64 = 460.0;
+
+/// Switches the Glass theme's backdrop on or off (see backdrop.rs) and gives
+/// the window the height that theme needs.
+pub fn set_glass(app: &AppHandle, on: bool) {
+    let was = GLASS.swap(on, Ordering::SeqCst);
     if !on {
         crate::backdrop::clear();
+    }
+    if on != was {
+        if let Some(w) = bar(app) {
+            let height = if on { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
+            let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
+        }
     }
 }
 

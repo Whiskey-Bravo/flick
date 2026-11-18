@@ -1165,7 +1165,7 @@ fn setup(app: &AppHandle) {
     // The Win key: its worker starts the hook when the setting is on.
     {
         let state = app.state::<AppState>();
-        window::set_glass(current_appearance(&state).glass);
+        window::set_glass(app, current_appearance(&state).glass);
         state.win_key.flags.set_bar_ready(app.get_webview_window(window::LABEL).is_some());
         let worker = app.clone();
         std::thread::Builder::new()
@@ -1490,7 +1490,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
     // Both pages repaint with the theme and animation level now in force.
     let appearance = current_appearance(&state);
-    window::set_glass(appearance.glass);
+    window::set_glass(app, appearance.glass);
     let _ = app.emit("appearance:changed", appearance);
 }
 
