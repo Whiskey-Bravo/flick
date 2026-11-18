@@ -17,8 +17,21 @@ pub struct WinInfo {
     pub elevated: bool,
 }
 
+/// A running process of this user's session whose image path can be read.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProcInfo {
+    pub pid: u32,
+    /// Full path of the process image.
+    pub exe: String,
+    pub elevated: bool,
+}
+
 pub trait WindowOps: Send + Sync {
     fn list(&self) -> Vec<WinInfo>;
+    /// Every process `kill` may offer: this session's, never Flick's own.
+    fn processes(&self) -> Vec<ProcInfo> {
+        Vec::new()
+    }
     fn exists(&self, hwnd: isize) -> bool;
     fn focus(&self, hwnd: isize) -> Result<(), String>;
     /// `pid` is the owner the window had when listed; the live window must still match.
@@ -45,15 +58,55 @@ pub fn listable(class: &str, pid: u32, own_pid: u32, title: &str, tool: bool, cl
         && !EXCLUDED_CLASSES.iter().any(|c| c.eq_ignore_ascii_case(class))
 }
 
+/// Processes Windows itself needs: ending one logs you out, blanks the
+/// screen or takes the desktop down. Never offered and never ended.
+const ESSENTIAL: [&str; 30] = [
+    "explorer.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "smss.exe",
+    "svchost.exe",
+    "dwm.exe",
+    "fontdrvhost.exe",
+    "sihost.exe",
+    "taskhostw.exe",
+    "ctfmon.exe",
+    "runtimebroker.exe",
+    "dllhost.exe",
+    "conhost.exe",
+    "searchhost.exe",
+    "startmenuexperiencehost.exe",
+    "shellexperiencehost.exe",
+    "shellhost.exe",
+    "textinputhost.exe",
+    "applicationframehost.exe",
+    "lockapp.exe",
+    "logonui.exe",
+    "userinit.exe",
+    "audiodg.exe",
+    "spoolsv.exe",
+    "wudfhost.exe",
+    "msmpeng.exe",
+    "securityhealthservice.exe",
+];
+
+/// Whether `exe` (a path or a file name) is one of the processes Windows needs.
+pub fn essential(exe: &str) -> bool {
+    let name = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+    ESSENTIAL.iter().any(|e| e.eq_ignore_ascii_case(name))
+}
+
 /// Whether a process found live under `pid` may be ended: it must still be the
-/// image that was listed, and never Flick itself or explorer.exe.
+/// image that was listed, and never Flick itself or a process Windows needs.
 pub fn may_terminate(live_exe: &str, expected_exe: &str, pid: u32, own_pid: u32) -> bool {
-    let name = std::path::Path::new(live_exe).file_name().map(|s| s.to_string_lossy().to_lowercase());
     pid != 0
         && pid != own_pid
         && !live_exe.is_empty()
         && live_exe.eq_ignore_ascii_case(expected_exe)
-        && name.as_deref() != Some("explorer.exe")
+        && !essential(live_exe)
 }
 
 /// Whether a live window may be sent WM_CLOSE: still owned by the listed
@@ -72,11 +125,18 @@ pub struct WindowList {
     snap: RwLock<Vec<WinInfo>>,
     /// AppUserModelID per listed window, read with the list.
     aumids: RwLock<HashMap<isize, String>>,
+    /// The running processes, read with the list.
+    procs: RwLock<Vec<ProcInfo>>,
 }
 
 impl WindowList {
     pub fn new(ops: Arc<dyn WindowOps>) -> Arc<Self> {
-        Arc::new(Self { ops, snap: RwLock::new(Vec::new()), aumids: RwLock::new(HashMap::new()) })
+        Arc::new(Self {
+            ops,
+            snap: RwLock::new(Vec::new()),
+            aumids: RwLock::new(HashMap::new()),
+            procs: RwLock::new(Vec::new()),
+        })
     }
 
     pub fn refresh(&self) {
@@ -85,6 +145,12 @@ impl WindowList {
             fresh.iter().filter_map(|w| self.ops.aumid(w.hwnd).map(|a| (w.hwnd, a))).collect();
         *self.snap.write().unwrap_or_else(|e| e.into_inner()) = fresh;
         *self.aumids.write().unwrap_or_else(|e| e.into_inner()) = aumids;
+        *self.procs.write().unwrap_or_else(|e| e.into_inner()) = self.ops.processes();
+    }
+
+    /// The processes found by the last refresh.
+    pub fn processes(&self) -> Vec<ProcInfo> {
+        self.procs.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The AppUserModelID found for `hwnd` by the last refresh. Memory only.
@@ -298,6 +364,43 @@ mod sys {
         out
     }
 
+    /// This session's processes whose image can be read, without Flick's own
+    /// (the bar and its Win-key helper).
+    pub fn processes() -> Vec<super::ProcInfo> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+        };
+        use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+        // SAFETY: the entry carries its own size; the snapshot handle is
+        // closed before returning; every result is checked.
+        unsafe {
+            let own = GetCurrentProcessId();
+            let mut session = 0u32;
+            if ProcessIdToSessionId(own, &mut session).is_err() {
+                return Vec::new();
+            }
+            let own_exe = image_path(own);
+            let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return Vec::new() };
+            let mut entry = PROCESSENTRY32W { dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+            let mut out = Vec::new();
+            let mut more = Process32FirstW(snap, &mut entry).is_ok();
+            while more {
+                let pid = entry.th32ProcessID;
+                let mut theirs = 0u32;
+                if pid != 0 && pid != own && ProcessIdToSessionId(pid, &mut theirs).is_ok() && theirs == session {
+                    if let Some(exe) = image_path(pid) {
+                        if !own_exe.as_deref().is_some_and(|o| o.eq_ignore_ascii_case(&exe)) {
+                            out.push(super::ProcInfo { pid, exe, elevated: is_elevated(pid) });
+                        }
+                    }
+                }
+                more = Process32NextW(snap, &mut entry).is_ok();
+            }
+            let _ = CloseHandle(snap);
+            out
+        }
+    }
+
     pub fn exists(h: isize) -> bool {
         // SAFETY: IsWindow accepts any handle value.
         unsafe { IsWindow(Some(hw(h))).as_bool() }
@@ -416,6 +519,9 @@ impl WindowOps for SystemWindows {
     fn list(&self) -> Vec<WinInfo> {
         sys::list(&self.names)
     }
+    fn processes(&self) -> Vec<ProcInfo> {
+        sys::processes()
+    }
     fn exists(&self, hwnd: isize) -> bool {
         sys::exists(hwnd)
     }
@@ -479,6 +585,30 @@ mod tests {
         assert_eq!(list.aumid(1).as_deref(), Some("Contoso.Foo_abc!App"));
         assert_eq!(list.aumid(2), None);
         assert_eq!(list.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn the_processes_windows_needs_are_known_by_name_or_path() {
+        assert!(essential(r"C:\Windows\explorer.exe"));
+        assert!(essential(r"C:\Windows\System32\SVCHOST.EXE"));
+        assert!(essential("dwm.exe"));
+        assert!(!essential(r"C:\Apps\node\node.exe"));
+        assert!(!essential(r"C:\Apps\explorer.exe.bak\tool.exe"));
+        // The last check before a process is ended refuses them too.
+        let dwm = r"C:\Windows\System32\dwm.exe";
+        assert!(!may_terminate(dwm, dwm, 30, 1));
+    }
+
+    /// Prints the real processes `kill` could offer; reads only, ends nothing.
+    /// `cargo test real_processes -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_processes_are_listed() {
+        let all = SystemWindows::new().processes();
+        println!("{} processes", all.len());
+        for p in all.iter().filter(|p| !essential(&p.exe)) {
+            println!("{} {} elevated={}", p.pid, p.exe, p.elevated);
+        }
     }
 
     /// Prints each real window's AUMID; reads only, closes nothing.

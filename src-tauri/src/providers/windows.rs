@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::fuzzy;
 use crate::provider::{Action, HelpLine,Modifier, Outcome, Provider, Query, ResultItem};
-use crate::winlist::{WinInfo, WindowList};
+use crate::winlist::{essential, ProcInfo, WinInfo, WindowList};
 
 /// Above the engine's learned-boost cap (300), so a window you are looking for
 /// outranks an app that merely has a habit.
@@ -106,6 +106,50 @@ fn kill_row(g: &Group, score: u32) -> ResultItem {
     }
 }
 
+/// The processes of one program that has no window open.
+struct Background {
+    exe: String,
+    pids: Vec<u32>,
+    elevated: bool,
+}
+
+/// Programs running without a window: every process whose image is not one
+/// of `windowed`, grouped by image; never the ones Windows needs.
+fn background(procs: &[ProcInfo], windowed: &[Group]) -> Vec<Background> {
+    let mut out: Vec<Background> = Vec::new();
+    for p in procs {
+        if essential(&p.exe) || windowed.iter().any(|g| g.exe.eq_ignore_ascii_case(&p.exe)) {
+            continue;
+        }
+        match out.iter_mut().find(|b| b.exe.eq_ignore_ascii_case(&p.exe)) {
+            Some(b) => {
+                b.pids.push(p.pid);
+                b.elevated |= p.elevated;
+            }
+            None => out.push(Background { exe: p.exe.clone(), pids: vec![p.pid], elevated: p.elevated }),
+        }
+    }
+    out
+}
+
+fn background_row(b: &Background, score: u32) -> ResultItem {
+    let n = b.pids.len();
+    ResultItem {
+        id: format!("killbg:{}", b.exe.to_lowercase()),
+        provider: "windows",
+        title: format!("End {} \u{b7} {} process{}", file_name(&b.exe), n, if n == 1 { "" } else { "es" }),
+        subtitle: if b.elevated {
+            NEEDS_ADMIN.to_string()
+        } else {
+            "Runs in the background \u{b7} unsaved work is lost".to_string()
+        },
+        score,
+        confirm: true,
+        icon: format!("file:{}", b.exe),
+        ..Default::default()
+    }
+}
+
 fn quit_all_row(score: u32) -> ResultItem {
     ResultItem {
         id: "quit-all".to_string(),
@@ -148,14 +192,24 @@ impl Provider for WindowsProvider {
             return vec![quit_all_row(1000)];
         }
         let mut rows: Vec<ResultItem> = if let Some((verb, rest)) = command(text) {
-            groups(&snap)
+            let windowed = groups(&snap);
+            let mut rows: Vec<ResultItem> = windowed
                 .iter()
-                .filter(|g| verb == "close" || !is_explorer(&g.exe))
+                .filter(|g| verb == "close" || !essential(&g.exe))
                 .filter_map(|g| {
                     let s = app_score(rest, g)? + WINDOW_BONUS;
                     Some(if verb == "close" { close_row(g, s) } else { kill_row(g, s) })
                 })
-                .collect()
+                .collect();
+            if verb == "kill" {
+                // Programs without a window, by file name; just below an app
+                // that matches as well.
+                rows.extend(background(&self.list.processes(), &windowed).iter().filter_map(|b| {
+                    let s = fuzzy::score(rest, &stem(&b.exe)).into_iter().chain(fuzzy::score(rest, &file_name(&b.exe))).max()?;
+                    Some(background_row(b, s + WINDOW_BONUS - 1))
+                }));
+            }
+            rows
         } else {
             snap.iter()
                 .filter_map(|w| {
@@ -188,8 +242,14 @@ impl Provider for WindowsProvider {
         if let Some(exe) = id.strip_prefix("kill:") {
             return groups(&snap)
                 .iter()
-                .find(|g| g.exe.to_lowercase() == exe && !is_explorer(&g.exe))
+                .find(|g| g.exe.to_lowercase() == exe && !essential(&g.exe))
                 .map(|g| kill_row(g, 0));
+        }
+        if let Some(exe) = id.strip_prefix("killbg:") {
+            return background(&self.list.processes(), &groups(&snap))
+                .iter()
+                .find(|b| b.exe.to_lowercase() == exe)
+                .map(|b| background_row(b, 0));
         }
         None
     }
@@ -245,6 +305,22 @@ impl Provider for WindowsProvider {
             ops.focus(h)?;
             return Ok(Outcome::Hide);
         }
+        if let Some(exe) = id.strip_prefix("killbg:") {
+            let b = background(&self.list.processes(), &groups(&snap))
+                .into_iter()
+                .find(|b| b.exe.to_lowercase() == exe)
+                .ok_or_else(|| "That app is gone.".to_string())?;
+            if b.elevated {
+                return Err(NEEDS_ADMIN.to_string());
+            }
+            // Some may have ended on their own since the bar opened (or with
+            // the first one): it worked when any was ended.
+            let results: Vec<Result<(), String>> = b.pids.iter().map(|pid| ops.kill(*pid, &b.exe)).collect();
+            return match results.iter().any(Result::is_ok) {
+                true => Ok(Outcome::Hide),
+                false => Err(results.into_iter().find_map(Result::err).unwrap_or_else(|| "That app is gone.".to_string())),
+            };
+        }
         let (verb, exe) = if let Some(e) = id.strip_prefix("close:") {
             ("close", e)
         } else if let Some(e) = id.strip_prefix("kill:") {
@@ -268,6 +344,9 @@ impl Provider for WindowsProvider {
             if is_explorer(&g.exe) {
                 return Err("Explorer can't be ended from here.".to_string());
             }
+            if essential(&g.exe) {
+                return Err("Windows needs that one running.".to_string());
+            }
             let mut pids: Vec<u32> = g.wins.iter().map(|w| w.pid).collect();
             pids.sort_unstable();
             pids.dedup();
@@ -279,6 +358,13 @@ impl Provider for WindowsProvider {
             }
             if let Some(e) = failed {
                 return Err(e);
+            }
+            // The app's processes that own no window (helpers, renderers) go
+            // too; many end with the ones above, so a miss here is no error.
+            for p in self.list.processes() {
+                if p.exe.eq_ignore_ascii_case(&g.exe) && !p.elevated && !g.wins.iter().any(|w| w.pid == p.pid) {
+                    let _ = ops.kill(p.pid, &g.exe);
+                }
             }
         }
         Ok(Outcome::Hide)
@@ -296,6 +382,9 @@ mod tests {
         gone: Mutex<Vec<isize>>,
         calls: Mutex<Vec<String>>,
         args: Mutex<Vec<String>>,
+        procs: Mutex<Vec<ProcInfo>>,
+        /// Process ids whose `kill` fails (already gone).
+        dead: Mutex<Vec<u32>>,
     }
 
     impl FakeOps {
@@ -307,6 +396,9 @@ mod tests {
     impl WindowOps for FakeOps {
         fn list(&self) -> Vec<WinInfo> {
             self.wins.lock().unwrap().clone()
+        }
+        fn processes(&self) -> Vec<ProcInfo> {
+            self.procs.lock().unwrap().clone()
         }
         fn exists(&self, hwnd: isize) -> bool {
             !self.gone.lock().unwrap().contains(&hwnd)
@@ -323,6 +415,9 @@ mod tests {
         fn kill(&self, pid: u32, exe: &str) -> Result<(), String> {
             self.calls.lock().unwrap().push(format!("kill {pid}"));
             self.args.lock().unwrap().push(format!("kill {pid} {exe}"));
+            if self.dead.lock().unwrap().contains(&pid) {
+                return Err("That app is gone.".to_string());
+            }
             Ok(())
         }
     }
@@ -332,10 +427,90 @@ mod tests {
     }
 
     fn setup(wins: Vec<WinInfo>) -> (WindowsProvider, Arc<FakeOps>) {
-        let ops = Arc::new(FakeOps { wins: Mutex::new(wins), gone: Mutex::new(vec![]), calls: Mutex::new(vec![]), args: Mutex::new(vec![]) });
+        setup_with(wins, vec![])
+    }
+
+    fn setup_with(wins: Vec<WinInfo>, procs: Vec<ProcInfo>) -> (WindowsProvider, Arc<FakeOps>) {
+        let ops = Arc::new(FakeOps {
+            wins: Mutex::new(wins),
+            gone: Mutex::new(vec![]),
+            calls: Mutex::new(vec![]),
+            args: Mutex::new(vec![]),
+            procs: Mutex::new(procs),
+            dead: Mutex::new(vec![]),
+        });
         let list = WindowList::new(ops.clone());
         list.refresh();
         (WindowsProvider::new(list), ops)
+    }
+
+    fn proc(pid: u32, exe: &str, elevated: bool) -> ProcInfo {
+        ProcInfo { pid, exe: exe.into(), elevated }
+    }
+
+    const NODE: &str = r"C:\Apps\node\node.exe";
+    const CHROME: &str = r"C:\Apps\Chrome\chrome.exe";
+
+    fn busy_pc() -> Vec<ProcInfo> {
+        vec![
+            proc(20, CHROME, false),
+            proc(21, CHROME, false),
+            proc(22, CHROME, false),
+            proc(40, NODE, false),
+            proc(41, NODE, false),
+            proc(50, r"C:\Windows\System32\svchost.exe", false),
+            proc(60, r"C:\Apps\Guard\guard.exe", true),
+        ]
+    }
+
+    #[test]
+    fn kill_offers_programs_that_have_no_window() {
+        let (p, ops) = setup_with(chromes(), busy_pc());
+        let rows = p.query(&q("kill node"));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, r"killbg:c:\apps\node\node.exe");
+        assert_eq!(rows[0].title, "End node.exe \u{b7} 2 processes");
+        assert_eq!(rows[0].subtitle, "Runs in the background \u{b7} unsaved work is lost");
+        assert!(rows[0].confirm, "a second Enter is asked for");
+        assert_eq!(p.item(&rows[0].id).map(|r| r.title), Some(rows[0].title.clone()));
+        assert_eq!(p.activate(&rows[0].id, Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(ops.args.lock().unwrap().clone(), [format!("kill 40 {NODE}"), format!("kill 41 {NODE}")]);
+        // `close` is for windows only, and so is a plain search.
+        assert!(p.query(&q("close node")).is_empty());
+        assert!(p.query(&q("node")).is_empty());
+    }
+
+    #[test]
+    fn kill_never_offers_what_windows_needs_and_refuses_administrator_programs() {
+        let (p, ops) = setup_with(chromes(), busy_pc());
+        assert!(p.query(&q("kill svchost")).is_empty());
+        assert!(p.item(r"killbg:c:\windows\system32\svchost.exe").is_none());
+        assert!(p.activate(r"killbg:c:\windows\system32\svchost.exe", Modifier::None).is_err());
+        let rows = p.query(&q("kill guard"));
+        assert_eq!(rows[0].subtitle, "Needs administrator");
+        assert_eq!(p.activate(&rows[0].id, Modifier::None), Err("Needs administrator".to_string()));
+        assert!(ops.calls().is_empty());
+    }
+
+    #[test]
+    fn a_background_program_that_partly_ended_already_still_counts_as_ended() {
+        let (p, ops) = setup_with(vec![], busy_pc());
+        ops.dead.lock().unwrap().push(40);
+        assert_eq!(p.activate(r"killbg:c:\apps\node\node.exe", Modifier::None), Ok(Outcome::Hide));
+        ops.dead.lock().unwrap().push(41);
+        assert_eq!(p.activate(r"killbg:c:\apps\node\node.exe", Modifier::None), Err("That app is gone.".to_string()));
+    }
+
+    #[test]
+    fn ending_an_app_ends_its_windowless_processes_too() {
+        let (p, ops) = setup_with(chromes(), busy_pc());
+        // One row for Chrome: its helper processes are not listed again.
+        let rows = p.query(&q("kill chrome"));
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), [r"kill:c:\apps\chrome\chrome.exe"]);
+        // A helper that went down with the main process is no error.
+        ops.dead.lock().unwrap().push(22);
+        assert_eq!(p.activate(&rows[0].id, Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(ops.calls(), ["kill 20", "kill 21", "kill 22"]);
     }
 
     fn q(text: &str) -> Query {
@@ -489,6 +664,8 @@ mod tests {
             gone: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
             args: Mutex::new(vec![]),
+            procs: Mutex::new(vec![]),
+            dead: Mutex::new(vec![]),
         });
         let list = WindowList::new(ops);
         assert!(list.snapshot().is_empty());
