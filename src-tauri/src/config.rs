@@ -38,6 +38,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## search_engine: the web search behind `? text` and Enter on a weather answer; {arg} is the search text.
 # search_engine = \"https://duckduckgo.com/?q={arg}\"
 ##
+## tr_languages: the two languages tr translates between, yours first (codes such as \"de\", \"en\", \"fr\", \"es\"). Unset: German and English.
+# tr_languages = [\"de\", \"en\"]
+##
 ## check_updates: ask GitHub about once a day whether a new version exists (false: never).
 # check_updates = true
 ##
@@ -124,6 +127,10 @@ pub struct Config {
     pub temperature_unit: String,
     /// Web search URL with `{arg}`; empty means DuckDuckGo.
     pub search_engine: String,
+    /// The two languages `tr` translates between, yours first; empty means
+    /// German and English.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tr_languages: Vec<String>,
     /// Look for a new version in the background (also needs `online`).
     pub check_updates: bool,
     /// The Win key pressed alone opens the bar instead of the Start menu.
@@ -163,6 +170,7 @@ impl Default for Config {
             currency: String::new(),
             temperature_unit: String::new(),
             search_engine: String::new(),
+            tr_languages: Vec::new(),
             check_updates: true,
             win_key: false,
             show_taskbar: false,
@@ -513,6 +521,7 @@ pub fn validate(c: &Config) -> Result<(), String> {
         return Err("temperature_unit must be \"c\" or \"f\"".into());
     }
     crate::theme::validate(&c.theme, &c.custom_theme, &c.animations)?;
+    crate::providers::words::validate_languages(&c.tr_languages)?;
     let engine = &c.search_engine;
     let engine_ok = engine.is_empty() || (engine.starts_with("https://") && engine.contains("{arg}"));
     if !engine_ok {
@@ -733,6 +742,21 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn tr_languages_are_two_different_listed_codes_or_nothing() {
+        assert!(parse("").unwrap().tr_languages.is_empty());
+        assert_eq!(parse("tr_languages = [\"fr\", \"en\"]").unwrap().tr_languages, ["fr", "en"]);
+        assert!(parse("tr_languages = [\"ZH-cn\", \"de\"]").is_ok(), "codes in any case");
+        for bad in [
+            "tr_languages = [\"fr\"]",
+            "tr_languages = [\"fr\", \"fr\"]",
+            "tr_languages = [\"fr\", \"klingon\"]",
+            "tr_languages = [\"fr\", \"en\", \"de\"]",
+        ] {
+            assert!(parse(bad).unwrap_err().contains("tr_languages"), "{bad}");
+        }
+    }
+
     #[test]
     fn tab_completion_defaults_off_and_parses_true() {
         assert!(!Config::default().tab_completion);

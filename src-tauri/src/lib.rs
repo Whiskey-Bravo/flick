@@ -930,6 +930,7 @@ fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -
     let shortcuts = push_distro(p, new, detected);
     p.status.set_online(new.online);
     p.words.set_online(new.online);
+    p.words.set_languages(&new.tr_languages);
     p.workspaces.set(new.workspaces.clone());
     // Unchanged roots are not re-set: that would restart a running scan and
     // re-register the watcher for nothing.
@@ -1117,6 +1118,7 @@ fn setup(app: &AppHandle) {
     providers.answers.set_config(&answers_config(&loaded.config, providers.formats.as_ref()));
     providers.status.set_online(loaded.config.online);
     providers.words.set_online(loaded.config.online);
+    providers.words.set_languages(&loaded.config.tr_languages);
     providers.workspaces.set(loaded.config.workspaces.clone());
     // Cheap (no watcher yet, no scan): the first file scan uses these roots.
     providers.files.set_roots(loaded.config.file_roots.clone());

@@ -66,6 +66,7 @@ open = "https://docs.rs"
 - `history`: set to `false` to stop saving past searches and recent launches (see [Past searches](typing.md#past-searches)). A new install starts with `history = false` in its config; a config without the line counts as `true`.
 - `online`, `weather_city`, `currency`, `temperature_unit`, `search_engine`: see Quick answers.
 - `check_updates`: set to `false` to stop Flick looking for new versions (see [Updates](#updates)). The default is `true`.
+- `tr_languages`: the two languages `tr` translates between, yours first, as codes: `["fr", "en"]`. Unset means German and English.
 - `tab_completion`: set to `true` for a grey preview of the top result that Tab completes (see [Tab completion](typing.md#tab-completion)). The default is `false`.
 - `win_key`: set to `true` to open the bar with the Win key on its own (see [Win key](windows.md#win-key)). The default is `false`.
 - `[[shortcut]]`: see Shortcuts.

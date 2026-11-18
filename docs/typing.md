@@ -25,7 +25,7 @@ Everything you can type in the bar, the keys it understands, and how results are
 | `timer` and a time | A timer that rings with a Windows notification | `timer 5m` |
 | `remind`, a time and a note | A reminder after a while, at a time today, or tomorrow | `remind 20m pizza`, `remind 18:30 call mum`, `remind tomorrow 9:00 dentist` |
 | `timers` | Your pending timers and reminders; Enter twice cancels one | `timers` |
-| `tr` and some text | Translates between German and English (online) | `tr guten Morgen` |
+| `tr` and some text | Translates between two languages, German and English unless you pick others (online) | `tr guten Morgen`, `tr >fr good morning` |
 | `def` and a word | Definitions from Wiktionary (online) | `def serendipity` |
 | `connect` or `disconnect`, and a device | Connects or disconnects a paired Bluetooth audio device | `connect headphones` |
 | `wifi` and a network | Joins a saved Wi-Fi network | `wifi home` |

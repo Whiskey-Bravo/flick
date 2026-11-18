@@ -46,6 +46,8 @@ export type Config = {
   hotkey: string;
   wsl_distro: string;
   file_roots: string[];
+  /** The two languages of `tr`, yours first; left out while it is German and English. */
+  tr_languages?: string[];
   history: boolean;
   online: boolean;
   weather_city: string;
@@ -78,6 +80,8 @@ export type SettingsState = {
   version: string;
   /** Every theme with its colours, in display order. */
   themes: ThemeInfo[];
+  /** The languages `tr` knows, as [code, name]. */
+  languages: [string, string][];
 };
 
 /** One setting; an empty string or list means "unset". */
@@ -85,6 +89,7 @@ export type Setting =
   | { key: "hotkey"; value: string }
   | { key: "wsl_distro"; value: string }
   | { key: "file_roots"; value: string[] }
+  | { key: "tr_languages"; value: string[] }
   | { key: "history"; value: boolean }
   | { key: "online"; value: boolean }
   | { key: "weather_city"; value: string }

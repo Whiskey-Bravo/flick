@@ -1,4 +1,6 @@
-//! `tr <text>` translates between German and English (MyMemory); `def <word>`
+//! `tr <text>` translates between two languages (German and English unless the
+//! config's `tr_languages` says otherwise; `tr >fr <text>` into any one of
+//! [`LANGUAGES`]) through MyMemory; `def <word>`
 //! shows definitions from English Wiktionary. Online, after typing pauses, and
 //! only the typed text is sent; answers are kept in memory only.
 
@@ -67,13 +69,143 @@ pub fn source_language(text: &str) -> Lang {
     }
 }
 
-/// MyMemory's address for `text`, from `from` into the other language.
-pub fn translate_url(text: &str, from: Lang) -> String {
-    let pair = match from {
-        Lang::German => "de%7Cen",
-        Lang::English => "en%7Cde",
-    };
-    format!("https://api.mymemory.translated.net/get?q={}&langpair={pair}", encode_url_component(text))
+/// The languages `tr` can translate between: MyMemory's code and the name
+/// shown. Settings offers these, and `tr >code` takes these codes.
+pub const LANGUAGES: [(&str, &str); 28] = [
+    ("ar", "Arabic"),
+    ("bg", "Bulgarian"),
+    ("zh-CN", "Chinese"),
+    ("hr", "Croatian"),
+    ("cs", "Czech"),
+    ("da", "Danish"),
+    ("nl", "Dutch"),
+    ("en", "English"),
+    ("fi", "Finnish"),
+    ("fr", "French"),
+    ("de", "German"),
+    ("el", "Greek"),
+    ("hi", "Hindi"),
+    ("hu", "Hungarian"),
+    ("it", "Italian"),
+    ("ja", "Japanese"),
+    ("ko", "Korean"),
+    ("no", "Norwegian"),
+    ("pl", "Polish"),
+    ("pt", "Portuguese"),
+    ("ro", "Romanian"),
+    ("ru", "Russian"),
+    ("sk", "Slovak"),
+    ("sl", "Slovenian"),
+    ("es", "Spanish"),
+    ("sv", "Swedish"),
+    ("tr", "Turkish"),
+    ("uk", "Ukrainian"),
+];
+
+/// The pair `tr` uses when the config names none.
+pub const DEFAULT_PAIR: (&str, &str) = ("de", "en");
+
+/// The listed code that `code` names, in any case (`ZH-cn` is `zh-CN`).
+pub fn language_code(code: &str) -> Option<&'static str> {
+    LANGUAGES.iter().map(|(c, _)| *c).find(|c| c.eq_ignore_ascii_case(code.trim()))
+}
+
+/// The name shown for a language code: the listed name, also for a regional
+/// form of a listed code (`de-DE` is German); else the code itself.
+pub fn language_name(code: &str) -> String {
+    let base = code.split(['-', '_']).next().unwrap_or(code);
+    LANGUAGES
+        .iter()
+        .find(|(c, _)| c.eq_ignore_ascii_case(code) || c.split('-').next().is_some_and(|b| b.eq_ignore_ascii_case(base)))
+        .map_or_else(|| code.to_string(), |(_, name)| name.to_string())
+}
+
+/// Checks the config's `tr_languages`: empty (the default pair), or two
+/// different listed codes.
+pub fn validate_languages(pair: &[String]) -> Result<(), String> {
+    match pair {
+        [] => Ok(()),
+        [a, b] => match (language_code(a), language_code(b)) {
+            (Some(a), Some(b)) if a != b => Ok(()),
+            (Some(_), Some(_)) => Err("tr_languages must name two different languages".into()),
+            _ => Err("tr_languages must name two language codes such as \"de\" and \"en\"".into()),
+        },
+        _ => Err("tr_languages must name exactly two languages".into()),
+    }
+}
+
+/// How one `tr` text is translated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// From and to are known before asking (German and English: the source
+    /// is guessed from the text, as it always was). One request.
+    Fixed { from: &'static str, to: &'static str },
+    /// Into this language, whatever the text is in (`tr >fr ...`). One
+    /// request; the service says what it took the text for.
+    Into(&'static str),
+    /// Between your language and another: into `mine` first, and when the
+    /// service finds the text already is `mine`, from `mine` into `other`
+    /// (a second request).
+    Between { mine: &'static str, other: &'static str },
+}
+
+/// A `>code` in front of the text names the language to translate into.
+/// Returns that language and the rest; a code that is not listed leaves the
+/// text as it is.
+pub fn explicit_target(text: &str) -> (Option<&'static str>, &str) {
+    let Some(rest) = text.strip_prefix('>') else { return (None, text) };
+    let (code, body) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    match language_code(code) {
+        Some(code) => (Some(code), body.trim()),
+        None => (None, text),
+    }
+}
+
+/// The plan for `text` (already without any `>code`), given an explicit
+/// target and the configured pair.
+pub fn plan_for(text: &str, target: Option<&'static str>, pair: (&'static str, &'static str)) -> Plan {
+    if let Some(to) = target {
+        return Plan::Into(to);
+    }
+    let german_english = matches!(pair, ("de", "en") | ("en", "de"));
+    if german_english {
+        return match source_language(text) {
+            Lang::German => Plan::Fixed { from: "de", to: "en" },
+            Lang::English => Plan::Fixed { from: "en", to: "de" },
+        };
+    }
+    Plan::Between { mine: pair.0, other: pair.1 }
+}
+
+/// MyMemory's address for `text` from `from` (a code, or `autodetect`) into `to`.
+pub fn translate_url(text: &str, from: &str, to: &str) -> String {
+    format!(
+        "https://api.mymemory.translated.net/get?q={}&langpair={}%7C{}",
+        encode_url_component(text),
+        encode_url_component(from),
+        encode_url_component(to)
+    )
+}
+
+/// A translation and the languages it went between (codes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Translation {
+    pub text: String,
+    pub from: String,
+    pub to: String,
+}
+
+/// The language MyMemory took an `autodetect` text for, if it says.
+pub fn detected_language(body: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v["responseData"]["detectedLanguage"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// Whether two codes name the same language, ignoring region and case
+/// (`de-DE` and `de`).
+fn same_language(a: &str, b: &str) -> bool {
+    let base = |c: &str| c.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
+    !base(a).is_empty() && base(a) == base(b)
 }
 
 /// The translation in a MyMemory answer.
@@ -208,11 +340,35 @@ fn flip_first(word: &str) -> Option<String> {
     Some(flipped + chars.as_str())
 }
 
-fn translate_job(text: &str, fetch: &dyn Fetch) -> Result<String, LookupError> {
-    match fetch.get(&translate_url(text, source_language(text))) {
-        Ok(body) => parse_translation(&body),
+fn fetch_translation(url: &str, fetch: &dyn Fetch) -> Result<(String, Option<String>), LookupError> {
+    match fetch.get(url) {
+        Ok(body) => parse_translation(&body).map(|text| (text, detected_language(&body))),
         Err(FetchError::Offline) => Err(LookupError::Offline),
         Err(_) => Err(LookupError::Bad),
+    }
+}
+
+fn translate_job(text: &str, plan: &Plan, fetch: &dyn Fetch) -> Result<Translation, LookupError> {
+    match plan {
+        Plan::Fixed { from, to } => {
+            let (text, _) = fetch_translation(&translate_url(text, from, to), fetch)?;
+            Ok(Translation { text, from: from.to_string(), to: to.to_string() })
+        }
+        Plan::Into(to) => {
+            let (text, detected) = fetch_translation(&translate_url(text, "autodetect", to), fetch)?;
+            Ok(Translation { text, from: detected.unwrap_or_default(), to: to.to_string() })
+        }
+        Plan::Between { mine, other } => {
+            let (first, detected) = fetch_translation(&translate_url(text, "autodetect", mine), fetch)?;
+            match detected {
+                // Already your language: the other way round.
+                Some(d) if same_language(&d, mine) => {
+                    let (text, _) = fetch_translation(&translate_url(text, mine, other), fetch)?;
+                    Ok(Translation { text, from: mine.to_string(), to: other.to_string() })
+                }
+                detected => Ok(Translation { text: first, from: detected.unwrap_or_default(), to: mine.to_string() }),
+            }
+        }
     }
 }
 
@@ -302,7 +458,9 @@ fn split(text: &str) -> Option<(Command, &str)> {
 }
 
 pub struct WordsProvider {
-    translations: Arc<Lookups<String>>,
+    translations: Arc<Lookups<Translation>>,
+    /// The config's pair: your language and the other one.
+    pair: Mutex<(&'static str, &'static str)>,
     definitions: Arc<Lookups<Definitions>>,
     clipboard: Arc<dyn Clipboard>,
     open_settings: Opener,
@@ -348,6 +506,7 @@ impl WordsProvider {
         WordsProvider {
             translations: Lookups::new(fetch.clone(), on_ready.clone(), pause),
             definitions: Lookups::keeping(fetch, on_ready, pause, |d| d.complete),
+            pair: Mutex::new(DEFAULT_PAIR),
             clipboard,
             open_settings,
             online: AtomicBool::new(true),
@@ -364,6 +523,16 @@ impl WordsProvider {
     fn is_newest(&self) -> bool {
         let seq = query_seq();
         seq == 0 || self.newest.fetch_max(seq, Ordering::SeqCst) <= seq
+    }
+
+    /// Follows the config's `tr_languages`: empty or not two listed codes
+    /// (config validation prevents that) is the default pair.
+    pub fn set_languages(&self, pair: &[String]) {
+        let chosen = match pair {
+            [a, b] => language_code(a).zip(language_code(b)).filter(|(a, b)| a != b),
+            _ => None,
+        };
+        *self.pair.lock().unwrap() = chosen.unwrap_or(DEFAULT_PAIR);
     }
 
     /// Follows the `online` config key: off means nothing is ever fetched.
@@ -419,18 +588,25 @@ impl WordsProvider {
             self.translations.forget_waiting();
             return vec![online_off(TRANSLATE_ICON)];
         }
-        let owned = text.to_string();
-        match self.translations.ask(text, move |f, _| translate_job(&owned, f)) {
+        let (target, body) = explicit_target(text);
+        if body.is_empty() {
+            self.translations.forget_waiting();
+            return vec![inert("Type the text to translate after the language", TRANSLATE_ICON)];
+        }
+        let plan = plan_for(body, target, *self.pair.lock().unwrap());
+        // The same text under another plan is another lookup.
+        let key = format!("{plan:?}\u{0}{body}");
+        let owned = body.to_string();
+        match self.translations.ask(&key, move |f, _| translate_job(&owned, &plan, f)) {
             Lookup::Waiting => vec![inert("Translating…", TRANSLATE_ICON)],
             Lookup::Ready(t) => {
-                let from = source_language(text);
-                let to = if from == Lang::German { Lang::English } else { Lang::German };
-                copies.push(t.to_string());
+                copies.push(t.text.clone());
+                let from = if t.from.is_empty() { "?".to_string() } else { language_name(&t.from) };
                 vec![ResultItem {
                     id: format!("{COPY}0"),
                     provider: NAME,
-                    title: dirs::one_line(&t, MAX_TRANSLATE),
-                    subtitle: format!("{} → {}", from.name(), to.name()),
+                    title: dirs::one_line(&t.text, MAX_TRANSLATE),
+                    subtitle: format!("{from} → {}", language_name(&t.to)),
                     score: TOP_SCORE,
                     icon: TRANSLATE_ICON.into(),
                     top: true,
@@ -587,6 +763,99 @@ mod tests {
     const WIKTIONARY_HAUS: &str = r#"{"de":[{"partOfSpeech":"Noun","language":"German","definitions":[{"definition":"<a rel=\"mw:WikiLink\" href=\"/wiki/house\" title=\"house\">house</a>","parsedExamples":[{"example":"Das <b>Haus</b> ist alt."}],"examples":["Das <b>Haus</b> ist alt."]},{"definition":"<a rel=\"mw:WikiLink\" href=\"/wiki/home\" title=\"home\">home</a>, <a rel=\"mw:WikiLink\" href=\"/wiki/household\" title=\"household\">household</a>"}]}],"en":[{"partOfSpeech":"Noun","language":"English","definitions":[{"definition":"A <i>structure</i> built &amp; serving   as a\n dwelling."},{"definition":""},{"definition":"<span class=\"use-with-mention\">A family</span>&nbsp;line."}]},{"partOfSpeech":"Verb","language":"English","definitions":[{"definition":"To <a href=\"/wiki/keep\">keep</a> within a structure."},{"definition":"To &lt;admit&gt; to residence."}]}],"lb":[{"partOfSpeech":"Noun","language":"Luxembourgish","definitions":[{"definition":"house"}]}]}"#;
     const WIKTIONARY_404: &str = r#"{"type":"https://mediawiki.org/wiki/HyperSwitch/errors/not_found","title":"Not found.","method":"get","detail":"Page or revision not found.","uri":"/en.wiktionary.org/v1/page/definition/haus"}"#;
 
+    const MYMEMORY_DETECTED_DE: &str = r#"{"responseData":{"translatedText":"Bonjour","match":0.85,"detectedLanguage":"de"},"responseStatus":200,"matches":[]}"#;
+    const MYMEMORY_DETECTED_FR: &str = r#"{"responseData":{"translatedText":"Bonjour","match":0.85,"detectedLanguage":"fr-FR"},"responseStatus":200,"matches":[]}"#;
+    const MYMEMORY_GOOD_MORNING: &str = r#"{"responseData":{"translatedText":"Good morning","match":1},"responseStatus":200,"matches":[]}"#;
+
+    /// Answers each address from a list, and remembers what was asked.
+    struct Script(Vec<(String, &'static str)>, Mutex<Vec<String>>);
+
+    impl Fetch for Script {
+        fn get_until(&self, url: &str, _deadline: std::time::Instant) -> Result<Vec<u8>, FetchError> {
+            self.1.lock().unwrap().push(url.to_string());
+            self.0.iter().find(|(u, _)| u == url).map(|(_, body)| body.as_bytes().to_vec()).ok_or(FetchError::Offline)
+        }
+    }
+
+    fn script(answers: &[(&str, &'static str)]) -> Script {
+        Script(answers.iter().map(|(u, b)| (u.to_string(), *b)).collect(), Mutex::new(Vec::new()))
+    }
+
+    #[test]
+    fn languages_are_listed_once_and_found_in_any_case() {
+        let mut codes: Vec<&str> = LANGUAGES.iter().map(|(c, _)| *c).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), LANGUAGES.len());
+        assert_eq!(language_code("FR"), Some("fr"));
+        assert_eq!(language_code(" zh-cn "), Some("zh-CN"));
+        assert_eq!(language_code("klingon"), None);
+        assert_eq!(language_name("de"), "German");
+        assert_eq!(language_name("de-DE"), "German");
+        assert_eq!(language_name("zh-CN"), "Chinese");
+        assert_eq!(language_name("xx"), "xx");
+        assert!(language_code(DEFAULT_PAIR.0).is_some() && language_code(DEFAULT_PAIR.1).is_some());
+    }
+
+    #[test]
+    fn a_language_after_an_arrow_is_the_target() {
+        assert_eq!(explicit_target(">fr good morning"), (Some("fr"), "good morning"));
+        assert_eq!(explicit_target(">ES  hola"), (Some("es"), "hola"));
+        assert_eq!(explicit_target(">fr"), (Some("fr"), ""));
+        // Not a listed code: the text is left as typed.
+        assert_eq!(explicit_target(">xx hello"), (None, ">xx hello"));
+        assert_eq!(explicit_target("good > morning"), (None, "good > morning"));
+    }
+
+    #[test]
+    fn the_plan_follows_the_target_then_the_pair() {
+        assert_eq!(plan_for("hello", Some("fr"), DEFAULT_PAIR), Plan::Into("fr"));
+        // German and English, in either order: the source is guessed, as before.
+        assert_eq!(plan_for("guten Morgen", None, ("de", "en")), Plan::Fixed { from: "de", to: "en" });
+        assert_eq!(plan_for("good morning", None, ("en", "de")), Plan::Fixed { from: "en", to: "de" });
+        assert_eq!(plan_for("bonjour", None, ("fr", "en")), Plan::Between { mine: "fr", other: "en" });
+    }
+
+    #[test]
+    fn into_a_language_asks_once_and_names_what_was_detected() {
+        let url = translate_url("guten Morgen", "autodetect", "fr");
+        assert!(url.ends_with("&langpair=autodetect%7Cfr"), "{url}");
+        let f = script(&[(&url, MYMEMORY_DETECTED_DE)]);
+        let t = translate_job("guten Morgen", &Plan::Into("fr"), &f).unwrap();
+        assert_eq!(t, Translation { text: "Bonjour".into(), from: "de".into(), to: "fr".into() });
+        assert_eq!(f.1.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn between_two_languages_goes_into_yours_or_out_of_it() {
+        let plan = Plan::Between { mine: "fr", other: "en" };
+        // A foreign text: into your language, one request.
+        let into = translate_url("guten Morgen", "autodetect", "fr");
+        let f = script(&[(&into, MYMEMORY_DETECTED_DE)]);
+        let t = translate_job("guten Morgen", &plan, &f).unwrap();
+        assert_eq!((t.text.as_str(), t.from.as_str(), t.to.as_str()), ("Bonjour", "de", "fr"));
+        assert_eq!(f.1.lock().unwrap().len(), 1);
+        // Already your language (a regional code counts): out into the other one.
+        let first = translate_url("bonjour", "autodetect", "fr");
+        let second = translate_url("bonjour", "fr", "en");
+        let f = script(&[(&first, MYMEMORY_DETECTED_FR), (&second, MYMEMORY_GOOD_MORNING)]);
+        let t = translate_job("bonjour", &plan, &f).unwrap();
+        assert_eq!((t.text.as_str(), t.from.as_str(), t.to.as_str()), ("Good morning", "fr", "en"));
+        assert_eq!(*f.1.lock().unwrap(), [first, second]);
+        // The service down: an error, never a guess.
+        assert_eq!(translate_job("bonjour", &plan, &script(&[])), Err(LookupError::Offline));
+    }
+
+    #[test]
+    fn the_pair_setting_takes_two_different_listed_codes() {
+        let pair = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+        assert!(validate_languages(&[]).is_ok());
+        assert!(validate_languages(&pair("fr", "EN")).is_ok());
+        assert!(validate_languages(&pair("fr", "fr")).unwrap_err().contains("two different"));
+        assert!(validate_languages(&pair("fr", "xx")).unwrap_err().contains("language codes"));
+        assert!(validate_languages(&["fr".to_string()]).unwrap_err().contains("exactly two"));
+    }
+
     const TR_HALLO_WELT: &str = "https://api.mymemory.translated.net/get?q=hallo%20welt&langpair=de%7Cen";
     const TR_GUTEN_MORGEN: &str = "https://api.mymemory.translated.net/get?q=guten%20Morgen&langpair=de%7Cen";
     const DEF_HAUS: &str = "https://en.wiktionary.org/api/rest_v1/page/definition/Haus";
@@ -653,9 +922,9 @@ mod tests {
 
     #[test]
     fn urls_carry_only_the_text() {
-        assert_eq!(translate_url("hallo welt", Lang::German), TR_HALLO_WELT);
+        assert_eq!(translate_url("hallo welt", "de", "en"), TR_HALLO_WELT);
         assert_eq!(
-            translate_url("a&b=c?", Lang::English),
+            translate_url("a&b=c?", "en", "de"),
             "https://api.mymemory.translated.net/get?q=a%26b%3Dc%3F&langpair=en%7Cde"
         );
         assert_eq!(definition_url("Straße"), "https://en.wiktionary.org/api/rest_v1/page/definition/Stra%C3%9Fe");

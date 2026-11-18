@@ -177,6 +177,8 @@ pub struct SettingsState {
     /// Every theme with its colours, in display order; `custom` carries the
     /// colours the config gives it now.
     themes: Vec<ThemeInfo>,
+    /// The languages `tr` knows, as (code, name), in the order shown.
+    languages: Vec<(&'static str, &'static str)>,
 }
 
 #[derive(Serialize)]
@@ -206,6 +208,7 @@ pub fn settings_state(app: AppHandle, state: State<AppState>) -> SettingsState {
     };
     SettingsState {
         themes: theme_infos(&config.custom_theme),
+        languages: crate::providers::words::LANGUAGES.to_vec(),
         config,
         file_error: read_config(&config::config_path()).err(),
         distros,

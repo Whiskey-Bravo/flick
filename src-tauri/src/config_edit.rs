@@ -14,6 +14,8 @@ pub enum Setting {
     Hotkey(String),
     WslDistro(String),
     FileRoots(Vec<PathBuf>),
+    /// The two languages of `tr`; empty removes the line (German and English).
+    TrLanguages(Vec<String>),
     History(bool),
     Online(bool),
     WeatherCity(String),
@@ -184,6 +186,10 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
             "file_roots",
             (!roots.is_empty())
                 .then(|| Value::Array(roots.iter().map(|p| p.to_string_lossy().into_owned()).collect())),
+        ),
+        Setting::TrLanguages(pair) => (
+            "tr_languages",
+            (!pair.is_empty()).then(|| Value::Array(pair.iter().map(String::as_str).collect())),
         ),
         Setting::History(b) => ("history", Some(Value::from(*b))),
         Setting::Online(b) => ("online", Some(Value::from(*b))),
@@ -565,6 +571,15 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn tr_languages_are_written_and_removed() {
+        let out = set("", &Setting::TrLanguages(vec!["fr".into(), "en".into()])).unwrap();
+        assert_eq!(config::parse(&out).unwrap().tr_languages, ["fr", "en"]);
+        let out = set(&out, &Setting::TrLanguages(vec![])).unwrap();
+        assert!(config::parse(&out).unwrap().tr_languages.is_empty());
+        assert!(!out.contains("tr_languages"), "{out}");
     }
 
     #[test]
