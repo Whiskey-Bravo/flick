@@ -37,6 +37,17 @@ describe("tab completion", () => {
     expect(completion(run(on, { type: "results", items: [item("Firefox")] }).state)).toBeNull();
   });
 
+  it("never offers an answer's text: only names complete", () => {
+    const timer: Item = { ...item("t"), provider: "timers", title: "Timer 30 min — rings at 22:09" };
+    expect(completion(typed("timer 30", timer))).toBeNull();
+    const sum: Item = { ...item("a"), provider: "answers", title: "12 km = 7.456 mi" };
+    expect(completion(typed("12 km", sum))).toBeNull();
+    // A row that says what Tab fills is offered whoever made it.
+    const shortcut: Item = { ...item("s"), provider: "shortcuts", title: "claude", complete: "claude " };
+    expect(completion(typed("cl", shortcut))).toBe("claude ");
+    expect(completion(typed("sle", { ...item("p"), provider: "power", title: "Sleep" }))).toBe("Sleep");
+  });
+
   it("prefers the row's own completion text over its title", () => {
     const row: Item = { ...item("claude"), title: "claude", complete: "claude " };
     expect(completion(typed("cl", row))).toBe("claude ");
