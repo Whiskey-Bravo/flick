@@ -35,6 +35,7 @@ mod settings;
 mod settings_window;
 mod status;
 mod updates;
+mod theme;
 mod tray;
 mod uninstall;
 mod window;
@@ -1036,6 +1037,7 @@ pub fn run() {
             item_search::settings_items_found,
             direct_keys::settings_hotkey_status,
             settings::settings_win_key_status,
+            appearance,
             updates::settings_update_status,
             updates::settings_check_now,
             updates::settings_install_update
@@ -1482,6 +1484,21 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     // After the direct keys and the shortcuts are in, so the Hotkeys status
     // read on this is fresh. It carries nothing, so its order needs no lock.
     let _ = app.emit_to(settings::WINDOW, "settings:changed", ());
+    // Both pages repaint with the theme and animation level now in force.
+    let _ = app.emit("appearance:changed", current_appearance(&state));
+}
+
+/// The theme and animation level of the config in force.
+fn current_appearance(state: &AppState) -> theme::Appearance {
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    theme::resolve(&config.theme, &config.custom_theme, &config.animations)
+}
+
+/// What a page applies when it loads: the theme's colours and the animation
+/// level. Changes arrive as `appearance:changed`.
+#[tauri::command]
+fn appearance(state: tauri::State<AppState>) -> theme::Appearance {
+    current_appearance(&state)
 }
 
 /// `applied` is the configured hotkey that last registered successfully (`None`

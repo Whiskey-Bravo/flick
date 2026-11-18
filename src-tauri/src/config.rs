@@ -44,6 +44,13 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## win_key: the Win key alone opens Flick instead of the Start menu; Win combinations keep working, Ctrl+Esc still opens Start (true: on).
 # win_key = false
 ##
+## theme: dark, light, midnight, frost, ember, glass or custom (your own colours, below).
+# theme = \"dark\"
+## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
+# custom_theme = { background = \"#101418\", surface = \"#1c232b\", border = \"#26303a\", text = \"#e8eef4\", muted = \"#9fb0c0\", accent = \"#4fd1c5\", error = \"#f0717a\", warning = \"#f2b441\" }
+## animations: minimal, medium or high.
+# animations = \"minimal\"
+##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
@@ -115,6 +122,13 @@ pub struct Config {
     pub check_updates: bool,
     /// The Win key pressed alone opens the bar instead of the Start menu.
     pub win_key: bool,
+    /// The bar's look: one of [`crate::theme::THEMES`]; empty means dark.
+    pub theme: String,
+    /// The colours of `theme = "custom"`.
+    #[serde(skip_serializing_if = "crate::theme::CustomTheme::is_empty")]
+    pub custom_theme: crate::theme::CustomTheme,
+    /// How much moves: one of [`crate::theme::ANIMATIONS`]; empty means minimal.
+    pub animations: String,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -140,6 +154,9 @@ impl Default for Config {
             search_engine: String::new(),
             check_updates: true,
             win_key: false,
+            theme: String::new(),
+            custom_theme: crate::theme::CustomTheme::default(),
+            animations: String::new(),
             shortcuts: Vec::new(),
             workspaces: Vec::new(),
             direct_hotkeys: Vec::new(),
@@ -465,6 +482,7 @@ pub fn validate(c: &Config) -> Result<(), String> {
     if !matches!(c.temperature_unit.as_str(), "" | "c" | "f") {
         return Err("temperature_unit must be \"c\" or \"f\"".into());
     }
+    crate::theme::validate(&c.theme, &c.custom_theme, &c.animations)?;
     let engine = &c.search_engine;
     let engine_ok = engine.is_empty() || (engine.starts_with("https://") && engine.contains("{arg}"));
     if !engine_ok {
@@ -683,6 +701,35 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn theme_settings_parse_and_wrong_ones_are_errors() {
+        let c = parse("").unwrap();
+        assert_eq!((c.theme.as_str(), c.animations.as_str()), ("", ""));
+        assert!(c.custom_theme.is_empty());
+        let c = parse("theme = \"frost\"\nanimations = \"high\"").unwrap();
+        assert_eq!((c.theme.as_str(), c.animations.as_str()), ("frost", "high"));
+        assert!(validate(&c).is_ok());
+        // Both ways of writing the custom colours.
+        let inline = parse("theme = \"custom\"\ncustom_theme = { background = \"#101418\", accent = \"#4fc\" }").unwrap();
+        let table = parse("theme = \"custom\"\n[custom_theme]\nbackground = \"#101418\"\naccent = \"#4fc\"").unwrap();
+        assert_eq!(inline.custom_theme, table.custom_theme);
+        assert_eq!(inline.custom_theme.background.as_deref(), Some("#101418"));
+        assert!(validate(&inline).is_ok());
+        for bad in ["theme = \"neon\"", "animations = \"wild\"", "custom_theme = { text = \"white\" }"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+        assert!(parse("custom_theme = { colour = \"#fff\" }").is_err(), "an unknown colour name");
+        // The default file's examples are valid once uncommented.
+        let on: String = DEFAULT_FILE
+            .lines()
+            .filter(|l| l.starts_with("# theme") || l.starts_with("# custom_theme") || l.starts_with("# animations"))
+            .map(|l| format!("{}\n", &l[2..]))
+            .collect();
+        let c = parse(&on).unwrap();
+        assert!(validate(&c).is_ok());
+        assert_eq!(c.custom_theme.entries().iter().filter(|(_, v)| v.is_some()).count(), 8);
+    }
+
     #[test]
     fn win_key_defaults_off_and_parses_true() {
         assert!(!Config::default().win_key);

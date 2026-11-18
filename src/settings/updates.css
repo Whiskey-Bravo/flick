@@ -27,7 +27,7 @@
 .updates button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #10131f;
+  color: var(--on-accent, #10131f);
 }
 
 .updates button:disabled {

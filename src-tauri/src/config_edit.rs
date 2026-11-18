@@ -22,6 +22,10 @@ pub enum Setting {
     SearchEngine(String),
     CheckUpdates(bool),
     WinKey(bool),
+    Theme(String),
+    Animations(String),
+    /// The custom theme's colours; one with no colours removes the line.
+    CustomTheme(crate::theme::CustomTheme),
 }
 
 /// Parses `text` (refusing a file that is already broken) and returns the editable document
@@ -107,6 +111,17 @@ fn restore_line_ends(original: &str, edited: &str) -> String {
     out
 }
 
+/// `{ background = "#101418", ... }`: the colours that are set, in order.
+fn custom_theme_value(custom: &crate::theme::CustomTheme) -> Value {
+    let mut table = toml_edit::InlineTable::new();
+    for (name, value) in custom.entries() {
+        if let Some(value) = value {
+            table.insert(name, Value::from(value.as_str()));
+        }
+    }
+    Value::InlineTable(table)
+}
+
 fn text_value(s: &str) -> Option<Value> {
     (!s.is_empty()).then(|| Value::from(s))
 }
@@ -176,6 +191,9 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
         Setting::SearchEngine(s) => ("search_engine", text_value(s)),
         Setting::CheckUpdates(b) => ("check_updates", Some(Value::from(*b))),
         Setting::WinKey(b) => ("win_key", Some(Value::from(*b))),
+        Setting::Theme(s) => ("theme", text_value(s)),
+        Setting::Animations(s) => ("animations", text_value(s)),
+        Setting::CustomTheme(custom) => ("custom_theme", (!custom.is_empty()).then(|| custom_theme_value(custom))),
     };
     match new {
         Some(mut value) => {
@@ -543,6 +561,38 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn theme_settings_are_written_and_removed() {
+        let out = set(config::DEFAULT_FILE, &Setting::Theme("frost".into())).unwrap();
+        let out = set(&out, &Setting::Animations("high".into())).unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!((c.theme.as_str(), c.animations.as_str()), ("frost", "high"));
+        // Empty removes the line again.
+        let out = set(&out, &Setting::Theme(String::new())).unwrap();
+        assert!(!out.lines().any(|l| l.starts_with("theme")), "{out}");
+        assert_eq!(config::parse(&out).unwrap().animations, "high");
+    }
+
+    #[test]
+    fn custom_theme_is_written_as_one_line_and_replaces_a_table() {
+        let custom = crate::theme::CustomTheme {
+            background: Some("#101418".into()),
+            accent: Some("#4fd1c5".into()),
+            ..Default::default()
+        };
+        let out = set("hotkey = \"Alt+Space\"\r\n", &Setting::CustomTheme(custom.clone())).unwrap();
+        assert!(out.contains("custom_theme = { background = \"#101418\", accent = \"#4fd1c5\" }"), "{out}");
+        assert_eq!(config::parse(&out).unwrap().custom_theme, custom);
+        // A hand-written [custom_theme] section is replaced, not doubled.
+        let by_hand = "theme = \"custom\"\r\n\r\n[custom_theme]\r\ntext = \"#ffffff\"\r\n";
+        let out = set(by_hand, &Setting::CustomTheme(custom.clone())).unwrap();
+        let c = config::parse(&out).unwrap();
+        assert_eq!((c.theme.as_str(), &c.custom_theme), ("custom", &custom));
+        // No colours: the line goes.
+        let out = set(&out, &Setting::CustomTheme(Default::default())).unwrap();
+        assert!(config::parse(&out).unwrap().custom_theme.is_empty(), "{out}");
     }
 
     #[test]

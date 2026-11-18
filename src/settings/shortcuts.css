@@ -40,6 +40,6 @@
   display: flex; align-items: center; gap: 8px;
   position: sticky; bottom: 0; margin-top: auto; padding: 10px 0 2px; background: var(--bg);
 }
-.sc-actions .primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.sc-actions .primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent, #fff); }
 .sc-actions .danger { color: var(--error); border-color: var(--error); }
 .sc button:disabled { opacity: 0.45; cursor: default; }

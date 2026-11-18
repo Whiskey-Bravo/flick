@@ -1,8 +1,9 @@
-export type Tab = "general" | "search" | "answers" | "shortcuts" | "workspaces" | "hotkeys" | "updates";
+export type Tab = "general" | "appearance" | "search" | "answers" | "shortcuts" | "workspaces" | "hotkeys" | "updates";
 
 /** The tab names as the window shows them; the key order is the tab order. */
 export const TAB_LABELS: Record<Tab, string> = {
   general: "General",
+  appearance: "Appearance",
   search: "Search",
   answers: "Quick answers",
   shortcuts: "Shortcuts",

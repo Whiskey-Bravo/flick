@@ -2,6 +2,7 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { DARK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, visibleItems,
@@ -52,9 +53,20 @@ qrPanel.hidden = true;
 qrPanel.append(qrHolder, qrCaption);
 panel.append(row, errorLine, listWrap, qrPanel, menuEl);
 
-// Bundled SVGs by name (src/icons/<name>.svg), resolved to URLs by Vite.
-const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?url", import: "default" });
-const svgUrl = (name: string): string => svgs[`./icons/${name}.svg`] ?? svgs["./icons/file.svg"];
+// Bundled SVGs by name (src/icons/<name>.svg), as text: they are repainted in
+// the theme's text colour and shown as data URLs, made once per theme.
+const svgs = import.meta.glob<string>("./icons/*.svg", { eager: true, query: "?raw", import: "default" });
+let iconInk = DARK.text;
+const svgUrls = new Map<string, string>();
+const svgUrl = (name: string): string => {
+  let url = svgUrls.get(name);
+  if (url === undefined) {
+    const raw = svgs[`./icons/${name}.svg`] ?? svgs["./icons/file.svg"];
+    url = svgDataUrl(themedSvg(raw, iconInk));
+    svgUrls.set(name, url);
+  }
+  return url;
+};
 
 let state: State = initial;
 let querySeq = 0;
@@ -393,6 +405,18 @@ listen("update:changed", () => dispatch({ type: "updateChanged" })).catch(listen
 // The back end hid the bar (Esc, focus loss, an activation): no live updates until it is shown again.
 listen("bar:hidden", () => dispatch({ type: "hidden" })).catch(listenFailed);
 listen<string | null>("config:error", (e) => dispatch({ type: "configError", message: e.payload })).catch(listenFailed);
+
+// The theme and animation level: asked once, then pushed on every change.
+const themed = (a: Appearance) => {
+  applyAppearance(a, a.colors, document.documentElement);
+  if (a.colors.text !== iconInk) {
+    iconInk = a.colors.text;
+    svgUrls.clear();
+  }
+  render();
+};
+listen<Appearance>("appearance:changed", (e) => themed(e.payload)).catch(listenFailed);
+invoke<Appearance>("appearance").then(themed, () => {});
 
 render();
 input.focus();
