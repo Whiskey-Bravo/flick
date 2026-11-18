@@ -503,6 +503,13 @@ list.addEventListener("mousemove", (e) => {
 document.addEventListener("click", (e) => {
   if (e.button !== 0) return;
   const target = e.target as Element | null;
+  // The window is taller than the bar, to leave room for the rows; a click
+  // on that empty part is a click beside the bar, and closes it like one.
+  if (!target || !panel.contains(target)) {
+    if (state.menu) dispatch({ type: "menuClose" });
+    else invoke("hide").catch(() => {});
+    return;
+  }
   const entry = target?.closest<HTMLElement>(".menu-item");
   if (entry) {
     dispatch({ type: "menuPick", action: entry.dataset.action as MenuAction });
