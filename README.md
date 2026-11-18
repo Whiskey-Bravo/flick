@@ -26,7 +26,7 @@ Apps, files, folders, Windows Settings pages, games and browser bookmarks, all f
 
 Sums, unit and currency conversions, times around the world, dates and the weather. Enter copies the answer.
 
-![A sum, a unit conversion and the time in Tokyo](screenshots/answers.gif)
+![A sum, a currency conversion, a unit conversion, the time in Tokyo and the weather in London](screenshots/answers.gif)
 
 ### Your own shortcuts, with their own icons
 
