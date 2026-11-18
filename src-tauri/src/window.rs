@@ -296,61 +296,79 @@ fn reveal_window(w: &WebviewWindow) {
 /// The bar window's size as the config file gives it (logical pixels).
 const BAR_WIDTH: f64 = 680.0;
 const BAR_HEIGHT: f64 = 420.0;
-/// The Glass theme's corner radius (logical pixels), as in styles.css.
-const GLASS_RADIUS: f64 = 18.0;
+/// The least height of the Glass window: the input row alone.
+const GLASS_MIN_HEIGHT: f64 = 40.0;
 /// Glass is on: the window is blurred behind and shaped to the panel.
 static GLASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Switches the Glass theme's window treatment on or off: Windows blurs what
-/// is behind the bar window, and the window is cut to the panel's shape
-/// ([`shape`]) so nothing outside the panel is blurred. Off puts the window
-/// back as every other theme has it.
+/// is behind the bar window and rounds the window's corners, and the window
+/// is kept at the panel's size ([`bar_shape`]) so nothing outside the panel
+/// is blurred. Off puts the window back as every other theme has it.
 pub fn set_glass(app: &AppHandle, on: bool) {
     use tauri::window::{Effect, EffectsBuilder};
     let was = GLASS.swap(on, Ordering::SeqCst);
     let Some(w) = bar(app) else { return };
     if on {
-        let _ = w.set_effects(EffectsBuilder::new().effect(Effect::Acrylic).build());
+        // A plain blur with no tint of its own: the page tints it.
+        let _ = w.set_effects(EffectsBuilder::new().effect(Effect::Blur).build());
+        round_corners(&w, true);
     } else if was {
         let _ = w.set_effects(None);
+        round_corners(&w, false);
         let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, BAR_HEIGHT));
-        if let Ok(h) = w.hwnd() {
-            // SAFETY: removing the region of this app's own window.
-            unsafe { windows::Win32::Graphics::Gdi::SetWindowRgn(HWND(h.0 as _), None, true) };
-        }
+    }
+}
+
+/// Has Windows round the window's corners (Windows 11; a no-op before) and
+/// leave out its own one-pixel border, or puts both back.
+fn round_corners(w: &WebviewWindow, on: bool) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
+    };
+    /// `DWMWA_COLOR_NONE` and `DWMWA_COLOR_DEFAULT`.
+    const NO_BORDER: u32 = 0xFFFF_FFFE;
+    const DEFAULT_BORDER: u32 = 0xFFFF_FFFF;
+    let Ok(h) = w.hwnd() else { return };
+    let hwnd = HWND(h.0 as _);
+    let corner = if on { DWMWCP_ROUND } else { DWMWCP_DONOTROUND };
+    let border = if on { NO_BORDER } else { DEFAULT_BORDER };
+    // SAFETY: attribute writes on this app's own window, each with a value
+    // of the size the attribute takes.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            std::ptr::from_ref(&corner).cast(),
+            std::mem::size_of_val(&corner) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            std::ptr::from_ref(&border).cast(),
+            std::mem::size_of_val(&border) as u32,
+        );
     }
 }
 
 /// The height the bar window takes for a panel `wanted` logical pixels tall.
 fn glass_height(wanted: f64) -> f64 {
     if wanted.is_finite() {
-        wanted.clamp(2.0 * GLASS_RADIUS, BAR_HEIGHT)
+        wanted.clamp(GLASS_MIN_HEIGHT, BAR_HEIGHT)
     } else {
         BAR_HEIGHT
     }
 }
 
 /// Glass only: the page says how tall the panel is (logical pixels), and the
-/// window is resized and rounded to it. Ignored under every other theme.
+/// window is resized to it. Ignored under every other theme.
 #[tauri::command]
 pub fn bar_shape(app: AppHandle, height: f64) {
-    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
     if !GLASS.load(Ordering::SeqCst) {
         return;
     }
-    let Some(w) = bar(&app) else { return };
-    let height = glass_height(height);
-    let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
-    let scale = w.scale_factor().unwrap_or(1.0);
-    let px = |v: f64| (v * scale).round() as i32;
-    if let Ok(h) = w.hwnd() {
-        // SAFETY: a region for this app's own window; the window owns the
-        // region once it is set.
-        unsafe {
-            let corner = px(2.0 * GLASS_RADIUS);
-            let region = CreateRoundRectRgn(0, 0, px(BAR_WIDTH) + 1, px(height) + 1, corner, corner);
-            SetWindowRgn(HWND(h.0 as _), Some(region), true);
-        }
+    if let Some(w) = bar(&app) {
+        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, glass_height(height)));
     }
 }
 
@@ -438,8 +456,8 @@ mod tests {
         assert_eq!(glass_height(57.0), 57.0);
         assert_eq!(glass_height(409.4), 409.4);
         assert_eq!(glass_height(900.0), BAR_HEIGHT);
-        assert_eq!(glass_height(0.0), 36.0);
-        assert_eq!(glass_height(-5.0), 36.0);
+        assert_eq!(glass_height(0.0), 40.0);
+        assert_eq!(glass_height(-5.0), 40.0);
         assert_eq!(glass_height(f64::NAN), BAR_HEIGHT);
         assert_eq!(glass_height(f64::INFINITY), BAR_HEIGHT);
     }
