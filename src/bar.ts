@@ -147,6 +147,11 @@ const fit = (s: State): State => {
   return top === s.top && selected === s.selected ? s : { ...s, selected, top };
 };
 
+// The empty unscoped bar opens on the latest recent launch, unless a welcome
+// row is shown: that stays on top.
+const emptyBarSelection = (items: Item[]): number =>
+  items.some((i) => i.provider === "welcome") ? 0 : Math.max(0, items.findIndex((i) => i.origin === "recent"));
+
 type Result = { state: State; effects: Effect[] };
 const done = (state: State, effects: Effect[] = []): Result => ({ state, effects });
 
@@ -168,16 +173,25 @@ export function reduce(s: State, e: Event): Result {
 
 function step(s: State, e: Event): Result {
   switch (e.type) {
-    case "shown":
+    case "shown": {
       // The empty text is queried so providers can offer rows for an empty bar
-      // (the first-start welcome). `awaiting` stays false: an Enter on the empty
-      // bar is not queued, and typing right away supersedes this query. Past
+      // (the first-start welcome). Typing right away supersedes this query. Past
       // searches are reloaded: none are recalled until they arrive (history may
       // have been switched off or cleared since the last show).
-      return done({ ...initial, configError: s.configError, error: s.configError }, [
+      const fresh: State = { ...initial, configError: s.configError, error: s.configError };
+      const effects: Effect[] = [
         { type: "query", text: "", scope: null },
         { type: "loadPast" },
-      ]);
+      ];
+      // Closed as an empty bar: its rows stay up until the fresh ones replace
+      // them, so the list doesn't vanish and come back as the bar opens. An
+      // Enter meanwhile waits for the fresh rows. Otherwise the bar opens with
+      // no rows and an Enter does nothing until they arrive.
+      if (s.text === "" && !s.scope && !s.armed && s.items.length > 0) {
+        return done(fit({ ...fresh, items: s.items, selected: emptyBarSelection(s.items), awaiting: true }), effects);
+      }
+      return done(fresh, effects);
+    }
     case "armed":
       // A direct hotkey pointed at an item that needs a second Enter: it is the
       // only row, armed. No query, so nothing replaces it.
@@ -293,8 +307,6 @@ function step(s: State, e: Event): Result {
         [{ type: "query", text: e.text, scope: s.scope?.name ?? null }],
       );
     case "results": {
-      // The empty unscoped bar opens on the latest recent launch, unless a
-      // welcome row is shown: that stays on top.
       let selected = 0;
       if (s.keep && !s.queued) {
         // The answers' re-query: stay on the row the user was on, if it is still there,
@@ -304,9 +316,7 @@ function step(s: State, e: Event): Result {
         const armed = at >= 0 && s.armed === k.id ? s.armed : null;
         return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu: null, keep: null }));
       }
-      if (s.text === "" && !s.scope && !e.items.some((i) => i.provider === "welcome")) {
-        selected = Math.max(0, e.items.findIndex((i) => i.origin === "recent"));
-      }
+      if (s.text === "" && !s.scope) selected = emptyBarSelection(e.items);
       const next: State = fit({ ...s, items: e.items, selected, top: 0, awaiting: false, queued: null, menu: null, keep: null });
       // An Enter pressed before these results arrived acts on them now.
       return s.queued ? enter(next, s.queued) : done(next);

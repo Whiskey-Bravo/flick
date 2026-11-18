@@ -24,6 +24,25 @@ describe("bar", () => {
     expect(state.error).toBe("bad toml");
   });
 
+  it("an empty bar opens on its last rows until the fresh ones arrive", () => {
+    const rows: Item[] = [item("a"), { ...item("b"), origin: "recent" }];
+    const s = run(initial, { type: "shown" }, { type: "results", items: rows }, key("ArrowDown"), { type: "hidden" }).state;
+    const shown = run(s, { type: "shown" }).state;
+    expect(shown.items).toEqual(rows);
+    expect([shown.selected, shown.top, shown.hidden]).toEqual([1, 0, false]);
+    // An Enter before the fresh rows waits for them instead of acting on an old row.
+    expect(shown.awaiting).toBe(true);
+    const entered = run(shown, key("Enter")).state;
+    expect(entered.queued).toBe("none");
+  });
+
+  it("a bar closed with text or in a pick list opens empty", () => {
+    const typed = run(withItems(item("a")), { type: "input", text: "x" }, { type: "results", items: [item("x")] }).state;
+    expect(run(typed, { type: "shown" }).state.items).toEqual([]);
+    const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } }, { type: "results", items: [item("w")] }).state;
+    expect(run(scoped, { type: "shown" }).state.items).toEqual([]);
+  });
+
   it("queries the empty text when shown", () => {
     const { effects } = reduce(initial, { type: "shown" });
     expect(effects).toEqual([{ type: "query", text: "", scope: null }, { type: "loadPast" }]);
