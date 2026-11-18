@@ -83,7 +83,7 @@ Pin the things you open every day. Select a row and press Ctrl+P (again to unpin
 
 ## Past searches
 
-A search is saved when you open a result from it. Press Up on an empty bar to step back through those searches (the last 50). Press Down to step forward again. Typing anything stops the recall.
+Past searches are off on a new install; switch on "Remember past searches and launches" in Settings, General, to use them. With that on, a search is saved when you open a result from it. Press Up on an empty bar to step back through those searches (the last 50). Press Down to step forward again. Typing anything stops the recall.
 
 Type `clear history` and press Enter twice to forget past searches and recent launches. Pins are kept.
 

@@ -6,7 +6,7 @@ What Flick keeps on your PC, what goes online, and what never does.
 
 Flick counts only which result you picked (an app, a Settings page, a file, a shortcut, an entry of a shortcut's list). This is stored only on this PC in `%APPDATA%\Flick\picks.json` and never shown. Power actions and system toggles (mute, Wi-Fi, dark mode and the like) are never counted or kept as recent launches.
 
-The text of a search is saved when you open a result from it, on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. This is new: until now nothing you typed was kept. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`.
+The text of a search is saved when you open a result from it, on this PC in `%APPDATA%\Flick\history.json`, together with your recent launches. On a new install this is switched off: nothing you type is kept until you turn on "Remember past searches and launches" in Settings (or set `history = true`). Installs from before version 0.11 keep it on. It keeps the last 50 searches and the last 5 launches. Pins are saved in `%APPDATA%\Flick\pins.json`.
 
 Flick goes online when you ask a currency or weather question, when you type `ip`, and to look for updates, and only while `online` is not `false`:
 

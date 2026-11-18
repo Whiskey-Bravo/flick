@@ -63,7 +63,7 @@ open = "https://docs.rs"
 - `hotkey`: the global shortcut that shows the bar.
 - `wsl_distro`: the WSL distro for `>` commands and `wsl` shortcuts. Leave it out to use WSL's default distro.
 - `file_roots`: the folders searched for files. Leave it out to search your whole user folder.
-- `history`: set to `false` to stop saving past searches and recent launches (see [Past searches](typing.md#past-searches)). The default is `true`.
+- `history`: set to `false` to stop saving past searches and recent launches (see [Past searches](typing.md#past-searches)). A new install starts with `history = false` in its config; a config without the line counts as `true`.
 - `online`, `weather_city`, `currency`, `temperature_unit`, `search_engine`: see Quick answers.
 - `check_updates`: set to `false` to stop Flick looking for new versions (see [Updates](#updates)). The default is `true`.
 - `win_key`: set to `true` to open the bar with the Win key on its own (see [Win key](windows.md#win-key)). The default is `false`.

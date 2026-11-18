@@ -62,7 +62,7 @@ No config file needed, though there is one if you prefer it. Hotkeys for single 
 
 - **Nothing you type leaves your PC** unless you ask for something that lives online: a currency rate, the weather, a translation, a definition, your public IP address, or the daily check for a new version.
 - **One switch turns all of that off:** `online = false`.
-- **What Flick remembers stays in files on your PC:** which results you pick, your last 50 searches and your pins. `history = false` stops the remembering.
+- **What Flick remembers stays in files on your PC:** which results you pick and your pins. Remembering your last searches and launches is off until you switch it on.
 - **No account, no telemetry, no ads.**
 
 The [privacy page](docs/privacy.md) lists every file Flick writes and every request it can make.
