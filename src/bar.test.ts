@@ -24,6 +24,31 @@ describe("bar", () => {
     expect(state.error).toBe("bad toml");
   });
 
+  it("an empty bar opens on its last rows until the fresh ones arrive", () => {
+    const rows: Item[] = [item("a"), { ...item("b"), origin: "recent" }];
+    const s = run(initial, { type: "shown" }, { type: "results", items: rows }, key("ArrowDown"), { type: "hidden" }).state;
+    const shown = run(s, { type: "shown" }).state;
+    expect(shown.items).toEqual(rows);
+    expect([shown.selected, shown.top, shown.hidden]).toEqual([1, 0, false]);
+    // An Enter before the fresh rows waits for them instead of acting on an old row.
+    expect(shown.awaiting).toBe(true);
+    const entered = run(shown, key("Enter")).state;
+    expect(entered.queued).toBe("none");
+  });
+
+  it("a direct hotkey's row is not kept, even once its arm is gone", () => {
+    const armed = run(initial, { type: "armed", item: item("x", true) }, { type: "blurred" }, { type: "hidden" }).state;
+    expect(armed.armed).toBeNull();
+    expect(run(armed, { type: "shown" }).state.items).toEqual([]);
+  });
+
+  it("a bar closed with text or in a pick list opens empty", () => {
+    const typed = run(withItems(item("a")), { type: "input", text: "x" }, { type: "results", items: [item("x")] }).state;
+    expect(run(typed, { type: "shown" }).state.items).toEqual([]);
+    const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "Search", scope: "web" } }, { type: "results", items: [item("w")] }).state;
+    expect(run(scoped, { type: "shown" }).state.items).toEqual([]);
+  });
+
   it("queries the empty text when shown", () => {
     const { effects } = reduce(initial, { type: "shown" });
     expect(effects).toEqual([{ type: "query", text: "", scope: null }, { type: "loadPast" }]);
@@ -430,6 +455,31 @@ describe("bar", () => {
       expect(s.selected).toBe(0);
     });
 
+    it("after moving down the empty bar's rows, Up moves back up before recalling", () => {
+      const s = run(withPast("b"), { type: "results", items: [item("x"), item("y"), item("z")] }).state;
+      const down2 = run(s, key("ArrowDown"), key("ArrowDown")).state;
+      expect(down2.selected).toBe(2);
+      const up1 = run(down2, key("ArrowUp")).state;
+      expect([up1.selected, up1.text]).toEqual([1, ""]);
+      const top = run(up1, key("ArrowUp")).state;
+      expect([top.selected, top.text]).toEqual([0, ""]);
+      // On the top row, Up recalls as before.
+      expect(run(top, key("ArrowUp")).state.text).toBe("b");
+    });
+
+    it("a row picked with the mouse also makes Up move up", () => {
+      const s = run(withPast("b"), { type: "results", items: [item("x"), item("y")] }, { type: "hover", index: 1 }).state;
+      const up = run(s, key("ArrowUp")).state;
+      expect([up.selected, up.text]).toEqual([0, ""]);
+    });
+
+    it("a fresh bar still recalls on the first Up, even on the recent row", () => {
+      const rows: Item[] = [item("x"), { ...item("y"), origin: "recent" }];
+      const s = run(initial, { type: "shown" }, { type: "results", items: rows }, { type: "past", items: ["b"] }).state;
+      expect(s.selected).toBe(1);
+      expect(run(s, key("ArrowUp")).state.text).toBe("b");
+    });
+
     it("Up on an empty bar recalls past searches", () => {
       const s = withPast("b", "a");
       const up1 = run(s, key("ArrowUp"));
@@ -449,9 +499,11 @@ describe("bar", () => {
       expect(down2.effects).toEqual([queryOf("")]);
     });
 
-    it("Up recalls even when the empty bar has rows", () => {
+    it("Up recalls even when the empty bar has rows, once back on the top row", () => {
       const s = run(withPast("b"), { type: "results", items: [row("a"), row("c")] }, key("ArrowDown")).state;
-      expect(run(s, key("ArrowUp")).state.text).toBe("b");
+      const up = run(s, key("ArrowUp")).state;
+      expect([up.selected, up.text]).toEqual([0, ""]);
+      expect(run(up, key("ArrowUp")).state.text).toBe("b");
     });
 
     it("Up does nothing without past searches", () => {

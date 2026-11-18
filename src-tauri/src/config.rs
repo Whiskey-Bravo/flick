@@ -41,6 +41,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## check_updates: ask GitHub about once a day whether a new version exists (false: never).
 # check_updates = true
 ##
+## win_key: the Win key alone opens Flick instead of the Start menu; Win combinations keep working, Ctrl+Esc still opens Start (true: on).
+# win_key = false
+##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
@@ -109,6 +112,8 @@ pub struct Config {
     pub search_engine: String,
     /// Look for a new version in the background (also needs `online`).
     pub check_updates: bool,
+    /// The Win key pressed alone opens the bar instead of the Start menu.
+    pub win_key: bool,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -133,6 +138,7 @@ impl Default for Config {
             temperature_unit: String::new(),
             search_engine: String::new(),
             check_updates: true,
+            win_key: false,
             shortcuts: Vec::new(),
             workspaces: Vec::new(),
             direct_hotkeys: Vec::new(),
@@ -672,6 +678,13 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn win_key_defaults_off_and_parses_true() {
+        assert!(!Config::default().win_key);
+        assert!(!parse("").unwrap().win_key);
+        assert!(parse("win_key = true").unwrap().win_key);
+    }
+
     #[test]
     fn check_updates_defaults_on_and_parses_false() {
         assert!(Config::default().check_updates);

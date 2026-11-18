@@ -79,6 +79,16 @@ The hotkey does nothing while an exclusive full-screen app (such as a game) is i
 
 Ctrl+Shift+Enter works for apps only, both Start-menu shortcuts and Store apps. Your own shortcuts with `admin = true` always run as administrator. A Store app that cannot be elevated says "this app cannot be run as administrator" instead of opening normally. Cancelling the UAC prompt just closes the bar.
 
+## Win key
+
+Flick can take over the Win key: tap it on its own and the bar opens instead of the Start menu; tap it again to close the bar. It is off by default. Switch it on in Settings, General (Win key opens Flick), or set `win_key = true` in the config. It applies at once, with no restart.
+
+- Win combinations keep working as before: Win+E, Win+D, Win+V, Win+Shift+S and the rest. Holding Win and clicking or scrolling counts as a combination too, so the bar stays closed.
+- The Start menu is still there: press Ctrl+Esc, or type `start` in the bar and pick the Start menu row. The row can't open Start when a window running as administrator was in front (Windows blocks Flick's keys there); Ctrl+Esc typed by hand still works.
+- Windows keeps the Win key while a window running as administrator is in front, while an exclusive full-screen game is running, and while Settings is waiting for you to press a hotkey. A tap then opens Start as usual.
+- While it's on, Task Manager shows a second flick.exe: it watches the Win key, and ends when you switch the setting off or quit Flick.
+- If Windows doesn't let Flick watch the Win key, Settings says "The Win key isn't available right now; Alt+Space still works." (with your bar hotkey). The bar hotkey is not affected by this setting.
+
 ## Icons and the mouse
 
 Each result shows the icon of its app, file or folder. Icons load in the background, so the text always appears first.
@@ -414,7 +424,7 @@ Of these, `empty bin` and `restart explorer` ask for the second Enter.
 
 Open the Settings window from the tray menu (Settings), by typing `settings` in the bar, or with the Open Settings row on the first-run welcome. Every setting is there, so you never have to open the config file. Changes in General, Search, Quick answers and Updates apply at once; a shortcut, workspace or hotkey is saved when you press Save.
 
-- **General**: the hotkey (click the box and press the keys), Start at login, remembering past searches and launches (with a Clear history button), and the WSL distro.
+- **General**: the hotkey (click the box and press the keys), Win key opens Flick (see Win key), Start at login, remembering past searches and launches (with a Clear history button), and the WSL distro.
 - **Search**: the folders to search (add or remove them) and your pins, which you can reorder or unpin.
 - **Quick answers**: going online, your home city, currency and temperature unit, and the search engine.
 - **Shortcuts**: your list of shortcuts, with an editor that checks each one as you type.
@@ -453,6 +463,7 @@ open = "https://docs.rs"
 - `history`: set to `false` to stop saving past searches and recent launches (see Past searches). The default is `true`.
 - `online`, `weather_city`, `currency`, `temperature_unit`, `search_engine`: see Quick answers.
 - `check_updates`: set to `false` to stop Flick looking for new versions (see Updates). The default is `true`.
+- `win_key`: set to `true` to open the bar with the Win key on its own (see Win key). The default is `false`.
 - `[[shortcut]]`: see Shortcuts.
 - `[[workspace]]` and `[[direct_hotkey]]`: your workspaces and hotkeys (see Workspaces and hotkeys). Settings writes them for you.
 
@@ -504,10 +515,6 @@ To switch it off, set `history = false` in the config: Flick stops recording and
 ## Hotkey conflict with PowerToys Run
 
 PowerToys Run also uses Alt+Space by default. Only one program can own a hotkey, so change one of the two (set `hotkey` in Flick's config, or change the shortcut in PowerToys). When Flick cannot register its hotkey and PowerToys Run is running, the bar and the tray tooltip name PowerToys Run as the likely cause.
-
-## Not yet
-
-- Taking over the Win key
 
 ## Build from source
 

@@ -5,6 +5,12 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::WindowsAndMessaging::{
+    BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsHungAppWindow, SetForegroundWindow,
+};
 use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
@@ -43,15 +49,78 @@ pub fn toggle(app: &AppHandle) {
     }
 }
 
+/// Win-key path ([`toggle`] for a lone Win press). The press was held back
+/// from Windows, so it gave Flick no right to take the foreground; if
+/// Windows keeps another window in front, the bar's thread joins that
+/// window's input queue for a moment and takes it from there.
+/// Main thread only (the bar's window thread, for `SetFocus`).
+pub fn toggle_from_win_key(app: &AppHandle) {
+    let Some(w) = bar(app) else { return };
+    if w.is_visible().unwrap_or(false) {
+        hide(app);
+        return;
+    }
+    if !hotkey_may_show(notification_state()) {
+        return;
+    }
+    show(app);
+    if let Ok(h) = w.hwnd() {
+        if take_foreground(HWND(h.0 as _)) {
+            // `SetFocus` reached only the frame: focus the page's input the
+            // way the normal path does.
+            let _ = w.set_focus();
+        }
+    }
+}
+
+/// Makes `hwnd` (a window of this thread) the foreground window with focus.
+/// True when it had to join the front window's input queue to do so.
+fn take_foreground(hwnd: HWND) -> bool {
+    // SAFETY: plain calls on window handles and thread ids; every result is
+    // checked, and the input queues are detached again before returning.
+    unsafe {
+        if GetForegroundWindow() == hwnd {
+            return false;
+        }
+        let _ = SetForegroundWindow(hwnd);
+        let front = GetForegroundWindow();
+        if front == hwnd {
+            return false;
+        }
+        let front_thread = GetWindowThreadProcessId(front, None);
+        let me = GetCurrentThreadId();
+        // A hung window's thread could stall this one while attached.
+        let hung = !front.is_invalid() && IsHungAppWindow(front).as_bool();
+        if !may_attach(front_thread, me, hung) {
+            return false;
+        }
+        if AttachThreadInput(me, front_thread, true).as_bool() {
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(Some(hwnd));
+            let _ = AttachThreadInput(me, front_thread, false);
+            return true;
+        }
+        false
+    }
+}
+
+/// Whether the bar's thread (`me`) may join the input queue of the front
+/// window's thread: not when there is none, it is this thread, or the front
+/// window is hung.
+fn may_attach(front_thread: u32, me: u32, hung: bool) -> bool {
+    front_thread != 0 && front_thread != me && !hung
+}
+
 /// `None` when the state cannot be read; that never blocks showing.
-fn notification_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
+pub(crate) fn notification_state() -> Option<QUERY_USER_NOTIFICATION_STATE> {
     // SAFETY: no pointers or preconditions; the wrapper owns the out-parameter.
     unsafe { SHQueryUserNotificationState() }.ok()
 }
 
 /// Only exclusive full-screen blocks the hotkey. Borderless full-screen and
 /// presentation mode (`QUNS_BUSY`, `QUNS_PRESENTATION_MODE`) do not.
-fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
+pub(crate) fn hotkey_may_show(state: Option<QUERY_USER_NOTIFICATION_STATE>) -> bool {
     state != Some(QUNS_RUNNING_D3D_FULL_SCREEN)
 }
 
@@ -214,6 +283,14 @@ fn bar_position(origin: (i32, i32), size: (u32, u32), width: u32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn never_attaches_to_a_hung_missing_or_own_thread() {
+        assert!(may_attach(20, 10, false));
+        assert!(!may_attach(20, 10, true), "the front window is hung");
+        assert!(!may_attach(0, 10, false), "no front window");
+        assert!(!may_attach(10, 10, false), "the bar's own thread");
+    }
 
     #[test]
     fn only_exclusive_full_screen_blocks_hotkey_show() {

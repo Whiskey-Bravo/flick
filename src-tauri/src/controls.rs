@@ -53,6 +53,42 @@ pub(crate) fn key_input(
     }
 }
 
+/// Tag on the input Flick sends itself ("FLWK").
+pub(crate) const FLICK_INPUT_TAG: usize = 0x464C_574B;
+
+/// Opens the real Start menu by sending Ctrl+Esc, tagged as Flick's own
+/// input. (Asking the taskbar with SC_TASKLIST hides it on Windows 11 but
+/// does not open Start.) Windows drops these keys while an administrator
+/// window is in front. Never called by tests.
+pub fn open_start_menu() -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, VK_CONTROL, VK_ESCAPE};
+
+    let mut inputs = [
+        key_input(VK_CONTROL, false),
+        key_input(VK_ESCAPE, false),
+        key_input(VK_ESCAPE, true),
+        key_input(VK_CONTROL, true),
+    ];
+    for i in &mut inputs {
+        i.Anonymous.ki.dwExtraInfo = FLICK_INPUT_TAG;
+    }
+    // SAFETY: a valid slice of fully initialised INPUTs.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == inputs.len() as u32 {
+        Ok(())
+    } else {
+        // Part of the batch went in: release both keys so Ctrl is never left
+        // down. A key-up for a key that isn't down is harmless.
+        let mut up = [key_input(VK_ESCAPE, true), key_input(VK_CONTROL, true)];
+        for i in &mut up {
+            i.Anonymous.ki.dwExtraInfo = FLICK_INPUT_TAG;
+        }
+        // SAFETY: a valid slice of fully initialised INPUTs.
+        unsafe { SendInput(&up, std::mem::size_of::<INPUT>() as i32) };
+        Err("couldn't open the Start menu".to_string())
+    }
+}
+
 mod real {
     use windows::core::{w, PCWSTR};
     use windows::Devices::Radios::{Radio, RadioAccessStatus, RadioState};

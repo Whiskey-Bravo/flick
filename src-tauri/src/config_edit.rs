@@ -21,6 +21,7 @@ pub enum Setting {
     TemperatureUnit(String),
     SearchEngine(String),
     CheckUpdates(bool),
+    WinKey(bool),
 }
 
 /// Parses `text` (refusing a file that is already broken) and returns the editable document
@@ -174,6 +175,7 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
         Setting::TemperatureUnit(s) => ("temperature_unit", text_value(s)),
         Setting::SearchEngine(s) => ("search_engine", text_value(s)),
         Setting::CheckUpdates(b) => ("check_updates", Some(Value::from(*b))),
+        Setting::WinKey(b) => ("win_key", Some(Value::from(*b))),
     };
     match new {
         Some(mut value) => {
@@ -537,6 +539,18 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn win_key_setting_is_written_and_keeps_comments() {
+        let out = set(config::DEFAULT_FILE, &Setting::WinKey(true)).unwrap();
+        let comments = |t: &str| t.lines().filter(|l| l.starts_with('#')).map(String::from).collect::<Vec<_>>();
+        assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
+        let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        assert_eq!(active, ["win_key = true"]);
+        assert!(config::parse(&out).unwrap().win_key);
+        let off = set(&out, &Setting::WinKey(false)).unwrap();
+        assert!(!config::parse(&off).unwrap().win_key);
     }
 
     #[test]
