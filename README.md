@@ -90,6 +90,14 @@ Flick can take over the Win key: tap it on its own and the bar opens instead of 
 - If Flick itself stops responding, the Win key goes back to Windows after 2 seconds, so Start is never out of reach.
 - If Windows doesn't let Flick watch the Win key, Settings says "The Win key isn't available right now; Alt+Space still works." (with your bar hotkey). The bar hotkey is not affected by this setting.
 
+## Showing the taskbar
+
+If your taskbar hides by itself, Flick can bring it up while the bar is open, the way the Start menu does. Switch on **Show the taskbar while Flick is open** in Settings, General, or set `show_taskbar = true` in the config. It is off by default.
+
+- While the bar is open, a Flick button sits on the taskbar; that button is what keeps the taskbar up. It lights up for a moment as the taskbar rises.
+- Closing the bar removes the button, and the taskbar hides again about half a second later. Clicking the button closes the bar, like a click anywhere else.
+- No Windows setting is changed, and it does nothing when the taskbar doesn't hide by itself.
+
 ## Icons and the mouse
 
 Each result shows the icon of its app, file or folder. Icons load in the background, so the text always appears first.

@@ -22,6 +22,7 @@ pub enum Setting {
     SearchEngine(String),
     CheckUpdates(bool),
     WinKey(bool),
+    ShowTaskbar(bool),
 }
 
 /// Parses `text` (refusing a file that is already broken) and returns the editable document
@@ -176,6 +177,7 @@ pub fn set(text: &str, setting: &Setting) -> Result<String, String> {
         Setting::SearchEngine(s) => ("search_engine", text_value(s)),
         Setting::CheckUpdates(b) => ("check_updates", Some(Value::from(*b))),
         Setting::WinKey(b) => ("win_key", Some(Value::from(*b))),
+        Setting::ShowTaskbar(b) => ("show_taskbar", Some(Value::from(*b))),
     };
     match new {
         Some(mut value) => {
@@ -543,6 +545,15 @@ mod tests {
         assert_eq!(comments(&out), comments(config::DEFAULT_FILE));
         let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         assert_eq!(active, ["history = false"]);
+    }
+
+    #[test]
+    fn show_taskbar_setting_is_written_and_read_back() {
+        let out = set(config::DEFAULT_FILE, &Setting::ShowTaskbar(true)).unwrap();
+        let active: Vec<&str> = out.lines().filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+        assert_eq!(active, ["show_taskbar = true"]);
+        assert!(config::parse(&out).unwrap().show_taskbar);
+        assert!(!config::parse(&set(&out, &Setting::ShowTaskbar(false)).unwrap()).unwrap().show_taskbar);
     }
 
     #[test]

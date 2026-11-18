@@ -160,6 +160,19 @@ export function General({ state }: { state: SettingsState }) {
         <label class="check">
           <input
             type="checkbox"
+            checked={config.show_taskbar}
+            onChange={(e) => void save("show_taskbar", { key: "show_taskbar", value: e.currentTarget.checked })}
+          />
+          Show the taskbar while Flick is open
+        </label>
+        <p class="hint">For a taskbar that hides by itself. A Flick button sits on it while the bar is open.</p>
+        {errors.show_taskbar && <p class="error">{errors.show_taskbar}</p>}
+      </div>
+
+      <div class="field">
+        <label class="check">
+          <input
+            type="checkbox"
             checked={config.history}
             onChange={(e) => void save("history", { key: "history", value: e.currentTarget.checked })}
           />

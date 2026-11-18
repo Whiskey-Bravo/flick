@@ -47,6 +47,7 @@ export type Config = {
   search_engine: string;
   check_updates: boolean;
   win_key: boolean;
+  show_taskbar: boolean;
   shortcut: ShortcutDef[];
   workspace: WorkspaceDef[];
   direct_hotkey: DirectHotkeyDef[];
@@ -75,7 +76,8 @@ export type Setting =
   | { key: "temperature_unit"; value: string }
   | { key: "search_engine"; value: string }
   | { key: "check_updates"; value: boolean }
-  | { key: "win_key"; value: boolean };
+  | { key: "win_key"; value: boolean }
+  | { key: "show_taskbar"; value: boolean };
 
 export type ShortcutField = "name" | "aliases" | "target" | "terminal" | "admin" | "pick" | "choices";
 

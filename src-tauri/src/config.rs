@@ -44,6 +44,9 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## win_key: the Win key alone opens Flick instead of the Start menu; Win combinations keep working, Ctrl+Esc still opens Start (true: on).
 # win_key = false
 ##
+## show_taskbar: a taskbar that hides by itself comes up while Flick is open, with a Flick button on it (true: on).
+# show_taskbar = false
+##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
@@ -115,6 +118,8 @@ pub struct Config {
     pub check_updates: bool,
     /// The Win key pressed alone opens the bar instead of the Start menu.
     pub win_key: bool,
+    /// An auto-hidden taskbar is brought up while the bar is open.
+    pub show_taskbar: bool,
     /// User-defined shortcuts, validated by `validate`.
     #[serde(rename = "shortcut")]
     pub shortcuts: Vec<ShortcutDef>,
@@ -140,6 +145,7 @@ impl Default for Config {
             search_engine: String::new(),
             check_updates: true,
             win_key: false,
+            show_taskbar: false,
             shortcuts: Vec::new(),
             workspaces: Vec::new(),
             direct_hotkeys: Vec::new(),
@@ -683,6 +689,13 @@ run = \"notepad\"").unwrap();
         assert!(c.shortcuts.is_empty());
     }
     #[test] fn parses_hotkey() { assert_eq!(parse("hotkey = \"Ctrl+Space\"").unwrap().hotkey, "Ctrl+Space"); }
+    #[test]
+    fn show_taskbar_defaults_off_and_parses_true() {
+        assert!(!Config::default().show_taskbar);
+        assert!(!parse("").unwrap().show_taskbar);
+        assert!(parse("show_taskbar = true").unwrap().show_taskbar);
+    }
+
     #[test]
     fn win_key_defaults_off_and_parses_true() {
         assert!(!Config::default().win_key);

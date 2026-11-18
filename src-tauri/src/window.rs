@@ -291,6 +291,8 @@ fn reveal_window(w: &WebviewWindow) {
     *LAST_SHOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     let _ = w.show();
     let _ = w.set_focus();
+    // After the bar has the focus: the taskbar comes up without taking it.
+    crate::taskbar::raise(w.app_handle());
 }
 
 /// Tells the weather store whether the bar is hidden (memory only).
@@ -312,6 +314,7 @@ pub fn hide(app: &AppHandle) {
     if let Some(w) = bar(app) {
         let _ = w.hide();
     }
+    crate::taskbar::lower(app);
 }
 
 /// Hide on focus loss; turn close requests (Alt+F4) into hides so the window
