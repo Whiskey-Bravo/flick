@@ -21,15 +21,15 @@ describe("spring", () => {
     expect(settled({ x: 44, v: 30 }, 44)).toBe(false);
   });
 
-  it("overshoots only a little", () => {
+  it("overshoots visibly but not wildly", () => {
     for (const feel of [HIGHLIGHT, LIST]) {
       const { path } = run({ x: 0, v: 0 }, 100, 1.2, feel);
       const peak = Math.max(...path);
-      expect(peak).toBeGreaterThan(100);
-      expect(peak).toBeLessThan(106);
-      // And it never swings back far below the target once it has passed it.
+      expect(peak).toBeGreaterThan(110);
+      expect(peak).toBeLessThan(125);
+      // And it swings back only a little below the target once it has passed it.
       const after = path.slice(path.findIndex((x) => x >= 100));
-      expect(Math.min(...after)).toBeGreaterThan(98);
+      expect(Math.min(...after)).toBeGreaterThan(93);
     }
   });
 
@@ -55,7 +55,8 @@ describe("spring", () => {
     const fast = run({ x: 0, v: 0 }, 100, 0.5).end;
     let slow: Spring = { x: 0, v: 0 };
     for (let t = 0; t < 0.5; t += 1 / 20) slow = stepSpring(slow, 100, 1 / 20, HIGHLIGHT);
-    expect(slow.x).toBeCloseTo(fast.x, 0);
+    // The same motion at a third of the frames: within a few pixels over a hundred.
+    expect(Math.abs(slow.x - fast.x)).toBeLessThan(3);
     // A frame that took ten seconds simulates only a moment: no leap, no NaN.
     const paused = stepSpring({ x: 0, v: 0 }, 100, 10, HIGHLIGHT);
     expect(paused.x).toBeGreaterThan(0);
@@ -66,9 +67,9 @@ describe("spring", () => {
 
   it("stretches with speed, up to a limit", () => {
     expect(stretch(0)).toBe(0);
-    expect(stretch(900)).toBeCloseTo(0.035, 5);
-    expect(stretch(-900)).toBeCloseTo(0.035, 5);
-    expect(stretch(1800)).toBeCloseTo(0.07, 5);
-    expect(stretch(99999)).toBeCloseTo(0.07, 5);
+    expect(stretch(700)).toBeCloseTo(0.08, 5);
+    expect(stretch(-700)).toBeCloseTo(0.08, 5);
+    expect(stretch(1400)).toBeCloseTo(0.16, 5);
+    expect(stretch(99999)).toBeCloseTo(0.16, 5);
   });
 });

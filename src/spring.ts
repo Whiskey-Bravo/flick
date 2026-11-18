@@ -16,10 +16,11 @@ export type Feel = {
   damping: number;
 };
 
-// Brisk, with a small overshoot (damping ratio about 0.72): the highlight.
-export const HIGHLIGHT: Feel = { stiffness: 380, damping: 28 };
-// A little softer and heavier (about 0.8): the list's height.
-export const LIST: Feel = { stiffness: 260, damping: 26 };
+// Overshoots by about a fifth of the way and settles in under half a second
+// (damping ratio about 0.45): the highlight.
+export const HIGHLIGHT: Feel = { stiffness: 260, damping: 14.5 };
+// A little heavier and calmer (about 0.53): the list's height.
+export const LIST: Feel = { stiffness: 200, damping: 15 };
 
 // The longest stretch of time one call simulates: after a pause (a hidden
 // window, a stalled frame) the weight carries on from where it was instead
@@ -48,6 +49,6 @@ export function settled(s: Spring, target: number): boolean {
 
 // How much the highlight stretches along its direction of travel, as a
 // share of its height: nothing at rest, growing with speed up to `most`.
-export function stretch(v: number, most = 0.07, fullAt = 1800): number {
+export function stretch(v: number, most = 0.16, fullAt = 1400): number {
   return Math.min(most, (Math.abs(v) / fullAt) * most);
 }

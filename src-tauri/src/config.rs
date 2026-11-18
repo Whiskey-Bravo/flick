@@ -58,7 +58,7 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
 ## are the choices) or choices (a list of texts), {name} is the picked entry and {path} its full path.
-## icon (optional): a program, shortcut or .ico file (the row shows its icon) or a .png file (its picture).
+## icon (optional): a program, shortcut or .ico file (the row shows its icon) or a .png or .jpg file (its picture).
 ##
 ## A plain link:
 # [[shortcut]]
@@ -426,7 +426,7 @@ pub struct ShortcutDef {
     #[serde(default)]
     pub choices: Vec<String>,
     /// The row's icon: a file (a program, shortcut or `.ico` shows its icon,
-    /// a `.png` the picture) or a Store app, `shell:AppsFolder\<id>`.
+    /// a `.png` or `.jpg` the picture) or a Store app, `shell:AppsFolder\<id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
