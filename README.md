@@ -182,7 +182,7 @@ A currency or weather answer needs the internet. The row says `Getting rates…`
 | `yt text` | YouTube |
 | `gh text` | GitHub |
 
-**Ask Claude.** `claude text` opens the Claude app in a new chat that starts with your text. Without the app it opens claude.ai in your browser instead. Flick looks for the app when it starts, so after installing Claude, restart Flick once. A shortcut of your own named `claude` replaces this one.
+**Ask Claude.** `claude text` opens the Claude app in a new chat that starts with your text. Without the app it opens claude.ai in your browser instead. Flick looks for the app when it starts and whenever the config is reloaded, so after installing Claude, pick Reload in the tray menu (or change any setting). A shortcut of your own named `claude` replaces this one.
 
 To add another engine, add a shortcut that opens its search page with `{arg}` where the text goes (see Shortcuts):
 

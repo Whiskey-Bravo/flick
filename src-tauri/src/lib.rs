@@ -193,7 +193,7 @@ impl Providers {
             qr: capture.qr,
             shortcuts: {
                 let shortcuts = ShortcutsProvider::new(launcher.clone(), distro);
-                // Read once, at start: a Claude installed later counts from the next start.
+                // Looked at again on every reload (`reload_with`).
                 shortcuts.set_claude_app(launch::link_scheme_registered("claude"));
                 shortcuts
             },
@@ -1434,6 +1434,9 @@ fn reload_config_after_detection(app: &AppHandle, detection: wsl_detect::Detecti
 
 fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     let state = app.state::<AppState>();
+    // Before the shortcuts are staged below: a Claude app installed (or
+    // removed) since the last look changes what the built-in `claude` opens.
+    state.providers.shortcuts.set_claude_app(launch::link_scheme_registered("claude"));
     let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     let redetected = detection.is_some();
     if let Some(detection) = detection {
