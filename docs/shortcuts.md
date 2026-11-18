@@ -8,7 +8,7 @@ Your own commands, commands in WSL, workspaces and direct hotkeys.
 
 Shortcuts are your own commands, defined in the config as `[[shortcut]]` tables. Type the shortcut's name (or one of its aliases) and press Enter. Each shortcut has exactly one of `run` (a Windows command), `wsl` (a command in WSL) or `open` (a file, folder, program or URL).
 
-A shortcut can have its own icon: add `icon = "..."` with the path of a program, a shortcut file or an `.ico` file (the row shows that file's icon) or of a `.png` file up to 1 MB (the row shows the picture). In Settings, the Icon field also lets you pick an app and use its icon. An icon that can't be read falls back to the usual one.
+A shortcut can have its own icon: add `icon = "..."` with the path of a program, a shortcut file or an `.ico` file (the row shows that file's icon) or of a `.png` or `.jpg` file up to 1 MB (the row shows the picture). In Settings, the Icon field also lets you pick an app and use its icon. An icon that can't be read falls back to the usual one.
 
 Search the web with what you type (`search rust traits`):
 

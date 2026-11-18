@@ -303,7 +303,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
                 }}
               />
             )}
-            <small>A program, a shortcut, or an .ico or .png file.</small>
+            <small>A program, a shortcut, or an .ico, .png or .jpg file.</small>
           </div>
 
           <div class="sc-field" role="radiogroup" aria-label="What it does">

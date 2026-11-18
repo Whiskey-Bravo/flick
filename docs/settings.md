@@ -33,7 +33,7 @@ Settings has an Appearance tab for how the bar looks and moves. The same choices
 - The text is dark over a light background and white over a dark one.
 - The Settings window uses the Dark colours under Glass.
 
-**Animations.** Minimal (the default) changes everything at once. Medium fades the bar in, glides the highlight between rows and eases the list to its new height. High also lets the bar rise into place, gives the highlight a little bounce and fades new rows in one after another. Closing is instant at every level, and typing is never held up. If Windows' animation effects are switched off, nothing moves whatever is chosen.
+**Animations.** Minimal (the default) changes everything at once. Medium fades the bar in, glides the highlight between rows and eases the list to its new height. High also lets the bar rise into place, gives the highlight a little bounce and fades new rows in one after another. Wobble gives things weight: the highlight and the list are moved by a small physics simulation, so they carry their speed from one move into the next, overshoot a little and settle softly. Closing is instant at every level, and typing is never held up. If Windows' animation effects are switched off, nothing moves whatever is chosen.
 
 A wrong `theme`, `animations` or colour is a config error like any other: Flick says so and keeps the last working config.
 

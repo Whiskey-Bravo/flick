@@ -335,3 +335,32 @@ kbd {
       color 110ms ease-out;
   }
 }
+
+/* Wobble: content settles in on a soft spring, and a pressed button dips
+   slightly and comes back. */
+@keyframes st-wob {
+  from { opacity: 0; transform: translateY(14px); }
+  40% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  :root[data-motion="wobble"] .page > :not(h1),
+  :root[data-motion="wobble"] .sc-editor {
+    animation: st-wob 540ms linear(0, 0.036, 0.128, 0.257, 0.405, 0.557, 0.703, 0.832, 0.942, 1.029, 1.092, 1.134, 1.157, 1.163, 1.157, 1.141, 1.12, 1.096, 1.071, 1.048, 1.026, 1.009, 0.995, 0.985, 0.978, 0.974, 0.973, 0.975, 0.977, 0.981, 1);
+  }
+
+  :root[data-motion="wobble"] .tab,
+  :root[data-motion="wobble"] .page button {
+    transition:
+      scale 380ms cubic-bezier(0.3, 1.7, 0.5, 1),
+      background-color 110ms ease-out,
+      border-color 110ms ease-out,
+      color 110ms ease-out;
+  }
+
+  :root[data-motion="wobble"] .tab:active,
+  :root[data-motion="wobble"] .page button:active {
+    scale: 0.95;
+    transition-duration: 60ms;
+  }
+}

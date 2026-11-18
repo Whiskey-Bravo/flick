@@ -340,7 +340,7 @@ pub fn settings_pick_folder(app: AppHandle) -> Option<String> {
 /// when cancelled.
 #[tauri::command(async)]
 pub fn settings_pick_icon(app: AppHandle) -> Option<String> {
-    let mut dialog = app.dialog().file().add_filter("Icons, pictures and programs", &["ico", "png", "exe", "lnk"]);
+    let mut dialog = app.dialog().file().add_filter("Icons, pictures and programs", &["ico", "png", "jpg", "jpeg", "exe", "lnk"]);
     if let Some(window) = app.get_webview_window(WINDOW) {
         dialog = dialog.set_parent(&window);
     }

@@ -157,7 +157,9 @@ fn hex(c: u8) -> Option<u8> {
 pub fn response(status: u16, body: Vec<u8>) -> Response<Vec<u8>> {
     let builder = Response::builder().status(status);
     let builder = if status == 200 {
-        builder.header(header::CONTENT_TYPE, "image/png").header(header::CACHE_CONTROL, "max-age=86400")
+        // Everything is a PNG except a shortcut's own JPEG picture.
+        let kind = if body.starts_with(JPEG_SIGNATURE) { "image/jpeg" } else { "image/png" };
+        builder.header(header::CONTENT_TYPE, kind).header(header::CACHE_CONTROL, "max-age=86400")
     } else {
         builder
     };
@@ -249,35 +251,38 @@ fn encode_png(rgba: &[u8], px: u32) -> Option<Vec<u8>> {
 /// above 32 px from the 48 px list, so they are not upscaled from 32.
 pub struct ShellIcons;
 
-/// The largest `.png` file served as an icon.
-const PNG_MAX: u64 = 1024 * 1024;
+/// The largest picture file served as an icon.
+const PICTURE_MAX: u64 = 1024 * 1024;
 const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+const JPEG_SIGNATURE: &[u8] = b"\xFF\xD8\xFF";
 
-/// A `.png` file is shown itself (a shortcut's own picture), not as the icon
-/// of the program that opens pictures.
-fn is_png_path(path: &std::path::Path) -> bool {
-    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+/// A `.png`, `.jpg` or `.jpeg` file is shown itself (a shortcut's own
+/// picture), not as the icon of the program that opens pictures.
+fn is_picture_path(path: &std::path::Path) -> bool {
+    path.extension().is_some_and(|e| ["png", "jpg", "jpeg"].iter().any(|p| e.eq_ignore_ascii_case(p)))
 }
 
-/// `bytes` when they are a PNG no larger than [`PNG_MAX`].
-fn png_picture(bytes: Vec<u8>) -> Option<Vec<u8>> {
-    (bytes.len() as u64 <= PNG_MAX && bytes.starts_with(PNG_SIGNATURE)).then_some(bytes)
+/// `bytes` when they are a PNG or a JPEG no larger than [`PICTURE_MAX`]:
+/// what the file holds decides, not its name.
+fn picture(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    let known = bytes.starts_with(PNG_SIGNATURE) || bytes.starts_with(JPEG_SIGNATURE);
+    (bytes.len() as u64 <= PICTURE_MAX && known).then_some(bytes)
 }
 
-/// Reads a `.png` icon; the size is checked before the file is read.
-fn read_png(path: &std::path::Path) -> Option<Vec<u8>> {
+/// Reads a picture icon; the size is checked before the file is read.
+fn read_picture(path: &std::path::Path) -> Option<Vec<u8>> {
     let meta = std::fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > PNG_MAX {
+    if !meta.is_file() || meta.len() > PICTURE_MAX {
         return None;
     }
-    png_picture(std::fs::read(path).ok()?)
+    picture(std::fs::read(path).ok()?)
 }
 
 impl IconSource for ShellIcons {
     fn png(&self, key: &IconKey, px: u32) -> Option<Vec<u8>> {
         if let IconKey::File(path) = key {
-            if is_png_path(path) {
-                return read_png(path);
+            if is_picture_path(path) {
+                return read_picture(path);
             }
         }
         let _com = shell::Com::init();
@@ -484,18 +489,34 @@ mod tests {
     }
 
     #[test]
-    fn only_a_real_png_of_modest_size_is_served_as_a_picture() {
-        assert!(is_png_path(std::path::Path::new(r"C:\i\a.PNG")));
-        assert!(!is_png_path(std::path::Path::new(r"C:\i\a.ico")));
-        assert!(!is_png_path(std::path::Path::new(r"C:\i\png")));
-        let mut ok = PNG_SIGNATURE.to_vec();
-        ok.extend_from_slice(b"rest");
-        assert_eq!(png_picture(ok.clone()), Some(ok.clone()));
-        assert_eq!(png_picture(b"<html>not a picture".to_vec()), None);
-        assert_eq!(png_picture(Vec::new()), None);
-        let mut huge = ok;
-        huge.resize(PNG_MAX as usize + 1, 0);
-        assert_eq!(png_picture(huge), None);
+    fn only_a_real_picture_of_modest_size_is_served_as_one() {
+        for name in [r"C:\i\a.PNG", r"C:\i\a.jpg", r"C:\i\a.JPEG", r"C:\i\photo.Jpg"] {
+            assert!(is_picture_path(std::path::Path::new(name)), "{name}");
+        }
+        for name in [r"C:\i\a.ico", r"C:\i\png", r"C:\i\jpg", r"C:\i\a.gif", r"C:\i\a.jpg.exe"] {
+            assert!(!is_picture_path(std::path::Path::new(name)), "{name}");
+        }
+        let mut png = PNG_SIGNATURE.to_vec();
+        png.extend_from_slice(b"rest");
+        assert_eq!(picture(png.clone()), Some(png.clone()));
+        let jpeg = b"\xFF\xD8\xFF\xE0rest".to_vec();
+        assert_eq!(picture(jpeg.clone()), Some(jpeg));
+        // What the file holds decides: other content is never served.
+        assert_eq!(picture(b"<html>not a picture".to_vec()), None);
+        assert_eq!(picture(b"\xFF\xD8".to_vec()), None);
+        assert_eq!(picture(Vec::new()), None);
+        let mut huge = png;
+        huge.resize(PICTURE_MAX as usize + 1, 0);
+        assert_eq!(picture(huge), None);
+    }
+
+    #[test]
+    fn a_picture_is_answered_with_its_own_type() {
+        let kind = |body: &[u8]| response(200, body.to_vec()).headers()[header::CONTENT_TYPE].to_str().unwrap().to_string();
+        assert_eq!(kind(b"\xFF\xD8\xFF\xE0jpeg"), "image/jpeg");
+        assert_eq!(kind(PNG_SIGNATURE), "image/png");
+        assert_eq!(kind(b"\x89PNG fake"), "image/png");
+        assert!(response(404, Vec::new()).headers().get(header::CONTENT_TYPE).is_none());
     }
 
     #[test]

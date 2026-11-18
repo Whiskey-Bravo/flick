@@ -51,14 +51,14 @@ pub(crate) const DEFAULT_FILE: &str = "\
 # theme = \"dark\"
 ## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
 # custom_theme = { background = \"#101418\", surface = \"#1c232b\", border = \"#26303a\", text = \"#e8eef4\", muted = \"#9fb0c0\", accent = \"#4fd1c5\", error = \"#f0717a\", warning = \"#f2b441\" }
-## animations: minimal, medium or high.
+## animations: minimal, medium, high or wobble (motion with weight and inertia).
 # animations = \"minimal\"
 ##
 ## Shortcuts: type the name (or an alias), then press Space for arguments or choices.
 ## Each needs exactly one of run (Windows command), wsl (command in the distro) or open (path or URL).
 ## Placeholders: {arg} is the text typed after the name; with pick (folder whose sub-folders
 ## are the choices) or choices (a list of texts), {name} is the picked entry and {path} its full path.
-## icon (optional): a program, shortcut or .ico file (the row shows its icon) or a .png file (its picture).
+## icon (optional): a program, shortcut or .ico file (the row shows its icon) or a .png or .jpg file (its picture).
 ##
 ## A plain link:
 # [[shortcut]]
@@ -426,7 +426,7 @@ pub struct ShortcutDef {
     #[serde(default)]
     pub choices: Vec<String>,
     /// The row's icon: a file (a program, shortcut or `.ico` shows its icon,
-    /// a `.png` the picture) or a Store app, `shell:AppsFolder\<id>`.
+    /// a `.png` or `.jpg` the picture) or a Store app, `shell:AppsFolder\<id>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
 }
