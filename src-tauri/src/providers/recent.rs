@@ -152,6 +152,25 @@ fn read_recent(fs: &dyn FileSystem, links: &dyn Links, folder: &Path) -> Result<
     Ok(out)
 }
 
+/// The Recent list after `old` was renamed to `new` (`None`: deleted): an
+/// entry for it, or for something inside it, follows or goes.
+fn moved_recent(entries: &[RecentEntry], old: &Path, new: Option<&Path>) -> Vec<RecentEntry> {
+    let old = old.to_string_lossy();
+    let new = new.map(|n| n.to_string_lossy().into_owned());
+    entries
+        .iter()
+        .filter_map(|e| {
+            let path = e.path.to_string_lossy();
+            // `old` itself as the target: does the entry lie at or under it?
+            match (crate::file_ops::moved_id(&path, &old, new.as_deref().unwrap_or(&old)), &new) {
+                (None, _) => Some(e.clone()),
+                (Some(moved), Some(_)) => Some(RecentEntry { path: PathBuf::from(moved), ..e.clone() }),
+                (Some(_), None) => None,
+            }
+        })
+        .collect()
+}
+
 /// The name of the folder holding `path` (the whole folder path for a drive root).
 fn parent_name(path: &Path) -> String {
     let Some(parent) = path.parent() else { return String::new() };
@@ -233,6 +252,13 @@ impl Provider for RecentProvider {
 
     fn item(&self, id: &str) -> Option<ResultItem> {
         item_from_id(self.name(), id)
+    }
+
+    /// The list read is patched in memory, so the row goes or is renamed on
+    /// the very next ask, not when the list is read again.
+    fn moved(&self, old: &Path, new: Option<&Path>) {
+        let Some(folder) = &self.folder else { return };
+        self.store.patch(&folder_key(folder), |entries| moved_recent(entries, old, new));
     }
 
     fn help(&self) -> Vec<HelpLine> {
@@ -426,6 +452,29 @@ mod tests {
         assert_eq!(rows[1].actions, crate::file_ops::menu(true, false, false));
         assert_eq!((rows[0].folder.as_str(), rows[1].folder.as_str()), ("", format!(r"{DOCS}\").as_str()));
         assert_eq!(titles(&ready(&r.p, &r.rx, "doc")), ["Documents"]);
+    }
+
+    #[test]
+    fn recent_rows_follow_a_delete_or_rename_at_once() {
+        let entries = vec![
+            DirEntry { modified: mins_ago(1), ..file("a.lnk", 1) },
+            DirEntry { modified: mins_ago(2), ..file("b.lnk", 1) },
+            DirEntry { modified: mins_ago(3), ..file("in.lnk", 1) },
+        ];
+        let r = recent_rig(entries, |fs, links| {
+            for (l, target, dir) in [("a.lnk", r"\a.txt", false), ("b.lnk", r"\Sub", true), ("in.lnk", r"\Sub\x.txt", false)] {
+                fs.set_kind(&format!("{DOCS}{target}"), Some(dir));
+                links.add(&lnk(l), &format!("{DOCS}{target}"));
+            }
+        });
+        assert_eq!(titles(&ready(&r.p, &r.rx, "")), ["a.txt", "Sub", "x.txt"]);
+        r.p.moved(&Path::new(DOCS).join("A.TXT"), None);
+        assert_eq!(titles(&r.p.query(&q(""))), ["Sub", "x.txt"], "gone at once");
+        r.p.moved(&Path::new(DOCS).join("Sub"), Some(&Path::new(DOCS).join("New")));
+        let rows = r.p.query(&q(""));
+        assert_eq!(titles(&rows), ["New", "x.txt"]);
+        assert_eq!(rows[1].id, format!(r"{DOCS}\New\x.txt"), "what is inside follows");
+        assert!(r.rx.recv_timeout(Duration::from_millis(100)).is_err(), "nothing read again");
     }
 
     #[test]

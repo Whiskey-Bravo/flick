@@ -219,22 +219,37 @@ impl Index {
     }
 
     /// A copy of the index after `old` (and what is below it) moved to `new`,
-    /// or, with `None`, was removed. Built beside the live one: the caller
-    /// swaps it in. Names are compared without regard to case.
-    pub fn patched(&self, old: &Path, new: Option<&Path>) -> Index {
+    /// or, with `None`, was removed; `None` when nothing in the index is `old`
+    /// or below it (the caller keeps the live index). Built beside the live
+    /// one: the caller swaps it in. Names are compared without regard to case.
+    /// Untouched entries are copied with their normalised names and masks; only
+    /// a renamed entry is normalised again.
+    pub fn patched(&self, old: &Path, new: Option<&Path>) -> Option<Index> {
         let key = |p: &Path| p.to_string_lossy().replace('/', r"\").trim_end_matches('\\').to_lowercase();
         let old_key = key(old);
-        // Whether a folder is `old` or below it, and where it goes.
-        let below = |dir: &Path| {
-            let k = key(dir);
-            k == old_key || k.strip_prefix(&old_key).is_some_and(|rest| rest.starts_with('\\'))
-        };
+        let old_parent = old.parent().map(key);
+        // Per folder: is it `old` or below it, and does it hold `old`.
+        let (below, beside): (Vec<bool>, Vec<bool>) = self
+            .dirs
+            .iter()
+            .map(|d| {
+                let k = key(d);
+                let below = k == old_key || k.strip_prefix(&old_key).is_some_and(|rest| rest.starts_with('\\'));
+                (below, Some(k) == old_parent)
+            })
+            .unzip();
+        let old_name = old.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let is_old = |s: &Slot| beside[s.parent as usize] && self.name(s).to_lowercase() == old_name;
+        if !below.contains(&true) && !self.slots.iter().any(|s| is_old(s)) {
+            return None;
+        }
         let mut out = Index::with_capacity(self.sizes());
         out.dirs = self
             .dirs
             .iter()
-            .map(|d| match new {
-                Some(new) if below(d) => {
+            .zip(&below)
+            .map(|(d, &below)| match new {
+                Some(new) if below => {
                     let rest = d.to_string_lossy().get(old.to_string_lossy().trim_end_matches('\\').len()..).unwrap_or("").to_string();
                     PathBuf::from(format!("{}{rest}", new.to_string_lossy().trim_end_matches('\\')))
                 }
@@ -242,24 +257,35 @@ impl Index {
             })
             .collect();
         out.depths = self.depths.clone();
-        let gone: Vec<bool> = self.dirs.iter().map(|d| new.is_none() && below(d)).collect();
-        let old_parent = old.parent().map(key);
-        let old_name = old.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let beside: Vec<bool> = self.dirs.iter().map(|d| Some(key(d)) == old_parent).collect();
         for s in &self.slots {
-            let is_old = beside[s.parent as usize] && self.name(s).to_lowercase() == old_name;
-            if is_old {
+            if is_old(s) {
                 // The entry itself: dropped, or under its new name (folder unchanged).
                 if let Some(new) = new {
                     let name = new.file_name().and_then(|n| n.to_str()).unwrap_or_else(|| self.name(s));
                     out.push(s.parent, name, s.is_dir);
                 }
-            } else if !gone[s.parent as usize] {
-                out.push(s.parent, self.name(s), s.is_dir);
+            } else if new.is_some() || !below[s.parent as usize] {
+                out.push_copy(self, s);
             }
         }
         out.trim();
-        out
+        Some(out)
+    }
+
+    /// `s` of `from`, as it is: name, normalised name and masks are copied.
+    fn push_copy(&mut self, from: &Index, s: &Slot) {
+        let name_at = self.names.len() as u32;
+        self.names.push_str(from.name(s));
+        let norm_at = self.norms.len() as u32;
+        self.norms.push_str(from.norm(s));
+        self.slots.push(Slot {
+            norm: (norm_at, self.norms.len() as u32),
+            name: (name_at, self.names.len() as u32),
+            parent: s.parent,
+            is_dir: s.is_dir,
+            chars: s.chars,
+            initials: s.initials,
+        });
     }
 
     fn add_dir(&mut self, path: PathBuf, depth: u8) -> u32 {

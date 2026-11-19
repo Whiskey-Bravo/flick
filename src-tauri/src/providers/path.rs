@@ -97,7 +97,8 @@ pub(crate) fn entry_row_in(
     subtitle: String,
     score: u32,
     complete: String,
-) -> ResultItem {    let text = path.to_string_lossy().into_owned();
+) -> ResultItem {
+    let text = path.to_string_lossy().into_owned();
     let title = path.file_name().map_or_else(|| text.clone(), |n| n.to_string_lossy().into_owned());
     let text_for_menu = text.clone();
     let mut id = text;
@@ -289,6 +290,20 @@ pub(crate) fn score_in_order(rows: &mut [ResultItem]) {
     }
 }
 
+/// A folder's listing after its entry `old` (any letter case) was renamed to
+/// `new` (`None`: deleted): the entry keeps its place, kind, size and time.
+pub(crate) fn moved_entries(entries: &[DirEntry], old: &str, new: Option<&str>) -> Vec<DirEntry> {
+    let old = old.to_lowercase();
+    entries
+        .iter()
+        .filter_map(|e| match (e.name.to_lowercase() == old, new) {
+            (false, _) => Some(e.clone()),
+            (true, Some(new)) => Some(DirEntry { name: new.to_string(), ..e.clone() }),
+            (true, None) => None,
+        })
+        .collect()
+}
+
 /// The most rows an unfolded folder shows.
 pub const UNFOLD_ROWS: usize = 15;
 
@@ -345,10 +360,21 @@ impl PathProvider {
         Self { dirs, fs, home, launcher, clipboard, ops }
     }
 
-    /// The folder's listing is out of date (something in it was deleted or
-    /// renamed): the next `unfold` reads it again and answers `reading`.
-    pub fn forget_folder(&self, folder: &Path) {
-        self.dirs.forget(&folder_key(folder));
+    /// `old` was renamed to `new` (`None`: deleted) through Flick. The listing
+    /// of the folder holding it is patched in memory, so a typed path, `dl`
+    /// and an unfolded folder answer at once (not `Reading…`) with the entry
+    /// gone or renamed in place; what was read below `old` is forgotten.
+    pub fn entry_moved(&self, old: &Path, new: Option<&Path>) {
+        if let (Some(parent), Some(name)) = (old.parent(), old.file_name()) {
+            let name = name.to_string_lossy();
+            // A new name in the same folder; anything else leaves the folder.
+            let renamed = new
+                .filter(|n| n.parent().is_some_and(|p| folder_key(p) == folder_key(parent)))
+                .and_then(|n| n.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            self.dirs.patch(&folder_key(parent), |entries| moved_entries(entries, &name, renamed.as_deref()));
+        }
+        self.dirs.forget_under(&folder_key(old));
     }
 
     /// What the folder under a row has to show: memory only, like `query`. A
@@ -1030,6 +1056,38 @@ mod tests {
         let a = u.rows.iter().find(|x| x.title == "a.txt").unwrap();
         r.fs.set_kind(r"C:\a.txt", None);
         assert_eq!(r.p.activate(&a.id, Modifier::None), Err(NOT_FOUND.to_string()));
+    }
+
+    #[test]
+    fn a_delete_or_rename_patches_the_typed_listing_and_it_answers_at_once() {
+        let r = rig();
+        assert_eq!(titles(&r.ready(r"C:\")), [r"C:\", "Games", "Users", "a.txt", "b.txt"]);
+        let reads = r.fs.reads();
+        r.p.entry_moved(Path::new(r"C:\A.TXT"), None);
+        assert_eq!(titles(&r.q(r"C:\")), [r"C:\", "Games", "Users", "b.txt"], "not Reading…");
+        r.p.entry_moved(Path::new(r"C:\b.txt"), Some(Path::new(r"C:\c.txt")));
+        let rows = r.q(r"C:\");
+        assert_eq!(titles(&rows), [r"C:\", "Games", "Users", "c.txt"]);
+        assert_eq!(rows[3].id, r"C:\c.txt");
+        assert_eq!(rows[3].subtitle, "2.0 KB", "size kept");
+        // A folder renamed: the same row, the new name; its own listing is read again.
+        r.fs.add_dir(r"C:\Games", vec![file("save.dat", 1)]);
+        assert_eq!(r.unfold_ready(r"C:\Games\").state, "ready");
+        r.p.entry_moved(Path::new(r"C:\Games"), Some(Path::new(r"C:\Play")));
+        assert_eq!(titles(&r.q(r"C:\")), [r"C:\", "Play", "Users", "c.txt"]);
+        assert_eq!(r.fs.reads(), reads + 1, "only the unfold read the disk");
+        assert_eq!(r.p.unfold(r"C:\Games\").state, "reading", "forgotten below the old name");
+        r.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+    }
+
+    #[test]
+    fn moved_entries_drop_or_rename_in_place() {
+        let entries = vec![folder("Sub"), file("a.txt", 5), file("b.txt", 6)];
+        let names = |v: Vec<DirEntry>| v.into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names(moved_entries(&entries, "A.TXT", None)), ["Sub", "b.txt"]);
+        let renamed = moved_entries(&entries, "sub", Some("New"));
+        assert_eq!(renamed[0], DirEntry { name: "New".into(), ..folder("Sub") });
+        assert_eq!(names(moved_entries(&entries, "zzz", None)), ["Sub", "a.txt", "b.txt"]);
     }
 
     #[test]

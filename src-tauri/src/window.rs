@@ -341,9 +341,11 @@ const FOCUS_CHECKS_MS: [u64; 3] = [300, 700, 1500];
 /// Whether an open bar has to take the keyboard again: it is on screen but
 /// another window is in front, so nothing typed reaches it and no focus loss
 /// will ever hide it. `same_show` is false once the bar has been shown again
-/// (that show has its own checks).
-fn must_refocus(same_show: bool, visible: bool, in_front: bool) -> bool {
-    same_show && visible && !in_front
+/// (that show has its own checks). `held`: the bar is held open (Windows' own
+/// menu or prompt for a row is in front on purpose); taking the foreground
+/// then would close that menu.
+fn must_refocus(same_show: bool, visible: bool, in_front: bool, held: bool) -> bool {
+    same_show && visible && !in_front && !held
 }
 
 /// Windows sometimes refuses the bar the foreground (another window took it
@@ -369,7 +371,7 @@ fn watch_focus(app: &AppHandle) {
                 let visible = w.is_visible().unwrap_or(false);
                 // SAFETY: no arguments.
                 let in_front = unsafe { GetForegroundWindow() } == hwnd;
-                if must_refocus(shows() == show, visible, in_front) {
+                if must_refocus(shows() == show, visible, in_front, held_open()) {
                     let _ = w.set_focus();
                     take_foreground(hwnd);
                     let _ = w.set_focus();
@@ -574,13 +576,20 @@ mod tests {
 
     #[test]
     fn an_open_bar_that_is_not_in_front_takes_the_keyboard_again() {
-        assert!(must_refocus(true, true, false), "on screen, another window in front");
-        assert!(!must_refocus(true, true, true), "it has the keyboard");
-        assert!(!must_refocus(true, false, false), "hidden: nothing to take");
-        assert!(!must_refocus(false, true, false), "shown again since: that show checks itself");
+        assert!(must_refocus(true, true, false, false), "on screen, another window in front");
+        assert!(!must_refocus(true, true, true, false), "it has the keyboard");
+        assert!(!must_refocus(true, false, false, false), "hidden: nothing to take");
+        assert!(!must_refocus(false, true, false, false), "shown again since: that show checks itself");
         // The first look comes after the grace in which a focus loss is ignored.
         assert!(Duration::from_millis(FOCUS_CHECKS_MS[0]) > BLUR_GRACE);
         assert!(FOCUS_CHECKS_MS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn a_held_bar_never_takes_the_foreground_back() {
+        // Windows' More options menu or its permanent-delete prompt is in front
+        // on purpose: taking the foreground would close it.
+        assert!(!must_refocus(true, true, false, true));
     }
 
     #[test]

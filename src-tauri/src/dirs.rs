@@ -233,10 +233,30 @@ impl<T: Send + Sync + 'static> Loader<T> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.clear();
     }
 
-    /// Forgets one key: the next `get` starts a read and answers `Pending`
-    /// instead of the old value. A read in flight finishes into nothing.
-    pub fn forget(&self, key: &str) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.remove(key);
+    /// Changes the value read for `key` in memory (`f` gets the old value and
+    /// gives the new one), so the next `get` answers it at once instead of
+    /// `Pending`. Its age stays: it is read again when it would have been. A
+    /// read in flight finishes into nothing, as it may have started before the
+    /// change. With no value read yet (or an error) the key is forgotten
+    /// instead: the next `get` reads it again.
+    pub fn patch(&self, key: &str, f: impl FnOnce(&T) -> T) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match state.slots.get_mut(key) {
+            Some(Slot { done: Some((Ok(value), _)), reading, .. }) => {
+                *value = Arc::new(f(value));
+                *reading = None;
+            }
+            Some(_) => {
+                state.slots.remove(key);
+            }
+            None => {}
+        }
+    }
+
+    /// Forgets `key` and every key that starts with it (a folder and the
+    /// folders inside it).
+    pub fn forget_under(&self, key: &str) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.retain(|k, _| !k.starts_with(key));
     }
 
     /// The last value read for `key`, however old. Never starts a read.
@@ -681,6 +701,57 @@ mod tests {
         gate_tx.send(()).unwrap();
         wait(&rx);
         assert!(l.peek("a").is_none());
+    }
+
+    #[test]
+    fn a_patched_value_is_served_at_once_without_reading() {
+        let (l, rx) = loader(Duration::from_secs(60), SLOW);
+        l.get("a", || Ok(1));
+        wait(&rx);
+        l.patch("a", |v| v + 10);
+        assert_eq!(show(l.get("a", || unreachable!())), "Ready(11)");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no read, no on_ready");
+        // Nothing read yet: nothing to patch, and the key reads as before.
+        l.patch("b", |_| unreachable!());
+        assert_eq!(show(l.get("b", || Ok(2))), "Pending");
+        wait(&rx);
+    }
+
+    #[test]
+    fn a_patch_drops_a_read_in_flight_and_forgets_an_error() {
+        let (l, rx) = loader(Duration::ZERO, SLOW);
+        l.get("a", || Ok(1));
+        wait(&rx);
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        // Stale: served while a read runs; that read may predate the change.
+        assert_eq!(
+            show(l.get("a", move || {
+                let _ = gate_rx.recv();
+                Ok(99)
+            })),
+            "Ready(1)"
+        );
+        l.patch("a", |v| v + 1);
+        gate_tx.send(()).unwrap();
+        wait(&rx);
+        assert_eq!(l.peek("a").as_deref(), Some(&2));
+        l.get("e", || Err(ReadError::NotFound));
+        wait(&rx);
+        l.patch("e", |_| unreachable!());
+        assert_eq!(show(l.get("e", || Ok(3))), "Pending", "forgotten: read again");
+        wait(&rx);
+    }
+
+    #[test]
+    fn forget_under_drops_a_folder_and_what_is_inside() {
+        let (l, rx) = loader(FRESH, SLOW);
+        for key in [r"c:\d\", r"c:\d\sub\", r"c:\dx\", r"c:\"] {
+            l.get(key, || Ok(1));
+            wait(&rx);
+        }
+        l.forget_under(r"c:\d\");
+        assert!(l.peek(r"c:\d\").is_none() && l.peek(r"c:\d\sub\").is_none());
+        assert!(l.peek(r"c:\dx\").is_some() && l.peek(r"c:\").is_some());
     }
 
     #[test]

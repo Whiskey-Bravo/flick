@@ -936,15 +936,17 @@ impl Provider for FilesProvider {
         super::path::rename_entry(&kind, &*self.ops, id, new_name)
     }
 
+    /// Nothing to do when `old` is not in the index.
     fn moved(&self, old: &Path, new: Option<&Path>) {
         loop {
             let epoch = self.epoch.load(Ordering::SeqCst);
             // Built beside the live index, which keeps answering meanwhile.
-            let patched = self.index.read().unwrap_or_else(|e| e.into_inner()).patched(old, new);
+            let Some(patched) = self.index.read().unwrap_or_else(|e| e.into_inner()).patched(old, new) else { return };
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             // A scan that swapped in meanwhile is newer than what this was built from.
             if self.epoch.load(Ordering::SeqCst) == epoch {
                 let before = std::mem::replace(&mut *index, patched);
+                self.epoch.fetch_add(1, Ordering::SeqCst);
                 drop(index);
                 drop(before); // freed outside the lock
                 return;
@@ -1024,6 +1026,28 @@ mod tests {
         use windows::core::HSTRING;
         use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES};
         unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_FLAGS_AND_ATTRIBUTES(attrs)) }.unwrap();
+    }
+
+    #[test]
+    fn moved_leaves_the_index_alone_when_the_path_is_not_in_it() {
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\Sub", true), entry(r"C:\d\Sub\x.txt", false).at_depth(2)]);
+        let epoch = p.epoch.load(Ordering::SeqCst);
+        p.moved(Path::new(r"C:\d\zzz.txt"), None);
+        p.moved(Path::new(r"C:\elsewhere\a.txt"), Some(Path::new(r"C:\elsewhere\b.txt")));
+        assert_eq!(p.epoch.load(Ordering::SeqCst), epoch, "not rebuilt, not swapped");
+        assert_eq!(p.index.read().unwrap().len(), 3);
+        // Indexed: patched and swapped in, the epoch moves on.
+        p.moved(Path::new(r"C:\D\SUB"), Some(Path::new(r"C:\d\New")));
+        assert_eq!(p.epoch.load(Ordering::SeqCst), epoch + 1);
+        let index = p.index.read().unwrap();
+        let mut paths: Vec<PathBuf> = index.slots.iter().map(|s| index.path(s)).collect();
+        paths.sort();
+        assert_eq!(paths, [PathBuf::from(r"C:\d\New"), PathBuf::from(r"C:\d\New\x.txt"), PathBuf::from(r"C:\d\a.txt")]);
+        // Copied entries keep their normalised names: still found by them.
+        let x = index.slots.iter().find(|s| index.name(s) == "x.txt").unwrap();
+        assert_eq!(index.norm(x), crate::fuzzy::normalize("x.txt"));
+        let renamed = index.slots.iter().find(|s| index.name(s) == "New").unwrap();
+        assert_eq!(index.norm(renamed), crate::fuzzy::normalize("New"));
     }
 
     #[test]
