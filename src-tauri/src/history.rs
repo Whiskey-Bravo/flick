@@ -9,7 +9,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::file_ops::{moved_id, same_item};
-use crate::ranking::save_json;
+use crate::ranking::{load_json, save_json};
 
 const MAX_SEARCHES: usize = 50;
 const MAX_RECENTS: usize = 5;
@@ -39,13 +39,10 @@ pub struct History {
 }
 
 impl History {
-    /// Missing or corrupt file -> empty. Disabled: starts empty and deletes the file.
+    /// Missing or corrupt file -> empty (a corrupt one is kept as `.corrupt`). Disabled: starts empty and deletes the file.
     pub fn load(path: PathBuf, enabled: bool) -> Self {
         let data = if enabled {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<HistoryFile>(&text).ok())
-                .unwrap_or_default()
+            load_json::<HistoryFile>(&path).unwrap_or_default()
         } else {
             let _ = std::fs::remove_file(&path);
             HistoryFile::default()

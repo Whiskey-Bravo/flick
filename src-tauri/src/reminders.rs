@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dirs::Clock;
-use crate::ranking::save_json;
+use crate::ranking::{load_json, save_json};
 
 /// Characters of reminder text kept.
 pub const MAX_TEXT: usize = 200;
@@ -213,16 +213,15 @@ impl Reminders {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reads the file once; a missing or corrupt one gives none. Items due
+    /// Reads the file once; a missing or corrupt one gives none (a corrupt
+    /// one is kept as `.corrupt`). Items due
     /// further ahead than Flick sets are dropped and repeated ids renumbered
     /// (then the file is rewritten by the thread).
     fn load(&self, st: &mut State) {
         if st.loaded {
             return;
         }
-        let read = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<FileIn>(&s).ok())
+        let read = load_json::<FileIn>(&self.path)
             .filter(|f| f.version == VERSION)
             .map(|f| f.items)
             .unwrap_or_default();
@@ -691,6 +690,8 @@ mod tests {
         assert_eq!(g.quiet_for(50), Vec::<String>::new());
         let r = g.r.add(g.now() + Duration::from_secs(60), "pizza", false).unwrap();
         assert_eq!(g.r.pending(), vec![r]);
+        let aside = g.dir.path().join("reminders.json.corrupt");
+        assert_eq!(std::fs::read_to_string(aside).unwrap(), "not json {", "kept for the user");
     }
 
     #[test]

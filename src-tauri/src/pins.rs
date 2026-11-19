@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::file_ops::{moved_id, same_item};
-use crate::ranking::save_json;
+use crate::ranking::{load_json, save_json};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct Pin {
@@ -26,11 +26,9 @@ pub struct Pins {
 }
 
 impl Pins {
-    /// Missing or corrupt file -> empty.
+    /// Missing or corrupt file -> empty (a corrupt one is kept as `.corrupt`).
     pub fn load(path: PathBuf) -> Self {
-        let pins = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<PinsFile>(&text).ok())
+        let pins = load_json::<PinsFile>(&path)
             .map(|f| f.pins)
             .unwrap_or_default();
         Self { pins: Mutex::new(pins), save_lock: Mutex::new(()), path }
