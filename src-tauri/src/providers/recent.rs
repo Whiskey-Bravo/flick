@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use super::path::{act_on_entry, entry_row, inert_row, item_from_id, loaded, open_entry, score_in_order, FOLDER_NOT_FOUND};
 use crate::clipboard::Clipboard;
+use crate::file_ops::FileOps;
 use crate::dirs::{ago, folder_key, size_text, Clock, DirEntry, FileSystem, Links, Loader, ReadError};
 use crate::fuzzy;
 use crate::launch::Launcher;
@@ -40,6 +41,7 @@ pub struct DownloadsProvider {
     folder: Option<PathBuf>,
     launcher: Arc<dyn Launcher>,
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
     now: Clock,
 }
 
@@ -50,9 +52,10 @@ impl DownloadsProvider {
         folder: Option<PathBuf>,
         launcher: Arc<dyn Launcher>,
         clipboard: Arc<dyn Clipboard>,
+        ops: Arc<dyn FileOps>,
         now: Clock,
     ) -> Self {
-        Self { dirs, fs, folder, launcher, clipboard, now }
+        Self { dirs, fs, folder, launcher, clipboard, ops, now }
     }
 }
 
@@ -93,7 +96,7 @@ impl Provider for DownloadsProvider {
     }
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
-        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, id, action)
+        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
     }
 
     /// Typed lists are never learned.
@@ -158,6 +161,7 @@ pub struct RecentProvider {
     folder: Option<PathBuf>,
     launcher: Arc<dyn Launcher>,
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
     now: Clock,
 }
 
@@ -169,9 +173,10 @@ impl RecentProvider {
         folder: Option<PathBuf>,
         launcher: Arc<dyn Launcher>,
         clipboard: Arc<dyn Clipboard>,
+        ops: Arc<dyn FileOps>,
         now: Clock,
     ) -> Self {
-        Self { store, fs, links, folder, launcher, clipboard, now }
+        Self { store, fs, links, folder, launcher, clipboard, ops, now }
     }
 }
 
@@ -207,7 +212,7 @@ impl Provider for RecentProvider {
     }
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
-        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, id, action)
+        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
     }
 
     fn rank_key(&self, _id: &str) -> Option<String> {
@@ -231,6 +236,7 @@ impl Provider for RecentProvider {
 mod tests {
     use super::*;
     use crate::clipboard::FakeClipboard;
+    use crate::file_ops::FakeFileOps;
     use crate::dirs::testing::{file, folder, FakeFolders, FakeFs, FakeLinks};
     use crate::dirs::{KnownFolders, FRESH, SLOW};
     use crate::launch::testing::RecordingLauncher;
@@ -299,7 +305,7 @@ mod tests {
         let (dirs, rx) = loader();
         let launcher = Arc::new(RecordingLauncher::default());
         let clip = Arc::new(FakeClipboard::default());
-        let p = DownloadsProvider::new(dirs, fs, folders.downloads(), launcher.clone(), clip.clone(), clock());
+        let p = DownloadsProvider::new(dirs, fs, folders.downloads(), launcher.clone(), clip.clone(), Arc::new(FakeFileOps::default()), clock());
         Dl { p, rx, launcher, clip }
     }
 
@@ -379,6 +385,7 @@ mod tests {
             known().recent(),
             Arc::new(RecordingLauncher::default()),
             Arc::new(FakeClipboard::default()),
+            Arc::new(FakeFileOps::default()),
             clock(),
         );
         Rc { p, rx }
@@ -448,6 +455,7 @@ mod tests {
             None,
             Arc::new(RecordingLauncher::default()),
             Arc::new(FakeClipboard::default()),
+            Arc::new(FakeFileOps::default()),
             clock(),
         );
         assert_eq!(titles(&p.query(&q(""))), [FOLDER_NOT_FOUND]);

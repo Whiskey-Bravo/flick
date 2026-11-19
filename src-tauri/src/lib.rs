@@ -196,7 +196,7 @@ impl Providers {
             windows: control.windows,
             system: control.system,
             status: control.status,
-            files: FilesProvider::new(launcher.clone(), Arc::new(WindowsClipboard)),
+            files: FilesProvider::new(launcher.clone(), Arc::new(WindowsClipboard), Arc::new(file_ops::SystemFileOps)),
             path: browse.path,
             downloads: browse.downloads,
             recent: browse.recent,
@@ -409,16 +409,17 @@ impl Browse {
         let store = Loader::new(on_ready, dirs::FRESH, dirs::SLOW);
         let clipboard: Arc<dyn clipboard::Clipboard> = Arc::new(WindowsClipboard);
         Browse {
-            path: Arc::new(PathProvider::new(dirs.clone(), fs.clone(), home, launcher.clone(), clipboard.clone())),
+            path: Arc::new(PathProvider::new(dirs.clone(), fs.clone(), home, launcher.clone(), clipboard.clone(), Arc::new(file_ops::SystemFileOps))),
             downloads: Arc::new(DownloadsProvider::new(
                 dirs,
                 fs.clone(),
                 downloads,
                 launcher.clone(),
                 clipboard.clone(),
+                Arc::new(file_ops::SystemFileOps),
                 now.clone(),
             )),
-            recent: Arc::new(RecentProvider::new(store, fs, links, recent, launcher, clipboard, now)),
+            recent: Arc::new(RecentProvider::new(store, fs, links, recent, launcher, clipboard, Arc::new(file_ops::SystemFileOps), now)),
         }
     }
 }
@@ -1179,6 +1180,11 @@ fn setup(app: &AppHandle) {
         save_qr: Box::new(save_qr_window(app.clone(), saved_notifier)),
         settle: after_hide::settle,
         shows: window::shows,
+        ops: Arc::new(file_ops::SystemFileOps),
+        reopen: {
+            let app = app.clone();
+            Box::new(move |error| window::reopen(&app, "", error))
+        },
     }));
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);

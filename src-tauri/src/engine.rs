@@ -686,7 +686,7 @@ mod tests {
         let dirs = Loader::new(Arc::new(move || {
             let _ = tx.lock().unwrap().send(());
         }), FRESH, SLOW);
-        let path = Arc::new(PathProvider::new(dirs, fs, None, Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default())));
+        let path = Arc::new(PathProvider::new(dirs, fs, None, Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()), Arc::new(crate::file_ops::FakeFileOps::default())));
         let (e, ranking, history, pins, _dir) = engine_stores(Vec::new());
         let e = e.with_path(path);
         assert_eq!(e.unfold(r"C:\Work\").state, "reading");

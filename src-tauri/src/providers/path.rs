@@ -11,11 +11,11 @@ use std::sync::Arc;
 use super::files::file_icon;
 use crate::clipboard::Clipboard;
 use crate::cloud_roots::{self, CloudRoots};
-use crate::file_ops;
+use crate::file_ops::{self, FileOps};
 use crate::dirs::{folder_key, size_text, DirEntry, FileSystem, Load, Loader};
 use crate::fuzzy;
 use crate::launch::Launcher;
-use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
 
 const NAME: &str = "path";
 pub(crate) const READING: &str = "Reading…";
@@ -165,15 +165,57 @@ pub(crate) fn open_entry(fs: &dyn FileSystem, launcher: &dyn Launcher, id: &str,
 }
 
 /// The actions menu of a file or folder row.
-pub(crate) fn act_on_entry(fs: &dyn FileSystem, launcher: &dyn Launcher, clipboard: &dyn Clipboard, id: &str, action: Action) -> Result<Outcome, String> {
-    if id.starts_with(INERT) || !matches!(action, Action::Reveal | Action::OpenFolder | Action::CopyPath) {
+pub(crate) fn act_on_entry(
+    fs: &dyn FileSystem,
+    launcher: &dyn Launcher,
+    clipboard: &dyn Clipboard,
+    ops: &dyn FileOps,
+    id: &str,
+    action: Action,
+) -> Result<Outcome, String> {
+    if id.starts_with(INERT) || !handled(id, action) {
         return Err(CANT_DO.into());
     }
     let path = checked(fs, id)?;
     match action {
         Action::Reveal => launcher.reveal(path)?,
         Action::OpenFolder => launcher.open(id)?,
-        _ => clipboard.set_text(path)?,
+        Action::CopyPath => clipboard.set_text(path)?,
+        _ => return run_entry_action(ops, path, action),
+    }
+    Ok(Outcome::Hide)
+}
+
+/// Whether the actions menu of the row `id` handles `action` (Rename, Delete
+/// and More options are not built yet; a drive root cannot be changed).
+pub(crate) fn handled(id: &str, action: Action) -> bool {
+    match action {
+        Action::Reveal
+        | Action::OpenFolder
+        | Action::CopyPath
+        | Action::OpenTerminal
+        | Action::Properties
+        | Action::OpenWith
+        | Action::CopyFile => true,
+        Action::Compress | Action::KeepOffline | Action::FreeUpSpace => !file_ops::is_drive_root(id),
+        _ => false,
+    }
+}
+
+/// The actions that go through [`FileOps`], on `path` (already checked to
+/// exist). Compress and the cloud pair run once the bar has hidden.
+pub(crate) fn run_entry_action(ops: &dyn FileOps, path: &str, action: Action) -> Result<Outcome, String> {
+    let p = Path::new(path);
+    let later = |then| Ok(Outcome::HideThen { then });
+    match action {
+        Action::OpenTerminal => ops.open_terminal(p)?,
+        Action::Properties => ops.properties(p)?,
+        Action::OpenWith => ops.open_with(p)?,
+        Action::CopyFile => ops.copy_file(p)?,
+        Action::Compress => return later(Then::Compress { path: path.to_string() }),
+        Action::KeepOffline => return later(Then::CloudPin { path: path.to_string(), keep: true }),
+        Action::FreeUpSpace => return later(Then::CloudPin { path: path.to_string(), keep: false }),
+        _ => return Err(CANT_DO.into()),
     }
     Ok(Outcome::Hide)
 }
@@ -248,6 +290,7 @@ pub struct PathProvider {
     home: Option<PathBuf>,
     launcher: Arc<dyn Launcher>,
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
 }
 
 impl PathProvider {
@@ -257,8 +300,9 @@ impl PathProvider {
         home: Option<PathBuf>,
         launcher: Arc<dyn Launcher>,
         clipboard: Arc<dyn Clipboard>,
+        ops: Arc<dyn FileOps>,
     ) -> Self {
-        Self { dirs, fs, home, launcher, clipboard }
+        Self { dirs, fs, home, launcher, clipboard, ops }
     }
 
     /// What the folder under a row has to show: memory only, like `query`. A
@@ -353,7 +397,7 @@ impl Provider for PathProvider {
     }
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
-        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, id, action)
+        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
     }
 
     /// Typed paths are never learned.
@@ -384,6 +428,7 @@ mod tests {
     use crate::clipboard::FakeClipboard;
     use crate::dirs::testing::{file, folder, FakeFs};
     use crate::dirs::{ReadError, FRESH, SLOW};
+    use crate::file_ops::FakeFileOps;
     use crate::launch::testing::RecordingLauncher;
     use std::sync::mpsc::{self, Receiver};
     use std::sync::Mutex;
@@ -396,6 +441,7 @@ mod tests {
         fs: Arc<FakeFs>,
         launcher: Arc<RecordingLauncher>,
         clip: Arc<FakeClipboard>,
+        ops: Arc<FakeFileOps>,
         rx: Receiver<()>,
     }
 
@@ -419,6 +465,7 @@ mod tests {
         let fs = Arc::new(fs);
         let launcher = Arc::new(RecordingLauncher::default());
         let clip = Arc::new(FakeClipboard::default());
+        let ops = Arc::new(FakeFileOps::default());
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
         let dirs = Loader::new(
@@ -428,8 +475,8 @@ mod tests {
             FRESH,
             slow,
         );
-        let p = PathProvider::new(dirs, fs.clone(), Some(PathBuf::from(HOME)), launcher.clone(), clip.clone());
-        Rig { p, fs, launcher, clip, rx }
+        let p = PathProvider::new(dirs, fs.clone(), Some(PathBuf::from(HOME)), launcher.clone(), clip.clone(), ops.clone());
+        Rig { p, fs, launcher, clip, ops, rx }
     }
 
     /// `C:\` holds two folders and two files; the home folder `Documents` and `notes.txt`.
@@ -506,9 +553,66 @@ mod tests {
         assert_eq!(row(r"C:\Cloud\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
         assert_eq!(row(r"C:\CloudBackup\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
         assert_eq!(row(r"C:\", true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
-        // The new entries are not handled yet.
+        // Rename, Delete and More options are not handled yet.
         let r = rig();
-        assert_eq!(r.p.act(r"C:\a.txt", Rename), Err("can't do that here".to_string()));
+        for action in [Rename, Delete, MoreOptions] {
+            assert_eq!(r.p.act(r"C:\a.txt", action), Err("can't do that here".to_string()));
+        }
+        assert!(r.ops.calls().is_empty());
+    }
+
+    #[test]
+    fn act_dispatches_each_entry() {
+        use Action::*;
+        let r = rig();
+        let a = r.ready(r"C:\").into_iter().find(|x| x.id == r"C:\a.txt").unwrap();
+        let games = r.ready(r"C:\").into_iter().find(|x| x.id == r"C:\Games\").unwrap();
+        assert_eq!(r.p.act(&games.id, OpenTerminal), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&games.id, Properties), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&a.id, Properties), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&a.id, OpenWith), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&a.id, CopyFile), Ok(Outcome::Hide));
+        assert_eq!(
+            r.ops.calls(),
+            [
+                r"open_terminal C:\Games",
+                r"properties C:\Games",
+                r"properties C:\a.txt",
+                r"open_with C:\a.txt",
+                r"copy_file C:\a.txt"
+            ]
+        );
+        assert!(r.launcher.calls().is_empty() && r.clip.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compress_and_cloud_run_after_hide() {
+        use Action::*;
+        let r = rig();
+        let then = |action, id: &str| match r.p.act(id, action) {
+            Ok(Outcome::HideThen { then }) => then,
+            other => panic!("{action:?}: {other:?}"),
+        };
+        assert_eq!(then(Compress, r"C:\Games\"), Then::Compress { path: r"C:\Games".into() });
+        assert_eq!(then(KeepOffline, r"C:\a.txt"), Then::CloudPin { path: r"C:\a.txt".into(), keep: true });
+        assert_eq!(then(FreeUpSpace, r"C:\a.txt"), Then::CloudPin { path: r"C:\a.txt".into(), keep: false });
+        assert!(r.ops.calls().is_empty(), "the work waits for the bar to hide");
+        // A drive root cannot be compressed or kept offline.
+        for action in [Compress, KeepOffline, FreeUpSpace] {
+            assert_eq!(r.p.act(r"C:\", action), Err("can't do that here".to_string()));
+        }
+    }
+
+    #[test]
+    fn act_on_a_missing_path_fails_without_calling_ops() {
+        use Action::*;
+        let r = rig();
+        r.fs.set_kind(r"C:\a.txt", None);
+        for action in [OpenTerminal, Properties, OpenWith, CopyFile, Compress, KeepOffline, FreeUpSpace] {
+            assert_eq!(r.p.act(r"C:\a.txt", action), Err(NOT_FOUND.to_string()), "{action:?}");
+            assert_eq!(r.p.act(r"C:\gone\", action), Err(NOT_FOUND.to_string()), "{action:?}");
+        }
+        assert!(r.ops.calls().is_empty());
     }
 
     #[test]

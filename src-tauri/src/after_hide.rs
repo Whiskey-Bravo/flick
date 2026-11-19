@@ -2,10 +2,12 @@
 //! front, Windows' clipboard history, the snip overlay, the colour picker and
 //! the Start menu.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::commands::AfterHide;
+use crate::file_ops::FileOps;
 use crate::launch::Launcher;
 use crate::paste::{paste_into, Desktop, PASTE_WAIT, POLL};
 use crate::provider::Then;
@@ -25,6 +27,22 @@ pub struct FollowUps {
     pub settle: fn(),
     /// How many times the bar has been shown (`window::shows`).
     pub shows: fn() -> u64,
+    /// Compress and the cloud keep/free pair.
+    pub ops: Arc<dyn FileOps>,
+    /// Brings the bar back with an error shown.
+    pub reopen: Box<dyn Fn(&str) + Send + Sync>,
+}
+
+impl FollowUps {
+    /// Shows `error` in the bar again, unless the bar has been shown since the
+    /// action started: it then belongs to something else.
+    fn report(&self, result: Result<(), String>, started: u64) {
+        if let Err(error) = result {
+            if (self.shows)() == started {
+                (self.reopen)(&error);
+            }
+        }
+    }
 }
 
 impl AfterHide for FollowUps {
@@ -59,6 +77,8 @@ impl AfterHide for FollowUps {
                 (self.settle)();
                 let _ = self.desktop.open_start_menu();
             }
+            Then::Compress { path } => self.report(self.ops.compress(Path::new(&path)).map(|_| ()), started),
+            Then::CloudPin { path, keep } => self.report(self.ops.set_cloud_pin(Path::new(&path), keep), started),
         }
     }
 }
@@ -77,6 +97,7 @@ pub fn settle() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::file_ops::FakeFileOps;
     use crate::launch::testing::RecordingLauncher;
     use crate::paste::FakeDesktop;
     use std::cell::Cell;
@@ -112,6 +133,8 @@ mod tests {
             save_qr: Box::new(move |text| saved_in.lock().unwrap().push(text.to_string())),
             settle: count_settle,
             shows: || 3,
+            ops: Arc::new(FakeFileOps::default()),
+            reopen: Box::new(|_| {}),
         };
         let keys = |d: &FakeDesktop, key: &str| d.calls().iter().filter(|c| *c == key).count();
 
@@ -157,6 +180,8 @@ mod tests {
             save_qr: Box::new(|_| {}),
             settle: count_settle,
             shows: || 3,
+            ops: Arc::new(FakeFileOps::default()),
+            reopen: Box::new(|_| {}),
         }
     }
 
@@ -178,5 +203,52 @@ mod tests {
         let desktop = Arc::new(FakeDesktop::new(vec![Some(7)]));
         paste_follow(desktop.clone()).run(Then::Paste { before: 0 }, 2);
         assert!(desktop.calls().iter().all(|c| c != "ctrl_v" && !c.starts_with("bring_to_front")));
+    }
+
+    /// Follow-ups over a fake file ops; `reopened` collects the errors shown.
+    fn file_follow(ops: Arc<FakeFileOps>, shows: fn() -> u64, reopened: Arc<std::sync::Mutex<Vec<String>>>) -> FollowUps {
+        FollowUps {
+            desktop: Arc::new(FakeDesktop::new(vec![Some(7)])),
+            launcher: Arc::new(RecordingLauncher::default()),
+            previous: || Some(7),
+            pick_color: Box::new(|| {}),
+            save_qr: Box::new(|_| {}),
+            settle: count_settle,
+            shows,
+            ops,
+            reopen: Box::new(move |error| reopened.lock().unwrap().push(error.to_string())),
+        }
+    }
+
+    #[test]
+    fn compress_and_cloud_pin_reach_the_ops() {
+        let ops = Arc::new(FakeFileOps::default());
+        let reopened = Arc::default();
+        let follow = file_follow(ops.clone(), || 3, Arc::clone(&reopened));
+        follow.run(Then::Compress { path: r"C:\d\a.txt".into() }, 3);
+        follow.run(Then::CloudPin { path: r"C:\d\b.txt".into(), keep: true }, 3);
+        follow.run(Then::CloudPin { path: r"C:\d\c.txt".into(), keep: false }, 3);
+        assert_eq!(
+            ops.calls(),
+            [r"compress C:\d\a.txt", r"set_cloud_pin C:\d\b.txt true", r"set_cloud_pin C:\d\c.txt false"]
+        );
+        assert!(reopened.lock().unwrap().is_empty(), "success shows nothing");
+    }
+
+    #[test]
+    fn after_hide_reopens_on_failure_only_in_the_same_session() {
+        let ops = Arc::new(FakeFileOps::default());
+        ops.fail("compress", "disk full");
+        ops.fail("set_cloud_pin", "access denied");
+        let reopened = Arc::default();
+        let follow = file_follow(ops.clone(), || 3, Arc::clone(&reopened));
+        follow.run(Then::Compress { path: r"C:\d\a.txt".into() }, 3);
+        follow.run(Then::CloudPin { path: r"C:\d\a.txt".into(), keep: true }, 3);
+        assert_eq!(*reopened.lock().unwrap(), ["disk full", "access denied"]);
+        // The bar was shown again since: the error stays unsaid.
+        follow.run(Then::Compress { path: r"C:\d\a.txt".into() }, 2);
+        follow.run(Then::CloudPin { path: r"C:\d\a.txt".into(), keep: false }, 2);
+        assert_eq!(reopened.lock().unwrap().len(), 2);
+        assert_eq!(ops.calls().len(), 4, "the work still ran");
     }
 }

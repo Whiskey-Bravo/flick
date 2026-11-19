@@ -213,6 +213,14 @@ fn environment_block(base: impl Iterator<Item = (String, String)>, extra: &[(Str
     block
 }
 
+/// Starts `program` with `args` (each one argument, quoted for CreateProcess)
+/// in `cwd`, in a console window of its own when it is a console program.
+/// Not waited for.
+pub(crate) fn start_in(program: &str, args: &[String], cwd: &str) -> Result<(), String> {
+    let params = args.iter().map(|a| crate::quote::quote_argv(a)).collect::<Vec<_>>().join(" ");
+    create_process(&CommandLine { program: program.to_string(), params, hidden: false }, &[], Some(cwd))
+}
+
 /// Start `line` directly with `env` (values through `windows_env_value`)
 /// added to this process's environment. `CreateProcessW` with no inherited
 /// handles and no `STARTF_USESTDHANDLES`, so a visible console

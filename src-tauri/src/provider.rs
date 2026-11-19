@@ -131,6 +131,10 @@ pub enum Then {
     StartMenu,
     /// Asks where to save the QR code for `text`, then saves it.
     SaveQr { text: String },
+    /// Zips the item next to itself.
+    Compress { path: String },
+    /// Cloud files: keep on this device (`keep`) or online only.
+    CloudPin { path: String, keep: bool },
 }
 
 #[derive(Debug, PartialEq, serde::Serialize)]
