@@ -97,7 +97,7 @@ impl TimersProvider {
         let tomorrow = now_z.date().tomorrow().ok();
         let day = if Some(due_z.date()) == tomorrow { "tomorrow, " } else { "" };
         row(
-            format!("set:{due}:r:{text}"),
+            format!("set:{}:r:{text}", when_id(when)),
             format!("Remind at {} \u{2014} {text}", self.clock_text(due)),
             format!("{day}in {left}"),
             false,
@@ -126,15 +126,19 @@ impl TimersProvider {
         rows
     }
 
+    /// A reminder, due as worked out at Enter (not when the row was shown):
+    /// `remind 20m` counts from Enter, and `18:30` that has just passed means tomorrow.
     fn set(&self, rest: &str) -> Result<Outcome, String> {
         let mut parts = rest.splitn(3, ':');
-        let (Some(due), Some(kind), Some(text)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(when), Some(kind), Some(text)) = (parts.next(), parts.next(), parts.next()) else {
             return Err(unknown());
         };
-        let due: i64 = due.parse().map_err(|_| unknown())?;
-        if kind != "r" {
+        let when = parse_when_id(when).ok_or_else(unknown)?;
+        if kind != "r" || matches!(when, When::In(d) if d > MAX_AHEAD) {
             return Err(unknown());
         }
+        let now_z = self.zoned(self.now_secs()).ok_or_else(unknown)?;
+        let due = due_at(when, &now_z).timestamp().as_second();
         self.reminders.add(from_unix(due), text, false)?;
         Ok(Outcome::Hide)
     }
@@ -151,6 +155,31 @@ impl TimersProvider {
         self.reminders.add(from_unix(due), &timer_label(d), true)?;
         Ok(Outcome::Hide)
     }
+}
+
+/// `when` in a row id, without `:`: `in1200`, `at1830`, or `tm0900` for tomorrow.
+fn when_id(when: When) -> String {
+    match when {
+        When::In(d) => format!("in{}", d.as_secs()),
+        When::At { hour, minute, tomorrow } => format!("{}{hour:02}{minute:02}", if tomorrow { "tm" } else { "at" }),
+    }
+}
+
+/// The `When` of [`when_id`]; `None` for anything else.
+fn parse_when_id(s: &str) -> Option<When> {
+    if let Some(secs) = s.strip_prefix("in") {
+        return Some(When::In(Duration::from_secs(secs.parse().ok()?)));
+    }
+    let (tomorrow, hhmm) = match s.split_at_checked(2)? {
+        ("at", hhmm) => (false, hhmm),
+        ("tm", hhmm) => (true, hhmm),
+        _ => return None,
+    };
+    if hhmm.len() != 4 || !hhmm.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (hour, minute) = (hhmm[..2].parse::<u8>().ok()?, hhmm[2..].parse::<u8>().ok()?);
+    (hour < 24 && minute < 60).then_some(When::At { hour, minute, tomorrow })
 }
 
 /// `Timer 5 min`.
@@ -312,8 +341,8 @@ mod tests {
         assert_eq!(r[0].title, "Remind at 14:47 \u{2014} pizza");
         assert_eq!(r[0].subtitle, "in 20 min");
         assert_eq!(r[0].icon, "builtin:timer");
-        let due = "2026-11-17T14:47:00Z".parse::<jiff::Timestamp>().unwrap().as_second();
-        assert_eq!(r[0].id, format!("set:{due}:r:pizza"));
+        assert_eq!(r[0].id, "set:in1200:r:pizza");
+        assert_eq!(rows(&g.p, "remind tomorrow 9:05 x")[0].id, "set:tm0905:r:x");
         let r = rows(&g.p, "remind 13:00 call mum");
         assert_eq!(r[0].title, "Remind at 13:00 \u{2014} call mum");
         assert_eq!(r[0].subtitle, "tomorrow, in 22 h 33 min");
@@ -327,6 +356,24 @@ mod tests {
         assert_eq!(r[0].subtitle, "in 3 d");
         assert_eq!(rows(&g.p, "remind 34h x")[0].subtitle, "in 1 d 10 h");
         assert_eq!(rows(&g.p, "remind 10h x")[0].subtitle, "tomorrow, in 10 h");
+    }
+
+    #[test]
+    fn a_reminder_is_due_as_worked_out_at_enter() {
+        let g = rig();
+        let after_20m = rows(&g.p, "remind 20m pizza")[0].id.clone();
+        let at_1430 = rows(&g.p, "remind 14:30 tea")[0].id.clone();
+        // Five minutes pass between the rows and Enter.
+        *g.now.lock().unwrap() += Duration::from_secs(300);
+        assert_eq!(g.p.activate(&after_20m, Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(g.p.activate(&at_1430, Modifier::None), Ok(Outcome::Hide));
+        let due = |s: &str| s.parse::<jiff::Timestamp>().unwrap().as_second();
+        let pending: Vec<(i64, String)> = g.reminders.pending().into_iter().map(|r| (r.due, r.text)).collect();
+        // 20 minutes from Enter; 14:30 has passed by then, so tomorrow.
+        assert_eq!(pending, [(due("2026-11-17T14:52:00Z"), "pizza".into()), (due("2026-11-18T14:30:00Z"), "tea".into())]);
+        for bad in ["set:in999999999:r:x", "set:at2500:r:x", "set:at930:r:x", "set:xx0930:r:x", "set:1:r:x", "set:in5:t:x"] {
+            assert_eq!(g.p.activate(bad, Modifier::None), Err(unknown()), "{bad}");
+        }
     }
 
     #[test]
