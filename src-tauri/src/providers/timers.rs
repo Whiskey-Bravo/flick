@@ -2,7 +2,7 @@
 //! list and cancel pending ones. Rows are never learned; the query reads only
 //! memory (the reminder thread reads the file).
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use jiff::tz::TimeZone;
@@ -32,13 +32,20 @@ pub const WORDS: [&str; 4] = ["timer", "remind", "timers", "reminders"];
 pub struct TimersProvider {
     reminders: Arc<Reminders>,
     now: Clock,
-    tz: TimeZone,
+    /// The PC's zone: read at start, and again each time the bar is shown (`set_zone`).
+    tz: RwLock<TimeZone>,
     on_ready: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl TimersProvider {
     pub fn new(reminders: Arc<Reminders>, now: Clock, tz: TimeZone, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { reminders, now, tz, on_ready }
+        Self { reminders, now, tz: RwLock::new(tz), on_ready }
+    }
+
+    /// The PC's time zone changed (or may have): memory only. Reminders already
+    /// set keep their moment; new ones and the shown times use the new zone.
+    pub fn set_zone(&self, tz: TimeZone) {
+        *self.tz.write().unwrap_or_else(|e| e.into_inner()) = tz;
     }
 
     /// Now, in whole seconds rounded up (as dues are).
@@ -47,7 +54,8 @@ impl TimersProvider {
     }
 
     fn zoned(&self, secs: i64) -> Option<Zoned> {
-        Some(Timestamp::from_second(secs).ok()?.to_zoned(self.tz.clone()))
+        let tz = self.tz.read().unwrap_or_else(|e| e.into_inner()).clone();
+        Some(Timestamp::from_second(secs).ok()?.to_zoned(tz))
     }
 
     fn clock_text(&self, secs: i64) -> String {
@@ -319,6 +327,18 @@ mod tests {
         assert_eq!(r[0].subtitle, "in 3 d");
         assert_eq!(rows(&g.p, "remind 34h x")[0].subtitle, "in 1 d 10 h");
         assert_eq!(rows(&g.p, "remind 10h x")[0].subtitle, "tomorrow, in 10 h");
+    }
+
+    #[test]
+    fn a_new_time_zone_is_used_once_set() {
+        let g = rig();
+        let id = rows(&g.p, "timer 5m")[0].id.clone();
+        g.p.activate(&id, Modifier::None).unwrap();
+        g.p.set_zone(jiff::tz::TimeZone::fixed(jiff::tz::offset(2)));
+        assert_eq!(titles(&g.p, "timer 5m"), ["Timer 5 min \u{2014} rings at 16:32"]);
+        assert_eq!(rows(&g.p, "timers")[0].subtitle, "rings at 16:32 \u{2014} 5 min left");
+        assert_eq!(titles(&g.p, "remind 18:30 x"), ["Remind at 18:30 \u{2014} x"]);
+        assert_eq!(rows(&g.p, "remind 18:30 x")[0].subtitle, "in 2 h 3 min");
     }
 
     #[test]

@@ -233,6 +233,12 @@ impl Providers {
         cloud_roots::shared().refresh_if_due();
         // Store installs (and, without a watcher, shortcuts): a background thread.
         self.apps.refresh_on_show();
+        // The time zone may have changed while Flick ran (travel, a manual
+        // change). Read here, not on the query path: it is quick, as the zone
+        // data is built into Flick.
+        let tz = jiff::tz::TimeZone::system();
+        self.answers.set_zone(tz.clone());
+        self.timers.set_zone(tz);
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
