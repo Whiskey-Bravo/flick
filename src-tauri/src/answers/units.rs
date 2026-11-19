@@ -120,9 +120,10 @@ static UNITS: &[Unit] = &[
     u("week", "wk", Duration, &["wk", "week", "weeks"], 604800.0),
 ];
 
-/// EUR plus the codes in the ECB daily reference-rate file.
+/// EUR plus the codes in the ECB daily reference-rate file. BGN left it when
+/// Bulgaria took the euro (1 January 2026).
 pub const CURRENCIES: &[&str] = &[
-    "EUR", "USD", "JPY", "BGN", "CZK", "DKK", "GBP", "HUF", "PLN", "RON", "SEK", "CHF", "ISK",
+    "EUR", "USD", "JPY", "CZK", "DKK", "GBP", "HUF", "PLN", "RON", "SEK", "CHF", "ISK",
     "NOK", "TRY", "AUD", "BRL", "CAD", "CNY", "HKD", "IDR", "ILS", "INR", "KRW", "MXN", "MYR",
     "NZD", "PHP", "SGD", "THB", "ZAR",
 ];
@@ -284,6 +285,7 @@ mod tests {
         assert_eq!(m("$20"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("20 usd"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("20 xyz in eur"), None);
+        assert_eq!(m("20 bgn in eur"), None, "the euro since 2026: no ECB rate");
         assert_eq!(m("20$"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("20usd"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("£5"), Some((5.0, "GBP".into(), None)));

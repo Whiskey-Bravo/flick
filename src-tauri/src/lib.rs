@@ -2182,6 +2182,7 @@ mod tests {
         );
         // Not an ECB currency, or none: EUR.
         assert_eq!(answers_config(&Config::default(), &Region(Some("XAF"), false)).currency, "EUR");
+        assert_eq!(answers_config(&Config::default(), &Region(Some("BGN"), false)).currency, "EUR");
         assert_eq!(answers_config(&Config::default(), &Region(None, false)).currency, "EUR");
         let set = Config {
             online: false,
