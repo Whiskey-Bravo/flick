@@ -17,7 +17,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[cfg(test)]
 use super::files_scan::skip_by_attributes;
-use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Sizes, Slot};
+use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Memory, Sizes, Slot};
 use crate::clipboard::Clipboard;
 use crate::fuzzy;
 use crate::launch::Launcher;
@@ -226,14 +226,67 @@ struct WatchState {
     /// Changes may have happened that no scan has seen yet. Set whenever the
     /// watcher cannot vouch for the index; cleared when a scan starts.
     dirty: AtomicBool,
-    /// Every root is under a live watcher.
+    /// Every root is under a live watcher that can be trusted to report.
     watching: AtomicBool,
+    /// Each root and whether it existed when the watch was set up.
+    seen: Mutex<Vec<(PathBuf, bool)>>,
 }
 
 impl WatchState {
+    /// Called once the watches are set up: remembers which roots exist, and
+    /// vouches (`watching`) only when every root is watched (`all_watched`)
+    /// and is on a local fixed drive (see [`root_is_trusted`]).
+    fn arm(&self, roots: &[PathBuf], all_watched: bool, exists: impl Fn(&Path) -> bool, fixed: impl Fn(char) -> bool) {
+        let trusted = roots.iter().all(|r| root_is_trusted(r, &fixed));
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = roots.iter().map(|r| (r.clone(), exists(r))).collect();
+        self.watching.store(all_watched && trusted, Ordering::SeqCst);
+    }
+
+    /// A root that went away, or came back, without the watcher saying so
+    /// (an ejected drive, a dropped share): stops vouching and marks dirty.
+    /// It stays unwatched until the next `watch` or `set_roots`, so every
+    /// tick then scans (today's behaviour).
+    fn check_roots(&self, exists: impl Fn(&Path) -> bool) {
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.iter().any(|(root, was)| exists(root) != *was) {
+            self.dirty.store(true, Ordering::SeqCst);
+            self.watching.store(false, Ordering::SeqCst);
+        }
+    }
+
     fn periodic_due(&self) -> bool {
         periodic_due(self.dirty.load(Ordering::SeqCst), self.watching.load(Ordering::SeqCst))
     }
+}
+
+/// Whether events from `root` can be trusted: only a folder on a local fixed
+/// drive. UNC paths (network shares) and anything without a drive letter are
+/// not; `fixed` says whether a drive letter is a fixed disk.
+fn root_is_trusted(root: &Path, fixed: impl Fn(char) -> bool) -> bool {
+    let text = root.to_string_lossy().replace('/', r"\");
+    // `\\?\C:\...` is a drive path; `\\?\UNC\...` and `\\server\...` are not.
+    let text = match text.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None if text.starts_with(r"\\") => return false,
+        None => text,
+    };
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => fixed(letter),
+        _ => false,
+    }
+}
+
+/// Whether drive `letter` is a fixed disk (not removable, network or unknown).
+fn os_drive_is_fixed(letter: char) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_FIXED: u32 = 3;
+    unsafe { GetDriveTypeW(&HSTRING::from(format!(r"{letter}:\"))) == DRIVE_FIXED }
+}
+
+fn path_exists(p: &Path) -> bool {
+    p.exists()
 }
 
 /// Whether an event the rescan logic ignores could still be a change to the
@@ -280,7 +333,9 @@ fn on_watch_result(
         return None;
     }
     let roots = roots.lock().unwrap_or_else(|e| e.into_inner());
-    // A root that goes away is no longer watched, even if it comes back.
+    // A root that goes away is no longer watched, even if it comes back: it
+    // stays unwatched until the next `watch`/`set_roots`, so every tick scans
+    // (today's behaviour).
     if event_ends_a_root(&event.kind, &event.paths, &roots) {
         state.watching.store(false, Ordering::SeqCst);
         state.dirty.store(true, Ordering::SeqCst);
@@ -462,7 +517,7 @@ impl FilesProvider {
             for r in &roots {
                 all &= w.watch(r, RecursiveMode::Recursive).is_ok();
             }
-            self.watch_state.watching.store(all, Ordering::SeqCst);
+            self.watch_state.arm(&roots, all, path_exists, os_drive_is_fixed);
         }
     }
 
@@ -484,10 +539,14 @@ impl FilesProvider {
     /// watcher lost track of something, or there is none).
     pub fn refresh_if_due(&self) {
         let home = self.home.clone();
-        self.refresh_if_due_using(|roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint));
+        self.refresh_if_due_using(
+            |roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint),
+            path_exists,
+        );
     }
 
-    fn refresh_if_due_using(&self, scan: impl FnMut(&[PathBuf], Sizes) -> Index) {
+    fn refresh_if_due_using(&self, scan: impl FnMut(&[PathBuf], Sizes) -> Index, exists: impl Fn(&Path) -> bool) {
+        self.watch_state.check_roots(exists);
         if self.watch_state.periodic_due() {
             self.refresh_using(scan);
         }
@@ -551,15 +610,17 @@ impl FilesProvider {
             let hint = self.index.read().unwrap_or_else(|e| e.into_inner()).sizes();
             let fresh = scan(&self.roots(), hint);
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, Some(started.elapsed())));
+            // Measured before the write lock is taken (it walks every folder).
+            let measured = timing::enabled().then(|| (fresh.len(), fresh.memory()));
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
-                if timing::enabled() {
-                    record_memory(&fresh);
-                }
                 let old = std::mem::replace(&mut *index, fresh);
                 self.scanned.store(true, Ordering::SeqCst);
                 drop(index);
                 drop(old); // freed outside the lock
+                if let Some((entries, m)) = measured {
+                    record_memory(entries, m);
+                }
                 return;
             }
         }
@@ -596,7 +657,7 @@ impl FilesProvider {
                 }
             }
         }
-        self.watch_state.watching.store(all, Ordering::SeqCst);
+        self.watch_state.arm(&self.roots(), all, path_exists, os_drive_is_fixed);
         let weak = Arc::downgrade(self);
         std::thread::spawn(move || {
             // Ends when the watcher (and with it `tx`) or the provider is dropped.
@@ -642,10 +703,11 @@ impl FilesProvider {
     }
 }
 
-/// Records the size of a freshly built index when timing is on.
-fn record_memory(index: &Index) {
-    let m = index.memory();
-    timing::mark("index.entries", index.len() as u64);
+/// Records the size of a freshly built index (the caller checks that timing
+/// is on). The `index.*` marks carry a count or kilobytes in the log's
+/// `micros` field, not a time.
+fn record_memory(entries: usize, m: Memory) {
+    timing::mark("index.entries", entries as u64);
     timing::mark("index.used_kb", (m.used / 1024) as u64);
     timing::mark("index.reserved_kb", (m.reserved / 1024) as u64);
     timing::mark("index.norms_kb", (m.norms / 1024) as u64);
@@ -1600,10 +1662,17 @@ mod tests {
     }
 
     fn tick(p: &FilesProvider, scans: &mut usize) {
-        p.refresh_if_due_using(|_, _| {
-            *scans += 1;
-            Index::default()
-        });
+        tick_with(p, scans, path_exists);
+    }
+
+    fn tick_with(p: &FilesProvider, scans: &mut usize, exists: impl Fn(&Path) -> bool) {
+        p.refresh_if_due_using(
+            |_, _| {
+                *scans += 1;
+                Index::default()
+            },
+            exists,
+        );
     }
 
     fn event(kind: EventKind, path: &str) -> notify::Result<notify::Event> {
@@ -1756,6 +1825,118 @@ mod tests {
         p.set_roots(vec![dir.path().to_path_buf()]);
         p.watch().unwrap();
         assert!(p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    fn fixed_c_only(letter: char) -> bool {
+        letter.eq_ignore_ascii_case(&'c')
+    }
+
+    #[test]
+    fn only_roots_on_a_local_fixed_drive_are_trusted() {
+        let trusted = |p: &str| root_is_trusted(Path::new(p), fixed_c_only);
+        assert!(trusted(r"C:\Users\x"));
+        assert!(trusted(r"c:\"));
+        assert!(trusted("C:/Users/x"));
+        assert!(trusted(r"\\?\C:\Users\x"));
+        // Another kind of drive (removable, network, unknown).
+        assert!(!trusted(r"D:\Docs"));
+        assert!(!trusted(r"\\?\D:\Docs"));
+        // Network shares, whatever the spelling.
+        assert!(!trusted(r"\\server\share\Docs"));
+        assert!(!trusted("//server/share/Docs"));
+        assert!(!trusted(r"\\?\UNC\server\share"));
+        // No drive letter at all.
+        assert!(!trusted(r"Users\x"));
+        assert!(!trusted(""));
+        assert!(!trusted(r"1:\x"));
+    }
+
+    #[test]
+    fn the_real_drive_lookup_answers_for_the_system_drive() {
+        // A letter that cannot exist is not fixed (no panic either way).
+        assert!(!os_drive_is_fixed('#'));
+    }
+
+    #[test]
+    fn a_root_that_vanishes_between_ticks_is_rescanned_without_any_event() {
+        let (p, _) = provider(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        p.watch_state.arm(&[root.clone()], true, path_exists, |_| true);
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        let mut scans = 0;
+        // Unchanged root: no scan.
+        tick_with(&p, &mut scans, path_exists);
+        tick_with(&p, &mut scans, path_exists);
+        assert_eq!(scans, 0);
+        // The folder goes away, and no event arrives.
+        fs::remove_dir_all(&root).unwrap();
+        tick_with(&p, &mut scans, path_exists);
+        assert_eq!(scans, 1);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        // Unwatched from now on: every tick scans, as before this round.
+        tick_with(&p, &mut scans, path_exists);
+        assert_eq!(scans, 2);
+    }
+
+    #[test]
+    fn a_root_that_comes_back_is_noticed_too() {
+        let (p, _) = provider(vec![]);
+        let root = PathBuf::from(r"E:\usb\docs");
+        p.watch_state.arm(&[root.clone()], false, |_| false, |_| true);
+        // It was missing when the watch was set up (so not watched) ...
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        // ... and now it exists: the index is stale and the watch is not vouched for.
+        let mut scans = 0;
+        tick_with(&p, &mut scans, |_| true);
+        assert_eq!(scans, 1);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_network_root_is_never_vouched_for() {
+        let (p, _) = provider(vec![]);
+        let unc = PathBuf::from(r"\\server\share\docs");
+        p.watch_state.arm(&[unc.clone()], true, |_| true, fixed_c_only);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        let mut scans = 0;
+        for _ in 0..3 {
+            tick_with(&p, &mut scans, |_| true);
+        }
+        assert_eq!(scans, 3, "due on every tick while such a root is configured");
+        assert!(periodic_due(false, p.watch_state.watching.load(Ordering::SeqCst)));
+        // One untrusted root among local ones is enough.
+        p.watch_state.arm(&[PathBuf::from(r"C:\Users\x"), unc], true, |_| true, fixed_c_only);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        p.watch_state.arm(&[PathBuf::from(r"C:\Users\x")], true, |_| true, fixed_c_only);
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        // Not every root watched: not vouched for either.
+        p.watch_state.arm(&[PathBuf::from(r"C:\Users\x")], false, |_| true, fixed_c_only);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_change_driven_scan_clears_what_the_watcher_marked() {
+        use notify::event::CreateKind;
+        let p = watched_provider();
+        *p.roots.lock().unwrap() = vec![PathBuf::from(r"C:\Users\x")];
+        let sent = on_watch_result(&p.watch_state, &p.roots, event(EventKind::Create(CreateKind::File), r"C:\Users\x\new.txt"));
+        assert!(sent.is_some());
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst));
+        // The throttled rescan the watcher thread starts is `refresh`: same path as here.
+        let mut scans = 0;
+        p.refresh_using(|_, _| {
+            scans += 1;
+            Index::default()
+        });
+        assert_eq!(scans, 1);
+        assert!(!p.watch_state.dirty.load(Ordering::SeqCst));
+        // So the 30-minute tick has nothing left to do.
+        let mut ticks = 0;
+        tick_with(&p, &mut ticks, |_| true);
+        assert_eq!(ticks, 0);
     }
 
     fn temp_tree(files: usize) -> tempfile::TempDir {
