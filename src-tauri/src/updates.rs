@@ -1,6 +1,7 @@
 //! Self-updates: what the last check found, kept in memory only. The source
 //! (the updater plugin in the app, a fake in tests) does the network work.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -139,11 +140,13 @@ pub struct PluginSource {
     app: AppHandle,
     /// What the last check found, for `install`.
     found: Mutex<Option<Update>>,
+    /// The plugin ran its before-exit hook, so Flick's quit cleanup is done.
+    exiting: Arc<AtomicBool>,
 }
 
 impl PluginSource {
     pub fn new(app: AppHandle) -> Self {
-        Self { app, found: Mutex::new(None) }
+        Self { app, found: Mutex::new(None), exiting: Arc::default() }
     }
 }
 
@@ -152,14 +155,20 @@ impl UpdateSource for PluginSource {
         // Called from a worker thread, never from the main thread.
         let update = tauri::async_runtime::block_on(async {
             // On Windows the install ends the process itself (no `RunEvent::Exit`):
-            // its hook does Flick's quit cleanup, then what the plugin's own hook did.
+            // its hook does Flick's quit cleanup and hides the tray icon. The
+            // hook runs before the installer is started, and that can still
+            // fail with Flick running on, so nothing is done here that
+            // `install` can't undo (not `cleanup_before_exit`, which drops the
+            // tray icon for good).
             let app = self.app.clone();
+            let exiting = self.exiting.clone();
             let updater = self
                 .app
                 .updater_builder()
                 .on_before_exit(move || {
+                    exiting.store(true, Ordering::SeqCst);
                     crate::on_exit(&app);
-                    app.cleanup_before_exit();
+                    tray::set_visible(&app, false);
                 })
                 .build()
                 .map_err(|e| e.to_string())?;
@@ -176,8 +185,16 @@ impl UpdateSource for PluginSource {
         let Some(update) = found else {
             return Err("no update to install".into());
         };
-        tauri::async_runtime::block_on(update.download_and_install(|_, _| {}, || {}))
-            .map_err(|e| e.to_string())?;
+        let installed = tauri::async_runtime::block_on(update.download_and_install(|_, _| {}, || {}));
+        if let Err(e) = installed {
+            // The installer didn't start after the quit cleanup ran: Flick
+            // runs on, so the tray icon and the Win key come back.
+            if self.exiting.swap(false, Ordering::SeqCst) {
+                crate::resume_after_failed_install(&self.app);
+                tray::set_visible(&self.app, true);
+            }
+            return Err(e.to_string());
+        }
         // Only a fallback: on Windows the plugin has already exited the process.
         self.app.restart()
     }

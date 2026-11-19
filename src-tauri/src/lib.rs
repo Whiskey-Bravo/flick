@@ -1549,13 +1549,24 @@ pub(crate) fn on_exit(app: &AppHandle) {
     quit_cleanup(state.as_ref().map(|s| s.providers.reminders.as_ref()));
     // Ends the helper, and with it the hook. Stopping waits for the helper
     // process to go: it ends at once, and a stuck one is ended after 0.5 s.
+    // The worker is told too, so it doesn't start a new helper before the end.
     if let Some(state) = state {
-        state.win_key.flags.set_on(false);
+        state.win_key.want(false);
         let hook = state.win_key.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(hook) = hook {
             hook.stop();
         }
     }
+}
+
+/// The updater ran [`on_exit`] but the installer didn't start, so Flick runs
+/// on: the Win key is asked for again as the setting says. Takes the config
+/// lock, so never on the main thread (the updater installs on its own thread).
+pub(crate) fn resume_after_failed_install(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    // Under the config lock, like a reload, so the switches stay in order.
+    state.win_key.want(config.win_key);
 }
 
 /// A reminder change whose save failed is written now (or it would ring again
