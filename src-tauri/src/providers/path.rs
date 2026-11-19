@@ -90,6 +90,7 @@ pub(crate) fn entry_row(provider: &'static str, path: &Path, is_dir: bool, subti
         id.push('\\');
     }
     ResultItem {
+        folder: if is_dir { id.clone() } else { String::new() },
         id,
         provider,
         icon: file_icon(&title, is_dir),
@@ -191,6 +192,41 @@ pub(crate) fn score_in_order(rows: &mut [ResultItem]) {
     }
 }
 
+/// The most rows an unfolded folder shows.
+pub const UNFOLD_ROWS: usize = 15;
+
+/// What a folder's unfolded part has to show right now.
+#[derive(Debug, serde::Serialize)]
+pub struct Unfolded {
+    /// `reading`, `ready`, `missing` or `denied`.
+    pub state: &'static str,
+    pub rows: Vec<ResultItem>,
+    /// Entries left out beyond [`UNFOLD_ROWS`].
+    pub more: usize,
+    /// The folder as the bar types it (see [`typed_form`]).
+    pub typed: String,
+}
+
+/// The folder as typed into the bar: `~\rest\` when it is the home folder or
+/// under it (compared without regard to case), else the full path; always
+/// ends in `\`.
+pub fn typed_form(folder: &Path, home: Option<&Path>) -> String {
+    let full = folder.to_string_lossy().replace('/', "\\");
+    let full = full.trim_end_matches('\\');
+    let under_home = home.and_then(|h| {
+        let h = h.to_string_lossy().replace('/', "\\");
+        let h = h.trim_end_matches('\\').to_string();
+        let head = full.get(..h.len())?;
+        // A name that merely starts with the home's name is not under it.
+        (!h.is_empty() && head.eq_ignore_ascii_case(&h) && (full.len() == h.len() || full[h.len()..].starts_with('\\')))
+            .then(|| &full[h.len()..])
+    });
+    match under_home {
+        Some(rest) => format!("~{rest}\\"),
+        None => format!("{full}\\"),
+    }
+}
+
 pub struct PathProvider {
     dirs: Arc<Loader<Vec<DirEntry>>>,
     fs: Arc<dyn FileSystem>,
@@ -208,6 +244,38 @@ impl PathProvider {
         clipboard: Arc<dyn Clipboard>,
     ) -> Self {
         Self { dirs, fs, home, launcher, clipboard }
+    }
+
+    /// What the folder under a row has to show: memory only, like `query`. A
+    /// folder the loader has not read yet starts its read and answers
+    /// `reading`; the page asks again when the read is done. A path that is
+    /// not absolute is never handed to the file system.
+    pub fn unfold(&self, folder: &str) -> Unfolded {
+        let path = Path::new(folder);
+        let typed = typed_form(path, self.home.as_deref());
+        let answer = |state, rows, more| Unfolded { state, rows, more, typed: typed.clone() };
+        if !path.is_absolute() {
+            return answer("missing", Vec::new(), 0);
+        }
+        let (fs, dir) = (Arc::clone(&self.fs), path.to_path_buf());
+        let entries = match self.dirs.get(&folder_key(path), move || fs.read_dir(&dir)) {
+            Load::Pending => return answer("reading", Vec::new(), 0),
+            Load::NotFound => return answer("missing", Vec::new(), 0),
+            Load::Denied | Load::Slow => return answer("denied", Vec::new(), 0),
+            Load::Ready(entries) => entries,
+        };
+        // Folders first, then files, each by name without regard to case.
+        let mut sorted: Vec<(bool, String, &DirEntry)> = entries.iter().map(|e| (!e.is_dir, e.name.to_lowercase(), e)).collect();
+        sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)).then_with(|| a.2.name.cmp(&b.2.name)));
+        let rows = sorted
+            .iter()
+            .take(UNFOLD_ROWS)
+            .map(|(_, _, e)| {
+                let subtitle = if e.is_dir { "Folder".to_string() } else { size_text(e.size) };
+                entry_row(NAME, &path.join(&e.name), e.is_dir, subtitle, 0, String::new())
+            })
+            .collect();
+        answer("ready", rows, entries.len().saturating_sub(UNFOLD_ROWS))
     }
 }
 
@@ -252,6 +320,7 @@ impl Provider for PathProvider {
         if pq.filter.is_empty() {
             let mut own = entry_row(NAME, &pq.folder, true, "This folder".into(), 0, String::new());
             own.title = shown;
+            own.folder = String::new();
             rows.push(own);
         }
         let room = MAX_ROWS - rows.len();
@@ -432,6 +501,19 @@ mod tests {
     }
 
     #[test]
+    fn folder_rows_carry_their_path_with_a_backslash_and_files_and_the_top_row_do_not() {
+        let r = rig();
+        let rows = r.ready(r"C:\");
+        assert_eq!(rows[0].folder, "", "This folder");
+        assert_eq!(rows[1].folder, r"C:\Games\");
+        assert_eq!(rows[2].folder, r"C:\Users\");
+        assert_eq!(rows[3].folder, "");
+        assert_eq!(r.p.item(r"C:\Games\").unwrap().folder, r"C:\Games\");
+        assert_eq!(r.p.item(r"C:\a.txt").unwrap().folder, "");
+        assert_eq!(r.p.item(r"C:\").unwrap().folder, r"C:\");
+    }
+
+    #[test]
     fn filter_is_fuzzy_and_folders_stay_first() {
         let fs = FakeFs::default();
         fs.add_dir(r"C:\", vec![file("game.txt", 1), folder("Users"), folder("Games"), file("my game notes.md", 1), folder("Old games")]);
@@ -608,12 +690,169 @@ mod tests {
     }
 
     #[test]
+    fn typed_form_shortens_home_and_always_ends_with_a_backslash() {
+        let home = Some(Path::new(r"C:\Users\me"));
+        let form = |p: &str, h: Option<&Path>| typed_form(Path::new(p), h);
+        assert_eq!(form(r"C:\Users\me\Documents\Projects", home), r"~\Documents\Projects\");
+        assert_eq!(form(r"C:\Users\me", home), r"~\");
+        assert_eq!(form(r"C:\Users\me\", home), r"~\");
+        assert_eq!(form(r"c:\users\ME\x", home), r"~\x\");
+        assert_eq!(form(r"C:\Users\meadow\x", home), r"C:\Users\meadow\x\");
+        assert_eq!(form(r"D:\", home), r"D:\");
+        assert_eq!(form(r"\\srv\share\x y", home), r"\\srv\share\x y\");
+        assert_eq!(form(r"C:\Users\me\Documents", None), r"C:\Users\me\Documents\");
+        assert_eq!(form("C:/Users/me/a", home), r"~\a\");
+    }
+
+    impl Rig {
+        fn unfold_ready(&self, folder: &str) -> Unfolded {
+            let u = self.p.unfold(folder);
+            if u.state == "reading" {
+                self.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready within 1 s");
+                return self.p.unfold(folder);
+            }
+            u
+        }
+    }
+
+    #[test]
+    fn unfold_of_an_unread_folder_reads_once_then_is_ready() {
+        let r = rig();
+        let u = r.p.unfold(r"C:\Games\");
+        assert_eq!((u.state, u.rows.len(), u.more), ("reading", 0, 0));
+        r.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+        assert_eq!(r.p.unfold(r"C:\").state, "reading", "another folder starts its own read");
+        r.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+        assert_eq!(r.p.unfold(r"C:\").state, "ready");
+        assert_eq!(r.p.unfold(r"C:\").state, "ready");
+        assert_eq!(r.fs.reads(), 2, "one read per folder");
+    }
+
+    #[test]
+    fn unfold_lists_folders_first_then_files_each_by_name_ignoring_case() {
+        let fs = FakeFs::default();
+        fs.add_dir(
+            r"C:\Work",
+            vec![file("b.txt", 2048), folder("zeta"), file("A.txt", 10), folder("Alpha"), file("c.txt", 0), folder("beta")],
+        );
+        let r = rig_with(fs, SLOW);
+        let u = r.unfold_ready(r"C:\Work\");
+        assert_eq!(u.state, "ready");
+        assert_eq!(titles(&u.rows), ["Alpha", "beta", "zeta", "A.txt", "b.txt", "c.txt"]);
+        let subs: Vec<&str> = u.rows.iter().map(|r| r.subtitle.as_str()).collect();
+        assert_eq!(subs, ["Folder", "Folder", "Folder", "10 B", "2.0 KB", "0 B"]);
+        for row in &u.rows {
+            let is_dir = row.id.ends_with('\\');
+            let want = entry_row("path", Path::new(row.id.trim_end_matches('\\')), is_dir, row.subtitle.clone(), 0, String::new());
+            assert_eq!((&row.id, &row.title, row.provider, &row.icon, &row.actions), (&want.id, &want.title, "path", &want.icon, &want.actions));
+            assert_eq!(row.complete, "");
+            assert_eq!(row.folder, want.folder);
+        }
+        assert_eq!(u.rows[0].id, r"C:\Work\Alpha\");
+        assert_eq!(u.rows[0].folder, r"C:\Work\Alpha\");
+        assert_eq!(u.rows[3].id, r"C:\Work\A.txt");
+        assert_eq!(u.rows[3].folder, "");
+    }
+
+    #[test]
+    fn unfold_shows_at_most_15_rows_and_counts_the_rest() {
+        let fs = FakeFs::default();
+        let many: Vec<DirEntry> = (0..10_000).map(|i| file(&format!("f{i:05}.txt"), 1)).collect();
+        fs.add_dir(r"C:\big", many);
+        fs.add_dir(r"C:\few", (0..15).map(|i| file(&format!("f{i:02}"), 1)).collect());
+        fs.add_dir(r"C:\none", Vec::new());
+        let r = rig_with(fs, SLOW);
+        let u = r.unfold_ready(r"C:\big\");
+        assert_eq!((u.state, u.rows.len(), u.more), ("ready", UNFOLD_ROWS, 9985));
+        assert_eq!(u.rows[0].title, "f00000.txt");
+        let u = r.unfold_ready(r"C:\few\");
+        assert_eq!((u.rows.len(), u.more), (15, 0));
+        let u = r.unfold_ready(r"C:\none\");
+        assert_eq!((u.state, u.rows.len(), u.more), ("ready", 0, 0));
+    }
+
+    #[test]
+    fn unfold_says_missing_or_denied_when_the_folder_cannot_be_read() {
+        let r = rig();
+        r.fs.fail_dir(r"D:\", ReadError::Denied);
+        r.fs.fail_dir(r"E:\gone", ReadError::NotFound);
+        assert_eq!(r.unfold_ready(r"E:\gone\").state, "missing");
+        assert_eq!(r.unfold_ready(r"F:\never\").state, "missing");
+        let u = r.unfold_ready(r"D:\");
+        assert_eq!((u.state, u.rows.len()), ("denied", 0));
+
+        let r = rig_with(FakeFs::default(), Duration::from_millis(50));
+        r.fs.block();
+        assert_eq!(r.p.unfold(r"F:\").state, "reading");
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(r.p.unfold(r"F:\").state, "denied");
+        r.fs.release();
+    }
+
+    #[test]
+    fn unfold_of_a_relative_path_is_missing_and_asks_the_file_system_nothing() {
+        let r = rig();
+        for path in [r"foo\bar", "", "~", r"\x"] {
+            let u = r.p.unfold(path);
+            assert_eq!((u.state, u.rows.len(), u.more), ("missing", 0, 0), "{path:?}");
+        }
+        assert!(r.rx.recv_timeout(Duration::from_millis(100)).is_err(), "no read started");
+        assert_eq!(r.fs.reads(), 0);
+    }
+
+    #[test]
+    fn unfold_lists_odd_names_unchanged() {
+        let fs = FakeFs::default();
+        fs.add_dir(r"C:\odd", vec![file("a b.txt", 1), file("#1.txt", 1), file("50%.txt", 1), file("it's.txt", 1), folder("ü dir")]);
+        let r = rig_with(fs, SLOW);
+        let u = r.unfold_ready(r"C:\odd\");
+        assert_eq!(titles(&u.rows), ["ü dir", "#1.txt", "50%.txt", "a b.txt", "it's.txt"]);
+        assert_eq!(u.rows[0].id, "C:\\odd\\ü dir\\");
+        assert_eq!(u.rows[4].id, r"C:\odd\it's.txt");
+    }
+
+    #[test]
+    fn unfold_answers_with_the_typed_form_of_the_folder() {
+        let r = rig();
+        assert_eq!(r.unfold_ready(r"C:\Users\someone\Documents\").typed, r"~\Documents\");
+        assert_eq!(r.p.unfold(r"C:\").typed, r"C:\");
+        assert_eq!(r.p.unfold(r"C:\Users\someone\").typed, r"~\");
+    }
+
+    #[test]
+    fn unfold_never_reads_on_the_calling_thread() {
+        let r = rig();
+        r.fs.block();
+        let t = Instant::now();
+        let u = r.p.unfold(r"C:\");
+        assert!(t.elapsed() < Duration::from_millis(50));
+        assert_eq!((u.state, u.rows.len()), ("reading", 0));
+        assert_eq!(r.fs.reads(), 0);
+        r.fs.release();
+        r.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+    }
+
+    #[test]
+    fn rows_inside_an_unfolded_folder_open_until_the_entry_is_gone() {
+        let r = rig();
+        let u = r.unfold_ready(r"C:\");
+        let games = u.rows.iter().find(|x| x.title == "Games").unwrap();
+        assert_eq!(r.p.activate(&games.id, Modifier::None), Ok(Outcome::Hide));
+        r.fs.set_kind(r"C:\Games", None);
+        assert_eq!(r.p.activate(&games.id, Modifier::None), Err(NOT_FOUND.to_string()));
+        let a = u.rows.iter().find(|x| x.title == "a.txt").unwrap();
+        r.fs.set_kind(r"C:\a.txt", None);
+        assert_eq!(r.p.activate(&a.id, Modifier::None), Err(NOT_FOUND.to_string()));
+    }
+
+    #[test]
     fn help_line_and_no_empty_bar_rows() {
         let r = rig();
         let help = r.p.help();
         assert_eq!(help[0].example, r"C:\ / ~\Documents\");
         assert_eq!(help[0].about, "browse a folder by typing its path; Tab completes a name");
         assert_eq!(help[0].fill, r"~\");
+        assert_eq!(help.len(), 1);
         assert!(r.p.empty_query().is_empty());
         assert_eq!(r.p.route(), None);
         assert_eq!(r.p.name(), "path");

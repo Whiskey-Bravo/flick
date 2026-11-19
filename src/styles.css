@@ -152,8 +152,14 @@ body {
 
 :root[data-glass="true"] .title,
 :root[data-glass="true"] .subtitle,
+:root[data-glass="true"] .chevron,
 :root[data-glass="true"] input {
   text-shadow: 0 0 6px color-mix(in srgb, var(--bg) 55%, transparent), 0 1px 1px color-mix(in srgb, var(--bg) 45%, transparent);
+}
+
+/* The chevron is a stroked SVG: text-shadow does not reach it, so it gets the same halo as a filter. */
+:root[data-glass="true"] .chevron svg {
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--bg) 55%, transparent));
 }
 
 :root[data-glass="true"] .results,
@@ -311,6 +317,9 @@ input {
   height: 44px;
   padding: 0 14px;
   border-radius: var(--row-radius);
+  /* Rows inside an unfolded folder: content indented 20px per level (the
+     highlight and the row background stay full width). */
+  padding-left: calc(14px + var(--depth, 0) * 20px);
 }
 
 .result.selected {
@@ -363,6 +372,39 @@ input {
 
 .result.armed .subtitle {
   color: var(--warning);
+}
+
+/* Rows the page makes inside a folder (Reading..., Empty folder, N more...). */
+.result.made .title,
+.result.made .subtitle {
+  color: var(--dim);
+}
+
+/* The fold control at a folder row's right end: right when folded, down when open. */
+.chevron {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: -6px;
+  border-radius: 6px;
+  color: var(--dim);
+}
+
+.chevron svg {
+  display: block;
+  transition: transform 120ms;
+}
+
+.chevron.open svg {
+  transform: rotate(90deg);
+}
+
+.chevron:hover {
+  color: var(--text, currentColor);
+  background: var(--row);
 }
 
 input::placeholder {

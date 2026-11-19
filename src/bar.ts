@@ -13,6 +13,7 @@ export type Item = {
   complete: string; // text Tab puts in the bar, "" = none
   panel: string; // SVG markup from Flick's backend to show large instead of the list, "" = none
   live: boolean; // the row changes by itself: ask again every second while it shows
+  folder: string; // absolute path ending in a backslash when the row is a folder that can unfold, "" = not
 };
 export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
@@ -37,6 +38,78 @@ export function panelItem(s: State): Item | null {
   return s.items.length === 1 && s.items[0].panel !== "" ? s.items[0] : null;
 }
 
+// An unfolded folder: what the back end answered for it, and the path it was asked for.
+export type Fold = { path: string; state: "reading" | "ready" | "missing" | "denied"; rows: Item[]; more: number; typed: string };
+// A row as shown: a result, or a row inside an unfolded folder. `chain` is the
+// key of the folder row it is inside ("" for a result), so the same folder
+// shown twice is two rows; `key` is its identity among the shown rows.
+export type Row = Item & { depth: number; chain: string; key: string; fold: "none" | "folded" | "unfolded"; parent: string | null };
+
+// At most this many rows of an unfolded folder show; "N more…" stands for the rest.
+const FOLD_ROWS = 15;
+const SEP = "\u0001";
+const rowKey = (chain: string, provider: string, id: string): string => `${chain}${SEP}${provider}${SEP}${id}`;
+// A row the page makes for a folder's state (provider "fold").
+const madeRow = (id: string, title: string): Item => ({
+  id, provider: "fold", title, subtitle: "", confirm: false, icon: "", origin: "search", pinned: false, pinnable: false,
+  actions: [], complete: "", panel: "", live: false, folder: "",
+});
+
+function addRows(out: Row[], items: Item[], depth: number, parent: string | null, unfolded: Record<string, Fold>): void {
+  const chain = parent ?? "";
+  for (const item of items) {
+    const key = rowKey(chain, item.provider, item.id);
+    const f = item.folder !== "" ? unfolded[key] : undefined;
+    out.push({ ...item, depth, chain, key, parent, fold: item.folder === "" ? "none" : f ? "unfolded" : "folded" });
+    if (!f) continue;
+    if (f.state === "ready") addRows(out, f.rows.slice(0, FOLD_ROWS), depth + 1, key, unfolded);
+    const made =
+      f.state === "reading" ? madeRow("reading", "Reading…")
+      : f.state === "missing" ? madeRow("missing", "Folder not found")
+      : f.state === "denied" ? madeRow("denied", "Can't open this folder")
+      : f.more > 0 ? madeRow("more", `${f.more} more…`)
+      : f.rows.length === 0 ? madeRow("empty", "Empty folder")
+      : null;
+    if (made) out.push({ ...made, depth: depth + 1, chain: key, key: rowKey(key, made.provider, made.id), parent: key, fold: "none" });
+  }
+}
+
+// The last answer, so rendering and every key do not build the rows again.
+let memo: { items: Item[]; unfolded: Record<string, Fold>; rows: Row[] } | null = null;
+/** The rows as shown: `items` in order, each unfolded folder's rows right after
+ *  it, recursively. `selected`, `top` and the menu index count these. */
+export function shownRows(s: State): Row[] {
+  if (memo && memo.items === s.items && memo.unfolded === s.unfolded) return memo.rows;
+  const rows: Row[] = [];
+  addRows(rows, s.items, 0, null, s.unfolded);
+  memo = { items: s.items, unfolded: s.unfolded, rows };
+  return rows;
+}
+// A shown row as the back end knows it: the row's place in the tree stripped.
+const plain = (row: Row): Item => {
+  const { depth, chain, key, fold, parent, ...item } = row;
+  return item;
+};
+// The folds still shown over these results: one whose folder row is gone goes,
+// and every fold under it with it. The same object when nothing goes.
+function foldsShown(items: Item[], unfolded: Record<string, Fold>): Record<string, Fold> {
+  const keys = Object.keys(unfolded);
+  if (keys.length === 0) return unfolded;
+  const rows: Row[] = [];
+  addRows(rows, items, 0, null, unfolded);
+  const open = new Set(rows.filter((r) => r.fold === "unfolded").map((r) => r.key));
+  return open.size === keys.length ? unfolded : Object.fromEntries(keys.filter((k) => open.has(k)).map((k) => [k, unfolded[k]]));
+}
+// What the folder of a row inside would be typed as: as path browsing writes it,
+// or its full path before the back end said.
+const typedOf = (f: Fold): string => f.typed || f.path;
+
+/** Left and Right act on the list only with the caret at the end of the text,
+ *  nothing selected and no modifier held; otherwise they move the caret. */
+export function arrowActsOnList(_key: string, selStart: number | null, selEnd: number | null, length: number, mods: boolean): boolean {
+  return !mods && selStart === length && selEnd === length;
+}
+
 // The mouse wheel scrolls the list by whole rows: the remainder carries over.
 export const WHEEL_PX_PER_ROW = 40;
 export function rowsFromWheel(acc: number, deltaY: number): { rows: number; acc: number } {
@@ -47,7 +120,7 @@ export function rowsFromWheel(acc: number, deltaY: number): { rows: number; acc:
 export type State = {
   text: string;
   items: Item[];
-  selected: number; // index into the full `items` list
+  selected: number; // index into the shown rows (`shownRows`)
   armed: string | null; // id awaiting a second Enter
   armedAction: "uninstall" | null; // what the armed second Enter does, besides activating
   scope: { name: string; prompt: string } | null;
@@ -57,16 +130,17 @@ export type State = {
   pending: boolean; // an activate is in flight
   awaiting: boolean; // a query is in flight; `items` belong to older text
   queued: Modifier | null; // Enter pressed while awaiting, run on the next results
-  top: number; // index of the first visible row
+  top: number; // index of the first visible shown row
   past: string[]; // past searches, newest first
   recall: number; // index into `past` being shown, -1 = not recalling
   menu: Menu | null; // the right-click menu, when open
   hidden: boolean; // the bar was hidden (Esc, focus loss) and not shown or typed into since
   queried: { text: string; scope: string | null } | null; // what the last query asked for
-  keep: { provider: string; id: string } | null; // row to stay on when the re-query's results arrive
+  keep: { provider: string; id: string; chain?: string } | null; // row to stay on when the re-query's results arrive; `chain` only for a row inside a folder
   browsed: boolean; // the rows were moved through (arrows or mouse) since the bar opened or the text changed: Up no longer recalls
   kept: boolean; // `items` are the last show's empty-bar rows, on screen until the fresh ones arrive
   tabCompletion: boolean; // the "Tab completion" setting: a grey preview, and no highlight until the rows are moved through
+  unfolded: Record<string, Fold>; // the unfolded folders, by their row's key
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -75,6 +149,7 @@ export type Effect =
   | { type: "togglePin"; item: Item }
   | { type: "act"; item: Item; action: Action }
   | { type: "liveRow"; provider: string; id: string }
+  | { type: "unfold"; key: string; path: string }
   | { type: "hide" };
 export type Event =
   | { type: "shown" }
@@ -87,7 +162,7 @@ export type Event =
   | { type: "tick" }
   | { type: "liveRowResult"; item: Item }
   | { type: "updateChanged" }
-  | { type: "input"; text: string }
+  | { type: "input"; text: string; composing?: boolean }
   | { type: "results"; items: Item[] }
   | { type: "past"; items: string[] }
   | { type: "hover"; index: number }
@@ -98,7 +173,9 @@ export type Event =
   | { type: "menuClose" }
   | { type: "wheel"; rows: number }
   | { type: "pinned"; provider: string; id: string; pinned: boolean }
-  | { type: "key"; key: "ArrowUp" | "ArrowDown" | "Enter" | "Escape" | "F1" | "p" | "Tab"; ctrl: boolean; shift: boolean }
+  | { type: "key"; key: "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Enter" | "Escape" | "F1" | "p" | "Tab"; ctrl: boolean; shift: boolean }
+  | { type: "unfolded"; key: string; path: string; reply: Omit<Fold, "path"> }
+  | { type: "fold"; index: number }
   | {
       type: "outcome";
       outcome:
@@ -135,6 +212,7 @@ export const initial: State = {
   browsed: false,
   kept: false,
   tabCompletion: false,
+  unfolded: {},
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -152,14 +230,15 @@ export function failureText(item: Item, err: unknown): string {
 // The window shows 8 rows, or 7 when the error line takes a row's worth of space.
 export const MAX_ROWS = 8;
 export const capOf = (s: State): number => (s.error ? MAX_ROWS - 1 : MAX_ROWS);
-export function visibleItems(s: State): Item[] {
-  return s.items.slice(s.top, s.top + capOf(s));
+export function visibleItems(s: State): Row[] {
+  return shownRows(s).slice(s.top, s.top + capOf(s));
 }
 // Keep `selected` in range and the window on it, moving `top` the minimum needed.
 const fit = (s: State): State => {
   const cap = capOf(s);
-  const selected = Math.min(s.selected, Math.max(0, s.items.length - 1));
-  let top = Math.min(s.top, Math.max(0, s.items.length - cap));
+  const n = shownRows(s).length;
+  const selected = Math.min(s.selected, Math.max(0, n - 1));
+  let top = Math.min(s.top, Math.max(0, n - cap));
   if (selected < top) top = selected;
   else if (selected >= top + cap) top = selected - cap + 1;
   return top === s.top && selected === s.selected ? s : { ...s, selected, top };
@@ -192,7 +271,7 @@ const NAMED = new Set([
 
 export function completion(s: State): string | null {
   if (!s.tabCompletion || highlighted(s) || s.text === "" || s.recall >= 0) return null;
-  const top = s.items[s.selected];
+  const top = shownRows(s)[s.selected];
   if (!top) return null;
   if (top.complete === "" && !NAMED.has(top.provider)) return null;
   const whole = top.complete !== "" ? top.complete : top.title;
@@ -200,6 +279,9 @@ export function completion(s: State): string | null {
 }
 
 type Result = { state: State; effects: Effect[] };
+// The row to stay on across a re-query: its chain only when it is inside a folder.
+const keepOf = (row: Row): NonNullable<State["keep"]> =>
+  row.chain === "" ? { provider: row.provider, id: row.id } : { provider: row.provider, id: row.id, chain: row.chain };
 const done = (state: State, effects: Effect[] = []): Result => ({ state, effects });
 
 // Remembers what the last query asked for, and drops a pending "keep this row"
@@ -274,19 +356,47 @@ function step(s: State, e: Event): Result {
         ],
       );
     case "hidden":
-      return done({ ...s, hidden: true });
+      return done({ ...s, hidden: true, unfolded: {} });
     case "blurred":
       return done({ ...s, armed: null, queued: null, menu: null });
     case "answersReady": {
-      // A rate or forecast arrived: ask again, but only when the text is still
+      // A folder read finished, or a rate or forecast arrived: ask again for
+      // every folder still being read, and for the rows when the text is still
       // what was asked and the bar is showing it.
+      const again = s.hidden
+        ? []
+        : Object.entries(s.unfolded)
+            .filter(([, f]) => f.state === "reading")
+            .map(([key, f]): Effect => ({ type: "unfold", key, path: f.path }));
       const q = s.queried;
-      if (s.hidden || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s);
-      if (s.text.trim() === "" && !s.scope) return done(s);
-      const sel = s.items[s.selected];
+      if (s.hidden || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s, again);
+      if (s.text.trim() === "" && !s.scope) return done(s, again);
+      const sel = shownRows(s)[s.selected];
       // While typed text is still waiting for its answer, the rows are for older text.
-      const keep = sel && !s.awaiting ? { provider: sel.provider, id: sel.id } : null;
-      return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }]);
+      const keep = sel && !s.awaiting ? keepOf(sel) : null;
+      return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }, ...again]);
+    }
+    case "unfolded": {
+      // Only the answer for a folder still unfolded from that very path, and
+      // still being read: a folded folder, changed text or a closed bar drop it,
+      // and a late "reading" never undoes an answer.
+      const f = s.unfolded[e.key];
+      if (!f || f.path !== e.path || f.state !== "reading") return done(s);
+      const next = { ...s, unfolded: { ...s.unfolded, [e.key]: { path: e.path, ...e.reply } } };
+      // The rows below change: the selection stays on its row, a menu only on an unmoved row.
+      const before = shownRows(s);
+      const after = shownRows(next);
+      const was = before[s.selected];
+      const at = was ? after.findIndex((r) => r.key === was.key) : -1;
+      const m = s.menu;
+      const menu = m && before[m.index]?.key === after[m.index]?.key ? m : null;
+      return done(fit({ ...next, selected: at >= 0 ? at : s.selected, menu }));
+    }
+    case "fold": {
+      // The chevron: unfolds or folds that row, as Right or Left on it would.
+      const row = shownRows(s)[e.index];
+      if (!row || row.fold === "none" || foldBlocked(s)) return done(s);
+      return side(fit({ ...s, selected: e.index }), row.fold === "folded");
     }
     case "tick": {
       // The clock's second: ask only for the live rows on screen, never the whole query.
@@ -310,18 +420,18 @@ function step(s: State, e: Event): Result {
     case "updateChanged": {
       // The update row (found, downloading, failed) lives in the empty bar only.
       if (s.hidden || s.text.trim() !== "" || s.scope) return done(s);
-      const sel = s.items[s.selected];
-      const keep = sel ? { provider: sel.provider, id: sel.id } : null;
+      const sel = shownRows(s)[s.selected];
+      const keep = sel ? keepOf(sel) : null;
       return done({ ...s, keep }, [{ type: "query", text: "", scope: null, keepSelection: true }]);
     }
     case "menuClose":
       return done({ ...s, menu: null });
     case "hover":
-      if (s.menu || !s.items[e.index] || e.index === s.selected) return done(s);
+      if (s.menu || !shownRows(s)[e.index] || e.index === s.selected) return done(s);
       return done(fit({ ...s, selected: e.index, armed: null, browsed: true }));
     case "click": {
       if (s.menu) return done({ ...s, menu: null });
-      if (!s.items[e.index]) return done(s);
+      if (!shownRows(s)[e.index]) return done(s);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
       // A click is an explicit choice: it opens the clicked row now, never a
       // queued pick from results still on their way.
@@ -329,7 +439,7 @@ function step(s: State, e: Event): Result {
       return enter({ ...sel, queued: null }, modifier);
     }
     case "menu": {
-      const item = s.items[e.index];
+      const item = shownRows(s)[e.index];
       if (!item) return done(s);
       const actions = menuActions(item);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
@@ -344,7 +454,8 @@ function step(s: State, e: Event): Result {
     }
     case "menuPick": {
       const m = s.menu;
-      const item = m && s.items[m.index];
+      const row = m && shownRows(s)[m.index];
+      const item = row && plain(row);
       // Only picking Uninstall keeps (or sets) the arm: any other pick must never fire it.
       const closed = { ...s, menu: null, ...(e.action === "uninstall" ? {} : { armed: null, armedAction: null }) };
       if (!m || !item || !m.actions.includes(e.action)) return done(closed);
@@ -363,16 +474,22 @@ function step(s: State, e: Event): Result {
     }
     case "wheel": {
       // A row-anchored menu would be left in the wrong place, so it closes.
-      const top = Math.min(Math.max(0, s.top + e.rows), Math.max(0, s.items.length - capOf(s)));
+      const top = Math.min(Math.max(0, s.top + e.rows), Math.max(0, shownRows(s).length - capOf(s)));
       return top === s.top ? done({ ...s, menu: null }) : done({ ...s, top, menu: null });
     }
     case "configError":
       return done(fit({ ...s, configError: e.message, error: s.failure ?? e.message }));
-    case "input":
+    case "input": {
+      // Text added at the end while the selection is inside an unfolded folder:
+      // the bar switches to that folder's path, followed by what was added.
+      const row = shownRows(s)[s.selected];
+      const f = row && row.parent !== null && s.scope === null ? s.unfolded[row.parent] : undefined;
+      const text = f && !e.composing && e.text.length > s.text.length && e.text.startsWith(s.text) ? typedOf(f) + e.text.slice(s.text.length) : e.text;
       return done(
         fit({
           ...s,
-          text: e.text,
+          text,
+          unfolded: {},
           recall: -1,
           browsed: false,
           kept: false,
@@ -385,36 +502,50 @@ function step(s: State, e: Event): Result {
           awaiting: true,
           queued: null,
         }),
-        [{ type: "query", text: e.text, scope: s.scope?.name ?? null }],
+        [{ type: "query", text, scope: s.scope?.name ?? null }],
       );
+    }
     case "results": {
-      let selected = 0;
+      // Folds stay over results for the same text (the text changing folds
+      // everything first), except those whose folder row is gone.
+      const before = shownRows(s);
+      const fresh = { ...s, items: e.items, unfolded: foldsShown(e.items, s.unfolded) };
+      const rows = shownRows(fresh);
       if (s.keep && !s.queued) {
         // The answers' re-query: stay on the row the user was on, if it is still there,
         // and keep the window where it was.
         const k = s.keep;
-        const at = e.items.findIndex((i) => i.provider === k.provider && i.id === k.id);
+        const kept = rowKey(k.chain ?? "", k.provider, k.id);
+        const at = rows.findIndex((r) => r.key === kept);
         const armed = at >= 0 && s.armed === k.id ? s.armed : null;
         // A menu opened after the tick was sent stays when its row is still at that place.
-        const was = s.menu ? s.items[s.menu.index] : undefined;
-        const now = s.menu ? e.items[s.menu.index] : undefined;
-        const menu = s.menu && was && now && was.provider === now.provider && was.id === now.id ? s.menu : null;
-        return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu, keep: null }));
+        const was = s.menu ? before[s.menu.index] : undefined;
+        const now = s.menu ? rows[s.menu.index] : undefined;
+        const menu = s.menu && was && now && was.key === now.key ? s.menu : null;
+        // A result that is gone: back to the first. A row inside a folder that
+        // folded: the row that took its place.
+        const selected = at >= 0 ? at : k.chain !== undefined ? s.selected : 0;
+        return done(fit({ ...fresh, selected, armed, awaiting: false, menu, keep: null }));
       }
-      if (s.text === "" && !s.scope) selected = emptyBarSelection(e.items);
+      // The result at this index of `e.items`, counted in shown rows.
+      const shownAt = (i: number): number => {
+        let n = -1;
+        return rows.findIndex((r) => r.depth === 0 && ++n === i);
+      };
+      let selected = 0;
+      if (s.text === "" && !s.scope) selected = shownAt(emptyBarSelection(e.items));
       // Rows kept from the last show were on screen: a row the user moved to
       // or pressed Enter on stays selected if the fresh rows still have it.
       let gone = false;
       if (s.kept && (s.browsed || s.queued)) {
-        const was = s.items[s.selected];
-        const at = was ? e.items.findIndex((i) => i.provider === was.provider && i.id === was.id) : -1;
+        const was = before[s.selected];
+        const at = was ? rows.findIndex((r) => r.key === was.key) : -1;
         if (at >= 0) selected = at;
         else gone = true;
       }
       const next: State = fit({
-        ...s,
-        items: e.items,
-        selected,
+        ...fresh,
+        selected: Math.max(0, selected),
         top: 0,
         awaiting: false,
         queued: null,
@@ -429,9 +560,13 @@ function step(s: State, e: Event): Result {
     case "past":
       return done({ ...s, past: e.items });
     case "pinned": {
+      const mark = (i: Item): Item => (i.provider === e.provider && i.id === e.id ? { ...i, pinned: e.pinned } : i);
+      const folds = Object.entries(s.unfolded);
       const next = {
         ...s,
-        items: s.items.map((i) => (i.provider === e.provider && i.id === e.id ? { ...i, pinned: e.pinned } : i)),
+        items: s.items.map(mark),
+        // Rows inside unfolded folders are pinned too.
+        unfolded: folds.length === 0 ? s.unfolded : Object.fromEntries(folds.map(([k, f]) => [k, { ...f, rows: f.rows.map(mark) }])),
       };
       // The empty bar is laid out by pins: ask for it again.
       const relayout = s.text === "" && !s.scope;
@@ -454,6 +589,7 @@ function step(s: State, e: Event): Result {
           text: "",
           recall: -1,
           items: [],
+          unfolded: {},
           selected: 0,
           top: 0,
           armed: null,
@@ -500,11 +636,11 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       // once the rows were moved through (arrows or mouse), the arrows stay in
       // the rows and wrap at the ends, so going back up past a pin never
       // drops into old searches. Typing, or opening the bar again, starts over.
-      const inRows = s.recall < 0 && s.browsed && s.items.length > 0;
+      const n = shownRows(s).length;
+      const inRows = s.recall < 0 && s.browsed && n > 0;
       if (!inRows && s.past.length > 0 && !s.scope && (s.text === "" || s.recall >= 0) && (e.key === "ArrowUp" || s.recall >= 0)) {
         return recallStep(s, e.key === "ArrowUp" ? 1 : -1);
       }
-      const n = s.items.length;
       if (n === 0) return done({ ...s, armed: null });
       // Tab completion: the first arrow only brings the highlight out. Down
       // shows it on the row Enter would open; Up on the last row.
@@ -514,10 +650,14 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       const step = e.key === "ArrowDown" ? 1 : n - 1;
       return done(fit({ ...s, selected: (s.selected + step) % n, armed: null, browsed: true }));
     }
+    case "ArrowLeft":
+    case "ArrowRight":
+      if (e.ctrl || e.shift || foldBlocked(s)) return done(s);
+      return side(s, e.key === "ArrowRight");
     case "p": {
-      const item = s.items[s.selected];
-      if (!e.ctrl || !item || !item.pinnable) return done(s);
-      return done(s, [{ type: "togglePin", item }]);
+      const row = shownRows(s)[s.selected];
+      if (!e.ctrl || !row || !row.pinnable) return done(s);
+      return done(s, [{ type: "togglePin", item: plain(row) }]);
     }
     case "F1": {
       // Unlike the fill outcome, this is not an activation finishing: `pending` stays.
@@ -541,14 +681,15 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
         const r = fill(s, whole);
         return done({ ...r.state, pending: s.pending }, r.effects);
       }
-      const item = s.items[s.selected];
+      const item = shownRows(s)[s.selected];
       if (s.awaiting || !item) return done(s);
       if (item.complete !== "") {
         // Like F1, not an activation finishing: `pending` stays.
         const r = fill(s, item.complete);
         return done({ ...r.state, pending: s.pending }, r.effects);
       }
-      if (s.items.some((i) => i.provider === "path")) return done(s);
+      // Path browsing's own rows: no menu. Rows inside an unfolded folder have one.
+      if (item.depth === 0 && s.items.some((i) => i.provider === "path")) return done(s);
       const actions = menuActions(item);
       if (actions.length === 0) return done(s);
       return done({ ...s, menu: { index: s.selected, actions, selected: 0, at: "row" } });
@@ -558,13 +699,52 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       if (t.armed) return done({ ...t, armed: null });
       if (t.scope) {
         return done(
-          { ...t, scope: null, text: "", recall: -1, items: [], selected: 0, top: 0, awaiting: true, browsed: false },
+          { ...t, scope: null, text: "", recall: -1, items: [], unfolded: {}, selected: 0, top: 0, awaiting: true, browsed: false },
           [{ type: "query", text: "", scope: null }],
         );
       }
-      return done(t, [{ type: "hide" }]);
+      return done({ ...t, unfolded: {} }, [{ type: "hide" }]);
     }
   }
+}
+
+// Right and Left (and the chevron) are ignored while a menu is open, a row is
+// armed, older results are awaited, an activation is pending, or a panel shows.
+const foldBlocked = (s: State): boolean => s.menu !== null || s.armed !== null || s.awaiting || s.pending || panelItem(s) !== null;
+
+// True exactly when Right or Left would change something; otherwise the key is
+// left to the text field (the caret moves).
+export function sideActs(s: State, right: boolean): boolean {
+  if (foldBlocked(s)) return false;
+  const row = shownRows(s)[s.selected];
+  if (!row) return false;
+  if (right) return row.fold !== "none" || (row.depth > 0 && row.provider === "fold" && row.id === "more");
+  return row.fold === "unfolded" || row.parent !== null;
+}
+
+// Right unfolds a folded folder (the selection stays), steps into an unfolded
+// one, or opens "N more…". Left folds an unfolded folder with everything
+// unfolded under it, or goes from a row inside to its folder's row.
+function side(s: State, right: boolean): Result {
+  const rows = shownRows(s);
+  const row = rows[s.selected];
+  if (!row) return done(s);
+  if (right) {
+    if (row.fold === "folded") {
+      const reading: Fold = { path: row.folder, state: "reading", rows: [], more: 0, typed: "" };
+      return done({ ...s, unfolded: { ...s.unfolded, [row.key]: reading }, browsed: true }, [{ type: "unfold", key: row.key, path: row.folder }]);
+    }
+    if (row.fold === "unfolded") return done(fit({ ...s, selected: s.selected + 1, browsed: true }));
+    if (row.depth > 0 && row.provider === "fold" && row.id === "more") return enter(s, "none");
+    return done(s);
+  }
+  if (row.fold === "unfolded") {
+    const under = row.key + SEP;
+    const unfolded = Object.fromEntries(Object.entries(s.unfolded).filter(([k]) => k !== row.key && !k.startsWith(under)));
+    return done(fit({ ...s, unfolded, browsed: true }));
+  }
+  if (row.parent !== null) return done(fit({ ...s, selected: rows.findIndex((r) => r.key === row.parent), browsed: true }));
+  return done(s);
 }
 
 // Up/Down through past searches: the recalled text is queried like typed text.
@@ -577,6 +757,7 @@ function recallStep(s: State, by: 1 | -1): Result {
       ...s,
       text,
       recall,
+      unfolded: {},
       selected: 0,
       top: 0,
       armed: null,
@@ -597,6 +778,7 @@ function fill(s: State, text: string): Result {
     text,
     recall: -1,
     items: [],
+    unfolded: {},
     selected: 0,
     top: 0,
     armed: null,
@@ -613,8 +795,14 @@ function fill(s: State, text: string): Result {
 
 // Enter on the selected item: a confirm item arms first, anything else activates.
 function enter(s: State, modifier: Modifier): Result {
-  const item = s.items[s.selected];
-  if (!item || s.pending) return done(s);
+  const row = shownRows(s)[s.selected];
+  if (!row || s.pending) return done(s);
+  if (row.depth > 0 && row.provider === "fold") {
+    // The page's own rows: "N more…" puts the folder's path in the bar, the others do nothing.
+    const f = row.parent !== null ? s.unfolded[row.parent] : undefined;
+    return row.id === "more" && f ? fill(s, typedOf(f)) : done(s);
+  }
+  const item = plain(row);
   if (s.armed === item.id && s.armedAction === "uninstall") {
     return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: "uninstall" }]);
   }

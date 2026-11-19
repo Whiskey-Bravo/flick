@@ -59,6 +59,7 @@ If you press Enter while results for what you just typed are still on their way,
 | Ctrl+Shift+Enter | Run the selected app as administrator |
 | Enter again | Confirm restart, shut down or sign out |
 | Up / Down | Move the selection |
+| Right / Left | With the cursor at the end of the text: unfold or fold the selected folder (see [Unfolding a folder](files.md#unfolding-a-folder)) |
 | Tab | Open the actions menu of the selected row; while a path is typed, complete the selected name |
 | Mouse wheel | Scroll the list |
 | Up (empty bar) | Recall your past searches, newest first |

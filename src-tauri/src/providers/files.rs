@@ -828,6 +828,15 @@ impl FilesProvider {
     fn row(&self, index: &Index, s: &Slot, score: u32) -> ResultItem {
         ResultItem {
             id: index.path(s).to_string_lossy().into_owned(),
+            folder: if s.is_dir {
+                let mut f = index.path(s).to_string_lossy().into_owned();
+                if !f.ends_with('\\') {
+                    f.push('\\');
+                }
+                f
+            } else {
+                String::new()
+            },
             provider: "files",
             title: index.name(s).to_string(),
             subtitle: shorten_home(index.dir(s), self.home.as_deref()),
@@ -1358,6 +1367,18 @@ mod tests {
             assert_eq!(r.actions, [first, Action::CopyPath], "{}", r.id);
             assert_eq!(r.complete, "");
         }
+    }
+
+    #[test]
+    fn a_folder_hit_says_it_can_be_unfolded() {
+        let (p, _) = provider(vec![entry(r"C:\x\notes.txt", false), entry(r"C:\x\notes", true)]);
+        let rows = p.query(&q("notes"));
+        let folder = rows.iter().find(|r| r.id == r"C:\x\notes").unwrap();
+        let file = rows.iter().find(|r| r.id == r"C:\x\notes.txt").unwrap();
+        assert_eq!(folder.folder, r"C:\x\notes\");
+        assert_eq!(file.folder, "");
+        assert_eq!(p.item(r"C:\x\notes").unwrap().folder, r"C:\x\notes\");
+        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().folder, "");
     }
 
     fn with_fake_clipboard(entries: Vec<FileEntry>) -> (Arc<FilesProvider>, Arc<RecordingLauncher>, Arc<FakeClipboard>) {

@@ -16,6 +16,16 @@ Type a path to look inside a folder: a drive (`C:\`), your user folder (`~\`, as
 
 The list shows up to 50 results and scrolls. Files take at most five of every eight rows, so folders, apps and other results stay in view.
 
+### Unfolding a folder
+
+Press Right on a selected folder to show what is inside it, under its row and indented. Left folds it again. A small arrow at the right end of a folder row does the same; a click on the rest of the row opens the folder as before. Right and Left only work on the list when the cursor is at the end of the text and nothing in the text is selected; otherwise they move the cursor as usual.
+
+You can unfold a folder inside a folder, level by level, to walk down to a file. Right on an unfolded folder moves to its first item; Left on an item moves to the folder it is in. Up and Down move through all the rows shown.
+
+An unfolded folder shows up to 15 items, folders first. If there are more, the last row says `N more…`; Enter or Right on it puts the folder's path in the bar, which lists up to 50. Enter opens an item, Ctrl+Enter shows it in Explorer, and Tab opens its menu, as when browsing by path.
+
+Typing while the selection is on an item inside a folder switches the bar to that folder's path, followed by what you typed, so you can narrow the folder from there. Folders fold again when the text changes or the bar closes; Flick does not remember what was unfolded.
+
 <details>
 <summary>What is searched, and how the list is kept up to date</summary>
 

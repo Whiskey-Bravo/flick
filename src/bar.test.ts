@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, visibleItems, wantsTick, type Effect, type Event, type Item, type State } from "./bar";
+import { arrowActsOnList, sideActs, completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
-  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false,
+  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false, folder: "",
 });
 const run = (s: State, ...events: Event[]) => {
   let state = s;
@@ -1329,5 +1329,516 @@ describe("query numbering", () => {
     expect(queryReply(null)).toBe("ask again");
     const items = [item("a")];
     expect(queryReply(items)).toEqual({ type: "results", items });
+  });
+});
+
+describe("folder unfolding", () => {
+  const SEP = "\u0001";
+  const keyOf = (provider: string, id: string, chain = "") => `${chain}${SEP}${provider}${SEP}${id}`;
+  const dir = (id: string, path = `C:\\${id}\\`): Item => ({ ...item(id), provider: "files", folder: path, actions: ["reveal"], pinnable: true });
+  const entry = (name: string, o: Partial<Item> = {}): Item =>
+    ({ ...item(`C:\\x\\${name}`), provider: "path", title: name, subtitle: "Folder", actions: ["reveal", "copy_path"], pinnable: true, ...o });
+  const ready = (rows: Item[], more = 0, typed = "~\\x\\"): Omit<Fold, "path"> => ({ state: "ready", rows, more, typed });
+  const fold = (path: string, reply: Omit<Fold, "path">): Fold => ({ path, ...reply });
+  const ids = (s: State) => shownRows(s).map((r) => [r.provider, r.id, r.depth]);
+
+  describe("shown rows", () => {
+    it("nothing_unfolded_shows_the_items_one_to_one", () => {
+      const s = withItems(item("a"), dir("D"), item("b"));
+      const rows = shownRows(s);
+      expect(rows.map(({ depth, chain, key, fold, parent, ...rest }) => rest)).toEqual(s.items);
+      expect(rows.map((r) => [r.depth, r.fold, r.parent, r.chain])).toEqual([
+        [0, "none", null, ""], [0, "folded", null, ""], [0, "none", null, ""],
+      ]);
+      expect(rows[1].key).toBe(keyOf("files", "D"));
+      expect(initial.unfolded).toEqual({});
+    });
+
+    it("an_unfolded_folder_is_followed_by_its_rows_one_level_down", () => {
+      const s0 = withItems(dir("D"), item("b"));
+      const k = keyOf("files", "D");
+      const s = { ...s0, unfolded: { [k]: fold("C:\\D\\", ready([entry("x"), entry("y.txt", { subtitle: "1 KB" })])) } };
+      expect(ids(s)).toEqual([["files", "D", 0], ["path", "C:\\x\\x", 1], ["path", "C:\\x\\y.txt", 1], ["apps", "b", 0]]);
+      const rows = shownRows(s);
+      expect(rows[0].fold).toBe("unfolded");
+      expect([rows[1].parent, rows[1].chain, rows[1].key]).toEqual([k, k, keyOf("path", "C:\\x\\x", k)]);
+    });
+
+    it("a_folder_inside_unfolded_too_is_two_levels_down", () => {
+      const k = keyOf("files", "D");
+      const sub = entry("sub", { folder: "C:\\x\\sub\\" });
+      const k2 = keyOf("path", sub.id, k);
+      const s = {
+        ...withItems(dir("D")),
+        unfolded: { [k]: fold("C:\\D\\", ready([sub, entry("z")])), [k2]: fold("C:\\x\\sub\\", ready([entry("deep")])) },
+      };
+      expect(ids(s)).toEqual([["files", "D", 0], ["path", sub.id, 1], ["path", "C:\\x\\deep", 2], ["path", "C:\\x\\z", 1]]);
+      expect(shownRows(s)[2].parent).toBe(k2);
+    });
+
+    it("the_same_folder_shown_twice_has_two_keys_and_only_the_unfolded_one_shows_rows", () => {
+      const sub = entry("sub", { folder: "C:\\x\\sub\\" });
+      const k = keyOf("files", "D");
+      const s = { ...withItems(dir("D"), sub), unfolded: { [k]: fold("C:\\D\\", ready([sub])) } };
+      const rows = shownRows(s);
+      expect(rows.map((r) => [r.id, r.depth, r.fold])).toEqual([["D", 0, "unfolded"], [sub.id, 1, "folded"], [sub.id, 0, "folded"]]);
+      expect(rows[1].key).not.toBe(rows[2].key);
+      const deeper = { ...s, unfolded: { ...s.unfolded, [rows[2].key]: fold("C:\\x\\sub\\", ready([entry("q")])) } };
+      expect(ids(deeper)).toEqual([["files", "D", 0], ["path", sub.id, 1], ["path", sub.id, 0], ["path", "C:\\x\\q", 1]]);
+    });
+
+    it("each_folder_state_shows_one_row_made_by_the_page", () => {
+      const k = keyOf("files", "D");
+      const made = (reply: Omit<Fold, "path">) => shownRows({ ...withItems(dir("D")), unfolded: { [k]: fold("C:\\D\\", reply) } }).slice(1);
+      const plain = { subtitle: "", confirm: false, icon: "", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false, folder: "" };
+      const expectOne = (reply: Omit<Fold, "path">, id: string, title: string) => {
+        const rows = made(reply);
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toEqual({ ...plain, provider: "fold", id, title, depth: 1, chain: k, key: keyOf("fold", id, k), fold: "none", parent: k });
+      };
+      expectOne({ state: "reading", rows: [], more: 0, typed: "" }, "reading", "Reading\u2026");
+      expectOne({ state: "missing", rows: [], more: 0, typed: "" }, "missing", "Folder not found");
+      expectOne({ state: "denied", rows: [], more: 0, typed: "" }, "denied", "Can't open this folder");
+      expectOne(ready([]), "empty", "Empty folder");
+    });
+
+    it("more_than_15_shows_15_rows_then_n_more", () => {
+      const k = keyOf("files", "D");
+      const fifteen = Array.from({ length: 15 }, (_, i) => entry(`f${i}`));
+      const rows = shownRows({ ...withItems(dir("D")), unfolded: { [k]: fold("C:\\D\\", ready(fifteen, 9985)) } });
+      expect(rows).toHaveLength(17);
+      expect(rows.slice(1, 16).every((r) => r.provider === "path" && r.depth === 1)).toBe(true);
+      expect([rows[16].provider, rows[16].id, rows[16].title, rows[16].depth]).toEqual(["fold", "more", "9985 more\u2026", 1]);
+    });
+
+    it("selection_window_and_menu_index_the_shown_rows", () => {
+      const k = keyOf("files", "D");
+      const s = { ...withItems(dir("D"), item("b")), unfolded: { [k]: fold("C:\\D\\", ready([entry("x"), entry("y")])) } };
+      // Down walks the rows inside, in the order shown.
+      const down = run(s, key("ArrowDown"), key("ArrowDown")).state;
+      expect(down.selected).toBe(2);
+      expect(run(down, key("Enter")).effects).toEqual([{ type: "activate", item: entry("y"), modifier: "none", text: "", scope: null }]);
+      expect(run(s, key("ArrowUp")).state.selected).toBe(3);
+      expect(visibleItems(s).map((r) => r.id)).toEqual(["D", "C:\\x\\x", "C:\\x\\y", "b"]);
+      expect(run(s, { type: "hover", index: 3 }).state.selected).toBe(3);
+      expect(run(s, { type: "click", index: 1, ctrl: true, shift: false }).effects).toEqual([
+        { type: "activate", item: entry("x"), modifier: "ctrl", text: "", scope: null },
+      ]);
+      const menu = run(s, { type: "menu", index: 2 }).state;
+      expect(menu.menu).toEqual({ index: 2, actions: ["reveal", "copy_path", "pin"], selected: 0, at: "pointer" });
+      expect(run(menu, { type: "menuPick", action: "pin" }).effects).toEqual([{ type: "togglePin", item: entry("y") }]);
+      expect(run(s, { type: "hover", index: 1 }, key("p", true)).effects).toEqual([{ type: "togglePin", item: entry("x") }]);
+      // The window counts the shown rows.
+      const many = { ...withItems(dir("D")), unfolded: { [k]: fold("C:\\D\\", ready(Array.from({ length: 15 }, (_, i) => entry(`f${i}`)))) } };
+      expect(run(many, { type: "wheel", rows: 100 }).state.top).toBe(8);
+      const last = run(many, key("ArrowUp")).state;
+      expect([last.selected, last.top]).toEqual([15, 8]);
+    });
+  });
+
+  const side = (k: "ArrowLeft" | "ArrowRight", ctrl = false, shift = false) => ({ type: "key", key: k, ctrl, shift }) as Event;
+  const R = side("ArrowRight");
+  const L = side("ArrowLeft");
+  const D = dir("D");
+  const kD = keyOf("files", "D");
+  const sub = entry("sub", { folder: "C:\\x\\sub\\" });
+  const kSub = keyOf("path", sub.id, kD);
+  const typedIn = (text: string, ...items: Item[]) =>
+    run(initial, { type: "shown" }, { type: "input", text }, { type: "results", items }).state;
+  const open = (s: State, k: string, f: Fold): State => ({ ...s, unfolded: { ...s.unfolded, [k]: f } });
+  const at = (s: State, selected: number): State => ({ ...s, selected, browsed: true });
+  const reading = (path: string): Fold => ({ path, state: "reading", rows: [], more: 0, typed: "" });
+  // D unfolded (sub folder, a file), then b.
+  const tree = () => open(typedIn("proj", D, item("b")), kD, fold("C:\\D\\", ready([sub, entry("f.txt")], 0, "~\\Documents\\Projects\\")));
+  const unchanged = (s: State, ...events: Event[]) => {
+    const r = run(s, ...events);
+    expect(r.state).toBe(s);
+    expect(r.effects).toEqual([]);
+  };
+
+  describe("right and left", () => {
+    it("right_on_a_folded_folder_starts_reading_it_and_the_selection_stays", () => {
+      const s = typedIn("proj", item("a"), D);
+      const r = run(at(s, 1), R);
+      expect(r.state.unfolded).toEqual({ [kD]: reading("C:\\D\\") });
+      expect(r.effects).toEqual([{ type: "unfold", key: kD, path: "C:\\D\\" }]);
+      expect([r.state.selected, r.state.browsed]).toEqual([1, true]);
+      expect(ids(r.state)).toEqual([["apps", "a", 0], ["files", "D", 0], ["fold", "reading", 1]]);
+      // Right counts as moving through the rows: the highlight comes out.
+      const tc = run(typedIn("proj", D), { type: "options", tabCompletion: true }).state;
+      expect(run(tc, R).state.browsed).toBe(true);
+    });
+
+    it("right_on_an_unfolded_folder_moves_to_its_first_row_inside", () => {
+      const r = run({ ...tree(), browsed: false }, R);
+      expect([r.state.selected, r.state.browsed]).toEqual([1, true]);
+      expect(r.effects).toEqual([]);
+      // While it is still being read, the first row inside is "Reading…".
+      expect(run(open(typedIn("proj", D), kD, reading("C:\\D\\")), R).state.selected).toBe(1);
+    });
+
+    it("left_on_an_unfolded_folder_folds_it_and_every_folder_under_it", () => {
+      const D2 = dir("D2");
+      const kD2 = keyOf("files", "D2");
+      const s = open(open(open(typedIn("proj", D, D2), kD, fold("C:\\D\\", ready([sub]))), kSub, fold("C:\\x\\sub\\", ready([entry("deep")]))), kD2, fold("C:\\D2\\", ready([entry("q")])));
+      const r = run(s, L);
+      // D2's key starts with D's: only the folders really under D go.
+      expect(r.state.unfolded).toEqual({ [kD2]: s.unfolded[kD2] });
+      expect([r.state.selected, r.state.browsed]).toEqual([0, true]);
+      expect(r.effects).toEqual([]);
+      // An unfolded folder inside folds the same way, leaving its parent open.
+      const inner = run(at(s, 1), L).state;
+      expect(Object.keys(inner.unfolded).sort()).toEqual([kD, kD2].sort());
+      expect(inner.selected).toBe(1);
+    });
+
+    it("left_on_a_row_inside_goes_to_the_row_of_its_folder", () => {
+      const s = open(tree(), kSub, fold("C:\\x\\sub\\", ready([entry("deep")])));
+      // D, sub, deep, f.txt, b
+      expect(run(at(s, 2), L).state.selected).toBe(1);
+      expect(run(at(s, 3), L).state.selected).toBe(0);
+      // A folded folder inside: to its folder's row as well.
+      expect(run(at(tree(), 1), L).state.selected).toBe(0);
+      // The page's own rows too.
+      const more = open(typedIn("proj", item("a"), D), kD, fold("C:\\D\\", ready([entry("x")], 4)));
+      expect(shownRows(more)[3].id).toBe("more");
+      const back = run(at(more, 3), L);
+      expect([back.state.selected, back.state.browsed]).toEqual([1, true]);
+      expect(back.effects).toEqual([]);
+    });
+
+    it("right_on_the_more_row_is_enter_on_it", () => {
+      const s = open(typedIn("proj", D), kD, fold("C:\\D\\", ready([entry("x")], 4, "~\\Documents\\Big\\")));
+      const r = run(at(s, 2), R);
+      expect(r.state.text).toBe("~\\Documents\\Big\\");
+      expect(r.effects).toEqual([{ type: "query", text: "~\\Documents\\Big\\", scope: null }]);
+      expect(r.state.unfolded).toEqual({});
+    });
+
+    it("other_rows_do_nothing", () => {
+      const s = tree();
+      unchanged(at(s, 2), R); // a file inside
+      unchanged(at(s, 3), R); // a result that is no folder
+      unchanged(at(s, 3), L);
+      unchanged(at(typedIn("proj", D), 0), L); // a folded result
+      unchanged(at(open(typedIn("proj", D), kD, reading("C:\\D\\")), 1), R); // "Reading…"
+    });
+
+    it("ignored_with_the_menu_open_a_row_armed_answers_awaited_an_activation_pending_ctrl_shift_or_a_panel", () => {
+      const s = typedIn("proj", D, item("b"));
+      const menu = run(s, { type: "menu", index: 0 }).state;
+      expect(menu.menu).not.toBeNull();
+      unchanged(menu, R);
+      unchanged({ ...s, armed: "b" }, R);
+      unchanged({ ...s, pending: true }, R);
+      unchanged(s, side("ArrowRight", true));
+      unchanged(s, side("ArrowRight", false, true));
+      unchanged(tree(), side("ArrowLeft", true));
+      const qr = typedIn("qr x", { ...D, panel: "<svg/>" });
+      unchanged(qr, R);
+    });
+
+    it("review_focus_2_right_while_older_results_are_awaited_unfolds_nothing", () => {
+      const waiting = run(typedIn("proj", D), { type: "input", text: "proje" }).state;
+      expect(waiting.awaiting).toBe(true);
+      unchanged(waiting, R);
+      unchanged({ ...tree(), awaiting: true }, L);
+    });
+  });
+
+  describe("replies", () => {
+    const asked = () => run(typedIn("proj", D, item("b")), R).state;
+
+    it("a_reply_is_stored_for_its_folder", () => {
+      const r = run(asked(), { type: "unfolded", key: kD, path: "C:\\D\\", reply: ready([entry("x")], 0, "~\\D\\") });
+      expect(r.state.unfolded).toEqual({ [kD]: fold("C:\\D\\", ready([entry("x")], 0, "~\\D\\")) });
+      expect(ids(r.state)).toEqual([["files", "D", 0], ["path", "C:\\x\\x", 1], ["apps", "b", 0]]);
+      expect(r.effects).toEqual([]);
+    });
+
+    it("a_reply_keeps_the_selection_on_its_row", () => {
+      // Selection on b below the folder: "Reading…" becomes three rows, b stays selected.
+      const s = at(asked(), 2);
+      expect(shownRows(s)[2].id).toBe("b");
+      const r = run(s, { type: "unfolded", key: kD, path: "C:\\D\\", reply: ready([entry("x"), entry("y"), entry("z")]) });
+      expect(shownRows(r.state)[r.state.selected].id).toBe("b");
+    });
+
+    it("review_focus_1_a_reply_for_a_folder_folded_or_a_search_changed_is_dropped", () => {
+      const reply = { type: "unfolded", key: kD, path: "C:\\D\\", reply: ready([entry("x")]) } as const;
+      // Folded again before the answer came.
+      const folded = run(asked(), L).state;
+      expect(folded.unfolded).toEqual({});
+      unchanged(folded, reply);
+      // The text changed.
+      const typed = run(asked(), { type: "input", text: "proje" }).state;
+      unchanged(typed, reply);
+      // The bar was hidden.
+      unchanged(run(asked(), { type: "hidden" }).state, reply);
+      // A reply for another path under the same key (an older unfolding) is never spliced in.
+      unchanged(asked(), { ...reply, path: "C:\\Other\\" });
+    });
+
+    it("a_late_reading_reply_never_undoes_an_answer", () => {
+      const answered = run(asked(), { type: "unfolded", key: kD, path: "C:\\D\\", reply: ready([entry("x")]) }).state;
+      unchanged(answered, { type: "unfolded", key: kD, path: "C:\\D\\", reply: { state: "reading", rows: [], more: 0, typed: "~\\D\\" } });
+    });
+
+    it("answers_ready_asks_again_for_every_folder_still_reading", () => {
+      const s = open(open(asked(), kSub, reading("C:\\x\\sub\\")), keyOf("files", "E"), fold("C:\\E\\", ready([])));
+      expect(run(s, { type: "answersReady" }).effects).toEqual([
+        { type: "query", text: "proj", scope: null, keepSelection: true },
+        { type: "unfold", key: kD, path: "C:\\D\\" },
+        { type: "unfold", key: kSub, path: "C:\\x\\sub\\" },
+      ]);
+      // On the empty bar, where today nothing is asked again.
+      const empty = run(run(initial, { type: "shown" }, { type: "results", items: [D] }).state, R).state;
+      expect(run(empty, { type: "answersReady" }).effects).toEqual([{ type: "unfold", key: kD, path: "C:\\D\\" }]);
+      // Never while hidden.
+      expect(run({ ...s, hidden: true }, { type: "answersReady" }).effects).toEqual([]);
+    });
+  });
+
+  describe("rows made by the page", () => {
+    const states: Omit<Fold, "path">[] = [
+      { state: "reading", rows: [], more: 0, typed: "" },
+      { state: "missing", rows: [], more: 0, typed: "~\\D\\" },
+      { state: "denied", rows: [], more: 0, typed: "~\\D\\" },
+      ready([]),
+    ];
+
+    it("enter_on_more_puts_the_folder_path_in_the_bar", () => {
+      const s = at(open(typedIn("proj", D), kD, fold("C:\\D\\", ready([entry("x")], 4, "~\\Documents\\Big\\"))), 2);
+      const r = run(s, key("Enter"));
+      expect([r.state.text, r.state.items, r.state.awaiting]).toEqual(["~\\Documents\\Big\\", [], true]);
+      expect(r.effects).toEqual([{ type: "query", text: "~\\Documents\\Big\\", scope: null }]);
+      // A click on it too.
+      expect(run(s, { type: "click", index: 2, ctrl: false, shift: false }).state.text).toBe("~\\Documents\\Big\\");
+    });
+
+    it("the_other_rows_do_nothing_on_enter_tab_ctrl_p_or_a_click", () => {
+      for (const reply of states) {
+        const s = at(open(typedIn("proj", D), kD, fold("C:\\D\\", reply)), 1);
+        expect(shownRows(s)[1].provider).toBe("fold");
+        unchanged(s, key("Enter"));
+        unchanged(s, key("Tab"));
+        unchanged(s, key("p", true));
+        expect(run(s, { type: "click", index: 1, ctrl: false, shift: false }).effects).toEqual([]);
+        expect(run(s, { type: "menu", index: 1 }).state.menu).toBeNull();
+      }
+      const more = at(open(typedIn("proj", D), kD, fold("C:\\D\\", ready([entry("x")], 4))), 2);
+      unchanged(more, key("Tab"));
+      unchanged(more, key("p", true));
+    });
+  });
+
+  describe("rows inside", () => {
+    it("enter_on_a_row_inside_activates_it_as_a_path_row", () => {
+      const r = run(at(tree(), 2), key("Enter", true));
+      expect(r.effects).toEqual([{ type: "activate", item: entry("f.txt"), modifier: "ctrl", text: "proj", scope: null }]);
+    });
+
+    it("tab_on_a_row_inside_opens_its_menu_even_while_browsing_a_path", () => {
+      const here = entry("here", { folder: "C:\\x\\here\\" });
+      const s = open(typedIn("C:\\x\\", here, entry("a.txt")), keyOf("path", here.id), fold("C:\\x\\here\\", ready([entry("in.txt")])));
+      const r = run(at(s, 1), key("Tab"));
+      expect(r.state.menu).toEqual({ index: 1, actions: ["reveal", "copy_path", "pin"], selected: 0, at: "row" });
+      // Path browsing's own rows: no menu on Tab, as today.
+      expect(run(at(s, 2), key("Tab")).state.menu).toBeNull();
+    });
+
+    it("rows_inside_offer_no_grey_completion", () => {
+      const s = { ...tree(), text: "f", tabCompletion: true, browsed: false, selected: 2 };
+      expect(shownRows(s)[2].title).toBe("f.txt");
+      expect(completion(s)).toBeNull();
+    });
+  });
+
+  describe("typing while inside", () => {
+    it("typing_at_the_end_while_inside_switches_to_the_folder_path", () => {
+      const r = run(at(tree(), 2), { type: "input", text: "projf" });
+      expect(r.state.text).toBe("~\\Documents\\Projects\\f");
+      expect(r.effects).toEqual([{ type: "query", text: "~\\Documents\\Projects\\f", scope: null }]);
+      expect([r.state.unfolded, r.state.awaiting, r.state.selected, r.state.browsed]).toEqual([{}, true, 0, false]);
+      // A paste at the end the same way.
+      expect(run(at(tree(), 1), { type: "input", text: "proj a b" }).state.text).toBe("~\\Documents\\Projects\\ a b");
+    });
+
+    it("before_the_folder_answered_its_full_path_is_used", () => {
+      const s = at(open(typedIn("proj", D), kD, reading("C:\\D\\")), 1);
+      expect(run(s, { type: "input", text: "projx" }).state.text).toBe("C:\\D\\x");
+    });
+
+    it("any_other_edit_or_a_row_not_inside_is_an_ordinary_search", () => {
+      for (const text of ["pro", "xproj", "pr0j", ""]) {
+        const r = run(at(tree(), 2), { type: "input", text });
+        expect([r.state.text, r.state.unfolded]).toEqual([text, {}]);
+      }
+      // On the unfolded folder itself (depth 0): ordinary.
+      expect(run(at(tree(), 0), { type: "input", text: "projf" }).state.text).toBe("projf");
+    });
+
+    it("inside_a_pick_list_typing_is_ordinary", () => {
+      const s = { ...at(tree(), 2), scope: { name: "web", prompt: "Search" } };
+      const r = run(s, { type: "input", text: "projf" });
+      expect(r.state.text).toBe("projf");
+      expect(r.effects).toEqual([{ type: "query", text: "projf", scope: "web" }]);
+    });
+
+    it("review_fix_composing_input_inside_is_ordinary_text_until_it_ends", () => {
+      const composing = run(at(tree(), 2), { type: "input", text: "projf", composing: true });
+      expect([composing.state.text, composing.state.unfolded]).toEqual(["projf", {}]);
+      expect(composing.effects).toEqual([{ type: "query", text: "projf", scope: null }]);
+      const done = run(at(tree(), 2), { type: "input", text: "projf", composing: false });
+      expect(done.state.text).toBe("~\\Documents\\Projects\\f");
+    });
+  });
+
+  describe("sideActs", () => {
+    it("is_true_exactly_where_right_or_left_would_act", () => {
+      const s = tree(); // D (unfolded), sub (folded), f.txt, b
+      expect(sideActs(at(s, 0), true)).toBe(true); // unfolded folder
+      expect(sideActs(at(s, 0), false)).toBe(true);
+      expect(sideActs(at(s, 1), true)).toBe(true); // folded folder inside
+      expect(sideActs(at(s, 1), false)).toBe(true); // row with a parent
+      expect(sideActs(at(s, 2), true)).toBe(false); // a file inside
+      expect(sideActs(at(s, 2), false)).toBe(true);
+      expect(sideActs(at(s, 3), true)).toBe(false); // any other row
+      expect(sideActs(at(s, 3), false)).toBe(false);
+      expect(sideActs(at(typedIn("proj", D), 0), true)).toBe(true); // folded result
+      expect(sideActs(at(typedIn("proj", D), 0), false)).toBe(false);
+      const more = open(typedIn("proj", D), kD, fold("C:\\D\\", ready([entry("x")], 4)));
+      expect(sideActs(at(more, 2), true)).toBe(true); // the more row
+      expect(sideActs(at(more, 2), false)).toBe(true);
+      expect(sideActs(at(open(typedIn("proj", D), kD, reading("C:\\D\\")), 1), true)).toBe(false); // Reading
+      expect(sideActs({ ...typedIn("proj"), selected: 0 }, true)).toBe(false); // no rows
+    });
+
+    it("is_false_in_every_blocked_state", () => {
+      const s = at(tree(), 0);
+      expect(sideActs(s, true)).toBe(true);
+      const menu = run(s, { type: "menu", index: 0 }).state;
+      expect(sideActs(menu, true)).toBe(false);
+      expect(sideActs({ ...s, armed: "b" }, true)).toBe(false);
+      expect(sideActs({ ...s, awaiting: true }, true)).toBe(false);
+      expect(sideActs({ ...s, pending: true }, true)).toBe(false);
+      expect(sideActs(typedIn("qr x", { ...D, panel: "<svg/>" }), true)).toBe(false);
+    });
+  });
+
+  describe("what folds", () => {
+    it("everything_folds_when_the_text_changes_a_scope_comes_or_goes_or_the_bar_hides_or_opens", () => {
+      const s = tree();
+      const folds = (t: State, ...events: Event[]) => expect(run(t, ...events).state.unfolded).toEqual({});
+      folds(s, { type: "input", text: "projx" });
+      folds(s, key("F1"));
+      folds(s, { type: "outcome", outcome: { kind: "fill", text: "C:\\" } });
+      folds(s, { type: "outcome", outcome: { kind: "step", prompt: "P", scope: "web" } });
+      folds({ ...s, text: "", queried: { text: "", scope: null }, browsed: false, past: ["old"] }, key("ArrowUp"));
+      folds({ ...s, scope: { name: "web", prompt: "P" } }, key("Escape"));
+      folds(s, key("Escape"));
+      folds(s, { type: "scoped", prompt: "P", scope: "web" });
+      folds(s, { type: "hidden" });
+      folds(s, { type: "shown" });
+      folds(s, { type: "reopen", text: "a", error: "" });
+    });
+
+    it("a_requery_for_the_same_text_keeps_the_folds_and_the_selected_row", () => {
+      const s = at(open(tree(), kSub, fold("C:\\x\\sub\\", ready([entry("deep")]))), 2);
+      const asked = run(s, { type: "answersReady" }).state;
+      expect(asked.keep).toEqual({ provider: "path", id: "C:\\x\\deep", chain: kSub });
+      const r = run(asked, { type: "results", items: [item("new"), D, item("b")] }).state;
+      expect(r.unfolded).toBe(s.unfolded);
+      expect(shownRows(r)[r.selected].key).toBe(keyOf("path", "C:\\x\\deep", kSub));
+      expect(r.selected).toBe(3);
+    });
+
+    it("a_folder_gone_from_the_results_folds_with_the_folders_under_it", () => {
+      const D2 = dir("D2");
+      const kD2 = keyOf("files", "D2");
+      const s = at(open(open(tree(), kSub, fold("C:\\x\\sub\\", ready([entry("deep")]))), kD2, fold("C:\\D2\\", ready([entry("q")]))), 3);
+      const withD2 = { ...s, items: [D, item("b"), D2] };
+      // D, sub, deep, f.txt, b, D2, q: the selection is on f.txt inside D.
+      expect(shownRows(withD2)[3].id).toBe("C:\\x\\f.txt");
+      const asked = run(withD2, { type: "answersReady" }).state;
+      const r = run(asked, { type: "results", items: [item("b"), D2, item("c"), item("d"), item("e")] }).state;
+      expect(r.unfolded).toEqual({ [kD2]: s.unfolded[kD2] });
+      // b, D2, q, c, d, e: the row that took its place.
+      expect(r.selected).toBe(3);
+      // Nothing left that far down: the last row.
+      expect(run(asked, { type: "results", items: [item("b")] }).state.selected).toBe(0);
+      // A result row that is gone: back to the first, as today.
+      const onB = run(at(withD2, 4), { type: "answersReady" }).state;
+      expect(run(onB, { type: "results", items: [D2, D] }).state.selected).toBe(0);
+    });
+
+    it("a_menu_stays_open_while_its_row_keeps_its_place", () => {
+      const s = run(tree(), { type: "menu", index: 2 }).state;
+      const asked = run(s, { type: "answersReady" }).state;
+      expect(run(asked, { type: "results", items: [D, item("b")] }).state.menu).toEqual(s.menu);
+      expect(run(asked, { type: "results", items: [item("new"), D, item("b")] }).state.menu).toBeNull();
+    });
+
+    it("a_live_row_changing_keeps_the_folds", () => {
+      const clock: Item = { ...item("now:local"), provider: "answers", live: true };
+      const s = open(typedIn("time", clock, D), kD, fold("C:\\D\\", ready([entry("x")])));
+      const r = run(s, { type: "liveRowResult", item: { ...clock, title: "12:01" } }).state;
+      expect(r.unfolded).toBe(s.unfolded);
+      expect(ids(r)).toEqual(ids(s));
+    });
+
+    it("fresh_empty_bar_rows_keep_the_folds_and_select_by_shown_row", () => {
+      // The empty bar laid out again after a pin: the first pin is selected, counted in shown rows.
+      const p = { ...item("p"), origin: "pin" as const, pinned: true };
+      const s0 = run(initial, { type: "shown" }, { type: "results", items: [D, p] }).state;
+      expect(s0.selected).toBe(1);
+      const s = run(at(s0, 0), R, { type: "unfolded", key: kD, path: "C:\\D\\", reply: ready([entry("x"), entry("y")]) }).state;
+      const r = run(s, { type: "pinned", provider: "apps", id: "p", pinned: true }, { type: "results", items: [D, p] }).state;
+      expect(r.unfolded).toEqual(s.unfolded);
+      expect(shownRows(r)[r.selected].id).toBe("p");
+    });
+
+    it("pinning_a_row_inside_marks_it_pinned", () => {
+      const s = at(tree(), 2);
+      const r = run(s, { type: "pinned", provider: "path", id: "C:\\x\\f.txt", pinned: true }).state;
+      expect(shownRows(r)[2].pinned).toBe(true);
+      expect(run(r, key("Tab")).state.menu?.actions).toEqual(["reveal", "copy_path", "unpin"]);
+    });
+  });
+
+  describe("chevron", () => {
+    it("a_chevron_click_unfolds_or_folds_that_row_and_selects_it", () => {
+      const s = at(typedIn("proj", item("a"), D), 0);
+      const r = run(s, { type: "fold", index: 1 });
+      expect(r.effects).toEqual([{ type: "unfold", key: kD, path: "C:\\D\\" }]);
+      expect([r.state.selected, r.state.unfolded]).toEqual([1, { [kD]: reading("C:\\D\\") }]);
+      // Folding from a row inside: the selection goes onto the folder's row.
+      const f = run(at(tree(), 2), { type: "fold", index: 0 });
+      expect([f.state.selected, f.state.unfolded, f.effects]).toEqual([0, {}, []]);
+      // No chevron there: nothing.
+      unchanged(at(tree(), 2), { type: "fold", index: 3 });
+      unchanged(tree(), { type: "fold", index: 9 });
+    });
+
+    it("a_chevron_click_is_ignored_when_the_keys_are", () => {
+      const s = typedIn("proj", item("a"), D);
+      const menu = run(s, { type: "menu", index: 1 }).state;
+      expect(menu.menu).not.toBeNull();
+      unchanged(menu, { type: "fold", index: 1 });
+      unchanged({ ...s, armed: "a" }, { type: "fold", index: 1 });
+      unchanged({ ...s, awaiting: true }, { type: "fold", index: 1 });
+      unchanged({ ...s, pending: true }, { type: "fold", index: 1 });
+    });
+  });
+});
+
+describe("arrowActsOnList", () => {
+  it("acts_only_with_the_caret_at_the_end_and_no_selection_or_modifier", () => {
+    expect(arrowActsOnList("ArrowRight", 5, 5, 5, false)).toBe(true);
+    expect(arrowActsOnList("ArrowLeft", 0, 0, 0, false)).toBe(true);
+    expect(arrowActsOnList("ArrowRight", 2, 2, 5, false)).toBe(false);
+    expect(arrowActsOnList("ArrowLeft", 0, 5, 5, false)).toBe(false);
+    expect(arrowActsOnList("ArrowRight", 5, 5, 5, true)).toBe(false);
+    expect(arrowActsOnList("ArrowRight", null, null, 5, false)).toBe(false);
   });
 });

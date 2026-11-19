@@ -873,7 +873,7 @@ fn build_engine(
         // Last: it has no help line, so the help list is unchanged.
         Box::new(p.welcome.clone()),
     ];
-    Engine::new(providers, ranking, history, pins)
+    Engine::new(providers, ranking, history, pins).with_path(p.path.clone())
 }
 
 /// Opens the Settings window; builds it off the calling thread.
@@ -1052,6 +1052,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::query,
             commands::live_row,
+            commands::unfold,
             commands::activate,
             commands::hide,
             commands::toggle_pin,
@@ -2380,6 +2381,7 @@ mod tests {
                 "Ctrl+P",
                 "Up",
                 "Tab",
+                "Right / Left",
             ]
         );
         let flick = &help[37];
@@ -2390,7 +2392,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 45);
+        assert_eq!(r.engine.query("Help", None).len(), 46);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
