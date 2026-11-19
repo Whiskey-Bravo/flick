@@ -12,6 +12,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::cloud_roots::{self, CloudRoots};
+use crate::file_ops;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -437,6 +439,8 @@ pub struct FilesProvider {
     /// For the Copy path action.
     clipboard: Arc<dyn Clipboard>,
     index: RwLock<Index>,
+    /// Decides which rows offer the cloud actions.
+    cloud: Arc<CloudRoots>,
     roots: Arc<Mutex<Vec<PathBuf>>>,
     /// Bumped by `set_roots`; a scan started before the bump is thrown away.
     generation: AtomicU64,
@@ -495,11 +499,20 @@ impl FilesProvider {
         Self::with_index(launcher, clipboard, Index::from_entries(e), true)
     }
 
+    /// Like [`Self::with_clipboard`], with the cloud roots rows are judged by.
+    #[cfg(test)]
+    fn with_cloud(launcher: Arc<dyn Launcher>, cloud: Arc<CloudRoots>, e: Vec<FileEntry>) -> Arc<Self> {
+        let mut p = Self::with_index(launcher, Arc::new(crate::clipboard::FakeClipboard::default()), Index::from_entries(e), true);
+        Arc::get_mut(&mut p).expect("not shared yet").cloud = cloud;
+        p
+    }
+
     fn with_index(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, index: Index, scanned: bool) -> Arc<Self> {
         Arc::new(Self {
             launcher,
             clipboard,
             index: RwLock::new(index),
+            cloud: Arc::clone(cloud_roots::shared()),
             roots: Arc::new(Mutex::new(default_roots())),
             generation: AtomicU64::new(0),
             refresh_state: Mutex::new(RefreshState::default()),
@@ -843,10 +856,10 @@ impl FilesProvider {
             score,
             icon: file_icon(index.name(s), s.is_dir),
             pinnable: true,
-            actions: if s.is_dir {
-                vec![Action::OpenFolder, Action::CopyPath]
-            } else {
-                vec![Action::Reveal, Action::CopyPath]
+            actions: {
+                let full = index.path(s);
+                let path = full.to_string_lossy();
+                file_ops::menu(s.is_dir, self.cloud.contains(&path), file_ops::is_drive_root(&path))
             },
             ..Default::default()
         }
@@ -1358,15 +1371,33 @@ mod tests {
     #[test]
     fn rows_offer_location_or_explorer_and_copy() {
         let (p, _) = provider(vec![entry(r"C:\x\notes.txt", false), entry(r"C:\x\notes", true)]);
-        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, [Action::Reveal, Action::CopyPath]);
-        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, file_ops::menu(false, false, false));
+        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, file_ops::menu(true, false, false));
         let rows = p.query(&q("notes"));
         assert_eq!(rows.len(), 2);
         for r in rows {
-            let first = if r.icon == "folder" { Action::OpenFolder } else { Action::Reveal };
-            assert_eq!(r.actions, [first, Action::CopyPath], "{}", r.id);
+            assert_eq!(r.actions, file_ops::menu(r.icon == "folder", false, false), "{}", r.id);
             assert_eq!(r.complete, "");
         }
+    }
+
+    #[test]
+    fn files_rows_carry_the_new_menu() {
+        use Action::*;
+        let cloud = Arc::new(CloudRoots::default());
+        cloud.set(vec![PathBuf::from(r"C:\Cloud")]);
+        let entries = vec![entry(r"C:\Cloud\a.txt", false), entry(r"C:\Cloud\dir", true), entry(r"C:\x\b.txt", false)];
+        let p = FilesProvider::with_cloud(Arc::new(RecordingLauncher::default()), cloud, entries);
+        assert_eq!(
+            p.item(r"C:\Cloud\a.txt").unwrap().actions,
+            [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]
+        );
+        assert_eq!(
+            p.item(r"C:\Cloud\dir").unwrap().actions,
+            [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]
+        );
+        assert_eq!(p.item(r"C:\x\b.txt").unwrap().actions, [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
+        assert_eq!(p.act(r"C:\x\b.txt", Rename), Err("can't do that here".to_string()));
     }
 
     #[test]

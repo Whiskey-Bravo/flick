@@ -44,6 +44,24 @@ pub enum Action {
     Copy,
     /// Save the row's picture (the QR code) to a file.
     SavePicture,
+    /// Open a folder in Windows Terminal.
+    OpenTerminal,
+    /// Compress a folder to a zip next to it.
+    Compress,
+    /// The item's Properties window.
+    Properties,
+    /// The "Open with" chooser.
+    OpenWith,
+    /// Put the file itself on the clipboard.
+    CopyFile,
+    Rename,
+    Delete,
+    /// Cloud files: always keep on this device.
+    KeepOffline,
+    /// Cloud files: online only.
+    FreeUpSpace,
+    /// The item's full Explorer context menu.
+    MoreOptions,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]

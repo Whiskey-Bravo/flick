@@ -298,6 +298,16 @@ const MENU_LABELS: Record<MenuAction, string> = {
   close_window: "Close window",
   copy: "Copy",
   save_picture: "Save as picture",
+  open_terminal: "Open in Terminal",
+  compress: "Compress to zip",
+  properties: "Properties",
+  open_with: "Open with…",
+  copy_file: "Copy",
+  rename: "Rename",
+  delete: "Delete",
+  keep_offline: "Keep on this device",
+  free_up_space: "Free up space",
+  more_options: "More options…",
 };
 /// Where the right-click happened, in window coordinates.
 let menuAt: Point = { x: 0, y: 0 };

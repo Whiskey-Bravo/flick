@@ -4,6 +4,7 @@ mod backdrop;
 mod bookmarks;
 mod clipboard;
 mod cliphistory;
+mod cloud_roots;
 mod chores;
 mod commands;
 mod config;
@@ -13,6 +14,7 @@ mod devices;
 mod dirs;
 mod direct_keys;
 mod engine;
+mod file_ops;
 mod fuzzy;
 mod games;
 mod history;
@@ -227,6 +229,7 @@ impl Providers {
     pub(crate) fn refresh_on_show(&self) {
         self.refresher.request();
         self.bookmarks.refresh_if_stale();
+        cloud_roots::shared().refresh_if_due();
         // Store installs (and, without a watcher, shortcuts): a background thread.
         self.apps.refresh_on_show();
     }
@@ -1139,6 +1142,7 @@ fn save_qr_window(app: AppHandle, notifier: Arc<dyn Notifier>) -> impl Fn(&str) 
 fn setup(app: &AppHandle) {
     let path = config::config_path();
     let first_run = !path.exists();
+    cloud_roots::shared().refresh_if_due();
     let loaded = config::load(&path, None);
 
     // One launcher for every provider that starts something.

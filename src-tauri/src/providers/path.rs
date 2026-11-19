@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use super::files::file_icon;
 use crate::clipboard::Clipboard;
+use crate::cloud_roots::{self, CloudRoots};
+use crate::file_ops;
 use crate::dirs::{folder_key, size_text, DirEntry, FileSystem, Load, Loader};
 use crate::fuzzy;
 use crate::launch::Launcher;
@@ -83,8 +85,21 @@ pub fn parse_path(text: &str, home: Option<&Path>) -> Option<PathQuery> {
 /// A file or folder row: the id is the path (folders end with `\`), the
 /// title its name (a drive or share root shows the whole path).
 pub(crate) fn entry_row(provider: &'static str, path: &Path, is_dir: bool, subtitle: String, score: u32, complete: String) -> ResultItem {
-    let text = path.to_string_lossy().into_owned();
+    entry_row_in(cloud_roots::shared(), provider, path, is_dir, subtitle, score, complete)
+}
+
+/// [`entry_row`] with the cloud roots to consult.
+pub(crate) fn entry_row_in(
+    roots: &CloudRoots,
+    provider: &'static str,
+    path: &Path,
+    is_dir: bool,
+    subtitle: String,
+    score: u32,
+    complete: String,
+) -> ResultItem {    let text = path.to_string_lossy().into_owned();
     let title = path.file_name().map_or_else(|| text.clone(), |n| n.to_string_lossy().into_owned());
+    let text_for_menu = text.clone();
     let mut id = text;
     if is_dir && !id.ends_with('\\') {
         id.push('\\');
@@ -98,7 +113,7 @@ pub(crate) fn entry_row(provider: &'static str, path: &Path, is_dir: bool, subti
         subtitle,
         score,
         pinnable: true,
-        actions: if is_dir { vec![Action::OpenFolder, Action::CopyPath] } else { vec![Action::Reveal, Action::CopyPath] },
+        actions: file_ops::menu(is_dir, roots.contains(&text_for_menu), file_ops::is_drive_root(&text_for_menu)),
         complete,
         ..Default::default()
     }
@@ -482,6 +497,21 @@ mod tests {
     }
 
     #[test]
+    fn path_rows_carry_the_new_menu() {
+        use Action::*;
+        let roots = CloudRoots::default();
+        roots.set(vec![PathBuf::from(r"C:\Cloud")]);
+        let row = |p: &str, dir| entry_row_in(&roots, "path", Path::new(p), dir, String::new(), 0, String::new()).actions;
+        assert_eq!(row(r"C:\Cloud\a.txt", false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(row(r"C:\Cloud\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(row(r"C:\CloudBackup\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
+        assert_eq!(row(r"C:\", true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
+        // The new entries are not handled yet.
+        let r = rig();
+        assert_eq!(r.p.act(r"C:\a.txt", Rename), Err("can't do that here".to_string()));
+    }
+
+    #[test]
     fn entries_list_folders_first_with_the_folder_itself_on_top() {
         let r = rig();
         let rows = r.ready(r"C:\");
@@ -490,12 +520,12 @@ mod tests {
         assert_eq!(subs, ["This folder", "Folder", "Folder", "10 B", "2.0 KB"]);
         assert_eq!(rows[0].id, r"C:\");
         assert_eq!(rows[0].complete, "");
-        assert_eq!(rows[0].actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(rows[0].actions, file_ops::menu(true, false, true));
         assert_eq!(rows[1].id, r"C:\Games\");
         assert_eq!(rows[1].icon, "folder");
         assert_eq!(rows[3].id, r"C:\a.txt");
         assert_eq!(rows[3].icon, "ext:.txt");
-        assert_eq!(rows[3].actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(rows[3].actions, file_ops::menu(false, false, false));
         assert!(rows.iter().all(|r| r.provider == "path" && r.pinnable));
         assert_scores_fall(&rows);
     }
@@ -623,10 +653,10 @@ mod tests {
         let before = r.fs.reads();
         let row = r.p.item(r"C:\Games\").unwrap();
         assert_eq!((row.id.as_str(), row.title.as_str(), row.provider), (r"C:\Games\", "Games", "path"));
-        assert_eq!(row.actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(row.actions, file_ops::menu(true, false, false));
         assert!(row.pinnable);
         let row = r.p.item(r"C:\a.txt").unwrap();
-        assert_eq!(row.actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(row.actions, file_ops::menu(false, false, false));
         assert_eq!(r.p.item(r"C:\").unwrap().title, r"C:\");
         assert!(r.p.item("notes").is_none());
         assert_eq!(r.fs.reads(), before);
