@@ -1,6 +1,7 @@
 //! Engine: fans a query out to providers, merges, ranks and truncates.
 
 use std::cell::Cell;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -466,6 +467,24 @@ impl Engine {
             self.listing_changed(id);
         }
         Ok(outcome)
+    }
+
+    /// Windows' own menu for a file or folder row (`show` gets the row's path).
+    /// Only a row whose menu offers More options… is shown one, and only while
+    /// its path is still on disk as the same kind; otherwise a short error and
+    /// `show` is not called. `show`'s answer is passed on: whether a command ran.
+    pub fn more_options(&self, provider: &str, id: &str, show: impl FnOnce(&Path) -> Result<bool, String>) -> Result<bool, String> {
+        let p = self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?;
+        if !p.item(id).is_some_and(|item| item.actions.contains(&Action::MoreOptions)) {
+            return Err("can't do that here".into());
+        }
+        let (path, is_dir) = crate::providers::path::split_id(id);
+        let path = Path::new(path);
+        // Checking the disk is fine here: this is not the query path.
+        if std::fs::metadata(path).ok().map(|m| m.is_dir()) != Some(is_dir) {
+            return Err("file not found".into());
+        }
+        show(path)
     }
 
     /// What an unfolded folder shows is out of date: the folder holding `id`
@@ -1788,6 +1807,35 @@ mod tests {
         assert_eq!(d.e.act("files", &b, Action::Delete), Err("in use".to_string()));
         assert_eq!(d.remembered(&b), (true, 15, true));
         assert_eq!(d.found("b.txt"), [b]);
+    }
+
+    #[test]
+    fn more_options_on_a_missing_path_errors_without_a_menu() {
+        use std::path::PathBuf;
+        let d = disk();
+        let a = d.id("a.txt");
+        let folder = format!("{}\\", d.id("sub"));
+        let shown = std::cell::RefCell::new(Vec::new());
+        let show = |p: &Path| {
+            shown.borrow_mut().push(p.to_path_buf());
+            Ok(true)
+        };
+        // A file and a folder still on disk: the menu is shown for the path alone.
+        assert_eq!(d.e.more_options("files", &a, show), Ok(true));
+        assert_eq!(d.e.more_options("files", &folder, show), Ok(true));
+        assert_eq!(*shown.borrow(), [PathBuf::from(&a), PathBuf::from(d.id("sub"))]);
+        shown.borrow_mut().clear();
+        // Gone since the search: a short error, and no menu.
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(d.e.more_options("files", &a, show), Err("file not found".to_string()));
+        // A folder row whose path is now a file is not that row either.
+        std::fs::remove_dir_all(d.id("sub")).unwrap();
+        std::fs::write(d.id("sub"), b"").unwrap();
+        assert_eq!(d.e.more_options("files", &folder, show), Err("file not found".to_string()));
+        // Not indexed, or another provider's id: refused before the disk is asked.
+        assert_eq!(d.e.more_options("files", &d.id("zzz.txt"), show), Err("can't do that here".to_string()));
+        assert_eq!(d.e.more_options("nowhere", &d.id("b.txt"), show), Err("unknown provider: nowhere".to_string()));
+        assert!(shown.borrow().is_empty());
     }
 
     #[test]

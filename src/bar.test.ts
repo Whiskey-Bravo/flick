@@ -845,6 +845,19 @@ describe("mouse and menu", () => {
     }
   });
 
+  it("more_options_effect_carries_the_row", () => {
+    const a = rich("a", { provider: "files", actions: ["reveal"] });
+    const b = rich("C:/x/b.txt", { provider: "files", actions: ["reveal", "more_options"] });
+    const open = run(withItems(a, b), { type: "menu", index: 1 }).state;
+    const r = run(open, { type: "menuPick", action: "more_options" });
+    // Not `act`: the page measures the row and asks for Windows' own menu.
+    expect(r.effects).toEqual([{ type: "moreOptions", item: b, index: 1 }]);
+    expect(r.state.pending).toBe(true);
+    expect(r.state.menu).toBeNull();
+    // A pick on its way already: nothing more is sent.
+    expect(run({ ...open, pending: true }, { type: "menuPick", action: "more_options" }).effects).toEqual([]);
+  });
+
   it("menu_lists_row_actions_then_pin", () => {
     const a = rich("a", { actions: ["admin", "reveal", "uninstall", "close"], pinnable: true, pinned: true });
     expect(menuActions(a)).toEqual(["admin", "reveal", "uninstall", "close", "unpin"]);

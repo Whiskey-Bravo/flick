@@ -156,6 +156,7 @@ export type Effect =
   | { type: "loadPast" }
   | { type: "togglePin"; item: Item }
   | { type: "act"; item: Item; action: Action }
+  | { type: "moreOptions"; item: Item; index: number }
   | { type: "liveRow"; provider: string; id: string }
   | { type: "rename"; item: Item; name: string }
   | { type: "selectName"; start: number; end: number }
@@ -506,6 +507,10 @@ function step(s: State, e: Event): Result {
           const [start, end] = nameSelection(item.title, item.id.endsWith("\\"));
           return done({ ...closed, selected: m.index, rename: { item, chain: row.chain, before }, text: item.title, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
         }
+        case "more_options":
+          // Windows' own menu, shown under the row: the page measures it.
+          if (s.pending) return done(closed);
+          return done({ ...closed, pending: true }, [{ type: "moreOptions", item, index: m.index }]);
         default:
           if (s.pending) return done(closed);
           return done({ ...closed, pending: true }, [{ type: "act", item, action: e.action }]);

@@ -39,6 +39,7 @@ mod refresh;
 mod reminders;
 mod settings;
 mod settings_window;
+mod shell_menu;
 mod status;
 mod updates;
 mod webview_memory;
@@ -1072,6 +1073,7 @@ pub fn run() {
             timing::timing_mark,
             commands::act,
             commands::rename,
+            commands::more_options,
             settings::settings_state,
             settings::settings_set,
             settings::settings_save_shortcut,

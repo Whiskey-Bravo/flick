@@ -468,6 +468,16 @@ function dispatch(event: Event) {
   effects.forEach(run);
 }
 
+/// Where Windows' menu for row `index` opens: the row's left edge and bottom,
+/// in screen pixels. The page's own window position (the bar's capability
+/// grants no window calls), scaled like the row's box.
+function moreOptionsAt(index: number): { x: number; y: number } {
+  const li = list.querySelector<HTMLElement>(`li.result[data-index="${index}"]`);
+  const box = li?.getBoundingClientRect() ?? input.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  return { x: Math.round((window.screenX + box.left) * scale), y: Math.round((window.screenY + box.bottom) * scale) };
+}
+
 /// Rows with a `liveRow` request on its way: a slow reply is never overtaken by another ask.
 const liveInFlight = new Set<string>();
 
@@ -573,6 +583,21 @@ function run(effect: Effect) {
       invoke<string>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
         .then((id) => {
           if (at === shows) dispatch({ type: "renamed", id });
+        })
+        .catch((err) => {
+          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+        });
+      break;
+    }
+    case "moreOptions": {
+      const at = shows;
+      const { x, y } = moreOptionsAt(effect.index);
+      invoke<boolean>("more_options", { provider: effect.item.provider, id: effect.item.id, x, y })
+        .then((ran) => {
+          if (at !== shows) return;
+          // A command ran: the back end hides the bar. Dismissed: the bar stays and types again.
+          dispatch({ type: "outcome", outcome: { kind: ran ? "hide" : "keep" } });
+          if (!ran) input.focus();
         })
         .catch((err) => {
           if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });

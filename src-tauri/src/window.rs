@@ -1,6 +1,6 @@
 //! The `bar` window: created once by Tauri at startup, then only shown and hidden.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -450,12 +450,69 @@ pub fn install_handlers(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
     let handle = app.clone();
     w.on_window_event(move |event| match event {
-        WindowEvent::Focused(false) if !within_blur_grace() => hide(&handle),
+        WindowEvent::Focused(false) if hides_on_blur(held_open(), within_blur_grace()) => hide(&handle),
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             hide(&handle);
         }
         _ => {}
+    });
+}
+
+/// How many holds are on: while any is, a focus loss does not hide the bar
+/// (Windows' own menu for a row takes the foreground while it shows).
+static HOLDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Switches a hold on or off; see [`HOLDS`]. Prefer [`holding_open`], which
+/// always switches it off again.
+pub fn hold_open(on: bool) {
+    if on {
+        HOLDS.fetch_add(1, Ordering::SeqCst);
+    } else {
+        let _ = HOLDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+}
+
+fn held_open() -> bool {
+    HOLDS.load(Ordering::SeqCst) > 0
+}
+
+/// Runs `f` with the bar held open; the hold is released however `f` ends
+/// (an error or a panic included).
+pub fn holding_open<T>(f: impl FnOnce() -> T) -> T {
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            hold_open(false);
+        }
+    }
+    hold_open(true);
+    let _release = Release;
+    f()
+}
+
+/// Whether a focus loss hides the bar: not while it is held open, nor within
+/// the grace after a show.
+fn hides_on_blur(held: bool, in_grace: bool) -> bool {
+    !held && !in_grace
+}
+
+/// Gives the keyboard back to a bar that is still on screen (after Windows'
+/// own menu was dismissed: the bar lost the foreground while held open, so no
+/// focus loss will come to hide it, and nothing typed would reach it).
+pub fn refocus(app: &AppHandle) {
+    let handle = app.clone();
+    // The window's own thread: `SetFocus` needs it.
+    let _ = app.run_on_main_thread(move || {
+        let Some(w) = bar(&handle) else { return };
+        if !w.is_visible().unwrap_or(false) {
+            return;
+        }
+        let _ = w.set_focus();
+        if let Ok(h) = w.hwnd() {
+            take_foreground(HWND(h.0 as _));
+            let _ = w.set_focus();
+        }
     });
 }
 
@@ -493,6 +550,27 @@ fn bar_position(origin: (i32, i32), size: (u32, u32), width: u32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hold_open_suppresses_blur_hide_and_is_released_on_error() {
+        assert!(hides_on_blur(false, false), "a plain focus loss hides the bar");
+        assert!(!hides_on_blur(false, true), "inside the show's grace");
+        assert!(!hides_on_blur(true, false), "held open while Windows' menu shows");
+        assert!(!hides_on_blur(true, true));
+        // Released when the work fails, and when it panics.
+        let out: Result<bool, String> = holding_open(|| {
+            assert!(held_open());
+            Err("File not found".into())
+        });
+        assert_eq!(out, Err("File not found".to_string()));
+        assert!(!held_open());
+        let panicked = std::panic::catch_unwind(|| holding_open(|| -> bool { panic!("menu failed") }));
+        assert!(panicked.is_err());
+        assert!(!held_open());
+        // Switched off more often than on: never below zero.
+        hold_open(false);
+        assert!(!held_open());
+    }
 
     #[test]
     fn an_open_bar_that_is_not_in_front_takes_the_keyboard_again() {
