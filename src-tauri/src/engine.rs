@@ -55,6 +55,50 @@ impl Drop for SeqGuard {
     }
 }
 
+/// Tells a search whether a newer one has begun since it started. Only the
+/// bar's `query` command makes searches that can be superseded (see
+/// [`Engine::query_newest`]); every other caller gets complete results.
+#[derive(Clone)]
+pub struct QueryGate {
+    newest: Arc<AtomicU64>,
+    mine: u64,
+}
+
+impl QueryGate {
+    /// A gate for the next search of `newest`'s owner (tests).
+    #[cfg(test)]
+    pub fn begin_for_test(newest: &Arc<AtomicU64>) -> QueryGate {
+        QueryGate { newest: newest.clone(), mine: newest.fetch_add(1, Ordering::SeqCst) + 1 }
+    }
+
+    /// True once a later search has begun on the same engine.
+    pub fn superseded(&self) -> bool {
+        self.newest.load(Ordering::Relaxed) != self.mine
+    }
+}
+
+thread_local! {
+    /// The gate of the cancellable search running on this thread, if any.
+    static GATE: std::cell::RefCell<Option<QueryGate>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The running search's gate: `None` outside a cancellable search.
+pub fn current_gate() -> Option<QueryGate> {
+    GATE.with(|g| g.borrow().clone())
+}
+
+/// Runs `f` as the cancellable search `gate` stands for.
+fn with_gate<R>(gate: QueryGate, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<QueryGate>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GATE.with(|g| *g.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(GATE.with(|g| g.borrow_mut().replace(gate)));
+    f()
+}
+
 /// Every provider, in order (tests only).
 #[cfg(test)]
 impl Engine {
@@ -94,6 +138,8 @@ pub struct Engine {
     ranking: Arc<Ranking>,
     history: Arc<History>,
     pins: Arc<Pins>,
+    /// Number of the newest cancellable search begun (see [`Engine::query_newest`]).
+    newest: Arc<AtomicU64>,
 }
 
 impl Engine {
@@ -103,7 +149,7 @@ impl Engine {
         history: Arc<History>,
         pins: Arc<Pins>,
     ) -> Self {
-        Self { providers, ranking, history, pins }
+        Self { providers, ranking, history, pins, newest: Arc::new(AtomicU64::new(0)) }
     }
 
     /// Pins or unpins an item; returns the new pinned state. Unpinning always
@@ -132,6 +178,18 @@ impl Engine {
     /// such provider alone; `help` wins over a claim, a claim over prefixes.
     pub fn query(&self, text: &str, scope: Option<&str>) -> Vec<ResultItem> {
         self.query_among(text, scope, &|_| true)
+    }
+
+    /// [`Engine::query`] for the bar: this search becomes the newest, and an
+    /// older one still scanning stops early. `None` when a newer search began
+    /// before this one finished: the page has asked again and drops the answer,
+    /// so it must never be taken for "no results". Other callers use
+    /// [`Engine::query`], which is never cut short.
+    pub fn query_newest(&self, text: &str, scope: Option<&str>) -> Option<Vec<ResultItem>> {
+        let mine = self.newest.fetch_add(1, Ordering::SeqCst) + 1;
+        let gate = QueryGate { newest: self.newest.clone(), mine };
+        let rows = with_gate(gate.clone(), || self.query(text, scope));
+        (!gate.superseded()).then_some(rows)
     }
 
     /// Like [`Engine::query`], but only the providers named nowhere in `skip`
@@ -839,6 +897,61 @@ mod tests {
         let rows = e.query("x", None);
         assert!(rows.iter().find(|r| r.id == "b").unwrap().pinned);
         assert!(!rows.iter().find(|r| r.id == "c").unwrap().pinned);
+    }
+
+    /// Reports whether it ran inside a cancellable search; with `interrupt`, a
+    /// newer search begins while it runs.
+    struct GateWatcher {
+        gated: std::sync::Mutex<Vec<bool>>,
+        interrupt: bool,
+    }
+
+    impl Provider for GateWatcher {
+        fn name(&self) -> &'static str {
+            "g"
+        }
+        fn query(&self, _q: &Query) -> Vec<ResultItem> {
+            let gate = current_gate();
+            self.gated.lock().unwrap().push(gate.is_some());
+            if let (true, Some(g)) = (self.interrupt, gate) {
+                g.newest.fetch_add(1, Ordering::SeqCst);
+            }
+            vec![ResultItem { id: "1".into(), provider: "g", title: "row".into(), ..Default::default() }]
+        }
+        fn activate(&self, _id: &str, _m: Modifier) -> Result<Outcome, String> {
+            Ok(Outcome::Hide)
+        }
+    }
+
+    #[test]
+    fn only_the_bars_query_is_cancellable() {
+        let w = Arc::new(GateWatcher { gated: Default::default(), interrupt: false });
+        let (e, _, _dir) = engine_boxed(vec![Box::new(w.clone())]);
+        assert_eq!(e.query("x", None).len(), 1);
+        assert_eq!(e.query_newest("x", None).map(|r| r.len()), Some(1));
+        assert_eq!(*w.gated.lock().unwrap(), [false, true]);
+        // The gate is gone once the search is over.
+        assert!(current_gate().is_none());
+    }
+
+    #[test]
+    fn a_search_a_newer_one_overtook_is_reported_cancelled_not_empty() {
+        let w = Arc::new(GateWatcher { gated: Default::default(), interrupt: true });
+        let (e, _, _dir) = engine_boxed(vec![Box::new(w.clone())]);
+        assert!(e.query_newest("x", None).is_none());
+        // The plain query is never cut short, whatever else is going on.
+        assert_eq!(e.query("x", None).len(), 1);
+        assert!(current_gate().is_none());
+    }
+
+    #[test]
+    fn looking_up_an_item_records_nothing() {
+        let a = Arc::new(FakeProvider::new("a", vec![("x", "Ex", 500)]));
+        let (e, ranking, h, _, dir) = engine_stores(vec![Box::new(a)]);
+        assert!(e.item("a", "x").is_some());
+        assert_eq!(ranking.boost("a", "x"), 0);
+        assert!(h.recents().is_empty() && h.searches().is_empty());
+        assert!(!dir.path().join("picks.json").exists());
     }
 
     #[test]

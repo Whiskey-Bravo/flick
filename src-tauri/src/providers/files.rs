@@ -31,6 +31,8 @@ const MAX_RESULTS: usize = 20;
 const PLAIN_SHARE: usize = 5;
 /// Shorter text matches far too much to be useful.
 const MIN_QUERY_CHARS: usize = 2;
+/// A scan asks whether a newer search has begun once per this many slots.
+const CANCEL_CHECK_SLOTS: usize = 4096;
 /// One directory listing adds at most this many entries.
 pub const MAX_PER_FOLDER: usize = 20_000;
 /// A watcher-triggered rescan starts this long after the last relevant change...
@@ -133,7 +135,43 @@ fn depth_penalty(depth: u8) -> u32 {
 /// word prefix (3+ chars); substring (4+ chars). Never acronyms, initials or
 /// typos. Below [`PARTIAL_MATCH_MAX_DEPTH`] levels, exact only. Minus
 /// [`depth_penalty`].
+///
+/// A needle of fewer than 3 chars can only be exact, so it is decided by
+/// name and stem alone and the fuzzy ladder never runs for it (the fuzzy
+/// score is 1000 exactly when needle and name are equal).
 fn file_score(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
+    if len < 3 {
+        let exact = !needle.is_empty()
+            && (hay == needle || (!is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle)));
+        if !exact {
+            return None;
+        }
+        let file = if is_dir { 0 } else { FILE_BELOW_FOLDER };
+        return Some(EXACT - file - depth_penalty(depth));
+    }
+    let f = fuzzy::score_prenormalized(needle, hay);
+    let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
+    let tier = if f == Some(1000) || stem_exact {
+        EXACT
+    } else if depth > PARTIAL_MATCH_MAX_DEPTH {
+        return None;
+    } else {
+        match f? {
+            900 => PREFIX,
+            850 => SQUASHED_PREFIX,
+            800 => WORD_PREFIX,
+            _ if len >= 4 && hay.contains(needle) => SUBSTRING,
+            _ => return None,
+        }
+    };
+    let file = if is_dir { 0 } else { FILE_BELOW_FOLDER };
+    Some(tier - file - depth_penalty(depth))
+}
+
+/// The scoring before short needles skipped the fuzzy ladder: what
+/// [`file_score`] must keep returning.
+#[cfg(test)]
+fn file_score_reference(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
     let f = fuzzy::score_prenormalized(needle, hay);
     let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
     let tier = if f == Some(1000) || stem_exact {
@@ -503,6 +541,73 @@ pub(crate) fn file_icon(name: &str, is_dir: bool) -> String {
 }
 
 impl FilesProvider {
+    /// Read lock only, no disk: every entry is checked against cheap char
+    /// masks first, `score` ([`file_score`]) runs only on candidates that can
+    /// still make the best 20, and result strings are built for those 20 alone.
+    /// `None` when `gate` says a newer search has begun: checked every 4096
+    /// slots, and the scan stops there. Otherwise the same rows, in the same
+    /// order, as without a gate.
+    fn search(
+        &self,
+        q: &Query,
+        score: impl Fn(&str, usize, &str, bool, u8) -> Option<u32>,
+        gate: Option<&crate::engine::QueryGate>,
+    ) -> Option<Vec<ResultItem>> {
+        let text = q.text.trim();
+        if text.chars().count() < MIN_QUERY_CHARS {
+            return Some(Vec::new());
+        }
+        let needle = fuzzy::normalize(text);
+        if needle.is_empty() {
+            return Some(Vec::new());
+        }
+        let len = needle.chars().count();
+        // Every tier needs each non-break char of the needle somewhere in the name.
+        let need = needle.chars().filter(|&c| !fuzzy::is_word_break(c)).fold(0, |m, c| m | char_bit(c));
+        // Every tier but substring needs a word of the name to start with the
+        // needle's first char (when that char is not itself a word break).
+        let first = needle.chars().next().filter(|&c| !fuzzy::is_word_break(c)).map(char_bit);
+
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        // Min-heap of (score, Reverse(position)): the top is the entry to drop
+        // next (lowest score, then latest), so equal scores keep index order.
+        let mut best: BinaryHeap<Reverse<(u32, Reverse<usize>)>> = BinaryHeap::with_capacity(MAX_RESULTS + 1);
+        for (i, s) in index.slots.iter().enumerate() {
+            if i % CANCEL_CHECK_SLOTS == 0 && gate.is_some_and(|g| g.superseded()) {
+                return None;
+            }
+            if s.chars & need != need {
+                continue;
+            }
+            let substring_only = first.is_some_and(|b| s.initials & b == 0);
+            if substring_only && len < 4 {
+                continue;
+            }
+            let depth = index.depth(s);
+            if best.len() == MAX_RESULTS {
+                let tier = if substring_only { SUBSTRING } else { EXACT };
+                let file = if s.is_dir { 0 } else { FILE_BELOW_FOLDER };
+                let Some(Reverse((worst, _))) = best.peek() else { continue };
+                if tier - file - depth_penalty(depth) <= *worst {
+                    continue;
+                }
+            }
+            let hay = index.norm(s);
+            if substring_only && !hay.contains(needle.as_str()) {
+                continue;
+            }
+            let Some(score) = score(&needle, len, hay, s.is_dir, depth) else { continue };
+            best.push(Reverse((score, Reverse(i))));
+            if best.len() > MAX_RESULTS {
+                best.pop();
+            }
+        }
+        let mut picked: Vec<(u32, usize)> = best.into_iter().map(|Reverse((score, Reverse(i)))| (score, i)).collect();
+        picked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        Some(picked.into_iter().map(|(score, i)| self.row(&index, &index.slots[i], score)).collect())
+    }
+
+
     fn row(&self, index: &Index, s: &Slot, score: u32) -> ResultItem {
         ResultItem {
             id: index.path(s).to_string_lossy().into_owned(),
@@ -527,64 +632,11 @@ impl Provider for FilesProvider {
         "files"
     }
 
-    /// Read lock only, no disk: every entry is checked against cheap char
-    /// masks first, [`file_score`] runs only on candidates that can still
-    /// make the best 20, and result strings are built for those 20 alone.
+    /// Read lock only, no disk: see [`FilesProvider::search`]. A search that a
+    /// newer one has superseded returns nothing (the engine then drops the
+    /// whole answer; see [`crate::engine::Engine::query_newest`]).
     fn query(&self, q: &Query) -> Vec<ResultItem> {
-        let text = q.text.trim();
-        if text.chars().count() < MIN_QUERY_CHARS {
-            return Vec::new();
-        }
-        let needle = fuzzy::normalize(text);
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let len = needle.chars().count();
-        // Every tier needs each non-break char of the needle somewhere in the name.
-        let need = needle.chars().filter(|&c| !fuzzy::is_word_break(c)).fold(0, |m, c| m | char_bit(c));
-        // Every tier but substring needs a word of the name to start with the
-        // needle's first char (when that char is not itself a word break).
-        let first = needle.chars().next().filter(|&c| !fuzzy::is_word_break(c)).map(char_bit);
-
-        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
-        // Min-heap of (score, Reverse(position)): the top is the entry to drop
-        // next (lowest score, then latest), so equal scores keep index order.
-        let mut best: BinaryHeap<Reverse<(u32, Reverse<usize>)>> = BinaryHeap::with_capacity(MAX_RESULTS + 1);
-        for (i, s) in index.slots.iter().enumerate() {
-            if s.chars & need != need {
-                continue;
-            }
-            let substring_only = first.is_some_and(|b| s.initials & b == 0);
-            if substring_only && len < 4 {
-                continue;
-            }
-            let depth = index.depth(s);
-            if best.len() == MAX_RESULTS {
-                let tier = if substring_only { SUBSTRING } else { EXACT };
-                let file = if s.is_dir { 0 } else { FILE_BELOW_FOLDER };
-                let Some(Reverse((worst, _))) = best.peek() else { continue };
-                if tier - file - depth_penalty(depth) <= *worst {
-                    continue;
-                }
-            }
-            let hay = index.norm(s);
-            if substring_only && !hay.contains(needle.as_str()) {
-                continue;
-            }
-            let Some(score) = file_score(&needle, len, hay, s.is_dir, depth) else { continue };
-            best.push(Reverse((score, Reverse(i))));
-            if best.len() > MAX_RESULTS {
-                best.pop();
-            }
-        }
-        let mut picked: Vec<(u32, usize)> = best.into_iter().map(|Reverse((score, Reverse(i)))| (score, i)).collect();
-        picked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        picked
-            .into_iter()
-            .map(|(score, i)| {
-                self.row(&index, &index.slots[i], score)
-            })
-            .collect()
+        self.search(q, file_score, crate::engine::current_gate().as_ref()).unwrap_or_default()
     }
 
     fn item(&self, id: &str) -> Option<ResultItem> {
@@ -803,6 +855,84 @@ mod tests {
         assert!(p.query(&q("a")).is_empty());
         assert!(p.query(&q("  a  ")).is_empty());
         assert_eq!(p.query(&q("ab")).len(), 1);
+    }
+
+    const SHORT_NAMES: [&str; 36] = [
+        "a", "a.txt", "A", "ab", "ab.txt", "fi", "fi.txt", "fi.tar.gz", "file", "File.txt", "files", "final.pdf",
+        "re", "re.md", "report.pdf", "Reports", "Annual Report.docx", "ca", "ca.exe", "Calculator", "calc.exe",
+        "ti", "tidy", "ti-84", "My Fi", "fi fi", ".fi", ".a", "a.", "ca.", "cache", "x-ca", "Café", "résumé.doc",
+        "re.re", "fi.re.ca",
+    ];
+
+    #[test]
+    fn short_needles_score_as_before_without_the_fuzzy_ladder() {
+        for needle in ["a", "fi", "re", "ca", "ti", "ab", "file", "report", "cal", "calc", "fi fi", "annual rep", ".fi"] {
+            let needle = fuzzy::normalize(needle);
+            let len = needle.chars().count();
+            for name in SHORT_NAMES {
+                let hay = fuzzy::normalize(name);
+                for is_dir in [false, true] {
+                    for depth in [1, 2, 6, 7, 9] {
+                        assert_eq!(
+                            file_score(&needle, len, &hay, is_dir, depth),
+                            file_score_reference(&needle, len, &hay, is_dir, depth),
+                            "{needle:?} vs {name:?} dir={is_dir} depth={depth}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(SHORT_NAMES.len() >= 30);
+    }
+
+    /// An index with enough variety for short and long needles.
+    fn varied_provider(count: usize) -> Arc<FilesProvider> {
+        let words = ["fi", "re", "ca", "ti", "file", "report", "Calc", "tidy", "Café", "notes", "a", "final copy"];
+        let entries = (0..count)
+            .map(|i| {
+                let w = words[i % words.len()];
+                let name = match i % 5 {
+                    0 => w.to_string(),
+                    1 => format!("{w}.txt"),
+                    2 => format!("{w} {}.pdf", i % 7),
+                    3 => format!("x{w}y"),
+                    _ => format!("{w}-{w}"),
+                };
+                entry(&format!(r"C:\d{}\e{}\{name}", i % 9, i % 4), i % 6 == 0)
+            })
+            .collect();
+        provider(entries).0
+    }
+
+    #[test]
+    fn a_search_gives_the_rows_and_order_it_gave_before() {
+        let p = varied_provider(9000);
+        let newest = Arc::new(AtomicU64::new(0));
+        let gate = crate::engine::QueryGate::begin_for_test(&newest);
+        let ids = |rows: &[ResultItem]| rows.iter().map(|r| (r.id.clone(), r.score)).collect::<Vec<_>>();
+        for text in ["fi", "re", "ca", "ti", "a", "file", "report", "calc", "tid", "final co", "caf", "zz"] {
+            let old = p.search(&q(text), file_score_reference, None).unwrap();
+            let new = p.search(&q(text), file_score, None).unwrap();
+            let gated = p.search(&q(text), file_score, Some(&gate)).unwrap();
+            assert_eq!(ids(&new), ids(&old), "{text}");
+            assert_eq!(ids(&gated), ids(&old), "{text}");
+            assert_eq!(ids(&p.query(&q(text))), ids(&old), "{text}");
+        }
+        assert!(!p.search(&q("fi"), file_score, None).unwrap().is_empty());
+        assert!(!p.search(&q("file"), file_score, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_superseded_search_stops_and_says_so() {
+        let p = varied_provider(9000);
+        let newest = Arc::new(AtomicU64::new(0));
+        let gate = crate::engine::QueryGate::begin_for_test(&newest);
+        assert!(p.search(&q("file"), file_score, Some(&gate)).is_some());
+        // A newer search begins: this one gives up, and that is not an empty answer.
+        let _newer = crate::engine::QueryGate::begin_for_test(&newest);
+        assert!(p.search(&q("file"), file_score, Some(&gate)).is_none());
+        // A text too short to search is an answer, not a cancellation.
+        assert_eq!(p.search(&q("a"), file_score, Some(&gate)).map(|r| r.len()), Some(0));
     }
 
     /// `file_score` for raw text, as the query path calls it.
@@ -1390,7 +1520,7 @@ mod tests {
             .collect();
         let (p, _) = provider(entries);
         let queries = [
-            "re", "in", "pd", "ca", "img", "rep", "doc", "2023", "notes", "tax", "invoice", "resum", "final pd",
+            "re", "in", "fi", "ti", "pd", "ca", "img", "rep", "doc", "2023", "notes", "tax", "invoice", "resum", "final pd",
             "meeting", "xq", "zzz", "fact 20", "screensh", "flick la", "statem",
         ];
         let mut worst = (0.0f64, "");

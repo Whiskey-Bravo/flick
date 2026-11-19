@@ -1047,6 +1047,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::query,
+            commands::live_row,
             commands::activate,
             commands::hide,
             commands::toggle_pin,

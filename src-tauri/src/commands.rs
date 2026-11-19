@@ -10,12 +10,26 @@ use crate::window;
 use crate::AppState;
 
 /// In-memory only. `async` runs it on the async runtime instead of the main thread.
+/// It makes this search the newest: an older one still scanning stops early. Its
+/// answer is `None` when a newer search began meanwhile; the page has asked
+/// again by then and drops it, and it is never shown as "no results".
 #[tauri::command(async)]
-pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Vec<ResultItem> {
+pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Option<Vec<ResultItem>> {
     let timer = crate::timing::query_timer();
-    let rows = state.engine.query(&text, scope.as_deref());
-    timer.finish(text.chars().count(), rows.len());
+    let rows = state.engine.query_newest(&text, scope.as_deref());
+    timer.finish(&text, rows.as_ref().map_or(0, Vec::len));
     rows
+}
+
+/// The fresh row of a live row (the clock), for the bar's once-a-second refresh.
+/// In-memory only; nothing is ranked, recorded or pinned, and it does not cancel
+/// a search in progress.
+#[tauri::command(async)]
+pub fn live_row(provider: String, id: String, state: State<AppState>) -> Option<ResultItem> {
+    let timer = crate::timing::tick_timer();
+    let item = state.engine.item(&provider, &id).filter(|i| i.live);
+    timer.finish();
+    item
 }
 
 /// Runs a follow-up once the bar has hidden (paste, clipboard history, snip,

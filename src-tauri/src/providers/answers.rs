@@ -408,6 +408,20 @@ impl Provider for AnswersProvider {
         answer.into_iter().collect()
     }
 
+    /// The clock rows, rebuilt for the bar's once-a-second refresh. Nothing else:
+    /// answers carry typed values, so they cannot be rebuilt from an id.
+    fn item(&self, id: &str) -> Option<ResultItem> {
+        let now = (self.clock)();
+        let today = now.to_zoned(self.local.clone()).date();
+        let ask = if id == LOCAL_NOW {
+            ClockAsk::LocalTime
+        } else {
+            let which = id.strip_prefix(NOW)?;
+            ClockAsk::TimeIn(clock::PLACES.iter().find(|p| p.name == which)?)
+        };
+        self.clock_row(ask, now, today).map(|r| ResultItem { score: 0, ..r })
+    }
+
     /// The bar was cleared: no weather question any more.
     fn empty_query(&self) -> Vec<ResultItem> {
         self.weather.cancel_pending();
@@ -828,6 +842,31 @@ mod tests {
         let before = r.clipboard.0.lock().unwrap().len();
         assert!(r.answers.activate("now:Nowhere", Modifier::None).is_err());
         assert_eq!(r.clipboard.0.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn item_rebuilds_the_clock_rows_for_the_ticks() {
+        let r = rig(true, "", None);
+        *r.now.lock().unwrap() = "2026-07-01T12:00:07Z".parse().unwrap();
+        let a = r.answers.item("now:local").unwrap();
+        let tokyo_a = r.answers.item("now:Tokyo").unwrap();
+        *r.now.lock().unwrap() = "2026-07-01T12:00:08Z".parse().unwrap();
+        let b = r.answers.item("now:local").unwrap();
+        let tokyo_b = r.answers.item("now:Tokyo").unwrap();
+        assert_eq!((a.title.as_str(), b.title.as_str()), ("14:00:07 Wed", "14:00:08 Wed"));
+        assert_eq!(a.id, b.id);
+        assert_eq!((tokyo_a.title.as_str(), tokyo_b.title.as_str()), ("21:00:07 Wed", "21:00:08 Wed"));
+        assert_eq!(tokyo_b.subtitle, "Tokyo · 7 h ahead");
+        assert!(a.live && tokyo_b.live);
+        // Same text as the row the query builds.
+        let queried = one(&r, "time tokyo");
+        assert_eq!((queried.title, queried.subtitle), (tokyo_b.title, tokyo_b.subtitle));
+        // Nothing else can be rebuilt from an id.
+        assert!(r.answers.item("copy:x").is_none());
+        assert!(r.answers.item("now:Nowhere").is_none());
+        assert!(r.answers.item("now:").is_none());
+        assert!(r.answers.item("wait").is_none());
+        assert_eq!(r.clipboard.0.lock().unwrap().len(), 0);
     }
 
     #[test]

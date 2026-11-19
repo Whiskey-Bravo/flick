@@ -5,7 +5,7 @@
 //!
 //! A line is `<unix-ms>\t<name>\t<micros>\n`. A query line carries two more
 //! fields, the length of the text (characters) and the number of rows.
-//! Names are compile-time strings: no typed text, no ids, no paths. The file
+//! The clock refresh (`live_row`) is the line `tick`. Names are compile-time strings: no typed text, no ids, no paths. The file
 //! is written by a background thread, never by the calling thread; each line
 //! is flushed as it is written, so a crash loses nothing earlier.
 
@@ -222,9 +222,25 @@ pub fn query_timer() -> QueryTimer {
 }
 
 impl QueryTimer {
-    pub fn finish(self, text_len: usize, rows: usize) {
+    /// Counting the characters happens only when timing is on.
+    pub fn finish(self, text: &str, rows: usize) {
         if let (Some(start), Some(t)) = (self.0, global()) {
-            t.query(micros_since(start), text_len, rows);
+            t.query(micros_since(start), text.chars().count(), rows);
+        }
+    }
+}
+
+/// Times one clock refresh (`live_row`); [`TickTimer::finish`] writes its line.
+pub struct TickTimer(Option<Instant>);
+
+pub fn tick_timer() -> TickTimer {
+    TickTimer(if enabled() { Some(Instant::now()) } else { None })
+}
+
+impl TickTimer {
+    pub fn finish(self) {
+        if let (Some(start), Some(t)) = (self.0, global()) {
+            t.mark("tick", micros_since(start));
         }
     }
 }
@@ -266,7 +282,7 @@ mod tests {
         let mut s = Steps::new("x");
         s.step("one");
         drop(s);
-        query_timer().finish(3, 1);
+        query_timer().finish("abc", 1);
         assert!(!enabled());
     }
 

@@ -1079,6 +1079,53 @@ describe("mouse and menu", () => {
       expect(run(open, { type: "results", items: [item("a"), clock] }).state.menu).toBeNull();
     });
 
+    it("a_tick_asks_only_for_the_visible_live_rows_and_never_queries", () => {
+      const tokyo: Item = { ...item("now:Tokyo"), provider: "answers", live: true };
+      const s = shown(clock, item("a"), tokyo);
+      const r = run(s, { type: "tick" });
+      expect(r.effects).toEqual([
+        { type: "liveRow", provider: "answers", id: "now:local" },
+        { type: "liveRow", provider: "answers", id: "now:Tokyo" },
+      ]);
+      expect(r.effects.some((f) => f.type === "query")).toBe(false);
+      expect(r.state).toBe(s);
+    });
+
+    it("a_tick_does_nothing_while_hidden_or_with_the_menu_open_or_without_live_rows", () => {
+      expect(run(shown(clock), { type: "hidden" }, { type: "tick" }).effects).toEqual([]);
+      expect(run(shown(clock), key("Tab"), { type: "tick" }).effects).toEqual([]);
+      expect(run(shown(item("a")), { type: "tick" }).effects).toEqual([]);
+    });
+
+    it("a_live_row_result_changes_only_that_item", () => {
+      const u = { ...item("now:u"), provider: "answers", actions: ["uninstall" as const], live: true };
+      const armed = run(shown(item("a"), u), key("ArrowDown"), key("Tab"), { type: "menuPick", action: "uninstall" }).state;
+      const fresh: Item = { ...u, title: "12:00:01", subtitle: "later" };
+      const after = run(armed, { type: "liveRowResult", item: fresh }).state;
+      expect(after.items[1].title).toBe("12:00:01");
+      expect(after.items[1].subtitle).toBe("later");
+      expect(after.items[0]).toBe(armed.items[0]);
+      expect([after.selected, after.menu, after.armed, after.top]).toEqual([armed.selected, armed.menu, armed.armed, armed.top]);
+      expect(after.items[1].actions).toEqual(["uninstall"]);
+    });
+
+    it("a_live_row_result_for_a_missing_row_or_while_hidden_is_the_same_state", () => {
+      const s = shown(clock, item("a"));
+      const other: Item = { ...clock, id: "now:Nowhere", title: "x" };
+      expect(reduce(s, { type: "liveRowResult", item: other }).state).toBe(s);
+      expect(reduce(s, { type: "liveRowResult", item: { ...clock, provider: "apps", title: "x" } }).state).toBe(s);
+      const hidden = run(s, { type: "hidden" }).state;
+      expect(reduce(hidden, { type: "liveRowResult", item: { ...clock, title: "x" } }).state).toBe(hidden);
+      // A row that is no longer live is not patched either, nor is an unchanged one.
+      expect(reduce(s, { type: "liveRowResult", item: { ...clock, title: "x", live: false } }).state).toBe(s);
+      expect(reduce(s, { type: "liveRowResult", item: { ...clock } }).state).toBe(s);
+    });
+
+    it("answers_ready_without_live_rows_behaves_as_before", () => {
+      const s = run(initial, { type: "shown" }, { type: "input", text: "1+1" }, { type: "results", items: [item("a")] }).state;
+      expect(run(s, { type: "answersReady" }).effects).toEqual([{ type: "query", text: "1+1", scope: null, keepSelection: true }]);
+    });
+
     it("no_tick_effect_once_hidden", () => {
       expect(run(shown(clock), { type: "hidden" }, { type: "answersReady" }).effects).toEqual([]);
     });

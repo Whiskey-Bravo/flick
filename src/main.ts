@@ -243,6 +243,7 @@ function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "result";
   li.dataset.index = String(index);
+  li.dataset.key = rowKey(item);
   if (fresh) {
     li.classList.add("fresh");
     li.style.setProperty("--at", String(index - state.top));
@@ -361,9 +362,7 @@ function scheduleTick() {
   if (tickTimer !== null) return;
   tickTimer = window.setTimeout(() => {
     tickTimer = null;
-    const started = performance.now();
-    dispatch({ type: "answersReady" });
-    reportAtFrame("page.tick", started);
+    dispatch({ type: "tick" });
   }, 1000 - (Date.now() % 1000) + 5);
 }
 
@@ -413,27 +412,66 @@ function render() {
   panel.classList.toggle("closed", state.hidden);
 }
 
+/// A live row's new text, written into its element: the rows, the marker, the
+/// icons and the animations stay as they are. False when the row's element is
+/// not on screen (the caller then renders normally).
+function patchLiveRow(item: Item): boolean {
+  const key = rowKey(item);
+  const li = Array.from(list.children).find((c): c is HTMLElement => c instanceof HTMLElement && c.dataset.key === key);
+  const shown = state.items.find((i) => rowKey(i) === key);
+  const title = li?.querySelector(".title");
+  const sub = li?.querySelector(".subtitle");
+  if (!shown || !title || !sub) return false;
+  title.textContent = shown.title;
+  if (state.armed !== shown.id) sub.textContent = shown.subtitle;
+  return true;
+}
+
 function dispatch(event: Event) {
   const { state: next, effects } = reduce(state, event);
+  const before = state;
   state = next;
-  render();
+  if (next !== before) {
+    if (event.type === "liveRowResult" && patchLiveRow(event.item)) scheduleTick();
+    else render();
+  } else scheduleTick();
   effects.forEach(run);
 }
+
+/// Rows with a `liveRow` request on its way: a slow reply is never overtaken by another ask.
+const liveInFlight = new Set<string>();
 
 function run(effect: Effect) {
   switch (effect.type) {
     case "query": {
       const seq = ++querySeq;
       const sent = performance.now();
-      invoke<Item[]>("query", { text: effect.text, scope: effect.scope })
+      invoke<Item[] | null>("query", { text: effect.text, scope: effect.scope })
         .then((items) => {
-          if (seq !== querySeq) return;
+          // null: a newer search overtook this one; its answer is the one to wait for.
+          if (seq !== querySeq || !items) return;
           dispatch({ type: "results", items });
           reportAtFrame("page.query_to_paint", sent);
         })
         .catch((err) => {
           if (seq === querySeq) dispatch({ type: "queryFailed", message: String(err) });
         });
+      break;
+    }
+    case "liveRow": {
+      const key = `${effect.provider} ${effect.id}`;
+      if (liveInFlight.has(key)) break;
+      liveInFlight.add(key);
+      const at = shows;
+      const sent = performance.now();
+      invoke<Item | null>("live_row", { provider: effect.provider, id: effect.id })
+        .then((item) => {
+          liveInFlight.delete(key);
+          if (at !== shows || !item) return;
+          dispatch({ type: "liveRowResult", item });
+          reportAtFrame("page.tick", sent);
+        })
+        .catch(() => liveInFlight.delete(key));
       break;
     }
     case "activate": {
