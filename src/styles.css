@@ -101,9 +101,13 @@ body {
   margin: 8px 12px 0;
   border: 0;
   background: transparent;
+  /* Each shadow stays inside the window (12px at the sides, 28px below):
+     a blur wider than that is cut off by the window's edge and leaves a
+     hard grey line, plainest on a white background. The big one is pulled
+     in at the sides by its negative spread: 26px - 16px = 10px. */
   box-shadow:
-    0 14px 28px color-mix(in srgb, #000 34%, transparent),
-    0 3px 8px color-mix(in srgb, #000 26%, transparent);
+    0 14px 26px -16px color-mix(in srgb, #000 58%, transparent),
+    0 3px 8px color-mix(in srgb, #000 22%, transparent);
 }
 
 /* The picture, a little soft and with its colours lifted, drawn larger than

@@ -479,10 +479,13 @@ impl Engine {
     /// `show` is not called. `show`'s answer is passed on: whether a command ran.
     pub fn more_options(&self, provider: &str, id: &str, show: impl FnOnce(&Path) -> Result<bool, String>) -> Result<bool, String> {
         let p = self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?;
-        if !p.item(id).is_some_and(|item| item.actions.contains(&Action::MoreOptions)) {
+        let Some(item) = p.item(id).filter(|item| item.actions.contains(&Action::MoreOptions)) else {
             return Err("can't do that here".into());
-        }
-        let (path, is_dir) = crate::providers::path::split_id(id);
+        };
+        // A folder row says so by its menu: search results carry a folder's
+        // path without the trailing `\` that typed paths have.
+        let (path, slash) = crate::providers::path::split_id(id);
+        let is_dir = slash || item.actions.contains(&Action::OpenFolder);
         let path = Path::new(path);
         // Checking the disk is fine here: this is not the query path.
         if std::fs::metadata(path).ok().map(|m| m.is_dir()) != Some(is_dir) {
@@ -1853,7 +1856,8 @@ mod tests {
         use std::path::PathBuf;
         let d = disk();
         let a = d.id("a.txt");
-        let folder = format!("{}\\", d.id("sub"));
+        // A folder row from the search has no trailing `\` in its id.
+        let folder = d.id("sub");
         let shown = std::cell::RefCell::new(Vec::new());
         let show = |p: &Path| {
             shown.borrow_mut().push(p.to_path_buf());
