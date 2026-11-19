@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::fuzzy;
 use crate::history::History;
@@ -39,6 +39,40 @@ thread_local! {
 /// late from the newest one. 0 when called outside a query (tests).
 pub fn query_seq() -> u64 {
     CURRENT_QUERY.with(Cell::get)
+}
+
+/// What a provider's rows will copy on Enter, written by its queries. An older
+/// query that finishes after a newer one never overwrites what the newer one
+/// wrote, so Enter copies what the bar shows. Writes outside a query (number 0)
+/// always count.
+pub struct NewestQuery<T> {
+    /// The highest query number that wrote, and what it wrote.
+    inner: Mutex<(u64, T)>,
+}
+
+impl<T> NewestQuery<T> {
+    pub fn new(value: T) -> Self {
+        NewestQuery { inner: Mutex::new((0, value)) }
+    }
+
+    /// Keeps `value`, unless a newer query has already written one.
+    pub fn set(&self, value: T) {
+        let seq = query_seq();
+        let mut slot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if seq == 0 || seq >= slot.0 {
+            *slot = (seq.max(slot.0), value);
+        }
+    }
+
+    /// Replaces the value whichever query wrote it (the bar hid).
+    pub fn reset(&self, value: T) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).1 = value;
+    }
+
+    /// Reads the value.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).1)
+    }
 }
 
 /// Gives the thread's query its number while it runs.
@@ -806,11 +840,11 @@ mod tests {
         assert_eq!(dl_rows(), ["x.zip", "y.zip"]);
 
         // Delete: the very next ask has the row gone, no `Reading…` in between.
-        assert_eq!(e.act("path", r"C:\Work\a.txt", Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(e.act("path", r"C:\Work\a.txt", Action::Delete), Ok(Outcome::Removed));
         assert_eq!(typed(&e), [r"C:\Work\", "b.txt", "c.txt"]);
         let u = e.unfold(r"C:\Work\");
         assert_eq!((u.state, u.rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>()), ("ready", vec!["b.txt", "c.txt"]));
-        assert_eq!(e.act("downloads", r"C:\Dl\x.zip", Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(e.act("downloads", r"C:\Dl\x.zip", Action::Delete), Ok(Outcome::Removed));
         assert_eq!(dl_rows(), ["y.zip"]);
 
         // Rename: the row is there at once under its new name.
@@ -1810,7 +1844,7 @@ mod tests {
         // Another provider's entry for the same file (and in another letter case) goes too.
         d.pins.toggle("path", &a.to_uppercase());
         d.ranking.record("path", &a.to_lowercase());
-        assert_eq!(d.e.act("files", &a, Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(d.e.act("files", &a, Action::Delete), Ok(Outcome::Removed));
         assert_eq!(d.ops.calls(), [format!("recycle {a}")]);
         assert_eq!(d.remembered(&a), (false, 0, false));
         assert_eq!(d.ranking.boost("path", &a.to_lowercase()), 0);
@@ -1829,7 +1863,7 @@ mod tests {
         assert_eq!(d.e.act("files", &a, Action::Delete), Err("file not found".to_string()));
         assert!(d.ops.calls().is_empty());
         assert_eq!(d.remembered(&a), (true, 15, true));
-        assert_eq!(d.found("a.txt"), [a.clone()], "the index is untouched too");
+        assert_eq!(d.found("a.txt"), std::slice::from_ref(&a), "the index is untouched too");
         // A failing recycle keeps them as well.
         let b = d.id("b.txt");
         d.remember(&b);
@@ -1951,13 +1985,25 @@ mod tests {
     fn rename_patches_the_files_index() {
         let d = disk();
         let a = d.id("a.txt");
-        assert_eq!(d.found("a.txt"), [a.clone()]);
+        assert_eq!(d.found("a.txt"), std::slice::from_ref(&a));
         let new = d.e.rename("files", &a, "Ä b.txt").unwrap();
         assert_eq!(d.found("Ä b"), [new]);
         assert!(d.found("a.txt").is_empty(), "{:?}", d.found("a.txt"));
         // The row is rebuilt for the new id, and the old id is gone.
         assert!(d.e.item("files", &d.id("Ä b.txt")).is_some());
         assert!(d.e.item("files", &a).is_none());
+    }
+
+    #[test]
+    fn a_folder_found_by_search_can_be_renamed() {
+        let d = disk();
+        // Search names a folder without the trailing backslash a typed path has.
+        let folder = d.id("sub");
+        assert_eq!(d.found("sub").first(), Some(&folder));
+        let new = d.e.rename("files", &folder, "Sub 2").unwrap();
+        assert_eq!(new, d.id("Sub 2"), "the new id is in search's form too");
+        assert_eq!(d.ops.calls(), [format!("rename {} Sub 2", d.id("sub"))]);
+        assert_eq!(d.found("sub 2").first(), Some(&new));
     }
 
     #[test]
@@ -1995,7 +2041,7 @@ mod tests {
         }
         assert!(d.ops.calls().is_empty());
         assert_eq!(d.remembered(&a), (true, 15, true));
-        assert_eq!(d.found("a.txt"), [a.clone()]);
+        assert_eq!(d.found("a.txt"), std::slice::from_ref(&a));
         // Nothing indexed under that id, or no such provider: a short error, and no call either.
         assert_eq!(d.e.rename("files", &d.id("zzz.txt"), "ok.txt"), Err("file not found".to_string()));
         assert_eq!(d.e.rename("nowhere", &a, "ok.txt"), Err("unknown provider: nowhere".to_string()));

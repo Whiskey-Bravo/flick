@@ -15,7 +15,7 @@ use crate::config::ShortcutDef;
 use crate::providers::answers::DUCKDUCKGO;
 use crate::fuzzy;
 use crate::launch::{bind_bash, bind_windows, check_windows_value, to_wsl_path, valid_distro, Launcher, Shell};
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{own_name_score, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 /// Most pick entries one query returns (the engine caps scoped results at 50).
 const MAX_ENTRIES: usize = 50;
@@ -128,11 +128,6 @@ fn template(def: &ShortcutDef) -> &str {
     def.run.as_deref().or(def.wsl.as_deref()).or(def.open.as_deref()).unwrap_or("")
 }
 
-/// `{x}` -> `FLICK_X`, as `bind_windows` / `bind_bash` name them.
-fn variable(name: &str) -> String {
-    format!("FLICK_{}", name.to_ascii_uppercase())
-}
-
 /// `template` with each `{x}` in `values` replaced by its value, in one pass
 /// (an inserted value is never scanned again).
 fn insert_plain(template: &str, values: &[(&str, String)]) -> String {
@@ -210,7 +205,10 @@ pub fn prepare(def: &ShortcutDef, sub: &Substitution, distro: &str) -> Result<Pr
         }
         let names: Vec<&str> = values.iter().map(|(n, _)| *n).collect();
         let command = bind_windows(command, &names)?;
-        let env = values.into_iter().map(|(n, v)| (variable(n), v)).collect();
+        let env = values
+            .into_iter()
+            .map(|(n, v)| Ok((crate::quote::variable(n)?, v)))
+            .collect::<Result<_, String>>()?;
         return Ok(Prepared::Run { command, env, keep_open, admin: false, cwd });
     }
 
@@ -612,7 +610,7 @@ impl Provider for ShortcutsProvider {
             if let Some(score) = words().filter_map(|w| fuzzy::score(text, w)).max() {
                 let (id, subtitle) = head(def, &st.distro);
                 // A built-in search never outranks an app on a short prefix (`g` is Gimp, not Google).
-                let score = if st.builtin.contains(&n.to_lowercase()) { score.min(BUILTIN_MAX) } else { score + BONUS };
+                let score = if st.builtin.contains(&n.to_lowercase()) { score.min(BUILTIN_MAX) } else { own_name_score(score) };
                 push(item(def, id, n.clone(), subtitle, score));
             }
 
@@ -916,12 +914,24 @@ mod tests {
     }
 
     #[test]
+    fn its_whole_name_puts_the_shortcut_above_an_open_window_that_starts_with_it() {
+        // `todo` against a ToDo Planer window: a prefix match with the window
+        // bonus and the most a learned pick can add.
+        let (p, _) = setup(vec![ShortcutDef { aliases: vec!["td".into()], ..run("todo", "notepad") }]);
+        let window = fuzzy::score("todo", "ToDo Planer").unwrap() + crate::providers::windows::WINDOW_BONUS + 300;
+        assert!(p.query(&q("todo"))[0].score > window);
+        assert!(p.query(&q("td"))[0].score > window, "an alias in full too");
+        // Only part of the name: just above an equal match elsewhere, as before.
+        assert_eq!(p.query(&q("tod"))[0].score, 900 + 50);
+    }
+
+    #[test]
     fn alias_finds_the_shortcut() {
         let (p, _) = setup(vec![ShortcutDef { aliases: vec!["np".into()], ..run("notepad", "notepad") }]);
         let r = p.query(&q("np"));
         assert_eq!(ids(&r), vec!["run:notepad"]);
         assert_eq!(r[0].title, "notepad");
-        assert_eq!(r[0].score, 1000 + 50);
+        assert!(r[0].score > 1000 + crate::providers::windows::WINDOW_BONUS + 300);
     }
 
     #[test]
@@ -1646,7 +1656,7 @@ mod tests {
         }
         // Argument rows keep the bonus; a user's own shortcut name row too.
         assert!(open_row(&p, "g cats").score >= 1000);
-        assert_eq!(p.query(&q("gx"))[0].score, fuzzy::score("gx", "gx").unwrap() + BONUS);
+        assert!(p.query(&q("gx"))[0].score > 1000 + crate::providers::windows::WINDOW_BONUS + 300);
     }
 
     #[test]

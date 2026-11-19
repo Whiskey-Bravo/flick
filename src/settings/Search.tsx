@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { builtinName, serverUrl } from "../icons";
 import { settingsMovePin, settingsPickFolder, settingsPins, togglePin, type PinRow, type SettingsState } from "./api";
 import { useSaver } from "./saver";
@@ -21,12 +21,28 @@ export function Search({ state }: { state: SettingsState }) {
   };
   useEffect(loadPins, [state]);
 
-  const setRoots = (value: string[]) => void save("file_roots", { key: "file_roots", value });
+  // The folder list as last sent: a second Remove before the reload builds on
+  // it, not on the list shown, or the first removed folder would come back.
+  // A reload, or a save that failed, goes back to the list from the file.
+  // The saves go one after another, so the last list sent is the one kept.
+  const sent = useRef(roots);
+  const fromFile = useRef(roots);
+  fromFile.current = roots;
+  const saves = useRef<Promise<unknown>>(Promise.resolve());
+  useEffect(() => {
+    sent.current = roots;
+  }, [state]);
+  const setRoots = (value: string[]) => {
+    sent.current = value;
+    saves.current = saves.current.then(async () => {
+      if (!(await save("file_roots", { key: "file_roots", value }))) sent.current = fromFile.current;
+    });
+  };
   const add = async () => {
     setFolderError("");
     try {
       const picked = await settingsPickFolder();
-      if (picked !== null && !roots.includes(picked)) setRoots([...roots, picked]);
+      if (picked !== null && !sent.current.includes(picked)) setRoots([...sent.current, picked]);
     } catch (e) {
       setFolderError(String(e));
     }
@@ -45,7 +61,7 @@ export function Search({ state }: { state: SettingsState }) {
             {roots.map((r) => (
               <li key={r}>
                 <span class="grow path">{r}</span>
-                <button onClick={() => setRoots(roots.filter((x) => x !== r))}>Remove</button>
+                <button onClick={() => setRoots(sent.current.filter((x) => x !== r))}>Remove</button>
               </li>
             ))}
           </ul>

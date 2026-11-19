@@ -217,7 +217,7 @@ impl<T: Send + Sync + 'static> Loader<T> {
                 _ => Load::Pending,
             },
         };
-        let stale = slot.done.as_ref().map_or(true, |(_, at)| now.duration_since(*at) >= self.fresh);
+        let stale = slot.done.as_ref().is_none_or(|(_, at)| now.duration_since(*at) >= self.fresh);
         if stale && slot.reading.is_none() {
             slot.reading = Some((now, tick));
             let first = slot.done.is_none();

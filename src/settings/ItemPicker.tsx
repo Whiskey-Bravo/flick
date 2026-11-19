@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { builtinName, serverUrl } from "../icons";
 import { onAnswersReady, settingsSearchItems, type PickRow } from "./api";
-import { askItems } from "./pickerSearch";
+import { askItems, enterRow } from "./pickerSearch";
 
 const MAX_ROWS = 20;
 
@@ -36,6 +36,8 @@ export function ItemPicker({
 }) {
   const [text, setText] = useState("");
   const [rows, setRows] = useState<PickRow[]>([]);
+  // The text `rows` answer.
+  const [asked, setAsked] = useState("");
   const [sel, setSel] = useState(0);
   // Bumped when a device, drive or Wi-Fi list has been read while nothing showed.
   const [reread, setReread] = useState(0);
@@ -61,6 +63,7 @@ export function ItemPicker({
         (q) => settingsSearchItems(q, forWorkspace),
         (found) => {
           setRows((only ? found.filter(only) : found).slice(0, MAX_ROWS));
+          setAsked(text);
           setSel(0);
         },
       );
@@ -86,7 +89,8 @@ export function ItemPicker({
       setSel((s) => Math.max(s - 1, 0));
     } else if (e.key === "Enter") {
       e.preventDefault();
-      if (rows[sel]) pick(rows[sel]);
+      const row = enterRow(rows, sel, asked, text);
+      if (row) pick(row);
     }
   };
 

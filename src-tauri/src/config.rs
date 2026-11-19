@@ -608,9 +608,6 @@ pub enum Field {
     Name,
     Aliases,
     Target,
-    /// No rule reports it yet; kept so the Settings form has a name for the field.
-    #[allow(dead_code)]
-    Terminal,
     Admin,
     Pick,
     Choices,
@@ -710,13 +707,37 @@ pub fn check_shortcut(s: &ShortcutDef, used: &mut Vec<String>) -> Result<(), Fie
 }
 
 /// Checks `def` against the other shortcuts of `config` (the one named `original` is
-/// left out, as it is being replaced) and the built-in `help`.
+/// left out, as it is being replaced) and the built-in `help`. A name or alias
+/// that is one of Flick's own command words is refused here, in Settings, as
+/// it could never be reached. The file itself still loads with such a name,
+/// so a config written before this rule keeps working.
 pub fn check_shortcut_in(config: &Config, original: Option<&str>, def: &ShortcutDef) -> Result<(), FieldError> {
     let mut used: Vec<String> = vec!["help".to_string()];
     for s in config.shortcuts.iter().filter(|s| Some(s.name.as_str()) != original) {
         used.extend(std::iter::once(&s.name).chain(&s.aliases).map(|w| w.to_lowercase()));
     }
-    check_shortcut(def, &mut used)
+    check_shortcut(def, &mut used)?;
+    if is_command_word(&def.name) {
+        return Err(FieldError { field: Field::Name, message: COMMAND_NAME.into() });
+    }
+    if def.aliases.iter().any(|a| is_command_word(a)) {
+        return Err(FieldError { field: Field::Aliases, message: COMMAND_NAME.into() });
+    }
+    check_choices(def).map_err(|message| FieldError { field: Field::Choices, message })
+}
+
+/// Choices that would fail only when picked: an empty one, and for a `run`
+/// shortcut one that cmd.exe cannot be given (see `check_windows_value`).
+fn check_choices(def: &ShortcutDef) -> Result<(), String> {
+    if def.choices.iter().any(|c| c.trim().is_empty()) {
+        return Err("a choice is empty".into());
+    }
+    if def.run.is_some() {
+        for c in &def.choices {
+            crate::quote::check_windows_value(c).map_err(|e| format!("choice \"{c}\": {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Reads the file. On error keeps `last_good` (or `Config::default()`) and returns the message.
@@ -729,14 +750,15 @@ pub fn load(path: &Path, last_good: Option<&Config>) -> Loaded {
             Err(e) => Loaded { config: fallback(), error: Some(format!("config.toml: {e}")) },
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let created = path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|_| std::fs::write(path, first_file()));
-            match created {
-                // What the file just written says: the defaults, with past
-                // searches switched off.
-                Ok(()) => Loaded { config: Config { history: false, ..Config::default() }, error: None },
+            // Only the very first start (no last good config) switches past
+            // searches off. A file deleted while Flick runs gets the plain
+            // defaults, so a reload never switches history off and deletes it.
+            let text = if last_good.is_none() { first_file() } else { DEFAULT_FILE.to_string() };
+            match create(path, &text) {
+                Ok(text) => match parse(&text) {
+                    Ok(config) => Loaded { config, error: None },
+                    Err(e) => Loaded { config: fallback(), error: Some(format!("config.toml: {e}")) },
+                },
                 Err(e) => Loaded {
                     config: fallback(),
                     error: Some(format!("config.toml: could not create: {e}")),
@@ -744,6 +766,21 @@ pub fn load(path: &Path, last_good: Option<&Config>) -> Loaded {
             }
         }
         Err(e) => Loaded { config: fallback(), error: Some(format!("config.toml: could not read: {e}")) },
+    }
+}
+
+/// Writes `text` to `path` (and creates its folder) unless the file exists,
+/// and returns what the file now holds. A file that another program created
+/// in the meantime is read, not overwritten.
+fn create(path: &Path, text: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file.write_all(text.as_bytes()).map(|_| text.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => std::fs::read_to_string(path),
+        Err(e) => Err(e),
     }
 }
 
@@ -974,6 +1011,27 @@ run = \"notepad\"").unwrap();
         assert_eq!(parse(&text).unwrap(), first);
         // The second start reads the same thing back.
         assert_eq!(load(&p, None).config, first);
+    }
+
+    #[test]
+    fn a_file_deleted_while_running_keeps_history_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let good = Config { hotkey: "Ctrl+J".into(), ..Default::default() };
+        let l = load(&p, Some(&good));
+        assert!(l.error.is_none());
+        assert!(l.config.history, "a reload must not switch history off");
+        assert_eq!(l.config, Config::default());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), DEFAULT_FILE);
+    }
+
+    #[test]
+    fn create_never_overwrites_a_file_that_appeared() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "hotkey = \"Ctrl+J\"").unwrap();
+        assert_eq!(create(&p, DEFAULT_FILE).unwrap(), "hotkey = \"Ctrl+J\"");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hotkey = \"Ctrl+J\"");
     }
 
     #[test]
@@ -1355,6 +1413,41 @@ search_engine = \"https://www.google.com/search?q={arg}\"").unwrap();
         let c = Config { shortcuts: vec![ShortcutDef { aliases: vec!["z".into()], ..def("s1") }], ..Default::default() };
         let e = check_shortcut_in(&c, None, &def("z")).unwrap_err();
         assert_eq!(e.field, Field::Name);
+    }
+
+    #[test]
+    fn settings_refuse_shortcut_names_flick_answers_to() {
+        let c = Config::default();
+        for name in ["v", "DL", "qr", "recent", "tr", "def", "timer", "wifi", "snip", r"~\x"] {
+            let e = check_shortcut_in(&c, None, &def(name)).unwrap_err();
+            assert_eq!((e.field, e.message.as_str()), (Field::Name, COMMAND_NAME), "{name}");
+        }
+        let e = check_shortcut_in(&c, None, &ShortcutDef { aliases: vec!["eject".into()], ..def("a") }).unwrap_err();
+        assert_eq!((e.field, e.message.as_str()), (Field::Aliases, COMMAND_NAME));
+        assert!(check_shortcut_in(&c, None, &def("notes")).is_ok());
+        // A file that already has one still loads.
+        assert!(parse("[[shortcut]]\nname = \"dl\"\nopen = \"x\"").is_ok());
+    }
+
+    #[test]
+    fn settings_refuse_choices_that_fail_when_picked() {
+        let c = Config::default();
+        let run = |choices: &[&str]| ShortcutDef {
+            open: None,
+            run: Some("notepad {name}".into()),
+            choices: choices.iter().map(|s| s.to_string()).collect(),
+            ..def("a")
+        };
+        for bad in [&["ok", "100%"][..], &[r#"a"b"#], &[""], &["  "]] {
+            let e = check_shortcut_in(&c, None, &run(bad)).unwrap_err();
+            assert_eq!(e.field, Field::Choices, "{bad:?}");
+        }
+        let e = check_shortcut_in(&c, None, &run(&["100%"])).unwrap_err();
+        assert_eq!(e.message, r#"choice "100%": cannot pass text containing " or % to this command"#);
+        assert!(check_shortcut_in(&c, None, &run(&["a & b", "it's"])).is_ok());
+        // `open` and `wsl` take any non-empty text.
+        let open = ShortcutDef { open: Some("x {name}".into()), choices: vec!["100%".into()], ..def("a") };
+        assert!(check_shortcut_in(&c, None, &open).is_ok());
     }
 
     fn item(provider: &str, id: &str, title: &str) -> ItemRef {

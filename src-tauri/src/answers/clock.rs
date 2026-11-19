@@ -81,10 +81,14 @@ fn month_number(w: &str) -> Option<i8> {
     if let Some(i) = MONTHS.iter().position(|m| *m == w || (w.len() == 3 && m.starts_with(w))) {
         return Some(i as i8 + 1);
     }
-    // German spellings that differ from English.
+    // German (and Austrian) spellings that differ from English.
     match w {
+        "januar" | "jänner" | "jän" => Some(1),
+        "februar" | "feber" => Some(2),
         "mär" | "märz" | "maerz" | "mrz" => Some(3),
         "mai" => Some(5),
+        "juni" => Some(6),
+        "juli" => Some(7),
         "okt" | "oktober" => Some(10),
         "dez" | "dezember" => Some(12),
         "sept" => Some(9),
@@ -92,18 +96,14 @@ fn month_number(w: &str) -> Option<i8> {
     }
 }
 
-/// Date without a year: this year, or next year when it already passed.
+/// Date without a year: the first one from today on, this year or a later one.
+/// A leap day can be up to eight years ahead (2096 to 2104 skips one).
 fn resolve(day: i8, month: i8, year: Option<i16>, today: Date) -> Option<Date> {
     match year {
         Some(y) => Date::new(y, month, day).ok(),
-        None => {
-            let d = Date::new(today.year(), month, day).ok()?;
-            if d < today {
-                Date::new(today.year() + 1, month, day).ok()
-            } else {
-                Some(d)
-            }
-        }
+        None => (0..=8)
+            .filter_map(|ahead| Date::new(today.year().checked_add(ahead)?, month, day).ok())
+            .find(|d| *d >= today),
     }
 }
 
@@ -147,14 +147,8 @@ pub fn shift(d: Date, amount: i64, unit: Span) -> Option<Date> {
     d.checked_add(span).ok()
 }
 
-/// The place's local date and time, and how many minutes it is ahead of the PC's zone.
-#[allow(dead_code)] // the bar uses `time_in_from` with the zone it read at start
-pub fn time_in(place: &Place, now: Timestamp) -> Option<(DateTime, i64)> {
-    static LOCAL: std::sync::OnceLock<TimeZone> = std::sync::OnceLock::new();
-    time_in_from(place, now, LOCAL.get_or_init(TimeZone::system))
-}
-
-/// Like [`time_in`] with an explicit "local" zone, so tests do not depend on the PC.
+/// The place's local date and time, and how many minutes it is ahead of
+/// `local` (the PC's zone, read once at start; a fixed one in tests).
 pub fn time_in_from(place: &Place, now: Timestamp, local: &TimeZone) -> Option<(DateTime, i64)> {
     let zone = TimeZone::get(place.zone).ok()?;
     let ahead = i64::from(zone.to_offset(now).seconds() - local.to_offset(now).seconds()) / 60;
@@ -349,8 +343,8 @@ mod tests {
     fn time_in_tokyo_with_dst_elsewhere() {
         let now: Timestamp = "2026-07-01T12:00:00Z".parse().unwrap();
         let p = place;
-        assert_eq!(time_in(p("time tokyo"), now).unwrap().0.time(), jiff::civil::time(21, 0, 0, 0));
-        assert_eq!(time_in(p("time london"), now).unwrap().0.time(), jiff::civil::time(13, 0, 0, 0)); // BST
+        assert_eq!(time_in_from(p("time tokyo"), now, &TimeZone::UTC).unwrap().0.time(), jiff::civil::time(21, 0, 0, 0));
+        assert_eq!(time_in_from(p("time london"), now, &TimeZone::UTC).unwrap().0.time(), jiff::civil::time(13, 0, 0, 0)); // BST
         assert_eq!(p("time france").name, "Paris");
     }
 
@@ -436,6 +430,38 @@ mod tests {
         assert_eq!(d("days until 16 nov"), jiff::civil::date(2027, 11, 16));
         assert!(parse_clock("days until 31 feb", today).is_none());
         assert!(parse_clock("days until soon", today).is_none());
+    }
+
+    #[test]
+    fn german_and_austrian_month_names() {
+        let today = jiff::civil::date(2026, 11, 17);
+        let d = |s| match parse_clock(s, today) {
+            Some(ClockAsk::DaysUntil(d)) => d,
+            _ => panic!("{s}"),
+        };
+        assert_eq!(d("days until 24 januar"), jiff::civil::date(2027, 1, 24));
+        assert_eq!(d("days until 24 jänner"), jiff::civil::date(2027, 1, 24));
+        assert_eq!(d("days until 24 jän"), jiff::civil::date(2027, 1, 24));
+        assert_eq!(d("days until 1 februar"), jiff::civil::date(2027, 2, 1));
+        assert_eq!(d("days until 1 feber"), jiff::civil::date(2027, 2, 1));
+        assert_eq!(d("days until 1 juni"), jiff::civil::date(2027, 6, 1));
+        assert_eq!(d("days until 3 juli"), jiff::civil::date(2027, 7, 3));
+    }
+
+    #[test]
+    fn a_leap_day_without_a_year_is_the_next_one() {
+        let d = |s, today| match parse_clock(s, today) {
+            Some(ClockAsk::DaysUntil(d)) => d,
+            _ => panic!("{s}"),
+        };
+        let leap = jiff::civil::date(2028, 2, 29);
+        assert_eq!(d("days until 29.2.", jiff::civil::date(2026, 11, 17)), leap);
+        assert_eq!(d("days until 29 feb", jiff::civil::date(2027, 3, 1)), leap);
+        assert_eq!(d("days until 29.2.", jiff::civil::date(2028, 2, 29)), leap);
+        // After this year's 29 Feb: the one four years on.
+        assert_eq!(d("days until 29.2.", jiff::civil::date(2028, 3, 1)), jiff::civil::date(2032, 2, 29));
+        // Never valid: still no answer.
+        assert!(parse_clock("days until 30.2.", jiff::civil::date(2026, 11, 17)).is_none());
     }
 
     #[test]

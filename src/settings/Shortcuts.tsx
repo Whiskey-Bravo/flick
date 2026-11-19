@@ -12,6 +12,7 @@ import {
   type ShortcutField,
 } from "./api";
 import { ItemPicker } from "./ItemPicker";
+import { oneAtATime } from "./oneAtATime";
 import { disabledReasons, emptyForm, iconFromRow, isDirty, toDef, toForm, type Form, type Kind } from "./shortcutForm";
 import "./shortcuts.css";
 
@@ -112,7 +113,15 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
     }
   }, [state]);
 
-  const doSave = async (): Promise<boolean> => {
+  // The editor as it is now: the leave question's Save (made by an older
+  // render) sends what the editor shows when it is clicked.
+  const now = useRef({ form, original });
+  now.current = { form, original };
+  const [saving, setSaving] = useState(false);
+  const [once] = useState(() => oneAtATime(setSaving));
+
+  const doSave = (): Promise<boolean> => once(async () => {
+    const { form, original } = now.current;
     setSaveError(null);
     try {
       await settingsSaveShortcut(original, toDef(form));
@@ -126,7 +135,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
       setSaveError(typeof e === "object" && e !== null && "field" in e ? (e as FieldError) : message(e));
       return false;
     }
-  };
+  });
 
   const valid = check?.key === key && check.error === null && form.name.trim() !== "";
 
@@ -201,7 +210,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
   const moreRef = useRef<HTMLDetailsElement>(null);
   const errField = saveError && typeof saveError === "object" ? saveError.field : check?.key === key ? check.error?.field : undefined;
   useEffect(() => {
-    if (moreRef.current && errField && ["admin", "terminal", "pick", "choices"].includes(errField)) {
+    if (moreRef.current && errField && ["admin", "pick", "choices"].includes(errField)) {
       moreRef.current.open = true;
     }
   }, [errField, open]);
@@ -250,7 +259,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
           {asking && (
             <div class="sc-ask" role="alertdialog" ref={askRef}>
               <span>This shortcut has unsaved changes.</span>
-              <button disabled={!valid} onClick={() => asking("save")}>
+              <button disabled={!valid || saving} onClick={() => asking("save")}>
                 Save
               </button>
               <button onClick={() => asking("discard")}>Discard</button>
@@ -359,7 +368,6 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
                 <option value="no">No</option>
               </select>
               {reasons.terminal && <small>({reasons.terminal})</small>}
-              {shown("terminal")}
             </label>
 
             <div class="sc-field">
@@ -419,7 +427,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
           )}
 
           <div class="sc-actions">
-            <button class="primary" disabled={!valid || !dirty} onClick={() => void doSave()}>
+            <button class="primary" disabled={!valid || !dirty || saving} onClick={() => void doSave()}>
               Save
             </button>
             {original !== null &&

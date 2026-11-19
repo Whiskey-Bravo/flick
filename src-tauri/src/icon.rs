@@ -278,7 +278,7 @@ fn read_picture(path: &std::path::Path) -> Option<Vec<u8>> {
     picture(std::fs::read(path).ok()?)
 }
 
-/// Serialises the Shell icon calls of all icon workers.
+/// Serialises the retries of failed Shell icon lookups (see `png`).
 static SHELL: Mutex<()> = Mutex::new(());
 
 impl IconSource for ShellIcons {
@@ -288,12 +288,16 @@ impl IconSource for ShellIcons {
                 return read_picture(path);
             }
         }
-        // One at a time: two first-time lookups racing in the Shell make one
-        // of them fail (seen with two Start-menu shortcuts asked for together
-        // on the empty bar), and the page then keeps the placeholder.
-        let _one = SHELL.lock().unwrap_or_else(|e| e.into_inner());
         let _com = shell::Com::init();
-        let icon = shell::icon(key, px)?;
+        // Two first-time lookups racing in the Shell can make one of them
+        // fail (seen with two Start-menu shortcuts asked for together on the
+        // empty bar). A failed lookup is asked once more alone. Only the
+        // retry waits for the others, so a slow one (a file on a network
+        // drive that is offline) never holds up every other icon.
+        let icon = shell::icon(key, px).or_else(|| {
+            let _one = SHELL.lock().unwrap_or_else(|e| e.into_inner());
+            shell::icon(key, px)
+        })?;
         let drawn = shell::draw(icon, px, 0x00).zip(shell::draw(icon, px, 0xFF));
         shell::destroy(icon);
         let (black, white) = drawn?;

@@ -189,6 +189,8 @@ pub struct RecentProvider {
 }
 
 impl RecentProvider {
+    /// One argument per seam, so tests can hand in fakes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Loader<Vec<RecentEntry>>>,
         fs: Arc<dyn FileSystem>,
@@ -212,7 +214,9 @@ impl Provider for RecentProvider {
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let Some(folder) = &self.folder else { return no_folder(self.name()) };
         let (fs, links, dir) = (Arc::clone(&self.fs), Arc::clone(&self.links), folder.clone());
-        let load = self.store.get(&folder_key(folder), move || read_recent(&*fs, &*links, &dir));
+        // COM is held for the whole read: each link's target then costs a
+        // reference count, not a COM load and unload.
+        let load = self.store.get(&folder_key(folder), move || crate::launch::with_com(|| read_recent(&*fs, &*links, &dir)));
         let entries = match loaded(self.name(), load, &folder.to_string_lossy()) {
             Ok(entries) => entries,
             Err(rows) => return rows,
@@ -534,7 +538,7 @@ mod tests {
         assert_eq!(rows[0].provider, "downloads");
         assert_eq!(d.p.item(&id).unwrap().title, "a.zip");
         assert_eq!(d.p.act(&id, Action::CopyPath), Ok(Outcome::Hide));
-        assert_eq!(*d.clip.0.lock().unwrap(), [id.clone()]);
+        assert_eq!(*d.clip.0.lock().unwrap(), std::slice::from_ref(&id));
         assert_eq!(d.p.activate(&id, Modifier::None), Ok(Outcome::Hide));
         assert_eq!(d.p.activate(&id, Modifier::Ctrl), Ok(Outcome::Hide));
         assert_eq!(d.launcher.calls(), [format!("open {id}"), format!("reveal {id}")]);

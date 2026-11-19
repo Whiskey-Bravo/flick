@@ -1,7 +1,9 @@
 import { useEffect, useState } from "preact/hooks";
 import {
   COLOR_NAMES,
+  colorsToSave,
   contrastWarnings,
+  draftAfterReload,
   normalizeColor,
   type ColorName,
   type Colors,
@@ -87,19 +89,18 @@ export function Appearance({ state }: { state: SettingsState }) {
   const saved = info("custom")?.colors;
 
   // The custom colours as edited: typed values may be half-finished, so they
-  // are kept as text and saved only once they are colours.
+  // are kept as text and saved only once they are colours. A reload keeps them.
   const [draft, setDraft] = useState<Colors | null>(saved ?? null);
   useEffect(() => {
-    setDraft(saved ?? null);
+    setDraft((d) => draftAfterReload(saved, d));
   }, [JSON.stringify(saved)]);
 
   const pickTheme = (name: string) => void save("theme", { key: "theme", value: name === "dark" ? "" : name });
 
+  // A colour still being typed in another field does not hold this one back.
   const saveCustom = (colors: Colors) => {
-    for (const name of COLOR_NAMES) if (normalizeColor(colors[name]) === null) return;
-    const clean = { ...colors };
-    for (const name of COLOR_NAMES) clean[name] = normalizeColor(colors[name])!;
-    void save("custom_theme", { key: "custom_theme", value: toCustom(clean) });
+    const clean = colorsToSave(colors, saved);
+    if (clean) void save("custom_theme", { key: "custom_theme", value: toCustom(clean) });
   };
   const setColor = (name: ColorName, value: string, commit: boolean) => {
     if (!draft) return;

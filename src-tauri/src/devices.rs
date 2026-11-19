@@ -174,10 +174,13 @@ mod ks {
         }
     }
 
+    /// What [`read`] finds: the endpoints, the filters' parts by id, and the enumerator.
+    pub type Read = (Vec<Seen>, HashMap<String, IPart>, IMMDeviceEnumerator);
+
     /// Every active or unplugged endpoint with its Bluetooth filter, the
     /// filters' parts by id, and the enumerator that found them. COM must be
     /// initialised on this thread.
-    pub fn read() -> Result<(Vec<Seen>, HashMap<String, IPart>, IMMDeviceEnumerator), String> {
+    pub fn read() -> Result<Read, String> {
         // SAFETY: COM objects and strings are released before returning
         // (drops and `take`); the caller runs inside `with_com`.
         unsafe {
@@ -305,10 +308,14 @@ impl Wifi for WlanWifi {
     }
 }
 
+/// One interface's saved profile names (or why they could not be read),
+/// and the profile it is connected with.
+type InterfaceProfiles = (Result<Vec<String>, String>, Option<String>);
+
 /// Every interface's saved profiles (and the one it is connected with) as
 /// one list, deduplicated by name. An interface whose list cannot be read is
 /// skipped; an error only when every interface failed.
-fn merge_profiles(per_interface: Vec<(Result<Vec<String>, String>, Option<String>)>) -> Result<Vec<WifiProfile>, String> {
+fn merge_profiles(per_interface: Vec<InterfaceProfiles>) -> Result<Vec<WifiProfile>, String> {
     let mut out: Vec<WifiProfile> = Vec::new();
     let (mut read_any, mut error) = (per_interface.is_empty(), None);
     for (profiles, current) in per_interface {

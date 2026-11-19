@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   DARK,
+  colorsToSave,
   contrast,
   contrastWarnings,
   cssVars,
+  draftAfterReload,
   isLight,
   onAccent,
   normalizeColor,
@@ -74,5 +76,24 @@ describe("appearance", () => {
     expect(normalizeColor(" #1B1B1F ")).toBe("#1b1b1f");
     expect(normalizeColor("#12345")).toBeNull();
     expect(normalizeColor("blue")).toBeNull();
+  });
+});
+
+describe("custom colours being edited", () => {
+  const saved = { ...DARK };
+  it("saves the colours that are done; one still being typed keeps its saved value", () => {
+    const draft = { ...DARK, background: "#ABC", text: "#12" };
+    expect(colorsToSave(draft, saved)).toEqual({ ...DARK, background: "#aabbcc" });
+    // Nothing saved yet to fall back on: nothing to save.
+    expect(colorsToSave(draft, undefined)).toBeNull();
+    expect(colorsToSave({ ...DARK, background: "#ABC" }, undefined)).toEqual({ ...DARK, background: "#aabbcc" });
+  });
+
+  it("a reload keeps a value still being typed and takes the rest from the file", () => {
+    const draft = { ...DARK, text: "#12", muted: "#ffffff" };
+    const after = draftAfterReload({ ...DARK, background: "#000000" }, draft);
+    expect(after).toEqual({ ...DARK, background: "#000000", text: "#12" });
+    expect(draftAfterReload(undefined, draft)).toBeNull();
+    expect(draftAfterReload(DARK, null)).toEqual(DARK);
   });
 });

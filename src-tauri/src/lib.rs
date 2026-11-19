@@ -233,6 +233,12 @@ impl Providers {
         cloud_roots::shared().refresh_if_due();
         // Store installs (and, without a watcher, shortcuts): a background thread.
         self.apps.refresh_on_show();
+        // The time zone may have changed while Flick ran (travel, a manual
+        // change). Read here, not on the query path: it is quick, as the zone
+        // data is built into Flick.
+        let tz = jiff::tz::TimeZone::system();
+        self.answers.set_zone(tz.clone());
+        self.timers.set_zone(tz);
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
@@ -584,7 +590,7 @@ const WIN_KEY_RETRY: Duration = Duration::from_secs(10);
 /// Whether the worker starts the helper now, without being asked: the
 /// setting is on, no helper runs, and the last start is long enough ago.
 fn win_key_start_due(on: bool, running: bool, since_last_start: Option<Duration>) -> bool {
-    on && !running && since_last_start.map_or(true, |d| d >= WIN_KEY_RETRY)
+    on && !running && since_last_start.is_none_or(|d| d >= WIN_KEY_RETRY)
 }
 
 /// What decides whether a lone Win press opens Flick. Each is set elsewhere;
@@ -1424,15 +1430,17 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
 }
 
 /// Reads `rates.json` and `weather.json`, then gives the weather store the home
-/// city of the current config. Under the config lock, so a reload never sets
-/// the home city between these steps.
+/// city of the current config. The weather steps run under the config lock,
+/// so a reload never sets the home city between them; the rates, which a
+/// reload never touches, are read before it, so a reload waits for one file
+/// at most.
 fn load_answer_stores(app: &AppHandle, p: &Providers) {
     let (rates, weather) = (p.rates.clone(), p.weather.clone());
     let handle = app.clone();
     std::thread::spawn(move || {
+        rates.load();
         let state = handle.state::<AppState>();
         let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-        rates.load();
         weather.load();
         weather.set_home(config.weather_city.trim());
     });
@@ -1549,13 +1557,24 @@ pub(crate) fn on_exit(app: &AppHandle) {
     quit_cleanup(state.as_ref().map(|s| s.providers.reminders.as_ref()));
     // Ends the helper, and with it the hook. Stopping waits for the helper
     // process to go: it ends at once, and a stuck one is ended after 0.5 s.
+    // The worker is told too, so it doesn't start a new helper before the end.
     if let Some(state) = state {
-        state.win_key.flags.set_on(false);
+        state.win_key.want(false);
         let hook = state.win_key.hook.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(hook) = hook {
             hook.stop();
         }
     }
+}
+
+/// The updater ran [`on_exit`] but the installer didn't start, so Flick runs
+/// on: the Win key is asked for again as the setting says. Takes the config
+/// lock, so never on the main thread (the updater installs on its own thread).
+pub(crate) fn resume_after_failed_install(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
+    // Under the config lock, like a reload, so the switches stay in order.
+    state.win_key.want(config.win_key);
 }
 
 /// A reminder change whose save failed is written now (or it would ring again
@@ -1812,7 +1831,7 @@ mod tests {
 
     impl StatusSource for FakeStatus {
         fn battery(&self) -> Option<Battery> {
-            Some(Battery { percent: 82, charging: false, minutes_left: None })
+            Some(Battery { percent: 82, charging: false, plugged_in: false, minutes_left: None })
         }
         fn memory(&self) -> Memory {
             Memory { used: 1, total: 2 }
@@ -2144,6 +2163,9 @@ mod tests {
         fn number(&self, x: f64) -> String {
             x.to_string()
         }
+        fn group(&self) -> char {
+            ','
+        }
         fn date(&self, d: jiff::civil::Date, _long: bool) -> String {
             d.to_string()
         }
@@ -2173,6 +2195,7 @@ mod tests {
         );
         // Not an ECB currency, or none: EUR.
         assert_eq!(answers_config(&Config::default(), &Region(Some("XAF"), false)).currency, "EUR");
+        assert_eq!(answers_config(&Config::default(), &Region(Some("BGN"), false)).currency, "EUR");
         assert_eq!(answers_config(&Config::default(), &Region(None, false)).currency, "EUR");
         let set = Config {
             online: false,
@@ -2720,7 +2743,6 @@ mod tests {
             id: id.into(),
             text: text.into(),
             copied: std::time::UNIX_EPOCH + Duration::from_secs(1_000_000 - secs_ago),
-            pinned: false,
         }
     }
 

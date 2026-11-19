@@ -255,7 +255,7 @@ fn write_take(mut stdin: ChildStdin, may_take: Box<dyn Fn() -> bool + Send + Syn
     let mut say = |line: &str| writeln!(stdin, "{line}").and_then(|()| stdin.flush()).is_ok();
     let mut sent: Option<bool> = None;
     loop {
-        let take = catch_unwind(AssertUnwindSafe(|| may_take())).unwrap_or(false);
+        let take = catch_unwind(AssertUnwindSafe(&may_take)).unwrap_or(false);
         if sent != Some(take) {
             if !say(take_line(take)) {
                 return;

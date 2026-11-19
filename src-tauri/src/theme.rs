@@ -212,6 +212,7 @@ pub fn resolve(theme: &str, custom: &CustomTheme, animations: &str) -> Appearanc
 }
 
 /// The channels of a `#rrggbb` colour, 0 to 255.
+#[cfg(test)]
 fn channels(color: &str) -> Option<[u8; 3]> {
     let c = normalize_color(color)?;
     let n = u32::from_str_radix(&c[1..], 16).ok()?;
@@ -219,6 +220,7 @@ fn channels(color: &str) -> Option<[u8; 3]> {
 }
 
 /// WCAG relative luminance of a colour, 0 (black) to 1 (white).
+#[cfg(test)]
 fn luminance(color: &str) -> Option<f64> {
     let linear = |v: u8| {
         let s = f64::from(v) / 255.0;
@@ -233,6 +235,8 @@ fn luminance(color: &str) -> Option<f64> {
 }
 
 /// WCAG contrast ratio of two colours, 1 (the same) to 21 (black on white).
+/// Used by the tests that keep every built-in theme readable.
+#[cfg(test)]
 pub fn contrast(a: &str, b: &str) -> Option<f64> {
     let (a, b) = (luminance(a)?, luminance(b)?);
     let (light, dark) = if a > b { (a, b) } else { (b, a) };

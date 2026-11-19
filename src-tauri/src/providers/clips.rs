@@ -39,7 +39,6 @@ struct Entry {
     /// `normalize` of the first `MATCH_CHARS` characters.
     matched: String,
     copied: SystemTime,
-    pinned: bool,
 }
 
 /// The outcome of one read, held until `forget`.
@@ -63,7 +62,6 @@ fn prepare(read: Result<History, HistoryError>) -> Read {
                         matched: normalize(&head),
                         id: c.id,
                         copied: c.copied,
-                        pinned: c.pinned,
                     }
                 })
                 .collect(),
@@ -178,10 +176,7 @@ impl Provider for ClipsProvider {
             .filter(|e| needle.is_empty() || score_prenormalized(&needle, &e.matched).is_some())
             .enumerate()
             .map(|(i, e)| {
-                let mut subtitle = ago(now, e.copied);
-                if e.pinned {
-                    subtitle.push_str(" \u{00B7} Pinned");
-                }
+                let subtitle = ago(now, e.copied);
                 ResultItem {
                     score: 1000u32.saturating_sub(i as u32),
                     actions: vec![Action::Copy],
@@ -307,12 +302,11 @@ mod tests {
         V { p, rx, fake, launcher }
     }
 
-    fn clip(id: &str, text: &str, secs_ago: u64, pinned: bool) -> Clip {
+    fn clip(id: &str, text: &str, secs_ago: u64) -> Clip {
         Clip {
             id: id.to_string(),
             text: text.to_string(),
             copied: UNIX_EPOCH + Duration::from_secs(NOW - secs_ago),
-            pinned,
         }
     }
 
@@ -346,7 +340,7 @@ mod tests {
     #[test]
     fn query_never_waits_for_the_history() {
         let fake = Arc::new(FakeHistory::new());
-        fake.set(items(vec![clip("a", "alpha", 10, false)]));
+        fake.set(items(vec![clip("a", "alpha", 10)]));
         fake.block();
         let threads = Arc::new(Threads { fake: fake.clone(), read_on: Mutex::new(Vec::new()) });
         let (on_ready, _rx) = signal();
@@ -374,15 +368,15 @@ mod tests {
     fn items_are_listed_newest_first_with_age() {
         let long = "x".repeat(200);
         let t = v(items(vec![
-            clip("1", "a\r\nb", 5 * 60, false),
-            clip("2", "pinned one", 2 * 3600, true),
-            clip("3", &long, 3 * 86_400, false),
+            clip("1", "a\r\nb", 5 * 60),
+            clip("2", "second one", 2 * 3600),
+            clip("3", &long, 3 * 86_400),
         ]));
         let rows = ready(&t, "");
         assert_eq!(ids(&rows), ["clip:1", "clip:2", "clip:3"]);
         assert_eq!(rows[0].title, "a\u{23CE}b");
         assert_eq!(rows[0].subtitle, "5 min ago");
-        assert_eq!(rows[1].subtitle, "2 h ago \u{00B7} Pinned");
+        assert_eq!(rows[1].subtitle, "2 h ago");
         assert_eq!(rows[2].title, format!("{}\u{2026}", "x".repeat(120)));
         assert!(rows.windows(2).all(|w| w[0].score > w[1].score), "scores strictly decrease");
         for row in &rows {
@@ -396,10 +390,10 @@ mod tests {
     fn typing_filters_on_the_full_text() {
         let deep = format!("{} needle", "y".repeat(300));
         let t = v(items(vec![
-            clip("1", "needle first", 10, false),
-            clip("2", "nothing here", 20, false),
-            clip("3", &deep, 30, false),
-            clip("4", "zzz", 40, false),
+            clip("1", "needle first", 10),
+            clip("2", "nothing here", 20),
+            clip("3", &deep, 30),
+            clip("4", "zzz", 40),
         ]));
         ready(&t, "");
         let rows = t.p.query(&q("needle"));
@@ -410,7 +404,7 @@ mod tests {
 
     #[test]
     fn a_long_item_filters_without_rereading() {
-        let clips = (0..5).map(|i| clip(&i.to_string(), &"ab ".repeat(200_000 / 3), i * 10, false)).collect();
+        let clips = (0..5).map(|i| clip(&i.to_string(), &"ab ".repeat(200_000 / 3), i * 10)).collect();
         let t = v(items(clips));
         assert_eq!(ready(&t, "").len(), 5);
         for n in 1..=10 {
@@ -460,9 +454,9 @@ mod tests {
 
     #[test]
     fn enter_sets_the_item_read_not_the_one_now_in_its_place() {
-        let t = v(items(vec![clip("b", "bee", 10, false), clip("a", "ay", 20, false)]));
+        let t = v(items(vec![clip("b", "bee", 10), clip("a", "ay", 20)]));
         let rows = ready(&t, "");
-        t.fake.set(items(vec![clip("c", "sea", 1, false), clip("b", "bee", 10, false), clip("a", "ay", 20, false)]));
+        t.fake.set(items(vec![clip("c", "sea", 1), clip("b", "bee", 10), clip("a", "ay", 20)]));
         assert_eq!(t.p.activate(&rows[0].id, Modifier::None), Ok(Outcome::HideThen { then: Then::Paste { before: 100 } }));
         assert_eq!(t.fake.set_calls(), ["b"]);
         assert_eq!(t.p.activate(&rows[1].id, Modifier::None), Ok(Outcome::HideThen { then: Then::Paste { before: 101 } }));
@@ -471,7 +465,7 @@ mod tests {
 
     #[test]
     fn the_paste_carries_the_number_read_before_the_set() {
-        let t = v(items(vec![clip("b", "bee", 10, false)]));
+        let t = v(items(vec![clip("b", "bee", 10)]));
         let rows = ready(&t, "");
         t.fake.set_content("x").unwrap();
         t.fake.set_content("y").unwrap();
@@ -481,7 +475,7 @@ mod tests {
 
     #[test]
     fn ctrl_enter_ctrl_shift_enter_and_copy_only_copy() {
-        let t = v(items(vec![clip("b", "bee", 10, false)]));
+        let t = v(items(vec![clip("b", "bee", 10)]));
         let rows = ready(&t, "");
         assert_eq!(t.p.activate(&rows[0].id, Modifier::Ctrl), Ok(Outcome::Hide));
         assert_eq!(t.fake.set_calls(), ["b"]);
@@ -493,13 +487,13 @@ mod tests {
 
     #[test]
     fn a_blank_item_says_blank() {
-        let t = v(items(vec![clip("s", " \r\n\t ", 10, false), clip("t", "text", 20, false)]));
+        let t = v(items(vec![clip("s", " \r\n\t ", 10), clip("t", "text", 20)]));
         assert_eq!(titles(&ready(&t, "")), ["(blank)", "text"]);
     }
 
     #[test]
     fn a_gone_item_says_so() {
-        let t = v(items(vec![clip("b", "bee", 10, false)]));
+        let t = v(items(vec![clip("b", "bee", 10)]));
         let rows = ready(&t, "");
         t.fake.mark_gone("b");
         let gone = Err("That item is gone from clipboard history".to_string());
@@ -527,11 +521,11 @@ mod tests {
 
     #[test]
     fn forget_drops_everything() {
-        let t = v(items(vec![clip("b", "bee", 10, false)]));
+        let t = v(items(vec![clip("b", "bee", 10)]));
         assert_eq!(titles(&ready(&t, "")), ["bee"]);
         assert_eq!(titles(&t.p.query(&q(""))), ["bee"]);
         assert_eq!(t.fake.reads(), 1);
-        t.fake.set(items(vec![clip("c", "sea", 1, false)]));
+        t.fake.set(items(vec![clip("c", "sea", 1)]));
         t.p.forget();
         assert_eq!(t.fake.forgets(), 1);
         assert_eq!(titles(&ready(&t, "")), ["sea"]);
@@ -540,7 +534,7 @@ mod tests {
 
     #[test]
     fn rows_are_never_learned() {
-        let t = v(items(vec![clip("b", "bee", 10, false)]));
+        let t = v(items(vec![clip("b", "bee", 10)]));
         let row = &ready(&t, "")[0];
         assert_eq!(t.p.rank_key(&row.id), None);
         assert!(t.p.item(&row.id).is_none());

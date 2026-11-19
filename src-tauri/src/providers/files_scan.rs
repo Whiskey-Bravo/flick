@@ -210,12 +210,18 @@ impl Index {
         self.dir(s).join(self.name(s))
     }
 
-    /// The entry whose full path is `path`, compared exactly.
+    /// The entry whose full path is `path`, compared exactly. The folder is
+    /// looked up first (far fewer than entries), so the pass over every entry
+    /// compares numbers, not names.
     pub fn find(&self, path: &Path) -> Option<&Slot> {
         let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str())) else {
             return None;
         };
-        self.slots.iter().find(|s| self.name(s) == name && self.dir(s) == dir)
+        let parents: Vec<u32> = (0..self.dirs.len() as u32).filter(|&i| self.dirs[i as usize] == dir).collect();
+        if parents.is_empty() {
+            return None;
+        }
+        self.slots.iter().find(|s| parents.contains(&s.parent) && self.name(s) == name)
     }
 
     /// A copy of the index after `old` (and what is below it) moved to `new`,
@@ -240,7 +246,7 @@ impl Index {
             .unzip();
         let old_name = old.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
         let is_old = |s: &Slot| beside[s.parent as usize] && self.name(s).to_lowercase() == old_name;
-        if !below.contains(&true) && !self.slots.iter().any(|s| is_old(s)) {
+        if !below.contains(&true) && !self.slots.iter().any(&is_old) {
             return None;
         }
         let mut out = Index::with_capacity(self.sizes());

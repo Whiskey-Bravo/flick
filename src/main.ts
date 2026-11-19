@@ -469,13 +469,14 @@ function dispatch(event: Event) {
 }
 
 /// Where Windows' menu for row `index` opens: the row's left edge and bottom,
-/// in screen pixels. The page's own window position (the bar's capability
-/// grants no window calls), scaled like the row's box.
+/// in physical pixels from the window's top-left corner. The back end adds
+/// the window's screen position: the page's own `screenX` is not in screen
+/// pixels on a monitor whose scaling differs from the main one's.
 function moreOptionsAt(index: number): { x: number; y: number } {
   const li = list.querySelector<HTMLElement>(`li.result[data-index="${index}"]`);
   const box = li?.getBoundingClientRect() ?? input.getBoundingClientRect();
   const scale = window.devicePixelRatio || 1;
-  return { x: Math.round((window.screenX + box.left) * scale), y: Math.round((window.screenY + box.bottom) * scale) };
+  return { x: Math.round(box.left * scale), y: Math.round(box.bottom * scale) };
 }
 
 /// Rows with a `liveRow` request on its way: a slow reply is never overtaken by another ask.
@@ -559,18 +560,25 @@ function run(effect: Effect) {
         .then((items) => dispatch({ type: "past", items }))
         .catch(() => {});
       break;
-    case "togglePin":
+    case "togglePin": {
+      const at = shows;
       invoke<boolean>("toggle_pin", { provider: effect.item.provider, id: effect.item.id })
-        .then((pinned) => dispatch({ type: "pinned", provider: effect.item.provider, id: effect.item.id, pinned }))
-        .catch((err) => dispatch({ type: "failed", message: failureText(effect.item, err) }));
+        .then((pinned) => {
+          if (at === shows) dispatch({ type: "pinned", provider: effect.item.provider, id: effect.item.id, pinned });
+        })
+        .catch((err) => {
+          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+        });
       break;
+    }
     case "act": {
       const at = shows;
       invoke<Outcome>("act", { provider: effect.item.provider, id: effect.item.id, action: effect.action })
         .then((outcome) => {
           if (at !== shows) return;
-          // A delete that kept the bar open: the list asks again, the row is gone.
-          if (effect.action === "delete" && outcome.kind === "keep") dispatch({ type: "deleted", item: effect.item });
+          // A delete that went through: the list asks again, the row is gone.
+          // A delete declined in Windows' prompt is "keep": nothing changed.
+          if (outcome.kind === "removed") dispatch({ type: "deleted", item: effect.item });
           else dispatch({ type: "outcome", outcome });
         })
         .catch((err) => {
@@ -731,7 +739,10 @@ document.addEventListener("click", (e) => {
 });
 
 document.addEventListener("mousedown", (e) => {
-  e.preventDefault(); // keep focus in the input
+  // Keep focus in the input. A press in the input itself keeps its default,
+  // so the mouse can place the caret and select text there.
+  if (e.target === input) return;
+  e.preventDefault();
   input.focus();
 });
 

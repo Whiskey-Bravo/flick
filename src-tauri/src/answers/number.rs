@@ -8,10 +8,20 @@ use windows::Win32::Globalization::{
     LOCALE_IMEASURE, LOCALE_SDECIMAL, LOCALE_SINTLSYMBOL, LOCALE_STHOUSAND, TIME_FORMAT_FLAGS,
 };
 
-/// Parses a typed number. `,` and `.` both work as the decimal separator; a single
-/// separator is always the decimal one. Grouping is accepted only when both kinds
-/// are present: the last one is the decimal, the other kind groups in threes.
-pub fn parse_number(s: &str) -> Option<f64> {
+/// Parses a typed number. `,` and `.` both work as the decimal separator.
+/// `group` is the locale's grouping character. Only one kind of separator:
+/// - when it is `group` and every group after the first has exactly three
+///   digits (`1,500` in English, `1.000.000` in German), it groups;
+/// - otherwise a single one is the decimal separator (`1,5`, `1.000` in English).
+///
+/// Both kinds present: the last one is the decimal, the other kind groups in threes.
+pub fn parse_number(s: &str, group: char) -> Option<f64> {
+    plain_number(s, group)?.parse().ok()
+}
+
+/// The typed number `s` (read as [`parse_number`] does) in Rust's own form:
+/// no grouping, `.` as the decimal point, `-` for a negative one.
+pub fn plain_number(s: &str, group: char) -> Option<String> {
     let s = s.trim();
     let (neg, body) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -22,8 +32,10 @@ pub fn parse_number(s: &str) -> Option<f64> {
     }
     let commas = body.matches(',').count();
     let dots = body.matches('.').count();
+    let one_kind = (commas == 0) != (dots == 0);
     let normalized = match (commas, dots) {
         (0, 0) => body.to_string(),
+        _ if one_kind && body.contains(group) && grouped_in_threes(body.split(group)) => body.replace(group, ""),
         (1, 0) | (0, 1) => {
             let (int, frac) = body.split_once(['.', ','])?;
             if frac.is_empty() {
@@ -34,21 +46,15 @@ pub fn parse_number(s: &str) -> Option<f64> {
         (c, d) if c > 0 && d > 0 => {
             let last = body.rfind(['.', ','])?;
             let decimal = body.as_bytes()[last] as char;
-            let group = if decimal == '.' { ',' } else { '.' };
+            let grouping = if decimal == '.' { ',' } else { '.' };
             let (int, frac) = (&body[..last], &body[last + 1..]);
-            if frac.is_empty() || frac.contains(group) {
+            if frac.is_empty() || frac.contains(grouping) {
                 return None;
             }
-            let groups: Vec<&str> = int.split(group).collect();
+            let groups: Vec<&str> = int.split(grouping).collect();
             let ok = groups.len() >= 2
-                && groups.iter().enumerate().all(|(i, g)| {
-                    !g.contains(decimal)
-                        && if i == 0 {
-                            (1..=3).contains(&g.len())
-                        } else {
-                            g.len() == 3
-                        }
-                });
+                && !int.contains(decimal)
+                && grouped_in_threes(groups.iter().copied());
             if !ok {
                 return None;
             }
@@ -56,8 +62,15 @@ pub fn parse_number(s: &str) -> Option<f64> {
         }
         _ => return None,
     };
-    let v: f64 = normalized.parse().ok()?;
-    Some(if neg { -v } else { v })
+    Some(if neg { format!("-{normalized}") } else { normalized })
+}
+
+/// Digit runs split at a grouping separator: the first has one to three
+/// digits, every later one exactly three.
+fn grouped_in_threes<'a>(mut groups: impl Iterator<Item = &'a str>) -> bool {
+    let all_digits = |g: &str| g.bytes().all(|b| b.is_ascii_digit());
+    groups.next().is_some_and(|g| (1..=3).contains(&g.len()) && all_digits(g))
+        && groups.all(|g| g.len() == 3 && all_digits(g))
 }
 
 /// Significant digits shown for `x`: every digit of an integer below 1e15 (exact
@@ -128,6 +141,8 @@ pub fn format_number(x: f64, decimal: char, group: char) -> String {
 /// Locale-dependent output: numbers, dates, times, units and currency defaults.
 pub trait Formats: Send + Sync {
     fn number(&self, x: f64) -> String;
+    /// The thousands separator, for reading typed numbers (see [`parse_number`]).
+    fn group(&self) -> char;
     fn date(&self, d: Date, long: bool) -> String;
     /// The time of day with seconds, in the user's format.
     fn time_seconds(&self, t: Time) -> String;
@@ -199,6 +214,10 @@ impl Formats for WindowsFormats {
         format_number(x, self.decimal, self.group)
     }
 
+    fn group(&self) -> char {
+        self.group
+    }
+
     fn date(&self, d: Date, long: bool) -> String {
         let st = systemtime(d, Time::midnight());
         let mut buf = [0u16; 128];
@@ -266,6 +285,10 @@ impl Formats for TestFormats {
         format_number(x, self.decimal, self.group)
     }
 
+    fn group(&self) -> char {
+        self.group
+    }
+
     fn date(&self, d: Date, long: bool) -> String {
         if long {
             d.strftime("%a %-d %b %Y").to_string()
@@ -293,14 +316,36 @@ mod tests {
 
     #[test]
     fn parses_both_decimal_separators() {
-        assert_eq!(parse_number("5,5"), Some(5.5));
-        assert_eq!(parse_number("1.5"), Some(1.5));
-        assert_eq!(parse_number("1.234,5"), Some(1234.5));
-        assert_eq!(parse_number("1,234.5"), Some(1234.5));
-        assert_eq!(parse_number("1.000"), Some(1.0)); // single separator = decimal (spec)
-        assert_eq!(parse_number("1.2.3"), None);
-        assert_eq!(parse_number("1,23.4"), None); // groups must be threes
-        assert_eq!(parse_number(".5"), Some(0.5));
+        // English locale: `,` groups.
+        let en = |s| parse_number(s, ',');
+        assert_eq!(en("5,5"), Some(5.5));
+        assert_eq!(en("1.5"), Some(1.5));
+        assert_eq!(en("1.234,5"), Some(1234.5));
+        assert_eq!(en("1,234.5"), Some(1234.5));
+        assert_eq!(en("1.000"), Some(1.0)); // a single separator that is not the group = decimal
+        assert_eq!(en("1.2.3"), None);
+        assert_eq!(en("1,23.4"), None); // groups must be threes
+        assert_eq!(en(".5"), Some(0.5));
+    }
+
+    #[test]
+    fn the_locales_group_with_three_digits_groups() {
+        let en = |s| parse_number(s, ',');
+        let de = |s| parse_number(s, '.');
+        assert_eq!(en("1,500"), Some(1500.0));
+        assert_eq!(en("-1,000,000"), Some(-1e6));
+        assert_eq!(de("1.000"), Some(1000.0));
+        assert_eq!(de("1.000.000"), Some(1e6));
+        // Not the locale's group, or not three digits after it: the decimal.
+        assert_eq!(de("1,500"), Some(1.5));
+        assert_eq!(en("1,5"), Some(1.5));
+        assert_eq!(en("1,5000"), Some(1.5));
+        assert_eq!(en(",500"), Some(0.5));
+        assert_eq!(de("1.000.00"), None);
+        assert_eq!(en("1.000.000"), None);
+        // Another group character (a French space): both stay decimals.
+        assert_eq!(parse_number("1,500", '\u{202f}'), Some(1.5));
+        assert_eq!(parse_number("1.500", '\u{202f}'), Some(1.5));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dirs::Clock;
-use crate::ranking::save_json;
+use crate::ranking::{load_json, save_json_durable};
 
 /// Characters of reminder text kept.
 pub const MAX_TEXT: usize = 200;
@@ -87,12 +87,22 @@ pub fn from_unix(secs: i64) -> SystemTime {
 }
 
 /// Items in the file due later than now + `MAX_AHEAD` + this were not set by
-/// Flick (a hand edit) and are dropped.
+/// Flick from this clock: a hand edit, or the clock is behind (a CMOS reset, a
+/// VM resumed before its time sync). They wait in [`State::ahead`].
 const SLACK: Duration = Duration::from_secs(24 * 3600);
+
+/// The latest due, in Unix seconds, that Flick could have set by `now`.
+fn latest_due(now: SystemTime) -> i64 {
+    unix_ceil(now).saturating_add((MAX_AHEAD + SLACK).as_secs() as i64)
+}
 
 struct State {
     /// By due.
     items: Vec<Reminder>,
+    /// Items of the file due further ahead than Flick sets (see [`SLACK`]).
+    /// Not shown and not fired, but kept in the file: once the clock reaches
+    /// them (it was set right), they join `items`.
+    ahead: Vec<Reminder>,
     next_id: u64,
     /// The file has been read.
     loaded: bool,
@@ -110,7 +120,11 @@ pub struct Reminders {
     now: Clock,
     fire: Fire,
     max_sleep: Duration,
+    /// Held across the file's reads and writes.
     state: Mutex<State>,
+    /// A copy of `State::items`, for [`Reminders::pending`]: the query path
+    /// never waits on `state` while a slow disk reads or writes the file.
+    shown: Mutex<Vec<Reminder>>,
     /// Woken by `add` and `cancel`.
     wake: Condvar,
     started: AtomicBool,
@@ -133,7 +147,15 @@ impl Reminders {
             now,
             fire,
             max_sleep,
-            state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false, overdue: vec![] }),
+            state: Mutex::new(State {
+                items: vec![],
+                ahead: vec![],
+                next_id: 1,
+                loaded: false,
+                dirty: false,
+                overdue: vec![],
+            }),
+            shown: Mutex::new(vec![]),
             wake: Condvar::new(),
             started: AtomicBool::new(false),
         })
@@ -162,13 +184,14 @@ impl Reminders {
         let r = Reminder { id: st.next_id, due: unix_ceil(due), text: text.chars().take(MAX_TEXT).collect(), timer };
         let at = st.items.partition_point(|x| x.due <= r.due);
         st.items.insert(at, r.clone());
-        if self.save(&st.items).is_err() {
+        if self.save(&st).is_err() {
             // The file is as it was: `dirty` stays what it was too.
             st.items.remove(at);
             return Err(SAVE_FAILED.to_string());
         }
         st.dirty = false;
         st.next_id = st.next_id.saturating_add(1);
+        self.publish(&st);
         self.wake.notify_all();
         Ok(r)
     }
@@ -188,9 +211,14 @@ impl Reminders {
         true
     }
 
-    /// Pending items by due. Memory only.
+    /// Pending items by due. Memory only, and never waits on a file read or write.
     pub fn pending(&self) -> Vec<Reminder> {
-        self.lock().items.clone()
+        self.shown.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Copies the items for [`Reminders::pending`]; called after each change.
+    fn publish(&self, st: &State) {
+        *self.shown.lock().unwrap_or_else(PoisonError::into_inner) = st.items.clone();
     }
 
     /// True once the file has been read.
@@ -213,22 +241,22 @@ impl Reminders {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Reads the file once; a missing or corrupt one gives none. Items due
-    /// further ahead than Flick sets are dropped and repeated ids renumbered
-    /// (then the file is rewritten by the thread).
+    /// Reads the file once; a missing or corrupt one gives none (a corrupt
+    /// one is kept as `.corrupt`). Items due further ahead than Flick sets wait
+    /// in [`State::ahead`]; items due past year 9999 are dropped and repeated
+    /// ids renumbered (then the file is rewritten by the thread).
     fn load(&self, st: &mut State) {
         if st.loaded {
             return;
         }
-        let read = std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<FileIn>(&s).ok())
+        let read = load_json::<FileIn>(&self.path)
             .filter(|f| f.version == VERSION)
             .map(|f| f.items)
             .unwrap_or_default();
         let now = (self.now)();
-        let latest = unix_ceil(now).saturating_add((MAX_AHEAD + SLACK).as_secs() as i64);
-        let mut items: Vec<Reminder> = read.iter().filter(|r| r.due <= latest).cloned().collect();
+        let latest = latest_due(now);
+        let possible = |r: &&Reminder| r.due <= latest || jiff::Timestamp::from_second(r.due).is_ok();
+        let mut items: Vec<Reminder> = read.iter().filter(possible).cloned().collect();
         let mut changed = items.len() != read.len();
         items.sort_by_key(|r| r.due);
         let mut next = items.iter().map(|r| r.id).max().map_or(1, |m| m.saturating_add(1)).max(st.next_id);
@@ -242,35 +270,54 @@ impl Reminders {
             }
         }
         let read_at = unix_floor(now).0;
+        let at = items.partition_point(|r| r.due <= latest);
+        st.ahead = items.split_off(at);
         st.overdue = items.iter().filter(|r| r.due <= read_at).map(|r| r.id).collect();
         st.next_id = next;
         st.items = items;
         st.loaded = true;
         st.dirty = changed;
+        self.publish(st);
     }
 
-    /// Saves `items` and records whether the file now matches them.
+    /// Shows the items (see [`Reminders::publish`]), saves them and records
+    /// whether the file now matches them.
     fn persist(&self, st: &mut State) {
-        st.dirty = self.save(&st.items).is_err();
+        self.publish(st);
+        st.dirty = self.save(st).is_err();
     }
 
-    /// Writes `items`; an empty list removes the file.
-    fn save(&self, items: &[Reminder]) -> std::io::Result<()> {
-        if items.is_empty() {
+    /// Writes the items, with those waiting in `ahead`; none removes the file.
+    fn save(&self, st: &State) -> std::io::Result<()> {
+        if st.items.is_empty() && st.ahead.is_empty() {
             return match std::fs::remove_file(&self.path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
                 _ => Ok(()),
             };
         }
-        save_json(&self.path, &FileOut { version: VERSION, items })
+        let items: Vec<Reminder> = st.items.iter().chain(&st.ahead).cloned().collect();
+        save_json_durable(&self.path, &FileOut { version: VERSION, items: &items })
     }
 
     /// Takes every item due by now out and saves the rest, before anything
-    /// fires: a crash in between loses one rather than repeating it.
+    /// fires, so a crash after the save never repeats one. When the save
+    /// fails, the thread retries it within `max_sleep` and at exit (`flush`);
+    /// a crash before that leaves the item in the file, and the next start
+    /// rings it again as `Missed: …`.
     fn take_due(&self, st: &mut State) -> Vec<Reminder> {
         self.load(st);
+        let clock = (self.now)();
+        // Items waiting in `ahead` that the clock has caught up with.
+        let latest = latest_due(clock);
+        if st.ahead.first().is_some_and(|r| r.due <= latest) {
+            let at = st.ahead.partition_point(|r| r.due <= latest);
+            let caught_up: Vec<Reminder> = st.ahead.drain(..at).collect();
+            st.items.extend(caught_up);
+            st.items.sort_by_key(|r| r.due);
+            self.publish(st);
+        }
         // Whole Unix seconds: no time arithmetic that could overflow on an odd due.
-        let (now, _) = unix_floor((self.now)());
+        let (now, _) = unix_floor(clock);
         let n = st.items.partition_point(|r| r.due <= now);
         if n == 0 {
             return vec![];
@@ -691,6 +738,22 @@ mod tests {
         assert_eq!(g.quiet_for(50), Vec::<String>::new());
         let r = g.r.add(g.now() + Duration::from_secs(60), "pizza", false).unwrap();
         assert_eq!(g.r.pending(), vec![r]);
+        let aside = g.dir.path().join("reminders.json.corrupt");
+        assert_eq!(std::fs::read_to_string(aside).unwrap(), "not json {", "kept for the user");
+    }
+
+    #[test]
+    fn pending_never_waits_while_the_file_is_read_or_written() {
+        let g = rig(None);
+        let r = g.r.add(g.now() + Duration::from_secs(60), "pizza", false).unwrap();
+        // The state lock is held, as during a slow save.
+        let _busy = g.r.lock();
+        let (tx, rx) = channel();
+        let reminders = Arc::clone(&g.r);
+        std::thread::spawn(move || {
+            let _ = tx.send(reminders.pending());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(vec![r]));
     }
 
     #[test]
@@ -801,9 +864,37 @@ mod tests {
         g.r.start();
         assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "Missed: old");
         assert_eq!(g.r.pending().iter().map(|r| r.text.as_str()).collect::<Vec<_>>(), ["pizza"], "far is dropped");
+        // Past year 9999: dropped from the file too.
         g.advance(Duration::from_secs(1));
         assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
         assert_eq!(g.quiet_for(100), Vec::<String>::new());
+        assert!(!g.path().exists());
+    }
+
+    #[test]
+    fn a_clock_far_behind_at_start_keeps_the_reminders_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let month = unix_ceil(t0()) + 30 * 24 * 3600;
+        write_items(&dir, serde_json::json!([
+            {"id": 4, "due": month, "text": "dentist", "timer": false},
+        ]));
+        let g = rig_in(dir, FAST);
+        g.r.start();
+        g.wait_ready();
+        assert!(g.r.pending().is_empty(), "not shown while the clock is behind");
+        std::thread::sleep(Duration::from_millis(40));
+        // A save for another reason keeps it, and does not reuse its id.
+        let pizza = g.r.add(g.now() + Duration::from_secs(3600), "pizza", false).unwrap();
+        assert_ne!(pizza.id, 4);
+        let saved = std::fs::read_to_string(g.path()).unwrap();
+        assert!(saved.contains("dentist") && saved.contains("pizza"), "{saved}");
+        // The clock is set right: it shows, and rings when due.
+        g.set_clock(from_unix(month - 3600));
+        wait_until("never joined the pending items", 500, || g.r.pending().iter().any(|r| r.text == "dentist"));
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "pizza");
+        g.set_clock(from_unix(month));
+        assert_eq!(g.rx.recv_timeout(Duration::from_secs(1)).unwrap(), "dentist");
+        assert_eq!(g.quiet_for(50), Vec::<String>::new());
         assert!(!g.path().exists());
     }
 

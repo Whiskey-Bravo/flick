@@ -68,17 +68,40 @@ fn restore_line_ends(original: &str, edited: &str) -> String {
     let old = split_lines(original);
     let new = split_lines(edited);
     let (n, m) = (old.len(), new.len());
-    // lcs[i][j]: longest common run of lines in old[i..] and new[j..].
-    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            lcs[i][j] = if old[i].0 == new[j].0 {
-                lcs[i + 1][j + 1] + 1
+    // An edit is local: only the lines between the common first and last
+    // lines get a table, so a large file does not need n * m cells.
+    let pre = old.iter().zip(&new).take_while(|(a, b)| a.0 == b.0).count();
+    let suf = old[pre..].iter().rev().zip(new[pre..].iter().rev()).take_while(|(a, b)| a.0 == b.0).count();
+    let (old_end, new_end) = (n - suf, m - suf);
+    let (rows, cols) = (old_end - pre, new_end - pre);
+    // mid[i][j]: longest common run of lines in old[pre + i..old_end] and new[pre + j..new_end].
+    let mut mid = vec![vec![0u32; cols + 1]; rows + 1];
+    for i in (0..rows).rev() {
+        for j in (0..cols).rev() {
+            mid[i][j] = if old[pre + i].0 == new[pre + j].0 {
+                mid[i + 1][j + 1] + 1
             } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
+                mid[i + 1][j].max(mid[i][j + 1])
             };
         }
     }
+    // lcs(i, j): longest common run of lines in old[i..] and new[j..]. In the
+    // common last lines one side is a tail of the other's end, so the shorter
+    // side's length; in the common first lines the walk below stays on the
+    // diagonal (i == j), each line adding one.
+    let lcs = |i: usize, j: usize| -> u32 {
+        if i < pre || j < pre {
+            (pre - i.min(j)) as u32 + mid[0][0] + suf as u32
+        } else if i >= old_end && j >= new_end {
+            (n - i).min(m - j) as u32
+        } else if i >= old_end {
+            (n - i) as u32
+        } else if j >= new_end {
+            (m - j) as u32
+        } else {
+            mid[i - pre][j - pre] + suf as u32
+        }
+    };
     let no_final_newline = !original.is_empty() && !original.ends_with('\n');
     let mut prev = old.first().map_or("\n", |l| if l.1.is_empty() { "\n" } else { l.1 });
     let mut out = String::with_capacity(edited.len() + m);
@@ -87,12 +110,12 @@ fn restore_line_ends(original: &str, edited: &str) -> String {
     let mut added = 0;
     while j < m {
         let mut end;
-        if i < n && old[i].0 == new[j].0 && lcs[i][j] == lcs[i + 1][j + 1] + 1 {
+        if i < n && old[i].0 == new[j].0 && lcs(i, j) == lcs(i + 1, j + 1) + 1 {
             end = old[i].1;
             i += 1;
             removed.clear();
             added = 0;
-        } else if i < n && lcs[i + 1][j] >= lcs[i][j + 1] {
+        } else if i < n && lcs(i + 1, j) >= lcs(i, j + 1) {
             removed.push(old[i].1);
             i += 1;
             continue;
@@ -371,12 +394,15 @@ fn edit_table(table: &mut Table, wanted: &Table, keys: &[&str]) -> Option<String
     (!leftover.is_empty()).then_some(leftover)
 }
 
+/// The table to edit: what finds it, and the error when none matches.
+type At<'a> = (&'a dyn Fn(&Table) -> bool, String);
+
 /// Adds `wanted` as a new `[[kind]]` table after every other table (`at` is `None`), or
 /// edits the first `[[kind]]` table `at` matches where it stands, keeping the comments above it.
 fn upsert_table(
     text: &str,
     kind: &str,
-    at: Option<(&dyn Fn(&Table) -> bool, String)>,
+    at: Option<At<'_>>,
     wanted: Table,
     keys: &[&str],
 ) -> Result<String, String> {
@@ -430,9 +456,26 @@ fn delete_table(text: &str, kind: &str, matches: &dyn Fn(&Table) -> bool, missin
         return Err(missing);
     };
     let at = tables.iter().position(matches).ok_or(missing)?;
+    // The comment lines above the header are not part of the table: they
+    // move to the next table of this kind, else to the end of the file.
+    let comment = tables
+        .get(at)
+        .and_then(|t| t.decor().prefix())
+        .and_then(|p| p.as_str())
+        .filter(|p| p.contains('#'))
+        .map(str::to_string);
     tables.remove(at);
+    let mut leftover = comment;
+    if let (Some(next), Some(prefix)) = (tables.get_mut(at), leftover.as_ref()) {
+        prepend_prefix(next.decor_mut(), prefix);
+        leftover = None;
+    }
     if tables.is_empty() {
         root.remove(kind);
+    }
+    if let Some(prefix) = leftover {
+        let rest = doc.trailing().as_str().unwrap_or("").to_string();
+        doc.set_trailing(format!("{prefix}{rest}"));
     }
     finish(&doc, &original)
 }
@@ -750,6 +793,32 @@ mod tests {
         assert!(config::parse(&none).unwrap().shortcuts.is_empty());
         assert!(!none.contains("[[shortcut]]"));
         assert!(delete_shortcut(TWO, "nope").is_err());
+    }
+
+    #[test]
+    fn line_ends_of_a_large_file_need_no_full_table() {
+        // 40,000 lines: a full table would take 6.4 GB.
+        let lines: Vec<String> = (0..40_000).map(|i| format!("# line {i}")).collect();
+        let original = lines.join("\r\n") + "\r\n";
+        let mut edited_lines = lines.clone();
+        edited_lines[20_000] = "# changed".into();
+        edited_lines.insert(20_050, "# added".into());
+        let edited = edited_lines.join("\n") + "\n";
+        assert_eq!(restore_line_ends(&original, &edited), edited_lines.join("\r\n") + "\r\n");
+    }
+
+    #[test]
+    fn delete_keeps_the_comments_above_the_table() {
+        let text = "[[shortcut]]\nname = \"s1\"\nopen = \"x\"\n\n## work shortcuts\n# old = \"y\"\n[[shortcut]]\nname = \"s2\"\nopen = \"x\"\n\n# third\n[[shortcut]]\nname = \"s3\"\nopen = \"x\"\n";
+        let out = delete_shortcut(text, "s2").unwrap();
+        assert_eq!(
+            out,
+            "[[shortcut]]\nname = \"s1\"\nopen = \"x\"\n\n## work shortcuts\n# old = \"y\"\n\n# third\n[[shortcut]]\nname = \"s3\"\nopen = \"x\"\n"
+        );
+        // The last table: the comment stays at the end of the file.
+        let out = delete_shortcut(&out, "s3").unwrap();
+        assert!(out.ends_with("\n# third\n"), "{out:?}");
+        assert_eq!(config::parse(&out).unwrap().shortcuts.len(), 1);
     }
 
     #[test]

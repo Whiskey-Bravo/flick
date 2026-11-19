@@ -3,10 +3,13 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
 };
 
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 
 use crate::file_ops::{moved_id, same_item};
 
@@ -20,12 +23,9 @@ pub struct Ranking {
 }
 
 impl Ranking {
-    /// Missing or corrupt file -> empty.
+    /// Missing or corrupt file -> empty (a corrupt one is kept as `.corrupt`).
     pub fn load(path: PathBuf) -> Self {
-        let picks = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<HashMap<String, u32>>(&text).ok())
-            .unwrap_or_default();
+        let picks = load_json::<HashMap<String, u32>>(&path).unwrap_or_default();
         Self { picks: Mutex::new(picks), save_lock: Mutex::new(()), path }
     }
 
@@ -95,18 +95,62 @@ impl Ranking {
 }
 
 /// Serialise `value` and write it to a temp file next to `path`, then rename over it.
+/// Each write has its own temp name, so two saves of the same file at once
+/// cannot mix. Not flushed to disk: for files that are cheap to lose (picks,
+/// history, caches), as these saves run on every Enter. A power cut right after
+/// one can leave an empty file, which [`load_json`] moves aside.
 pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    write_json(path, value, false)
+}
+
+/// Like [`save_json`], but the temp file is flushed to disk before the rename,
+/// so a power cut right after a save leaves the old file or the new one, never
+/// an empty one. For what the user set by hand: reminders and pins.
+pub(crate) fn save_json_durable(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    write_json(path, value, true)
+}
+
+/// [`save_json`] and [`save_json_durable`]; `durable` flushes before the rename.
+fn write_json(path: &Path, value: &impl Serialize, durable: bool) -> std::io::Result<()> {
+    use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let json = serde_json::to_string(value).map_err(std::io::Error::other)?;
-    let mut tmp = path.to_path_buf().into_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let tmp = temp_path(path);
+    let written = std::fs::File::create(&tmp).and_then(|mut f| {
+        f.write_all(json.as_bytes())?;
+        if durable {
+            f.sync_all()?;
+        }
+        Ok(())
+    });
+    written.and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// A temp name next to `path` that no other write uses: `<path>.<pid>-<n>.tmp`.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(format!(".{}-{n}.tmp", std::process::id()));
+    PathBuf::from(tmp)
+}
+
+/// Reads the JSON file at `path`; None when it is missing, unreadable or does
+/// not parse. A file that was read but does not parse is renamed to
+/// `<name>.corrupt` first, so the next save cannot write over what is left of it.
+pub(crate) fn load_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
+    let bytes = std::fs::read(path).ok()?;
+    let parsed = serde_json::from_slice::<T>(&bytes).ok();
+    if parsed.is_none() {
+        let mut aside = path.to_path_buf().into_os_string();
+        aside.push(".corrupt");
+        let _ = std::fs::rename(path, PathBuf::from(aside));
+    }
+    parsed
 }
 
 fn key(provider: &str, id: &str) -> String {
@@ -159,6 +203,47 @@ mod tests {
         assert_eq!(r.boost("apps", "chrome"), 0);
         r.record("apps", "chrome");
         assert_eq!(r.boost("apps", "chrome"), 15);
+    }
+
+    #[test]
+    fn a_corrupt_file_is_kept_aside_before_the_next_save() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("picks.json"), "{\"apps:chrome\": 4").unwrap();
+        ranking_in(&dir).record("apps", "code");
+        let aside = std::fs::read_to_string(dir.path().join("picks.json.corrupt")).unwrap();
+        assert_eq!(aside, "{\"apps:chrome\": 4");
+        assert_eq!(ranking_in(&dir).boost("apps", "code"), 15);
+    }
+
+    #[test]
+    fn a_missing_file_leaves_nothing_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_json::<HashMap<String, u32>>(&dir.path().join("picks.json")), None);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn each_save_has_its_own_temp_file_and_leaves_none_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rates.json");
+        assert_ne!(temp_path(&path), temp_path(&path));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _ = save_json(&path, &vec![i; 500]);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let saved: Vec<u32> = load_json(&path).expect("the file is whole");
+        assert_eq!(saved.len(), 500);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["rates.json"]);
     }
 
     #[test]

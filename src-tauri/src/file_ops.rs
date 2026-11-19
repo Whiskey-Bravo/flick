@@ -44,11 +44,11 @@ pub trait FileOps: Send + Sync {
 }
 
 /// The actions menu of a file or folder row, in order. `cloud`: the item is
-/// under a cloud sync root (adds the keep/free pair); `drive_root`: `C:\`,
-/// which cannot be compressed, renamed, deleted or kept offline.
+/// under a cloud sync root (adds the keep/free pair); `drive_root`: `C:\` or
+/// `\\server\share\`, which cannot be compressed, renamed, deleted or kept offline.
 pub(crate) fn menu(is_dir: bool, cloud: bool, drive_root: bool) -> Vec<Action> {
     let mut actions = if is_dir {
-        vec![Action::OpenFolder, Action::OpenTerminal, Action::CopyPath, Action::Compress, Action::Properties]
+        vec![Action::OpenFolder, Action::OpenTerminal, Action::CopyPath, Action::Compress, Action::Rename, Action::Delete, Action::Properties]
     } else {
         vec![Action::Reveal, Action::OpenWith, Action::CopyFile, Action::CopyPath, Action::Rename, Action::Delete]
     };
@@ -111,10 +111,21 @@ pub(crate) fn moved_id(id: &str, old: &str, new: &str) -> Option<String> {
     (rest.is_empty() || rest.starts_with('\\')).then(|| format!("{}{rest}{}", bare(new), &id[id_bare.len()..]))
 }
 
-/// Whether `path` is a drive root: `C:\` or `C:`, any letter case.
-pub(crate) fn is_drive_root(path: &str) -> bool {
+/// Whether `path` is a drive root (`C:\` or `C:`, any letter case) or the
+/// root of a network share (`\\server\share`, with or without a trailing `\`).
+pub(crate) fn is_volume_root(path: &str) -> bool {
     let b = path.as_bytes();
-    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || (b.len() == 3 && b[2] == b'\\'))
+    let drive = b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b.len() == 2 || (b.len() == 3 && b[2] == b'\\'));
+    drive || is_share_root(path)
+}
+
+/// Whether `path` is `\\server\share` or `\\server\share\`: both named,
+/// nothing below them (`\\?\` and `\\.\` paths are not shares).
+fn is_share_root(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(r"\\") else { return false };
+    let mut parts = rest.strip_suffix('\\').unwrap_or(rest).split('\\');
+    let (Some(server), Some(share)) = (parts.next(), parts.next()) else { return false };
+    !server.is_empty() && !share.is_empty() && server != "?" && server != "." && parts.next().is_none()
 }
 
 
@@ -196,11 +207,19 @@ fn write_zip(parent: &Path, item: &Path, file: std::fs::File) -> Result<(), Stri
     let mut writer = zip::ZipWriter::new(file);
     let mut stack = vec![item.to_path_buf()];
     while let Some(current) = stack.pop() {
-        let meta = std::fs::symlink_metadata(&current).map_err(|e| short(&e))?;
-        let Some(name) = zip_entry_name(parent, &current) else { return Err("outside".into()) };
+        // A failure inside a folder names the file or folder it hit.
+        let at = |e: std::io::Error| {
+            if current == item {
+                short(&e)
+            } else {
+                format!("{}: {}", current.file_name().unwrap_or_default().to_string_lossy(), short(&e))
+            }
+        };
+        let meta = std::fs::symlink_metadata(&current).map_err(at)?;
+        let Some(name) = zip_entry_name(parent, &current) else { return Err("it isn't inside its folder".into()) };
         if meta.file_type().is_symlink() {
             if current == item {
-                return Err("link".into());
+                return Err("it's a link".into());
             }
             continue;
         }
@@ -210,14 +229,14 @@ fn write_zip(parent: &Path, item: &Path, file: std::fs::File) -> Result<(), Stri
         };
         if meta.is_dir() {
             writer.add_directory(format!("{name}/"), options).map_err(|e| e.to_string())?;
-            for child in std::fs::read_dir(&current).map_err(|e| short(&e))? {
-                stack.push(child.map_err(|e| short(&e))?.path());
+            for child in std::fs::read_dir(&current).map_err(at)? {
+                stack.push(child.map_err(at)?.path());
             }
         } else {
             let options = options.large_file(meta.len() >= u64::from(u32::MAX));
             writer.start_file(name, options).map_err(|e| e.to_string())?;
-            let mut source = std::fs::File::open(&current).map_err(|e| short(&e))?;
-            std::io::copy(&mut source, &mut writer).map_err(|e| short(&e))?;
+            let mut source = std::fs::File::open(&current).map_err(at)?;
+            std::io::copy(&mut source, &mut writer).map_err(at)?;
         }
     }
     writer.finish().map_err(|e| e.to_string())?.flush().map_err(|e| short(&e))
@@ -244,10 +263,11 @@ fn compress_to(path: &Path, taken: &dyn Fn(&Path) -> bool) -> Result<PathBuf, St
             Ok(file) => {
                 return match write_zip(parent, path, file) {
                     Ok(()) => Ok(zip),
-                    Err(_) => {
+                    Err(why) => {
                         // Ours: created by the open above.
                         let _ = std::fs::remove_file(&zip);
-                        Err(failed())
+                        // The reason says which file blocked it, when one did.
+                        Err(format!("{}: {why}", failed()))
                     }
                 };
             }
@@ -361,6 +381,9 @@ pub(crate) const DELETE_DECLINED: &str = "delete declined";
 /// The error `rename` gives when the user answered No to Windows' prompt: the
 /// item keeps its name; the command answers with no new id and no error.
 pub(crate) const RENAME_DECLINED: &str = "rename declined";
+
+/// The text of the refusal to rename onto a name that is taken.
+pub(crate) const NAME_TAKEN: &str = "A file with that name already exists";
 
 /// How a shell file operation did not finish.
 #[derive(Debug, PartialEq)]
@@ -483,15 +506,16 @@ impl FileOps for SystemFileOps {
             let format = RegisterClipboardFormatW(windows::core::w!("Preferred DropEffect"));
             let effect: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE, 4).unwrap_or_default();
             let at = GlobalLock(effect) as *mut u32;
-            if format != 0 && !at.is_null() {
+            // Unlocked once, right after the write; the block is only freed after that.
+            let written = format != 0 && !at.is_null();
+            if written {
                 at.write_unaligned(DROPEFFECT_COPY.0);
-                let _ = GlobalUnlock(effect);
-                if SetClipboardData(format, Some(HANDLE(effect.0))).is_ok() {
-                    return Ok(());
-                }
             }
             if !at.is_null() {
                 let _ = GlobalUnlock(effect);
+            }
+            if written && SetClipboardData(format, Some(HANDLE(effect.0))).is_ok() {
+                return Ok(());
             }
             if !effect.is_invalid() {
                 let _ = GlobalFree(Some(effect));
@@ -531,7 +555,7 @@ impl FileOps for SystemFileOps {
         let same_name = path.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == new_name.to_lowercase());
         // The shell would ask or number the new name: refuse before it can.
         if !same_name && std::fs::symlink_metadata(&target).is_ok() {
-            return Err("A file with that name already exists".into());
+            return Err(NAME_TAKEN.into());
         }
         let flags = FOF_NOERRORUI | FOF_SILENT;
         let new = wide_str(new_name);
@@ -616,13 +640,13 @@ mod tests {
 
     #[test]
     fn menu_orders_for_file_and_folder() {
-        assert_eq!(menu(true, true, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(menu(true, true, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
         assert_eq!(menu(false, true, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
     }
 
     #[test]
     fn menu_without_cloud_drops_the_pair() {
-        assert_eq!(menu(true, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
+        assert_eq!(menu(true, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, MoreOptions]);
         assert_eq!(menu(false, false, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
     }
 
@@ -656,12 +680,18 @@ mod tests {
     }
 
     #[test]
-    fn drive_root_rules() {
-        assert!(is_drive_root(r"C:\"));
-        assert!(is_drive_root("c:"));
-        assert!(!is_drive_root(r"C:\x\"));
-        assert!(!is_drive_root(r"\\srv\share\"));
-        assert!(!is_drive_root(""));
+    fn volume_root_rules() {
+        assert!(is_volume_root(r"C:\"));
+        assert!(is_volume_root("c:"));
+        assert!(!is_volume_root(r"C:\x\"));
+        // A network share's root is one too; a folder in it is not.
+        assert!(is_volume_root(r"\\srv\share\"));
+        assert!(is_volume_root(r"\\srv\share"));
+        assert!(!is_volume_root(r"\\srv\share\x"));
+        assert!(!is_volume_root(r"\\srv\share\x\"));
+        assert!(!is_volume_root(r"\\srv\"));
+        assert!(!is_volume_root(r"\\?\C:"));
+        assert!(!is_volume_root(""));
     }
 
     #[test]
@@ -774,13 +804,28 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_compress_names_the_file_that_blocked_it() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("Docs");
+        std::fs::create_dir(&folder).unwrap();
+        let locked = folder.join("data.pst");
+        std::fs::write(&locked, b"x").unwrap();
+        // Held open with no sharing, as another program would.
+        let _hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&locked).unwrap();
+        let error = compress_to(&folder, &|_| false).unwrap_err();
+        assert!(error.starts_with("Couldn't compress Docs: data.pst: "), "{error}");
+    }
+
+    #[test]
     fn a_failed_compress_removes_only_its_own_zip() {
         let dir = tempfile::tempdir().unwrap();
         let existing = dir.path().join("gone.zip");
         std::fs::write(&existing, b"not mine").unwrap();
         // The item is missing, so writing fails after the zip was created.
         let gone = dir.path().join("gone.txt");
-        assert_eq!(compress_to(&gone, &|_| false), Err("Couldn't compress gone.txt".to_string()));
+        let error = compress_to(&gone, &|_| false).unwrap_err();
+        assert!(error.starts_with("Couldn't compress gone.txt: "), "{error}");
         assert_eq!(std::fs::read(&existing).unwrap(), b"not mine");
         let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["gone.zip"], "its own half-written zip is gone, the other one stays");

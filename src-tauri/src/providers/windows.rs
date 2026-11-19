@@ -298,9 +298,13 @@ impl Provider for WindowsProvider {
             return Ok(Outcome::Hide);
         }
         if let Some(h) = id.strip_prefix("win:") {
-            let h: isize = h.parse().map_err(|_| "That window is gone.".to_string())?;
-            if !ops.exists(h) {
-                return Err("That window is gone.".to_string());
+            const GONE: &str = "That window is gone.";
+            let h: isize = h.parse().map_err(|_| GONE.to_string())?;
+            // Only the listed window, still owned by its listed process: a
+            // reused handle may now be another app's window.
+            let w = snap.iter().find(|w| w.hwnd == h).ok_or_else(|| GONE.to_string())?;
+            if !ops.owned_by(h, w.pid) {
+                return Err(GONE.to_string());
             }
             ops.focus(h)?;
             return Ok(Outcome::Hide);
@@ -380,6 +384,8 @@ mod tests {
     struct FakeOps {
         wins: Mutex<Vec<WinInfo>>,
         gone: Mutex<Vec<isize>>,
+        /// Handles (with their listed owner) that now name another process's window.
+        reused: Mutex<Vec<(isize, u32)>>,
         calls: Mutex<Vec<String>>,
         args: Mutex<Vec<String>>,
         procs: Mutex<Vec<ProcInfo>>,
@@ -402,6 +408,9 @@ mod tests {
         }
         fn exists(&self, hwnd: isize) -> bool {
             !self.gone.lock().unwrap().contains(&hwnd)
+        }
+        fn owned_by(&self, hwnd: isize, pid: u32) -> bool {
+            self.exists(hwnd) && !self.reused.lock().unwrap().contains(&(hwnd, pid))
         }
         fn focus(&self, hwnd: isize) -> Result<(), String> {
             self.calls.lock().unwrap().push(format!("focus {hwnd}"));
@@ -434,6 +443,7 @@ mod tests {
         let ops = Arc::new(FakeOps {
             wins: Mutex::new(wins),
             gone: Mutex::new(vec![]),
+            reused: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
             args: Mutex::new(vec![]),
             procs: Mutex::new(procs),
@@ -588,6 +598,18 @@ mod tests {
         assert!(ops.calls().is_empty());
     }
 
+    /// A handle that now names another process's window, or one never
+    /// listed, is not focused.
+    #[test]
+    fn a_reused_or_unlisted_handle_is_not_focused() {
+        let (p, ops) = setup(mail_and_word());
+        let pid = ops.wins.lock().unwrap().iter().find(|w| w.hwnd == 1).unwrap().pid;
+        ops.reused.lock().unwrap().push((1, pid));
+        assert_eq!(p.activate("win:1", Modifier::None), Err("That window is gone.".to_string()));
+        assert_eq!(p.activate("win:99", Modifier::None), Err("That window is gone.".to_string()));
+        assert!(ops.calls().is_empty());
+    }
+
     #[test]
     fn close_groups_windows_by_app() {
         let (p, ops) = setup(chromes());
@@ -662,6 +684,7 @@ mod tests {
         let ops = Arc::new(FakeOps {
             wins: Mutex::new(mail_and_word()),
             gone: Mutex::new(vec![]),
+            reused: Mutex::new(vec![]),
             calls: Mutex::new(vec![]),
             args: Mutex::new(vec![]),
             procs: Mutex::new(vec![]),

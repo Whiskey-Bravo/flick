@@ -533,6 +533,17 @@ pub fn refocus(app: &AppHandle) {
     });
 }
 
+/// A point given in physical pixels from the bar window's top-left corner, in
+/// screen pixels. The page can't place it itself: its `screenX` is not in
+/// screen pixels on a monitor whose scaling differs from the main one's.
+/// Unchanged when the window's position can't be read.
+pub fn to_screen(app: &AppHandle, x: i32, y: i32) -> (i32, i32) {
+    match bar(app).and_then(|w| w.inner_position().ok()) {
+        Some(at) => (at.x.saturating_add(x), at.y.saturating_add(y)),
+        None => (x, y),
+    }
+}
+
 fn within_blur_grace() -> bool {
     LAST_SHOW
         .lock()

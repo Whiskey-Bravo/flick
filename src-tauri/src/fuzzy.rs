@@ -93,7 +93,7 @@ fn initials_start_with<'a>(needle: &str, ws: impl Iterator<Item = &'a str>) -> b
     for w in ws {
         match n.next() {
             None => return true,
-            Some(c) if w.chars().next() != Some(c) => return false,
+            Some(c) if !w.starts_with(c) => return false,
             Some(_) => {}
         }
     }

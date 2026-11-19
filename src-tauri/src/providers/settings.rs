@@ -97,8 +97,8 @@ impl SettingsPage {
     }
 }
 
-/// A bare program name started with parameters comes from System32 by
-/// absolute path, so nothing on `PATH` or next to Flick runs in its place.
+/// A bare program name comes from System32 by absolute path, so nothing on
+/// `PATH`, in the working folder or next to Flick runs in its place.
 fn program_path(program: &str) -> String {
     if program.contains(['\\', '/']) {
         program.to_string()
@@ -113,7 +113,7 @@ fn open_page(p: &SettingsPage) -> Result<(), String> {
     } else if !p.args.is_empty() {
         launch::open_with(&program_path(p.uri), p.args, false)
     } else {
-        launch::open(p.uri)
+        launch::open(&program_path(p.uri))
     }
 }
 
@@ -221,6 +221,16 @@ mod tests {
         let p = PAGES.iter().find(|p| p.title == "Environment variables").unwrap();
         let exe = program_path(p.uri);
         assert!(exe.ends_with(r"\System32\rundll32.exe") && std::path::Path::new(&exe).is_absolute(), "{exe}");
+    }
+
+    /// Programs without parameters (Control Panel, Task Manager) are found
+    /// in System32 too, never by a bare name.
+    #[test]
+    fn every_program_page_starts_from_system32() {
+        for p in PAGES.iter().filter(|p| !p.uri.starts_with("ms-settings:")) {
+            let exe = program_path(p.uri);
+            assert!(exe.ends_with(&format!(r"\System32\{}", p.uri)) && std::path::Path::new(&exe).is_absolute(), "{exe}");
+        }
     }
 
     #[test]

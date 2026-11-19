@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { askItems, REASK_MS } from "./pickerSearch";
+import { askItems, enterRow, REASK_MS } from "./pickerSearch";
 
 describe("askItems", () => {
   beforeEach(() => vi.useFakeTimers());
@@ -39,5 +39,14 @@ describe("askItems", () => {
     await vi.advanceTimersByTimeAsync(REASK_MS * 3);
     expect(n).toBe(1);
     expect(shown).toEqual([[]]);
+  });
+});
+
+describe("enterRow", () => {
+  it("picks the selected row only when the rows belong to the text in the box", () => {
+    expect(enterRow(["Firefox", "Firewall"], 1, "fire", "fire")).toBe("Firewall");
+    // "wall" typed, its rows not here yet: Firefox (for "fire") is not picked.
+    expect(enterRow(["Firefox"], 0, "fire", "wall")).toBeNull();
+    expect(enterRow([], 0, "fire", "fire")).toBeNull();
   });
 });

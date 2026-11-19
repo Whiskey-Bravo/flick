@@ -7,12 +7,13 @@
 //! words are not taken away from the rest of the search (`password` still
 //! finds apps and settings below).
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
 use crate::clipboard::{Clipboard, ClipboardText};
 use crate::dirs::{one_line, Load, Loader, ReadError, NEVER_STALE, SLOW};
+use crate::engine::NewestQuery;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 const NAME: &str = "make";
@@ -150,8 +151,8 @@ pub struct MakeProvider {
     source: Arc<dyn ClipboardText>,
     clipboard: Arc<dyn Clipboard>,
     random: Arc<dyn Random>,
-    /// What the row of the latest query copies. Memory only.
-    made: Mutex<Option<String>>,
+    /// What the row of the newest query copies. Memory only.
+    made: NewestQuery<Option<String>>,
 }
 
 impl MakeProvider {
@@ -161,17 +162,17 @@ impl MakeProvider {
         random: Arc<dyn Random>,
         on_ready: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
-        Self { loader: Loader::new(on_ready, NEVER_STALE, SLOW), source, clipboard, random, made: Mutex::new(None) }
+        Self { loader: Loader::new(on_ready, NEVER_STALE, SLOW), source, clipboard, random, made: NewestQuery::new(None) }
     }
 
     /// Forgets what was made and the clipboard text read (the bar hid).
     pub fn forget(&self) {
         self.loader.clear();
-        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.made.reset(None);
     }
 
     fn row(&self, value: String, title: String, subtitle: &str) -> Vec<ResultItem> {
-        *self.made.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+        self.made.set(Some(value));
         vec![ResultItem {
             id: format!("{COPY}0"),
             provider: NAME,
@@ -225,7 +226,7 @@ impl Provider for MakeProvider {
     /// Memory only; the clipboard (for `hash`) is read on a loader thread.
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let Some(ask) = parse(&q.text) else {
-            *self.made.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            self.made.set(None);
             return vec![];
         };
         let no_random = || vec![inert("Windows gave no random numbers")];
@@ -259,7 +260,7 @@ impl Provider for MakeProvider {
         if !id.starts_with(COPY) {
             return Ok(Outcome::Keep);
         }
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let made = self.made.with(Clone::clone);
         match made {
             Some(text) => {
                 self.clipboard.set_text(&text)?;
@@ -296,6 +297,7 @@ mod tests {
     use crate::clipboard::{FakeClipboard, FakeText};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver};
+    use std::sync::Mutex;
     use std::time::Duration;
 
     /// Bytes 0, 1, 2, ... wrapping round: every value in turn.
@@ -462,6 +464,19 @@ mod tests {
         assert!(!rows[0].title.contains('\n'));
         r.p.activate(&rows[0].id, Modifier::None).unwrap();
         assert_eq!(r.copied().last().unwrap(), &lorem(2));
+    }
+
+    #[test]
+    fn an_older_query_finishing_late_never_changes_what_enter_copies() {
+        use crate::engine::as_query;
+        let r = rig(None, Arc::new(Mixed::default()));
+        let shown = as_query(6, || r.p.query(&q("password 32")));
+        // Query 5 (`password`) was typed first but runs after query 6.
+        as_query(5, || r.p.query(&q("password")));
+        as_query(5, || r.p.query(&q("passwor")));
+        assert_eq!(r.p.activate(&shown[0].id, Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(r.copied(), [shown[0].title.clone()]);
+        assert_eq!(shown[0].title.chars().count(), 32);
     }
 
     #[test]

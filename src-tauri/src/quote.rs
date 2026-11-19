@@ -79,7 +79,7 @@ pub fn to_wsl_path(windows_path: &str) -> Option<String> {
 // of the script for bash.
 
 /// `FLICK_` + the upper-cased placeholder name (ASCII letters only).
-fn variable(name: &str) -> Result<String, String> {
+pub(crate) fn variable(name: &str) -> Result<String, String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic()) {
         return Err(format!("invalid placeholder name {name:?}"));
     }
@@ -168,7 +168,8 @@ pub fn bind_windows(template: &str, names: &[&str]) -> Result<String, String> {
             if quoted {
                 out.push_str(&format!("!{var}!"));
             } else {
-                out.push_str(&format!("\"!{var}!\""));
+                open_quote(&mut out);
+                out.push_str(&format!("!{var}!\""));
             }
             bound = true;
             i += len;
@@ -189,6 +190,26 @@ pub fn bind_windows(template: &str, names: &[&str]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Opens the quotes [`bind_windows`] puts around an unquoted reference. Right
+/// after a `\` (as in `C:\notes\{x}`) a `"` would be read by the program's
+/// `CommandLineToArgvW` as a literal quote, so the quotes start at the
+/// beginning of the word instead (`"C:\notes\!FLICK_X!"`). When that word has
+/// quotes of its own the backslashes are doubled instead: `\\"` is one
+/// backslash and an opening quote.
+fn open_quote(out: &mut String) {
+    let slashes = out.len() - out.trim_end_matches('\\').len();
+    if slashes == 0 {
+        out.push('"');
+        return;
+    }
+    let delimiter = out.rfind([' ', '\t', '&', '|', '<', '>', '(', ')', '"']);
+    match delimiter {
+        Some(at) if out.as_bytes()[at] == b'"' => out.push_str(&format!("{}\"", "\\".repeat(slashes))),
+        Some(at) => out.insert(at + 1, '"'),
+        None => out.insert(0, '"'),
+    }
+}
+
 /// The refusal of a placeholder used together with `construct`.
 fn cannot_use(construct: &str) -> String {
     format!("this command cannot use {construct} together with a placeholder")
@@ -205,19 +226,41 @@ fn has_word(t: &str, word: &str) -> bool {
     })
 }
 
+/// `word` in `t` as a command word (see [`has_word`]) with `option` among the
+/// options right after it, separated by any run of blanks: `test  -v`,
+/// `wait -n -p`.
+fn has_option(t: &str, word: &str, option: &str) -> bool {
+    let bytes = t.as_bytes();
+    let part_of_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
+    t.match_indices(word).any(|(at, _)| {
+        if at > 0 && part_of_word(bytes[at - 1]) {
+            return false;
+        }
+        let rest = &t[at + word.len()..];
+        if !rest.starts_with([' ', '\t']) {
+            return false;
+        }
+        rest.split([' ', '\t']).filter(|w| !w.is_empty()).take_while(|w| w.starts_with('-')).any(|w| w == option)
+    })
+}
+
 /// The first construct of `template` where bash would evaluate a value as an
 /// arithmetic expression or a variable name (whose array subscript is
 /// arithmetic): `((`, `$[`, `[[`, an array subscript holding a placeholder
 /// ("an array index"), the builtins `let`, `declare`, `typeset`, `local`,
-/// `unset`, `read`, `mapfile`, `readarray`, and `test -v` / `[ -v` /
-/// `printf -v`. The builtins are matched as words anywhere, quoted text
+/// `unset`, `read`, `mapfile`, `readarray`, `getopts`, and `test -v` / `[ -v` /
+/// `printf -v` / `wait -p`. The builtins are matched as words anywhere, quoted text
 /// included (`echo please read {x}` is refused too): conservative on purpose.
 fn arithmetic_context(template: &str, names: &[&str]) -> Option<&'static str> {
-    let texts = ["((", "$[", "[[", "[ -v", "test -v", "printf -v"];
+    let texts = ["((", "$[", "[["];
     if let Some(t) = texts.into_iter().find(|s| template.contains(s)) {
         return Some(t);
     }
-    let words = ["let", "declare", "typeset", "local", "unset", "read", "mapfile", "readarray"];
+    let options = [("[", "-v", "[ -v"), ("test", "-v", "test -v"), ("printf", "-v", "printf -v"), ("wait", "-p", "wait -p")];
+    if let Some((_, _, t)) = options.into_iter().find(|(w, o, _)| has_option(template, w, o)) {
+        return Some(t);
+    }
+    let words = ["let", "declare", "typeset", "local", "unset", "read", "mapfile", "readarray", "getopts"];
     if let Some(w) = words.into_iter().find(|w| has_word(template, w)) {
         return Some(w);
     }
@@ -254,7 +297,7 @@ fn arithmetic_context(template: &str, names: &[&str]) -> Option<&'static str> {
 /// `$((`, `$[`, `[[`, `let`, `declare`, `typeset`, `local`, array subscripts
 /// holding a placeholder, a placeholder inside `${...}` (substring offsets
 /// are arithmetic), and builtins that take a variable name (`unset`, `read`,
-/// `mapfile`, `readarray`, `test -v`, `[ -v`, `printf -v`). Plain `[ ... ]`
+/// `mapfile`, `readarray`, `test -v`, `[ -v`, `printf -v`, `getopts`, `wait -p`). Plain `[ ... ]`
 /// tests stay allowed. Unknown `{...}` stay as they are. A value with NUL is
 /// refused. A value beginning with `-` is read as an option by the target
 /// program (argument injection, not execution); put `--` before the
@@ -504,6 +547,26 @@ mod tests {
     }
 
     #[test]
+    fn bind_windows_after_a_backslash_keeps_the_path_whole() {
+        let name = &["name"];
+        assert_eq!(bind_windows(r"notepad C:\notes\{name}.txt", name).unwrap(), r#"notepad "C:\notes\!FLICK_NAME!".txt"#);
+        assert_eq!(bind_windows(r"x&C:\a\\{name}", name).unwrap(), r#"x&"C:\a\\!FLICK_NAME!""#);
+        assert_eq!(bind_windows(r"\{name}", name).unwrap(), r#""\!FLICK_NAME!""#);
+        // A word with quotes of its own: the backslashes are doubled.
+        assert_eq!(bind_windows(r#"p "a b"\{name}"#, name).unwrap(), r#"p "a b"\\"!FLICK_NAME!""#);
+        // What the program sees once cmd.exe has put the value in.
+        for (template, want) in [
+            (r"notepad C:\notes\{name}.txt", r"C:\notes\My Notes.txt"),
+            (r"notepad C:\a\\{name}", r"C:\a\\My Notes"),
+            (r#"notepad "C:\a b"\{name}"#, r"C:\a b\My Notes"),
+            (r"notepad {name}\{name}", r"My Notes\My Notes"),
+        ] {
+            let line = bind_windows(template, name).unwrap().replace("!FLICK_NAME!", &windows_env_value("My Notes"));
+            assert_eq!(argv(&line), vec!["notepad", want], "{template}");
+        }
+    }
+
+    #[test]
     fn bind_windows_refuses_caret_with_a_placeholder() {
         let refused = Err("this command cannot use ^ together with a placeholder".to_string());
         assert_eq!(bind_windows(r#"echo ^"{a} | findstr ."#, &["a"]), refused);
@@ -646,6 +709,13 @@ mod tests {
             ("printf -v {n} x", "printf -v"),
             ("mapfile {n} < /dev/null", "mapfile"),
             ("readarray {n} < /dev/null", "readarray"),
+            ("getopts ab {n}", "getopts"),
+            ("[  -v {n} ]", "[ -v"),
+            ("[\t-v {n} ]", "[ -v"),
+            ("test \t -v {n}", "test -v"),
+            ("printf  -v {n} x", "printf -v"),
+            ("sleep 1 & wait -p {n}", "wait -p"),
+            ("sleep 1 & wait -n -p {n}", "wait -p"),
         ] {
             let refused = Err(format!("this command cannot use {construct} together with a placeholder"));
             assert_eq!(bind_bash(template, n), refused, "{template}");
@@ -661,6 +731,7 @@ mod tests {
         );
         assert_eq!(bind_bash("[ {n} -gt 0 ]", n).unwrap(), r#"FLICK_N='1'; [ "${FLICK_N}" -gt 0 ]"#);
         assert!(bind_bash("readlink -f {n}; outlet {n}; grep -v {n} x", n).is_ok());
+        assert!(bind_bash("wait; echo {n}; latest -v {n}", n).is_ok());
         // Without a bound placeholder nothing is refused.
         assert_eq!(bind_bash("echo $(( 1 + 2 ))", n).unwrap(), "FLICK_N='1'; echo $(( 1 + 2 ))");
     }

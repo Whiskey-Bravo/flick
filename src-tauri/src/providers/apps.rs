@@ -211,11 +211,6 @@ fn own_dir() -> PathBuf {
     std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)).unwrap_or_default()
 }
 
-#[cfg(not(test))]
-fn windows_dir() -> PathBuf {
-    std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| r"C:\Windows".into())
-}
-
 /// Uninstall plan per app target. Pure: the programs are passed in.
 fn plans_for(
     entries: &[AppEntry],
@@ -237,6 +232,19 @@ fn plans_for(
             };
             plan(&e.name, targets.with_args.contains(&e.target), exe, store_id, programs, windows_dir, own_dir, broad).map(|p| (e.target.clone(), p))
         })
+        .collect()
+}
+
+/// The shortcut exes whose windows count as the app's own, for Close. A
+/// shortcut that passes arguments runs a host (`cmd.exe /k ...`,
+/// `javaw.exe -jar ...`), so the host's other windows are not its own and it
+/// gets none. The uninstall planner treats such shortcuts the same way.
+fn window_exes(targets: &Targets) -> HashMap<String, String> {
+    targets
+        .exes
+        .iter()
+        .filter(|(lnk, _)| !targets.with_args.contains(*lnk))
+        .map(|(lnk, exe)| (lnk.clone(), exe.clone()))
         .collect()
 }
 
@@ -336,8 +344,7 @@ pub fn scan_start_menu(roots: &[PathBuf]) -> Vec<AppEntry> {
 /// Windows PowerShell by absolute path, so no `powershell.exe` earlier on
 /// `PATH` (or in the working directory) is run instead.
 fn powershell_exe() -> PathBuf {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    PathBuf::from(root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+    PathBuf::from(crate::quote::system32(r"WindowsPowerShell\v1.0\powershell.exe"))
 }
 
 /// Packaged (Store) apps from `Get-StartApps`. `None` when PowerShell fails or
@@ -422,7 +429,8 @@ pub struct AppsProvider {
     last_targets: Mutex<Targets>,
     /// How each app is uninstalled; swapped by `refresh`, read by queries.
     plans: RwLock<HashMap<String, Uninstall>>,
-    /// Each shortcut's exe, from the last refresh.
+    /// Each shortcut's exe whose windows Close may close (see `window_exes`),
+    /// from the last refresh.
     exes: RwLock<HashMap<String, String>>,
     /// The open windows, for `Close`. Without it no Close is offered.
     windows: OnceLock<Arc<WindowList>>,
@@ -615,7 +623,7 @@ impl AppsProvider {
         let index = p.index.read().unwrap_or_else(|e| e.into_inner()).clone();
         *p.plans.write().unwrap_or_else(|e| e.into_inner()) =
             plans_for(&index, &targets, &programs, &p.windows_dir, &p.own_dir, &p.broad);
-        *p.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes;
+        *p.exes.write().unwrap_or_else(|e| e.into_inner()) = window_exes(&targets);
         p
     }
 
@@ -638,7 +646,8 @@ impl AppsProvider {
             }),
         );
         #[cfg(not(test))]
-        let (windows_dir, own_dir, broad) = (windows_dir(), own_dir(), uninstall::broad_roots());
+        let (windows_dir, own_dir, broad) =
+            (PathBuf::from(crate::quote::windows_dir()), own_dir(), uninstall::broad_roots());
         Arc::new(Self {
             plans: RwLock::new(HashMap::new()),
             exes: RwLock::new(HashMap::new()),
@@ -726,7 +735,7 @@ impl AppsProvider {
         let targets = add_aliases(&mut start);
         let programs = self.programs.programs();
         self.set_plans(&start, &last_store, &targets, &programs);
-        *self.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes.clone();
+        *self.exes.write().unwrap_or_else(|e| e.into_inner()) = window_exes(&targets);
         self.publish(&start, &last_store);
         *self.last_start.lock().unwrap_or_else(|e| e.into_inner()) = start.clone();
         *self.last_targets.lock().unwrap_or_else(|e| e.into_inner()) = targets.clone();
@@ -1684,6 +1693,33 @@ mod tests {
         p.set_windows(list);
         assert_eq!(p.act(r"C:\Foo.lnk", Action::Close), Ok(Outcome::Hide));
         assert_eq!(*ops.closes.lock().unwrap(), ["close 1 10", "close 2 10"]);
+    }
+
+    /// A shortcut that runs a host with arguments ("Developer Command Prompt"
+    /// is `cmd.exe /k ...`) is not that host: its row offers no Close, and
+    /// Close never reaches the host's other windows.
+    #[test]
+    fn close_skips_shortcuts_that_pass_arguments_to_a_host() {
+        let rec = Arc::new(RecordingLauncher::default());
+        let p = AppsProvider::with_programs(
+            rec.clone(),
+            vec![shortcut("Developer Command Prompt", r"C:\Dev.lnk"), shortcut("Command Prompt", r"C:\Cmd.lnk")],
+            vec![],
+            vec![],
+        );
+        let cmd = r"C:\Windows\System32\cmd.exe";
+        let targets = Targets {
+            exes: HashMap::from([(r"C:\Dev.lnk".to_string(), cmd.to_string()), (r"C:\Cmd.lnk".to_string(), cmd.to_string())]),
+            with_args: HashSet::from([r"C:\Dev.lnk".to_string()]),
+        };
+        *p.exes.write().unwrap() = window_exes(&targets);
+        let (list, ops) = fake_windows(vec![win(1, 10, cmd, false)], &[]);
+        p.set_windows(list);
+        assert!(!actions_of(&p, r"C:\Dev.lnk").contains(&Action::Close));
+        assert_eq!(p.act(r"C:\Dev.lnk", Action::Close), Err("That window is gone.".to_string()));
+        assert!(ops.closes.lock().unwrap().is_empty());
+        // The plain shortcut to the host still closes its windows.
+        assert!(actions_of(&p, r"C:\Cmd.lnk").contains(&Action::Close));
     }
 
     #[test]

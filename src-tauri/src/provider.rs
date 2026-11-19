@@ -2,6 +2,19 @@
 
 use std::sync::Arc;
 
+/// The score of a name the user gave something (a shortcut or snippet name,
+/// or an alias), from its fuzzy `score`. Typed in full it is a keyword and
+/// goes above every other row: above an open window whose name starts with it,
+/// even with the most a learned pick adds (1000 + 310 + 300). Otherwise it is
+/// just above an equal match from another provider.
+pub fn own_name_score(score: u32) -> u32 {
+    if score >= 1000 {
+        score + 700
+    } else {
+        score + 50
+    }
+}
+
 pub struct Query {
     pub text: String,
     pub scope: Option<String>,
@@ -150,6 +163,10 @@ pub enum Outcome {
     },
     /// Done, bar stays.
     Keep,
+    /// Done: the row's item is gone (deleted to the Recycle Bin), and the
+    /// bar stays so its list can be asked again. A delete the user declined
+    /// in Windows' prompt is `Keep` instead: nothing changed.
+    Removed,
     /// Show `prompt`; next queries carry `scope`.
     Step { prompt: String, scope: String },
     /// Put `text` in the bar and keep it open (picked help lines).

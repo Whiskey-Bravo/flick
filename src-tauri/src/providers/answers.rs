@@ -75,8 +75,8 @@ pub struct AnswersProvider {
     launcher: Arc<dyn Launcher>,
     open_config: Opener,
     clock: Clock,
-    /// The PC's zone, read once at start.
-    local: TimeZone,
+    /// The PC's zone: read at start, and again each time the bar is shown (`set_zone`).
+    local: RwLock<TimeZone>,
     config: RwLock<AnswersConfig>,
 }
 
@@ -212,7 +212,7 @@ fn has_symbol(text: &str) -> bool {
 }
 
 impl AnswersProvider {
-    /// Cheap apart from reading the PC's time zone once.
+    /// Cheap apart from reading the PC's time zone (again on each show: `set_zone`).
     pub fn new(
         formats: Arc<dyn Formats>,
         rates: Arc<RatesStore>,
@@ -245,7 +245,7 @@ impl AnswersProvider {
             launcher,
             open_config,
             clock,
-            local,
+            local: RwLock::new(local),
             config: RwLock::new(AnswersConfig::default()),
         })
     }
@@ -259,13 +259,23 @@ impl AnswersProvider {
         self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The PC's time zone changed (or may have): memory only.
+    pub fn set_zone(&self, tz: TimeZone) {
+        *self.local.write().unwrap_or_else(|e| e.into_inner()) = tz;
+    }
+
+    /// The PC's time zone as last read.
+    fn local(&self) -> TimeZone {
+        self.local.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Locale text of a finite number; None for NaN or infinity.
     fn number(&self, x: f64) -> Option<String> {
         x.is_finite().then(|| self.formats.number(x))
     }
 
     fn calc_row(&self, text: &str) -> Option<ResultItem> {
-        let c = calc::evaluate_with(text, &|n| self.formats.number(n))?;
+        let c = calc::evaluate_with(text, self.formats.group(), &|n| self.formats.number(n))?;
         let shown = self.number(c.value)?;
         Some(copy_row(&shown, format!("= {shown}"), c.shown, Icon::Calc, true))
     }
@@ -273,12 +283,12 @@ impl AnswersProvider {
     fn clock_row(&self, ask: ClockAsk, now: Timestamp, today: Date) -> Option<ResultItem> {
         match ask {
             ClockAsk::LocalTime => {
-                let here = now.to_zoned(self.local.clone());
+                let here = now.to_zoned(self.local());
                 let title = format!("{} {}", self.formats.time_seconds(here.time()), here.strftime("%a"));
                 Some(live_row(LOCAL_NOW.into(), title, self.formats.date(today, true), false))
             }
             ClockAsk::TimeIn(place) => {
-                let (there, ahead) = clock::time_in_from(place, now, &self.local)?;
+                let (there, ahead) = clock::time_in_from(place, now, &self.local())?;
                 let title = format!("{} {}", self.formats.time_seconds(there.time()), there.strftime("%a"));
                 let subtitle = format!("{} · {}", place_name(place), offset_text(ahead));
                 Some(live_row(format!("{NOW}{}", place.name), title, subtitle, true))
@@ -397,10 +407,10 @@ impl Provider for AnswersProvider {
         self.weather.cancel_pending();
         let cfg = self.config();
         let now = (self.clock)();
-        let today = now.to_zoned(self.local.clone()).date();
+        let today = now.to_zoned(self.local()).date();
         let answer = if let Some(ask) = clock::parse_clock(text, today) {
             self.clock_row(ask, now, today)
-        } else if let Some(ask) = units::parse_conversion(text) {
+        } else if let Some(ask) = units::parse_conversion(text, self.formats.group()) {
             self.conversion_row(ask, text, now, &cfg)
         } else {
             self.calc_row(text)
@@ -412,7 +422,7 @@ impl Provider for AnswersProvider {
     /// answers carry typed values, so they cannot be rebuilt from an id.
     fn item(&self, id: &str) -> Option<ResultItem> {
         let now = (self.clock)();
-        let today = now.to_zoned(self.local.clone()).date();
+        let today = now.to_zoned(self.local()).date();
         let ask = if id == LOCAL_NOW {
             ClockAsk::LocalTime
         } else {
@@ -444,10 +454,10 @@ impl Provider for AnswersProvider {
         if let Some(which) = id.strip_prefix(NOW) {
             let now = (self.clock)();
             let time = if id == LOCAL_NOW {
-                now.to_zoned(self.local.clone()).time()
+                now.to_zoned(self.local()).time()
             } else {
                 let place = clock::PLACES.iter().find(|p| p.name == which).ok_or("unknown place")?;
-                clock::time_in_from(place, now, &self.local).ok_or("unknown place")?.0.time()
+                clock::time_in_from(place, now, &self.local()).ok_or("unknown place")?.0.time()
             };
             self.clipboard.set_text(&self.formats.time_seconds(time))?;
             return Ok(Outcome::Hide);
@@ -634,6 +644,9 @@ mod tests {
         assert_eq!(titled(&r, "5 miles in km"), ("8,05 km".into(), "5 miles → km".into()));
         assert_eq!(titled(&r, "1234,5*1"), ("= 1.234,5".into(), "1.234,5 * 1".into()));
         assert_eq!(titled(&r, "0,1+0,2"), ("= 0,3".into(), "0,1 + 0,2".into()));
+        // `.` is the German group: before three digits it groups.
+        assert_eq!(titled(&r, "1.000 + 1"), ("= 1.001".into(), "1.000 + 1".into()));
+        assert_eq!(titled(&r, "1.000 km in m"), ("1.000.000 m".into(), "1.000 kilometers → m".into()));
         assert_eq!(one(&r, "in 1500 days").subtitle, "in 1.500 days");
         assert_eq!(one(&r, "1500 days ago").subtitle, "1.500 days ago");
         assert_eq!(one(&r, "1 mile in km").subtitle, "1 mile → km");
@@ -867,6 +880,17 @@ mod tests {
         assert!(r.answers.item("now:").is_none());
         assert!(r.answers.item("wait").is_none());
         assert_eq!(r.clipboard.0.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_new_time_zone_is_used_once_set() {
+        let r = rig(true, "", None);
+        *r.now.lock().unwrap() = "2026-07-01T12:00:07Z".parse().unwrap();
+        assert_eq!(one(&r, "time").title, "14:00:07 Wed");
+        // The user flew to Tokyo and Windows changed the zone.
+        r.answers.set_zone(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap());
+        assert_eq!(one(&r, "time").title, "21:00:07 Wed");
+        assert_eq!(one(&r, "time berlin").subtitle, "Berlin · 7 h behind");
     }
 
     #[test]

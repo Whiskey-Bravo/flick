@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::file_ops::{moved_id, same_item};
-use crate::ranking::save_json;
+use crate::ranking::{load_json, save_json_durable};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct Pin {
@@ -26,11 +26,9 @@ pub struct Pins {
 }
 
 impl Pins {
-    /// Missing or corrupt file -> empty.
+    /// Missing or corrupt file -> empty (a corrupt one is kept as `.corrupt`).
     pub fn load(path: PathBuf) -> Self {
-        let pins = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<PinsFile>(&text).ok())
+        let pins = load_json::<PinsFile>(&path)
             .map(|f| f.pins)
             .unwrap_or_default();
         Self { pins: Mutex::new(pins), save_lock: Mutex::new(()), path }
@@ -56,7 +54,7 @@ impl Pins {
             };
             (now_pinned, pins.clone())
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
         now_pinned
     }
 
@@ -74,7 +72,7 @@ impl Pins {
             pins.swap(i, j);
             pins.clone()
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
     }
 
     /// The item `old` (and anything below it, for a folder) is now at `new`:
@@ -103,7 +101,7 @@ impl Pins {
             *pins = seen;
             pins.clone()
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
     }
 
     /// Unpins the item `id`, of every provider. Saved like `toggle`.
@@ -118,7 +116,7 @@ impl Pins {
             }
             pins.clone()
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
     }
 
     pub fn is_pinned(&self, provider: &str, id: &str) -> bool {
