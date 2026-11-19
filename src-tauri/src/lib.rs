@@ -2733,7 +2733,6 @@ mod tests {
             id: id.into(),
             text: text.into(),
             copied: std::time::UNIX_EPOCH + Duration::from_secs(1_000_000 - secs_ago),
-            pinned: false,
         }
     }
 

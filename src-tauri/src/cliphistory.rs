@@ -25,8 +25,6 @@ pub struct Clip {
     pub id: String,
     pub text: String,
     pub copied: SystemTime,
-    /// The public API has no pinned flag; kept for when one is found.
-    pub pinned: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -223,7 +221,6 @@ fn clip_of(item: &ClipboardHistoryItem, text: &HSTRING, files: &HSTRING) -> Opti
         id: item.Id().ok()?.to_string_lossy(),
         text: body.to_string_lossy(),
         copied: from_universal_time(item.Timestamp().ok()?.UniversalTime),
-        pinned: false,
     })
 }
 
@@ -412,7 +409,6 @@ mod tests {
             id: id.to_string(),
             text: format!("text {id}"),
             copied: UNIX_EPOCH + Duration::from_secs(secs),
-            pinned: false,
         }
     }
 

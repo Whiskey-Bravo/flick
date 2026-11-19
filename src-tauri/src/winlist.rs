@@ -33,6 +33,12 @@ pub trait WindowOps: Send + Sync {
         Vec::new()
     }
     fn exists(&self, hwnd: isize) -> bool;
+    /// The window still exists and still belongs to `pid`, the owner it had
+    /// when listed. Windows reuses handles, so a listed handle can name a new
+    /// window of another app.
+    fn owned_by(&self, hwnd: isize, _pid: u32) -> bool {
+        self.exists(hwnd)
+    }
     fn focus(&self, hwnd: isize) -> Result<(), String>;
     /// `pid` is the owner the window had when listed; the live window must still match.
     fn close(&self, hwnd: isize, pid: u32) -> Result<(), String>;
@@ -191,7 +197,7 @@ mod sys {
         PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     };
     use windows::core::GUID;
-    use windows::Win32::Foundation::ERROR_SUCCESS;
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
     use windows::Win32::Storage::Packaging::Appx::GetApplicationUserModelId;
     use windows::Win32::Foundation::PROPERTYKEY;
     use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
@@ -214,13 +220,21 @@ mod sys {
         String::from_utf16_lossy(&buf[..(n.max(0) as usize).min(buf.len())])
     }
 
-    /// Image path of an open process handle.
+    /// Image path of an open process handle. Starts with a 1024-char buffer
+    /// and grows it while Windows says it is too small, up to the longest
+    /// path Windows allows (32 767 chars).
     fn image_of(h: HANDLE) -> Option<String> {
-        let mut buf = vec![0u16; 1024];
-        let mut len = buf.len() as u32;
-        // SAFETY: buf and len describe the same buffer.
-        unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) }.ok()?;
-        Some(String::from_utf16_lossy(&buf[..len as usize]))
+        let mut size = 1024usize;
+        loop {
+            let mut buf = vec![0u16; size];
+            let mut len = buf.len() as u32;
+            // SAFETY: buf and len describe the same buffer.
+            match unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len) } {
+                Ok(()) => return Some(String::from_utf16_lossy(&buf[..len as usize])),
+                Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && size < 32_768 => size *= 4,
+                Err(_) => return None,
+            }
+        }
     }
 
     fn image_path(pid: u32) -> Option<String> {
@@ -406,6 +420,16 @@ mod sys {
         unsafe { IsWindow(Some(hw(h))).as_bool() }
     }
 
+    /// The window exists and its owner process is `pid`.
+    pub fn owned_by(h: isize, pid: u32) -> bool {
+        let w = hw(h);
+        // SAFETY: IsWindow and GetWindowThreadProcessId accept any handle value.
+        unsafe {
+            let mut live = 0u32;
+            IsWindow(Some(w)).as_bool() && GetWindowThreadProcessId(w, Some(&mut live)) != 0 && live == pid
+        }
+    }
+
     pub fn focus(h: isize) -> Result<(), String> {
         let w = hw(h);
         // SAFETY: calls on a window handle; failures are reported, not assumed.
@@ -524,6 +548,9 @@ impl WindowOps for SystemWindows {
     }
     fn exists(&self, hwnd: isize) -> bool {
         sys::exists(hwnd)
+    }
+    fn owned_by(&self, hwnd: isize, pid: u32) -> bool {
+        sys::owned_by(hwnd, pid)
     }
     fn focus(&self, hwnd: isize) -> Result<(), String> {
         sys::focus(hwnd)
