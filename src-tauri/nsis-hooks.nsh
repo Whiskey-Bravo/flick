@@ -6,7 +6,10 @@
 !macroend
 
 ; Remove Flick's sign-in task before its files go: flick.exe deletes the task
-; and the old Run value. Skipped on an update, which keeps Start at login.
+; and the old Run value, and when Start at login was on leaves a marker next
+; to the config so a manual upgrade ("Uninstall before installing" runs this
+; uninstaller) gets it back on the new version's first start. Skipped on an
+; in-app update, which keeps Start at login.
 !macro NSIS_HOOK_PREUNINSTALL
   ${If} $UpdateMode <> 1
     ExecWait '"$INSTDIR\flick.exe" --remove-login-task'

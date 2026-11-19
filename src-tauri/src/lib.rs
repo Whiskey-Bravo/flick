@@ -1027,7 +1027,9 @@ fn reminders_path() -> PathBuf {
 pub fn run_helper_if_asked() -> bool {
     let args: Vec<String> = std::env::args().collect();
     if login_task::wants_remove_login_task(&args) {
-        login_task::remove_all(&login_task::WindowsLoginStart);
+        if login_task::remove_for_uninstall(&login_task::WindowsLoginStart) {
+            let _ = std::fs::write(login_task::restore_marker(&config::config_path()), b"");
+        }
         return true;
     }
     match winkey_helper::helper_parent(&args) {
@@ -1291,15 +1293,25 @@ fn setup(app: &AppHandle) {
 }
 
 /// Start at login, in the background (Task Scheduler and the registry block):
-/// the first run turns it on, any other start moves an old install (Run value,
-/// or a task for another exe) over, then the tray's check mark follows the real
-/// state. Debug builds only read: they would register the debug exe.
+/// the first run, or the first start after a manual upgrade removed it (the
+/// uninstaller's restore marker), turns it on; any other start moves an old
+/// install (Run value, or a task for another exe) over; then the tray's check
+/// mark follows the real state. Debug builds only read: they would register
+/// the debug exe.
 fn start_login(app: &AppHandle, first_run: bool) {
     let app = app.clone();
     std::thread::spawn(move || {
         let s = &login_task::WindowsLoginStart;
+        let marker = login_task::restore_marker(&config::config_path());
         let on = match std::env::current_exe() {
-            Ok(exe) if !cfg!(debug_assertions) => login_task::at_start(s, first_run, &exe),
+            Ok(exe) if !cfg!(debug_assertions) => {
+                let restore = marker.exists();
+                let on = login_task::at_start(s, first_run || restore, &exe);
+                if restore {
+                    let _ = std::fs::remove_file(&marker);
+                }
+                on
+            }
             _ => login_task::is_enabled(s),
         };
         tray::set_login_checked(&app, on);
