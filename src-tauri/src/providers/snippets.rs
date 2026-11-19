@@ -38,8 +38,9 @@ impl SnippetsProvider {
         *self.defs.write().unwrap_or_else(|e| e.into_inner()) = defs;
     }
 
-    fn defs(&self) -> Vec<SnippetDef> {
-        self.defs.read().unwrap_or_else(|e| e.into_inner()).clone()
+    /// The snippets, read in place: a query copies only the rows it returns.
+    fn defs(&self) -> std::sync::RwLockReadGuard<'_, Vec<SnippetDef>> {
+        self.defs.read().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -81,7 +82,7 @@ impl Provider for SnippetsProvider {
     }
 
     fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
-        let def = self.defs().into_iter().find(|d| id_of(d) == id).ok_or_else(|| GONE.to_string())?;
+        let def = self.defs().iter().find(|d| id_of(d) == id).cloned().ok_or_else(|| GONE.to_string())?;
         // Read before the set: the paste waits for the clipboard to move on.
         let before = (self.sequence)();
         self.clipboard.set_text(&def.text)?;

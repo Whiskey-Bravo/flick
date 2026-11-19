@@ -203,7 +203,7 @@ impl Provider for WorkspacesProvider {
             .and_then(Weak::upgrade)
             .ok_or_else(|| STILL_STARTING.to_string())?;
         if self.running.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            return Err("This workspace is still opening".to_string());
+            return Err("A workspace is still opening".to_string());
         }
         let done = Done(self.running.clone());
         let (report, pause, wait) = (self.report.clone(), self.pause, self.wait);
@@ -469,8 +469,8 @@ mod tests {
         let runner = Arc::new(runner_for(&["a", "b", "c"]));
         attach(&p, &runner);
         assert_eq!(p.activate("work", Modifier::None), Ok(Outcome::Hide));
-        assert_eq!(p.activate("work", Modifier::None), Err("This workspace is still opening".to_string()));
-        assert_eq!(p.activate("play", Modifier::None), Err("This workspace is still opening".to_string()));
+        assert_eq!(p.activate("work", Modifier::None), Err("A workspace is still opening".to_string()));
+        assert_eq!(p.activate("play", Modifier::None), Err("A workspace is still opening".to_string()));
         wait_idle(&p);
         assert_eq!(runner.opened(), ["a", "b", "c"]);
         // Once the run is over, a workspace opens again.
