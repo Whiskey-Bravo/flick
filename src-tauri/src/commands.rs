@@ -10,13 +10,14 @@ use crate::window;
 use crate::AppState;
 
 /// In-memory only. `async` runs it on the async runtime instead of the main thread.
-/// It makes this search the newest: an older one still scanning stops early. Its
-/// answer is `None` when a newer search began meanwhile; the page has asked
-/// again by then and drops it, and it is never shown as "no results".
+/// `seq` is the page's number for this search: a search is cancelled only by a
+/// higher number, so the newest one always completes. Its answer is `None` when
+/// a higher number began meanwhile; the page has asked again and drops it, and
+/// it is never shown as "no results". No `seq` (or 0): never cancelled.
 #[tauri::command(async)]
-pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Option<Vec<ResultItem>> {
+pub fn query(text: String, scope: Option<String>, seq: Option<u64>, state: State<AppState>) -> Option<Vec<ResultItem>> {
     let timer = crate::timing::query_timer();
-    let rows = state.engine.query_newest(&text, scope.as_deref());
+    let rows = state.engine.query_newest(&text, scope.as_deref(), seq.unwrap_or(0));
     timer.finish(&text, rows.as_ref().map_or(0, Vec::len));
     rows
 }

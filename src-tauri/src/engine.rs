@@ -67,13 +67,14 @@ pub struct QueryGate {
 impl QueryGate {
     /// A gate for the next search of `newest`'s owner (tests).
     #[cfg(test)]
-    pub fn begin_for_test(newest: &Arc<AtomicU64>) -> QueryGate {
-        QueryGate { newest: newest.clone(), mine: newest.fetch_add(1, Ordering::SeqCst) + 1 }
+    pub fn begin_for_test(newest: &Arc<AtomicU64>, seq: u64) -> QueryGate {
+        newest.fetch_max(seq, Ordering::SeqCst);
+        QueryGate { newest: newest.clone(), mine: seq }
     }
 
-    /// True once a later search has begun on the same engine.
+    /// True once a search with a higher number has begun on the same engine.
     pub fn superseded(&self) -> bool {
-        self.newest.load(Ordering::Relaxed) != self.mine
+        self.newest.load(Ordering::Relaxed) > self.mine
     }
 }
 
@@ -138,7 +139,7 @@ pub struct Engine {
     ranking: Arc<Ranking>,
     history: Arc<History>,
     pins: Arc<Pins>,
-    /// Number of the newest cancellable search begun (see [`Engine::query_newest`]).
+    /// Highest number of any cancellable search begun (see [`Engine::query_newest`]).
     newest: Arc<AtomicU64>,
 }
 
@@ -180,14 +181,20 @@ impl Engine {
         self.query_among(text, scope, &|_| true)
     }
 
-    /// [`Engine::query`] for the bar: this search becomes the newest, and an
-    /// older one still scanning stops early. `None` when a newer search began
-    /// before this one finished: the page has asked again and drops the answer,
-    /// so it must never be taken for "no results". Other callers use
+    /// [`Engine::query`] for the bar, which numbers its searches (`seq`, rising;
+    /// 0 = unnumbered). A numbered search registers its number, and an older one
+    /// still scanning stops early: a search is superseded only by a higher
+    /// number, so the highest one is never cancelled, whatever order the
+    /// commands start in. `None` when superseded: the page has asked again and
+    /// drops the answer, so it must never be taken for "no results". An
+    /// unnumbered search neither cancels nor is cancelled. Other callers use
     /// [`Engine::query`], which is never cut short.
-    pub fn query_newest(&self, text: &str, scope: Option<&str>) -> Option<Vec<ResultItem>> {
-        let mine = self.newest.fetch_add(1, Ordering::SeqCst) + 1;
-        let gate = QueryGate { newest: self.newest.clone(), mine };
+    pub fn query_newest(&self, text: &str, scope: Option<&str>, seq: u64) -> Option<Vec<ResultItem>> {
+        if seq == 0 {
+            return Some(self.query(text, scope));
+        }
+        self.newest.fetch_max(seq, Ordering::SeqCst);
+        let gate = QueryGate { newest: self.newest.clone(), mine: seq };
         let rows = with_gate(gate.clone(), || self.query(text, scope));
         (!gate.superseded()).then_some(rows)
     }
@@ -899,11 +906,19 @@ mod tests {
         assert!(!rows.iter().find(|r| r.id == "c").unwrap().pinned);
     }
 
-    /// Reports whether it ran inside a cancellable search; with `interrupt`, a
-    /// newer search begins while it runs.
+    /// Reports whether it ran inside a cancellable search; with `register`, a
+    /// search with that sequence number is registered while it runs.
     struct GateWatcher {
         gated: std::sync::Mutex<Vec<bool>>,
-        interrupt: bool,
+        register: Option<u64>,
+    }
+
+    impl GateWatcher {
+        fn engine(register: Option<u64>) -> (Engine, Arc<GateWatcher>, tempfile::TempDir) {
+            let w = Arc::new(GateWatcher { gated: Default::default(), register });
+            let (e, _, dir) = engine_boxed(vec![Box::new(w.clone())]);
+            (e, w, dir)
+        }
     }
 
     impl Provider for GateWatcher {
@@ -913,8 +928,8 @@ mod tests {
         fn query(&self, _q: &Query) -> Vec<ResultItem> {
             let gate = current_gate();
             self.gated.lock().unwrap().push(gate.is_some());
-            if let (true, Some(g)) = (self.interrupt, gate) {
-                g.newest.fetch_add(1, Ordering::SeqCst);
+            if let (Some(n), Some(g)) = (self.register, gate) {
+                g.newest.fetch_max(n, Ordering::SeqCst);
             }
             vec![ResultItem { id: "1".into(), provider: "g", title: "row".into(), ..Default::default() }]
         }
@@ -924,24 +939,36 @@ mod tests {
     }
 
     #[test]
-    fn only_the_bars_query_is_cancellable() {
-        let w = Arc::new(GateWatcher { gated: Default::default(), interrupt: false });
-        let (e, _, _dir) = engine_boxed(vec![Box::new(w.clone())]);
+    fn only_the_bars_numbered_query_is_cancellable() {
+        let (e, w, _dir) = GateWatcher::engine(None);
         assert_eq!(e.query("x", None).len(), 1);
-        assert_eq!(e.query_newest("x", None).map(|r| r.len()), Some(1));
-        assert_eq!(*w.gated.lock().unwrap(), [false, true]);
-        // The gate is gone once the search is over.
+        assert_eq!(e.query_newest("x", None, 3).map(|r| r.len()), Some(1));
+        assert_eq!(e.query_newest("x", None, 0).map(|r| r.len()), Some(1));
+        assert_eq!(*w.gated.lock().unwrap(), [false, true, false]);
         assert!(current_gate().is_none());
     }
 
     #[test]
-    fn a_search_a_newer_one_overtook_is_reported_cancelled_not_empty() {
-        let w = Arc::new(GateWatcher { gated: Default::default(), interrupt: true });
-        let (e, _, _dir) = engine_boxed(vec![Box::new(w.clone())]);
-        assert!(e.query_newest("x", None).is_none());
-        // The plain query is never cut short, whatever else is going on.
-        assert_eq!(e.query("x", None).len(), 1);
+    fn the_highest_number_wins_whatever_order_the_searches_start_in() {
+        // (a) 5 starts first, 4 arrives while it runs: 5 completes; 4 started later is superseded.
+        let (e, _, _d) = GateWatcher::engine(Some(4));
+        assert!(e.query_newest("x", None, 5).is_some());
+        assert!(e.query_newest("x", None, 4).is_none());
+        // (b) 4 starts first and 5 is registered while it runs: 4 is superseded, 5 completes.
+        let (e, _, _d) = GateWatcher::engine(Some(5));
+        assert!(e.query_newest("x", None, 4).is_none());
+        assert!(e.query_newest("x", None, 5).is_some());
         assert!(current_gate().is_none());
+    }
+
+    #[test]
+    fn a_search_without_a_number_neither_cancels_nor_is_cancelled() {
+        // (c) zero is never superseded, and registers nothing.
+        let (e, _, _d) = GateWatcher::engine(Some(9));
+        assert!(e.query_newest("x", None, 0).is_some());
+        assert_eq!(e.query("x", None).len(), 1);
+        assert!(e.newest.load(Ordering::SeqCst) == 0);
+        assert!(e.query_newest("x", None, 3).is_none()); // its own provider registers 9
     }
 
     #[test]

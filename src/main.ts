@@ -8,7 +8,7 @@ import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } f
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
-  panelItem, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  panelItem, queryArgs, queryReply, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -110,7 +110,9 @@ const reportAtFrame = (name: "page.shown_to_paint" | "page.query_to_paint" | "pa
 };
 
 let state: State = initial;
-let querySeq = 0;
+// Rises with every search and starts from the clock, so a reloaded page never
+// restarts below the numbers the back end has already seen.
+let querySeq = Date.now();
 /// Bumped on every `bar:shown`: an activation answered after the bar was
 /// shown again belongs to an old session and is dropped.
 let shows = 0;
@@ -446,11 +448,12 @@ function run(effect: Effect) {
     case "query": {
       const seq = ++querySeq;
       const sent = performance.now();
-      invoke<Item[] | null>("query", { text: effect.text, scope: effect.scope })
+      invoke<Item[] | null>("query", queryArgs(effect, seq))
         .then((items) => {
-          // null: a newer search overtook this one; its answer is the one to wait for.
-          if (seq !== querySeq || !items) return;
-          dispatch({ type: "results", items });
+          if (seq !== querySeq) return;
+          const reply = queryReply(items);
+          if (reply === "ask again") return run(effect);
+          dispatch(reply);
           reportAtFrame("page.query_to_paint", sent);
         })
         .catch((err) => {

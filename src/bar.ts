@@ -621,3 +621,17 @@ function enter(s: State, modifier: Modifier): Result {
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
   return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);
 }
+
+/** The arguments of the back end's `query` command: the page's own number for
+ *  this search rides along, so only a higher number can cancel an older one. */
+export function queryArgs(effect: { text: string; scope: string | null }, seq: number) {
+  return { text: effect.text, scope: effect.scope, seq };
+}
+
+/** What to do with the answer to the CURRENT search. The back end answers null
+ *  only for a search a higher number overtook, which cannot be the current one;
+ *  should it happen anyway, ask again (the new number is the highest, so that
+ *  answer completes) rather than leave `awaiting` set for ever. */
+export function queryReply(items: Item[] | null): { type: "results"; items: Item[] } | "ask again" {
+  return items ? { type: "results", items } : "ask again";
+}

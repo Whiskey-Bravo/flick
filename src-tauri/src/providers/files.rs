@@ -908,7 +908,7 @@ mod tests {
     fn a_search_gives_the_rows_and_order_it_gave_before() {
         let p = varied_provider(9000);
         let newest = Arc::new(AtomicU64::new(0));
-        let gate = crate::engine::QueryGate::begin_for_test(&newest);
+        let gate = crate::engine::QueryGate::begin_for_test(&newest, 1);
         let ids = |rows: &[ResultItem]| rows.iter().map(|r| (r.id.clone(), r.score)).collect::<Vec<_>>();
         for text in ["fi", "re", "ca", "ti", "a", "file", "report", "calc", "tid", "final co", "caf", "zz"] {
             let old = p.search(&q(text), file_score_reference, None).unwrap();
@@ -926,10 +926,10 @@ mod tests {
     fn a_superseded_search_stops_and_says_so() {
         let p = varied_provider(9000);
         let newest = Arc::new(AtomicU64::new(0));
-        let gate = crate::engine::QueryGate::begin_for_test(&newest);
+        let gate = crate::engine::QueryGate::begin_for_test(&newest, 1);
         assert!(p.search(&q("file"), file_score, Some(&gate)).is_some());
         // A newer search begins: this one gives up, and that is not an empty answer.
-        let _newer = crate::engine::QueryGate::begin_for_test(&newest);
+        let _newer = crate::engine::QueryGate::begin_for_test(&newest, 2);
         assert!(p.search(&q("file"), file_score, Some(&gate)).is_none());
         // A text too short to search is an answer, not a cancellation.
         assert_eq!(p.search(&q("a"), file_score, Some(&gate)).map(|r| r.len()), Some(0));
