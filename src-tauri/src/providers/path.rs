@@ -345,6 +345,12 @@ impl PathProvider {
         Self { dirs, fs, home, launcher, clipboard, ops }
     }
 
+    /// The folder's listing is out of date (something in it was deleted or
+    /// renamed): the next `unfold` reads it again and answers `reading`.
+    pub fn forget_folder(&self, folder: &Path) {
+        self.dirs.forget(&folder_key(folder));
+    }
+
     /// What the folder under a row has to show: memory only, like `query`. A
     /// folder the loader has not read yet starts its read and answers
     /// `reading`; the page asks again when the read is done. A path that is

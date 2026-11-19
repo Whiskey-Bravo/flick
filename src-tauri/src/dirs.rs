@@ -233,6 +233,12 @@ impl<T: Send + Sync + 'static> Loader<T> {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.clear();
     }
 
+    /// Forgets one key: the next `get` starts a read and answers `Pending`
+    /// instead of the old value. A read in flight finishes into nothing.
+    pub fn forget(&self, key: &str) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).slots.remove(key);
+    }
+
     /// The last value read for `key`, however old. Never starts a read.
     pub fn peek(&self, key: &str) -> Option<Arc<T>> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());

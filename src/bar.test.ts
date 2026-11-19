@@ -1043,6 +1043,21 @@ describe("mouse and menu", () => {
         expect(shownRows(after)[after.selected].id).toBe(inC.id);
       });
 
+      it("a folder read again keeps its rows while it answers reading, and the ready answer replaces them", () => {
+        const { s, fkey } = unfoldedAt(2);
+        const r = run(s, { type: "deleted", item: inB });
+        const reading: Event = { type: "unfolded", key: fkey, path: "C:/x/d/", reply: { state: "reading", rows: [], more: 0, typed: "" } };
+        const waiting = run(r.state, { type: "results", items: [dirRow] }, reading).state;
+        expect(shownRows(waiting).map((x) => x.id)).toEqual([dirRow.id, inA.id, inB.id, inC.id]);
+        // The read finished: the fold is asked again, and its ready answer drops the file.
+        const again = run(waiting, { type: "answersReady" });
+        expect(again.effects).toContainEqual({ type: "unfold", key: fkey, path: "C:/x/d/" });
+        const after = run(again.state, reply(fkey, [inA, inC])).state;
+        expect(shownRows(after).map((x) => x.id)).toEqual([dirRow.id, inA.id, inC.id]);
+        expect(shownRows(after)[after.selected].id).toBe(inC.id);
+        expect(after.unfolded[fkey].refresh).toBeUndefined();
+      });
+
       it("rename_inside_an_unfolded_folder_selects_the_renamed_row", () => {
         const { s, fkey } = unfoldedAt(1);
         const started = pick(s, "rename");

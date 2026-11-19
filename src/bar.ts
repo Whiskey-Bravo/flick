@@ -391,7 +391,7 @@ function step(s: State, e: Event): Result {
       const again = s.hidden
         ? []
         : Object.entries(s.unfolded)
-            .filter(([, f]) => f.state === "reading")
+            .filter(([, f]) => f.state === "reading" || f.refresh)
             .map(([key, f]): Effect => ({ type: "unfold", key, path: f.path }));
       const q = s.queried;
       if (s.hidden || s.rename || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s, again);
@@ -408,6 +408,8 @@ function step(s: State, e: Event): Result {
       const f = s.unfolded[e.key];
       // A folder re-read after a delete or rename inside it (`refresh`) answers too.
       if (!f || f.path !== e.path || (f.state !== "reading" && !f.refresh)) return done(s);
+      // The folder is being read again: its rows stay until the new listing is ready.
+      if (f.refresh && e.reply.state === "reading") return done(s);
       const next = { ...s, unfolded: { ...s.unfolded, [e.key]: { path: e.path, ...e.reply } } };
       // The rows below change: the selection stays on its row, a menu only on an unmoved row.
       const before = shownRows(s);

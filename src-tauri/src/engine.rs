@@ -463,8 +463,21 @@ impl Engine {
             self.ranking.forget(id);
             self.history.forget(id);
             self.moved(id, None);
+            self.listing_changed(id);
         }
         Ok(outcome)
+    }
+
+    /// What an unfolded folder shows is out of date: the folder holding `id`
+    /// (and `id` itself, when it is a folder) is read again on the next unfold.
+    fn listing_changed(&self, id: &str) {
+        let Some(path) = &self.path else { return };
+        let (own, _) = crate::providers::path::split_id(id);
+        let own = std::path::Path::new(own);
+        if let Some(parent) = own.parent() {
+            path.forget_folder(parent);
+        }
+        path.forget_folder(own);
     }
 
     /// The item `old` (a row id) now is `new`, or gone: every provider that
@@ -487,6 +500,7 @@ impl Engine {
             self.history.rename(id, &new_id);
             self.moved(id, Some(&new_id));
         }
+        self.listing_changed(id);
         Ok(new_id)
     }
 
@@ -727,6 +741,35 @@ mod tests {
         assert_eq!(ranking.boost("path", r"C:\Work\a.txt"), 0);
         assert!(history.searches().is_empty() && pins.list().is_empty());
         assert_eq!(Engine::new(Vec::new(), ranking, history, pins).unfold(r"C:\Work\").state, "missing");
+    }
+
+    #[test]
+    fn delete_makes_the_parent_folder_read_again() {
+        use crate::clipboard::FakeClipboard;
+        use crate::dirs::testing::{file, FakeFs};
+        use crate::dirs::{Loader, FRESH, SLOW};
+        use crate::launch::testing::RecordingLauncher;
+
+        let fs = Arc::new(FakeFs::default());
+        fs.add_dir(r"C:\Work", vec![file("a.txt", 10), file("b.txt", 10)]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let dirs = Loader::new(Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        }), FRESH, SLOW);
+        let path = Arc::new(PathProvider::new(dirs, fs, None, Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()), Arc::new(crate::file_ops::FakeFileOps::default())));
+        let files = FakeProvider::new("files", vec![]);
+        let (e, _, _, _, _dir) = engine_stores(vec![Box::new(files)]);
+        let e = e.with_path(path);
+        let wait = || rx.recv_timeout(std::time::Duration::from_secs(1)).expect("on_ready");
+        assert_eq!(e.unfold(r"C:\Work\").state, "reading");
+        wait();
+        assert_eq!(e.unfold(r"C:\Work\").state, "ready", "cached");
+        // After a delete the cached listing is not served: the folder is read again.
+        assert_eq!(e.act("files", r"C:\Work\a.txt", Action::Delete), Ok(Outcome::Hide));
+        assert_eq!(e.unfold(r"C:\Work\").state, "reading");
+        wait();
+        assert_eq!(e.unfold(r"C:\Work\").state, "ready");
     }
 
     /// A welcome-like provider `w` (one empty-bar row), then `a`.
