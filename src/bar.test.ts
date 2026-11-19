@@ -1038,6 +1038,24 @@ describe("mouse and menu", () => {
       expect(run(last, { type: "results", items: [a] }).state.selected).toBe(0);
     });
 
+    it("a folder read finishing before the re-query's answer keeps the selection where the deleted row was", () => {
+      // The re-query after a delete starts a background read of the folder;
+      // its `answers:ready` can reach the page before the re-query's rows do.
+      const s = run(typed(a, b, c), { type: "hover", index: 1 }).state;
+      const r = run(s, { type: "deleted", item: b }, { type: "answersReady" });
+      expect(r.state.keep).toEqual({ provider: "files", id: b.id, index: 1 });
+      // Only the newest query's answer reaches the page (main.ts drops older ones).
+      expect(r.effects.filter((e) => e.type === "query")).toEqual([{ type: "query", text: "x", scope: null, keepSelection: true }]);
+      const after = run(r.state, { type: "results", items: [a, c] }).state;
+      expect(after.selected).toBe(1);
+      // The same for a rename: the selection follows the renamed row.
+      const started = run(typed(a, b, c), { type: "hover", index: 1 }, key("Tab"), { type: "menuPick", action: "rename" });
+      const sent = run(started.state, { type: "input", text: "z.txt" }, key("Enter")).state;
+      const z = f("C:/x/z.txt", "z.txt");
+      const renamed = run(sent, { type: "renamed", id: z.id }, { type: "answersReady" }, { type: "results", items: [a, c, z] }).state;
+      expect(renamed.selected).toBe(2);
+    });
+
     describe("inside an unfolded folder", () => {
       const dirRow: Item = rich("C:/x/d/", { provider: "files", title: "d", folder: "C:/x/d/", actions: [] });
       const inA = f("C:/x/d/a.txt", "a.txt");

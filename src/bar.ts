@@ -420,7 +420,10 @@ function step(s: State, e: Event): Result {
       if (s.text.trim() === "" && !s.scope) return done(s, again);
       const sel = shownRows(s)[s.selected];
       // While typed text is still waiting for its answer, the rows are for older text.
-      const keep = sel && !s.awaiting ? keepOf(sel) : null;
+      // A keep still waiting for its re-query (after a delete or rename: where the
+      // selection lands when its row is gone or renamed) is kept, not replaced by
+      // the row that is about to go.
+      const keep = s.keep ?? (sel && !s.awaiting ? keepOf(sel) : null);
       return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }, ...again]);
     }
     case "unfolded": {

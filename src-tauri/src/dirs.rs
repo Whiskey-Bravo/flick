@@ -235,15 +235,18 @@ impl<T: Send + Sync + 'static> Loader<T> {
 
     /// Changes the value read for `key` in memory (`f` gets the old value and
     /// gives the new one), so the next `get` answers it at once instead of
-    /// `Pending`. Its age stays: it is read again when it would have been. A
-    /// read in flight finishes into nothing, as it may have started before the
+    /// `Pending`. It counts as just read: Flick made the change itself, so the
+    /// next `get` starts no read (whose `on_ready` would make the page ask
+    /// again while it still waits for the answer to its own re-query). A read
+    /// in flight finishes into nothing, as it may have started before the
     /// change. With no value read yet (or an error) the key is forgotten
     /// instead: the next `get` reads it again.
     pub fn patch(&self, key: &str, f: impl FnOnce(&T) -> T) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match state.slots.get_mut(key) {
-            Some(Slot { done: Some((Ok(value), _)), reading, .. }) => {
+            Some(Slot { done: Some((Ok(value), at)), reading, .. }) => {
                 *value = Arc::new(f(value));
+                *at = Instant::now();
                 *reading = None;
             }
             Some(_) => {
@@ -715,6 +718,18 @@ mod tests {
         l.patch("b", |_| unreachable!());
         assert_eq!(show(l.get("b", || Ok(2))), "Pending");
         wait(&rx);
+    }
+
+    #[test]
+    fn a_stale_value_once_patched_is_served_without_a_read() {
+        let (l, rx) = loader(Duration::from_millis(50), SLOW);
+        l.get("a", || Ok(1));
+        wait(&rx);
+        std::thread::sleep(Duration::from_millis(80));
+        // Stale now: a plain `get` would read again and call `on_ready`.
+        l.patch("a", |v| v + 1);
+        assert_eq!(show(l.get("a", || unreachable!())), "Ready(2)");
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "no read, no on_ready");
     }
 
     #[test]
