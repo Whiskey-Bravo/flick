@@ -233,6 +233,12 @@ impl Providers {
         cloud_roots::shared().refresh_if_due();
         // Store installs (and, without a watcher, shortcuts): a background thread.
         self.apps.refresh_on_show();
+        // The time zone may have changed while Flick ran (travel, a manual
+        // change). Read here, not on the query path: it is quick, as the zone
+        // data is built into Flick.
+        let tz = jiff::tz::TimeZone::system();
+        self.answers.set_zone(tz.clone());
+        self.timers.set_zone(tz);
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
@@ -1825,7 +1831,7 @@ mod tests {
 
     impl StatusSource for FakeStatus {
         fn battery(&self) -> Option<Battery> {
-            Some(Battery { percent: 82, charging: false, minutes_left: None })
+            Some(Battery { percent: 82, charging: false, plugged_in: false, minutes_left: None })
         }
         fn memory(&self) -> Memory {
             Memory { used: 1, total: 2 }
@@ -2157,6 +2163,9 @@ mod tests {
         fn number(&self, x: f64) -> String {
             x.to_string()
         }
+        fn group(&self) -> char {
+            ','
+        }
         fn date(&self, d: jiff::civil::Date, _long: bool) -> String {
             d.to_string()
         }
@@ -2186,6 +2195,7 @@ mod tests {
         );
         // Not an ECB currency, or none: EUR.
         assert_eq!(answers_config(&Config::default(), &Region(Some("XAF"), false)).currency, "EUR");
+        assert_eq!(answers_config(&Config::default(), &Region(Some("BGN"), false)).currency, "EUR");
         assert_eq!(answers_config(&Config::default(), &Region(None, false)).currency, "EUR");
         let set = Config {
             online: false,

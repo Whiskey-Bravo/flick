@@ -3,7 +3,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::fuzzy;
 use crate::history::History;
@@ -39,6 +39,40 @@ thread_local! {
 /// late from the newest one. 0 when called outside a query (tests).
 pub fn query_seq() -> u64 {
     CURRENT_QUERY.with(Cell::get)
+}
+
+/// What a provider's rows will copy on Enter, written by its queries. An older
+/// query that finishes after a newer one never overwrites what the newer one
+/// wrote, so Enter copies what the bar shows. Writes outside a query (number 0)
+/// always count.
+pub struct NewestQuery<T> {
+    /// The highest query number that wrote, and what it wrote.
+    inner: Mutex<(u64, T)>,
+}
+
+impl<T> NewestQuery<T> {
+    pub fn new(value: T) -> Self {
+        NewestQuery { inner: Mutex::new((0, value)) }
+    }
+
+    /// Keeps `value`, unless a newer query has already written one.
+    pub fn set(&self, value: T) {
+        let seq = query_seq();
+        let mut slot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if seq == 0 || seq >= slot.0 {
+            *slot = (seq.max(slot.0), value);
+        }
+    }
+
+    /// Replaces the value whichever query wrote it (the bar hid).
+    pub fn reset(&self, value: T) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).1 = value;
+    }
+
+    /// Reads the value.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).1)
+    }
 }
 
 /// Gives the thread's query its number while it runs.

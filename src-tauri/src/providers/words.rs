@@ -291,7 +291,10 @@ fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let decoded = rest.get(1..12.min(rest.len())).and_then(|tail| tail.find(';')).and_then(|end| {
+        // Bytes, not a str slice: byte 12 may fall inside a letter, and `;` is
+        // ASCII, so the name always ends on a letter boundary.
+        let semicolon = rest.as_bytes()[1..12.min(rest.len())].iter().position(|&b| b == b';');
+        let decoded = semicolon.and_then(|end| {
             let name = &rest[1..1 + end];
             let c = match name {
                 "amp" => Some('&'),
@@ -944,6 +947,10 @@ mod tests {
         assert_eq!(plain_text("<b>a</b> &amp;&nbsp;b\n\t c"), "a & b c");
         assert_eq!(plain_text("&lt;x&gt; &quot;q&quot; &#39;s &#228; &#xE4; &bogus; & x"), "<x> \"q\" 's ä ä &bogus; & x");
         assert_eq!(plain_text("  "), "");
+        // A letter of two bytes across byte 12 after the `&`.
+        assert_eq!(plain_text("&#39;слово"), "'слово");
+        assert_eq!(plain_text("&#39;s Grüße"), "'s Grüße");
+        assert_eq!(plain_text("&ééééééé;"), "&ééééééé;");
     }
 
     #[test]

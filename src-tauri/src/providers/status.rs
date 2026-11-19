@@ -3,9 +3,10 @@
 //! The query path reads the store's cache only; sampling happens in the background.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub use crate::clipboard::Clipboard;
+use crate::engine::NewestQuery;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 use crate::status::{StatusKind, StatusStore, StatusValue};
 
@@ -18,8 +19,8 @@ pub struct StatusProvider {
     store: Arc<StatusStore>,
     clipboard: Arc<dyn Clipboard>,
     online: AtomicBool,
-    /// Copy text of the rows of the latest query, by the `<n>` of their id.
-    copies: Mutex<Vec<String>>,
+    /// Copy text of the rows of the newest query, by the `<n>` of their id.
+    copies: NewestQuery<Vec<String>>,
 }
 
 fn kind_of(text: &str) -> Option<StatusKind> {
@@ -35,7 +36,7 @@ fn kind_of(text: &str) -> Option<StatusKind> {
 
 impl StatusProvider {
     pub fn new(store: Arc<StatusStore>, clipboard: Arc<dyn Clipboard>) -> Self {
-        StatusProvider { store, clipboard, online: AtomicBool::new(true), copies: Mutex::new(Vec::new()) }
+        StatusProvider { store, clipboard, online: AtomicBool::new(true), copies: NewestQuery::new(Vec::new()) }
     }
 
     /// Follows the `online` config key: off means the public IP is never fetched.
@@ -72,9 +73,8 @@ impl Provider for StatusProvider {
             StatusValue::Pending => vec![("Checking…".to_string(), String::new())],
             StatusValue::Lines(l) => l,
         };
-        let mut copies = self.copies.lock().unwrap();
-        copies.clear();
-        lines
+        let mut copies = Vec::with_capacity(lines.len());
+        let rows = lines
             .into_iter()
             .enumerate()
             .map(|(n, (title, copy))| {
@@ -92,12 +92,14 @@ impl Provider for StatusProvider {
                     ..Default::default()
                 }
             })
-            .collect()
+            .collect();
+        self.copies.set(copies);
+        rows
     }
 
     fn activate(&self, id: &str, _modifier: Modifier) -> Result<Outcome, String> {
         let n: usize = id.strip_prefix(PREFIX).and_then(|n| n.parse().ok()).ok_or("unknown item")?;
-        let text = self.copies.lock().unwrap().get(n).cloned().ok_or("unknown item")?;
+        let text = self.copies.with(|c| c.get(n).cloned()).ok_or("unknown item")?;
         if text.is_empty() {
             return Ok(Outcome::Keep);
         }
@@ -125,13 +127,13 @@ mod tests {
     use crate::clipboard::FakeClipboard;
     use crate::net::FakeFetch;
     use crate::status::{Battery, CpuTimes, Disk, Memory, StatusSource};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Mutex};
     use std::time::Duration;
 
     struct Src;
     impl StatusSource for Src {
         fn battery(&self) -> Option<Battery> {
-            Some(Battery { percent: 82, charging: false, minutes_left: None })
+            Some(Battery { percent: 82, charging: false, plugged_in: false, minutes_left: None })
         }
         fn memory(&self) -> Memory {
             Memory { used: 1 << 30, total: 2 << 30 }
@@ -180,6 +182,19 @@ mod tests {
         assert_eq!((r.title.as_str(), r.score, r.top, r.pinnable, r.provider), ("82%", 1000, true, false, "status"));
         assert_eq!(p.rank_key(&r.id), None);
         assert_eq!(p.activate(&r.id, Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(*clipboard.0.lock().unwrap(), vec!["82%".to_string()]);
+    }
+
+    #[test]
+    fn an_older_query_finishing_late_never_changes_what_enter_copies() {
+        use crate::engine::as_query;
+        let (p, clipboard, rx) = setup();
+        p.query(&q("battery"));
+        rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let shown = as_query(6, || p.query(&q("battery")));
+        // Query 5 (`cpu`) was typed first but runs after query 6.
+        as_query(5, || p.query(&q("cpu")));
+        assert_eq!(p.activate(&shown[0].id, Modifier::None), Ok(Outcome::Hide));
         assert_eq!(*clipboard.0.lock().unwrap(), vec!["82%".to_string()]);
     }
 

@@ -120,9 +120,10 @@ static UNITS: &[Unit] = &[
     u("week", "wk", Duration, &["wk", "week", "weeks"], 604800.0),
 ];
 
-/// EUR plus the codes in the ECB daily reference-rate file.
+/// EUR plus the codes in the ECB daily reference-rate file. BGN left it when
+/// Bulgaria took the euro (1 January 2026).
 pub const CURRENCIES: &[&str] = &[
-    "EUR", "USD", "JPY", "BGN", "CZK", "DKK", "GBP", "HUF", "PLN", "RON", "SEK", "CHF", "ISK",
+    "EUR", "USD", "JPY", "CZK", "DKK", "GBP", "HUF", "PLN", "RON", "SEK", "CHF", "ISK",
     "NOK", "TRY", "AUD", "BRL", "CAD", "CNY", "HKD", "IDR", "ILS", "INR", "KRW", "MXN", "MYR",
     "NZD", "PHP", "SGD", "THB", "ZAR",
 ];
@@ -165,15 +166,15 @@ fn currency_code(s: &str) -> Option<String> {
 }
 
 /// Splits `20 usd`, `5km`, `$20`, `20$` into the amount, the remaining unit text
-/// and a currency implied by a symbol.
-fn split_quantity(s: &str) -> Option<(f64, String, Option<&'static str>)> {
+/// and a currency implied by a symbol. `group` is the locale's thousands separator.
+fn split_quantity(s: &str, group: char) -> Option<(f64, String, Option<&'static str>)> {
     let s = s.trim();
     let first = s.chars().next()?;
     let last = s.chars().last()?;
     let (amount, rest, sym) = if let Some(code) = symbol_code(first) {
-        (parse_number(&s[first.len_utf8()..])?, String::new(), Some(code))
+        (parse_number(&s[first.len_utf8()..], group)?, String::new(), Some(code))
     } else if let Some(code) = symbol_code(last) {
-        (parse_number(&s[..s.len() - last.len_utf8()])?, String::new(), Some(code))
+        (parse_number(&s[..s.len() - last.len_utf8()], group)?, String::new(), Some(code))
     } else {
         let end = s
             .char_indices()
@@ -181,13 +182,13 @@ fn split_quantity(s: &str) -> Option<(f64, String, Option<&'static str>)> {
                 !(c.is_ascii_digit() || c == ',' || c == '.' || (i == 0 && (c == '-' || c == '+')))
             })
             .map_or(s.len(), |(i, _)| i);
-        (parse_number(&s[..end])?, s[end..].trim().to_string(), None)
+        (parse_number(&s[..end], group)?, s[end..].trim().to_string(), None)
     };
     amount.is_finite().then_some((amount, rest, sym))
 }
 
-fn ask_between(left: &str, right: &str) -> Option<Ask> {
-    let (amount, unit_text, sym) = split_quantity(left)?;
+fn ask_between(left: &str, right: &str, group: char) -> Option<Ask> {
+    let (amount, unit_text, sym) = split_quantity(left, group)?;
     if sym.is_none() {
         if let (Some(from), Some(to)) = (find_unit(&unit_text), find_unit(right)) {
             return Some(Ask::Unit { amount, from, to });
@@ -202,19 +203,20 @@ fn ask_between(left: &str, right: &str) -> Option<Ask> {
 
 /// Recognises `<n> <unit> in|to <unit>`, the same with currencies, and a bare
 /// `<n> <currency>` (converted to the home currency). `<n> in <unit>` is not an
-/// answer: `in` is the separator there, so there is no source unit.
-pub fn parse_conversion(text: &str) -> Option<Ask> {
+/// answer: `in` is the separator there, so there is no source unit. `group` is
+/// the locale's thousands separator (see [`parse_number`]).
+pub fn parse_conversion(text: &str, group: char) -> Option<Ask> {
     let lower = text.trim().to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
     for (i, t) in tokens.iter().enumerate() {
         if *t == "in" || *t == "to" {
             let (left, right) = (tokens[..i].join(" "), tokens[i + 1..].join(" "));
-            if let Some(ask) = ask_between(&left, &right) {
+            if let Some(ask) = ask_between(&left, &right, group) {
                 return Some(ask);
             }
         }
     }
-    let (amount, unit_text, sym) = split_quantity(&lower)?;
+    let (amount, unit_text, sym) = split_quantity(&lower, group)?;
     let from = match sym {
         Some(code) => code.to_string(),
         None => currency_code(&unit_text)?,
@@ -237,14 +239,14 @@ mod tests {
     use super::*;
 
     fn ans(s: &str) -> Option<f64> {
-        match parse_conversion(s) {
+        match parse_conversion(s, ',') {
             Some(Ask::Unit { amount, from, to }) => convert(amount, from, to),
             _ => None,
         }
     }
 
     fn m(s: &str) -> Option<(f64, String, Option<String>)> {
-        match parse_conversion(s) {
+        match parse_conversion(s, ',') {
             Some(Ask::Money { amount, from, to }) => Some((amount, from, to)),
             _ => None,
         }
@@ -283,6 +285,7 @@ mod tests {
         assert_eq!(m("$20"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("20 usd"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("20 xyz in eur"), None);
+        assert_eq!(m("20 bgn in eur"), None, "the euro since 2026: no ECB rate");
         assert_eq!(m("20$"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("20usd"), Some((20.0, "USD".into(), None)));
         assert_eq!(m("£5"), Some((5.0, "GBP".into(), None)));
@@ -294,7 +297,7 @@ mod tests {
     #[test]
     fn not_conversions() {
         for s in ["5 in", "in 45 days", "km", "time tokyo", "5", "", "5 in cm", "5 to"] {
-            assert!(parse_conversion(s).is_none(), "{s}");
+            assert!(parse_conversion(s, ',').is_none(), "{s}");
         }
     }
 

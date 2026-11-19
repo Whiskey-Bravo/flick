@@ -51,7 +51,8 @@ struct State<T> {
     /// The key whose job is running.
     running: Option<String>,
     /// The latest answer that is not kept (`Offline`/`Bad`, or one `keep`
-    /// turned down), told once: the next ask looks it up again.
+    /// turned down), told once: the next ask looks it up again. Dropped when
+    /// another text is asked, and a failure also when the text is forgotten.
     once: Option<(String, Result<Arc<T>, LookupError>)>,
     /// A worker thread is alive.
     worker: bool,
@@ -102,6 +103,10 @@ impl<T: Send + Sync + 'static> Lookups<T> {
     ) -> Lookup<T> {
         let mut st = self.state.lock().unwrap();
         st.latest = Some(key.to_string());
+        // A failure of another text is never told later: that text is asked anew.
+        if st.once.as_ref().is_some_and(|(k, _)| k != key) {
+            st.once = None;
+        }
         // Any answer for `key` means `key` is the latest text: nothing else may stay waiting.
         let known = st.cache.iter().find(|(k, _)| k == key).map(|(_, answer)| match answer {
             Ok(v) => Lookup::Ready(v.clone()),
@@ -137,11 +142,15 @@ impl<T: Send + Sync + 'static> Lookups<T> {
         Lookup::Waiting
     }
 
-    /// Drops the waiting key (the bar hid or the text moved on): nothing is sent for it.
+    /// Drops the waiting key (the bar hid or the text moved on): nothing is sent
+    /// for it. A failure not yet told is dropped too, so the next ask looks again.
     pub fn forget_waiting(&self) {
         let mut st = self.state.lock().unwrap();
         st.waiting = None;
         st.latest = None;
+        if st.once.as_ref().is_some_and(|(_, answer)| answer.is_err()) {
+            st.once = None;
+        }
         drop(st);
         self.wake.notify_all();
     }
@@ -170,10 +179,14 @@ impl<T: Send + Sync + 'static> Lookups<T> {
                 .unwrap_or(Err(LookupError::Bad));
             st = self.state.lock().unwrap();
             st.running = None;
+            // Forgotten while it ran (the bar hid, online off): a failure told
+            // once would only be told much later, when it may no longer hold.
+            let forgotten = st.latest.is_none();
             match out {
                 Ok(v) if (self.keep)(&v) => st.cache.push_back((key, Ok(Arc::new(v)))),
                 Ok(v) => st.once = Some((key, Ok(Arc::new(v)))),
                 Err(LookupError::NotFound) => st.cache.push_back((key, Err(LookupError::NotFound))),
+                Err(_) if forgotten => {}
                 Err(e) => st.once = Some((key, Err(e))),
             }
             while st.cache.len() > CACHE_MAX {
@@ -274,6 +287,34 @@ mod tests {
         assert!(matches!(ask(&s, "b"), Lookup::Ready(_)));
         assert!(matches!(ask(&s, "b"), Lookup::Ready(_)));
         assert_eq!(fetch.urls().len(), 3);
+    }
+
+    #[test]
+    fn a_failure_is_not_told_later_once_the_text_moved_on_or_the_bar_hid() {
+        // The text moved on after the failure arrived.
+        let fetch = Arc::new(FakeFetch::offline());
+        let (s, rx) = store(fetch.clone(), PAUSE_TEST);
+        assert!(matches!(ask(&s, "hello"), Lookup::Waiting));
+        rx.recv_timeout(WAIT).unwrap();
+        assert!(matches!(ask(&s, "other"), Lookup::Waiting));
+        assert!(matches!(ask(&s, "hello"), Lookup::Waiting), "looked up again");
+
+        // The bar hid while it ran.
+        let fetch = Arc::new(FakeFetch::offline().with_delay(PAUSE_TEST * 2));
+        let (s, rx) = store(fetch.clone(), PAUSE_TEST);
+        assert!(matches!(ask(&s, "hello"), Lookup::Waiting));
+        std::thread::sleep(PAUSE_TEST * 2);
+        s.forget_waiting();
+        rx.recv_timeout(WAIT).unwrap();
+        assert!(matches!(ask(&s, "hello"), Lookup::Waiting), "looked up again");
+
+        // The bar hid after it failed, before the failure was shown.
+        let fetch = Arc::new(FakeFetch::offline());
+        let (s, rx) = store(fetch.clone(), PAUSE_TEST);
+        assert!(matches!(ask(&s, "hello"), Lookup::Waiting));
+        rx.recv_timeout(WAIT).unwrap();
+        s.forget_waiting();
+        assert!(matches!(ask(&s, "hello"), Lookup::Waiting), "looked up again");
     }
 
     #[test]
