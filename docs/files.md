@@ -22,7 +22,7 @@ The list shows up to 50 results and scrolls. Files take at most five of every ei
 - The searched folder is your whole user folder, or the ones listed in `file_roots` in the config.
 - Hidden and system files, names starting with `.`, and build, package or tool folders (`node_modules`, `target`, `dist`, `build`, `__pycache__`, `venv`, `AppData`, `vendor`, `site-packages`, `Pods`, `bower_components`, `obj`) and Python distributions (`miniconda3`, `anaconda3`, `miniforge3`, `mambaforge`) are skipped.
 - At most 1 000 000 entries are indexed (shared equally between the folders), down to nine folder levels. More than six levels down (counted from Desktop, Documents and the like), only the exact name finds a file or folder.
-- The list is built in the background when Flick starts, kept up to date as files are added, removed or renamed, and rebuilt every 30 minutes. A file that was moved since says "file not found".
+- The list is built in the background when Flick starts, kept up to date as files are added, removed or renamed, and rebuilt in the background when something changed (at most every 30 minutes, and at least every 2 hours). A file that was moved since says "file not found".
 
 </details>
 

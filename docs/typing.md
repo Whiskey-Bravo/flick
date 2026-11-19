@@ -8,7 +8,7 @@ Everything you can type in the bar, the keys it understands, and how results are
 
 | You type | What happens | Example |
 |---|---|---|
-| Part of an app name | Opens the app (Start-menu shortcuts and Store apps) | `vsc` opens Visual Studio Code |
+| Part of an app name | Opens the app (Start-menu shortcuts and Store apps). An app you just installed shows up within seconds, a Store app the next time you open the bar | `vsc` opens Visual Studio Code |
 | Part of a file or folder name | Opens it (searches your whole user folder by default) | `invoice` |
 | A folder path (a drive, `~`, or a network share) | Lists that folder's contents; Enter opens an item | `C:\`, `~\Documents\` |
 | `dl` | The 20 newest files in your Downloads folder | `dl` |
