@@ -153,37 +153,31 @@ pub(crate) fn zip_entry_name(base: &Path, item: &Path) -> Option<String> {
 /// 100 ns ticks from 1601-01-01 (a FILETIME) to 1970-01-01.
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 
-/// A zip entry's date and time from a local time given as a FILETIME (100 ns
-/// ticks since 1601-01-01): `None` outside what a zip can hold (1980-2107).
-pub(crate) fn zip_time(local_ticks: u64) -> Option<zip::DateTime> {
-    let secs = local_ticks.checked_sub(FILETIME_UNIX_EPOCH)? / 10_000_000;
-    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
-    // Days since 1970-01-01 to a civil date (H. Hinnant's `civil_from_days`).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    let (hour, minute, second) = ((rest / 3_600) as u8, (rest / 60 % 60) as u8, (rest % 60) as u8);
-    zip::DateTime::from_date_and_time(u16::try_from(year).ok()?, month, day, hour, minute, second).ok()
+/// A zip entry's date and time from a local `SYSTEMTIME`: `None` outside what
+/// a zip can hold (1980-2107).
+pub(crate) fn zip_time(local: &windows::Win32::Foundation::SYSTEMTIME) -> Option<zip::DateTime> {
+    zip::DateTime::from_date_and_time(local.wYear, local.wMonth as u8, local.wDay as u8, local.wHour as u8, local.wMinute as u8, local.wSecond as u8).ok()
 }
 
 /// A file's modification time as a zip entry's (local time, as Explorer's
-/// zips have it); `None` when it can't be had or held.
+/// zips have it); `None` when it can't be had or held. The zone's offset is
+/// the one in force on the file's own date (daylight saving included), not
+/// today's.
 fn zip_time_of(meta: &std::fs::Metadata) -> Option<zip::DateTime> {
-    use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
     let since = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
     let ticks = FILETIME_UNIX_EPOCH + since.as_secs() * 10_000_000 + u64::from(since.subsec_nanos()) / 100;
     let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
-    let mut local = FILETIME::default();
-    // SAFETY: both point at live FILETIMEs for the call.
-    unsafe { FileTimeToLocalFileTime(&utc, &mut local) }.ok()?;
-    zip_time((u64::from(local.dwHighDateTime) << 32) | u64::from(local.dwLowDateTime))
+    let mut utc_time = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: all point at live values for the call; no time zone given means
+    // the current one, with its rules for the date in `utc_time`.
+    unsafe {
+        FileTimeToSystemTime(&utc, &mut utc_time).ok()?;
+        SystemTimeToTzSpecificLocalTime(None, &utc_time, &mut local).ok()?;
+    }
+    zip_time(&local)
 }
 
 /// Writes `file` (the new zip) holding `item` (a file, or a folder with
@@ -740,12 +734,12 @@ mod tests {
 
     #[test]
     fn zip_times_are_the_files_own() {
-        let ticks = |unix: u64| FILETIME_UNIX_EPOCH + unix * 10_000_000;
-        // 2024-02-29 13:45:30 and 1999-12-31 23:59:58.
-        assert_eq!(zip_time(ticks(1_709_214_330)), Some(zip::DateTime::from_date_and_time(2024, 2, 29, 13, 45, 30).unwrap()));
-        assert_eq!(zip_time(ticks(946_684_798)), Some(zip::DateTime::from_date_and_time(1999, 12, 31, 23, 59, 58).unwrap()));
-        assert_eq!(zip_time(ticks(0)), None, "1970: before what a zip holds");
-        assert_eq!(zip_time(0), None);
+        use windows::Win32::Foundation::SYSTEMTIME;
+        let at = |y, mo, d, h, mi, s| SYSTEMTIME { wYear: y, wMonth: mo, wDayOfWeek: 0, wDay: d, wHour: h, wMinute: mi, wSecond: s, wMilliseconds: 0 };
+        assert_eq!(zip_time(&at(2024, 2, 29, 13, 45, 30)), Some(zip::DateTime::from_date_and_time(2024, 2, 29, 13, 45, 30).unwrap()));
+        assert_eq!(zip_time(&at(1999, 12, 31, 23, 59, 58)), Some(zip::DateTime::from_date_and_time(1999, 12, 31, 23, 59, 58).unwrap()));
+        assert_eq!(zip_time(&at(1970, 1, 1, 0, 0, 0)), None, "1970: before what a zip holds");
+        assert_eq!(zip_time(&SYSTEMTIME::default()), None);
     }
 
     #[test]
