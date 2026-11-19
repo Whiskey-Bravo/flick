@@ -278,6 +278,9 @@ fn read_picture(path: &std::path::Path) -> Option<Vec<u8>> {
     picture(std::fs::read(path).ok()?)
 }
 
+/// Serialises the Shell icon calls of all icon workers.
+static SHELL: Mutex<()> = Mutex::new(());
+
 impl IconSource for ShellIcons {
     fn png(&self, key: &IconKey, px: u32) -> Option<Vec<u8>> {
         if let IconKey::File(path) = key {
@@ -285,6 +288,10 @@ impl IconSource for ShellIcons {
                 return read_picture(path);
             }
         }
+        // One at a time: two first-time lookups racing in the Shell make one
+        // of them fail (seen with two Start-menu shortcuts asked for together
+        // on the empty bar), and the page then keeps the placeholder.
+        let _one = SHELL.lock().unwrap_or_else(|e| e.into_inner());
         let _com = shell::Com::init();
         let icon = shell::icon(key, px)?;
         let drawn = shell::draw(icon, px, 0x00).zip(shell::draw(icon, px, 0xFF));
@@ -706,6 +713,27 @@ mod tests {
             let target = ShellIcons.png(&IconKey::File(notepad.clone()), px).expect("target icon");
             let shortcut = ShellIcons.png(&IconKey::File(lnk.clone()), px).expect("shortcut icon");
             assert_eq!(target, shortcut, "at {px} px the shortcut icon differs (arrow overlay?)");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn two_shortcut_icons_asked_for_at_once_both_come() {
+        // Two first-time lookups at once once made one of them fail.
+        let dir = PathBuf::from(std::env::var_os("ProgramData").expect("ProgramData")).join(r"Microsoft\Windows\Start Menu\Programs");
+        let links: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lnk")))
+            .take(2)
+            .collect();
+        assert_eq!(links.len(), 2, "two shortcuts in {}", dir.display());
+        let asks: Vec<_> = links
+            .into_iter()
+            .map(|p| std::thread::spawn(move || ShellIcons.png(&IconKey::File(p), 40).is_some()))
+            .collect();
+        for ask in asks {
+            assert!(ask.join().unwrap());
         }
     }
 }
