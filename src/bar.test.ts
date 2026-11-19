@@ -1199,6 +1199,16 @@ describe("mouse and menu", () => {
         expect(after.selected).toBe(0);
       });
 
+      it("rename_declined_in_windows_prompt_stays_in_rename_mode_with_no_error", () => {
+        const sent = run(start().state, { type: "input", text: "new.docx" }, key("Enter")).state;
+        expect(sent.pending).toBe(true);
+        const r = run(sent, { type: "renameDeclined" });
+        expect(r.effects).toEqual([]);
+        expect([r.state.rename === null, r.state.pending, r.state.error, r.state.failure, r.state.text]).toEqual([false, false, null, null, "new.docx"]);
+        // Enter tries again.
+        expect(kind(run(r.state, key("Enter")))).toEqual(["rename"]);
+      });
+
       it("typing_in_rename_mode_sends_no_query", () => {
         const r = start();
         const t = run(r.state, { type: "input", text: "q" });

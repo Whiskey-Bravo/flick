@@ -197,6 +197,7 @@ export type Event =
     }
   | { type: "failed"; message: string }
   | { type: "renamed"; id: string }
+  | { type: "renameDeclined" }
   | { type: "deleted"; item: Item }
   | { type: "queryFailed"; message: string }
   | { type: "configError"; message: string | null }
@@ -664,6 +665,10 @@ function step(s: State, e: Event): Result {
         ...again.effects,
       ]);
     }
+    case "renameDeclined":
+      // The user said No in a prompt Windows showed: nothing was renamed, no
+      // error; the name stays in the field to be changed or sent again.
+      return done({ ...s, pending: false });
     case "deleted": {
       // The file went to the Recycle Bin: ask again for the same text; the
       // selection stays at its index (the list's end clamps it).

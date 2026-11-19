@@ -174,15 +174,26 @@ pub async fn act(
     result
 }
 
-/// Renames a file or folder row; the new row id. The bar stays. The shell
+/// Renames a file or folder row; the new row id, or `None` when the user said
+/// No to a prompt of Windows' own (nothing renamed, no error). The bar stays. The shell
 /// call can block, so it runs on a blocking-pool thread.
 #[tauri::command]
-pub async fn rename(provider: String, id: String, new_name: String, state: State<'_, AppState>) -> Result<String, String> {
+pub async fn rename(provider: String, id: String, new_name: String, state: State<'_, AppState>) -> Result<Option<String>, String> {
     let engine = state.engine.clone();
-    tauri::async_runtime::spawn_blocking(move || engine.rename(&provider, &id, &new_name))
-        .await
-        .map_err(|e| format!("rename failed: {e}"))
-        .and_then(|r| r)
+    declined_as_none(
+        tauri::async_runtime::spawn_blocking(move || engine.rename(&provider, &id, &new_name))
+            .await
+            .map_err(|e| format!("rename failed: {e}"))
+            .and_then(|r| r),
+    )
+}
+
+/// A rename the user declined in Windows' prompt is no error: `None`.
+fn declined_as_none(r: Result<String, String>) -> Result<Option<String>, String> {
+    match r {
+        Err(e) if e == crate::file_ops::RENAME_DECLINED => Ok(None),
+        other => other.map(Some),
+    }
 }
 
 /// Shows Windows' own menu for a file or folder row (More options…) with its
@@ -225,6 +236,15 @@ pub fn hide(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    use super::declined_as_none;
+
+    #[test]
+    fn a_declined_rename_is_none_a_real_error_stays() {
+        assert_eq!(declined_as_none(Err(crate::file_ops::RENAME_DECLINED.into())), Ok(None));
+        assert_eq!(declined_as_none(Err("Couldn't rename a".into())), Err("Couldn't rename a".to_string()));
+        assert_eq!(declined_as_none(Ok("C:b".into())), Ok(Some("C:b".to_string())));
+    }
+
     use super::*;
     use crate::launch;
 

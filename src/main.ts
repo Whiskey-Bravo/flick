@@ -5,7 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
 import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
-import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
+import { builtinName, fallbackName, forgetFailedIcons, pickIconSrc, serverUrl } from "./icons";
 import {
   actionFailureText, arrowActsOnList, sideActs, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
   panelItem, queryArgs, queryReply, retryArgs, shownRows as allRows, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type Row, type State,
@@ -580,9 +580,10 @@ function run(effect: Effect) {
     }
     case "rename": {
       const at = shows;
-      invoke<string>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
+      invoke<string | null>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
         .then((id) => {
-          if (at === shows) dispatch({ type: "renamed", id });
+          // null: the user said No to a prompt of Windows' own.
+          if (at === shows) dispatch(id === null ? { type: "renameDeclined" } : { type: "renamed", id });
         })
         .catch((err) => {
           if (at === shows) dispatch({ type: "failed", message: actionFailureText(effect.item, "rename", err) });
@@ -738,6 +739,7 @@ const listenFailed = (err: unknown) => dispatch({ type: "failed", message: `Even
 
 const afterShow = (event: Event) => {
   const handled = performance.now();
+  forgetFailedIcons(failedIcons); // a failed icon is asked for again
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
   jumpNext = true; // nothing glides in from where it was when the bar closed
