@@ -39,7 +39,7 @@ export function panelItem(s: State): Item | null {
 }
 
 // An unfolded folder: what the back end answered for it, and the path it was asked for.
-export type Fold = { path: string; state: "reading" | "ready" | "missing" | "denied"; rows: Item[]; more: number; typed: string };
+export type Fold = { path: string; state: "reading" | "ready" | "missing" | "denied"; rows: Item[]; more: number; typed: string; refresh?: { provider: string; id: string | null } };
 // A row as shown: a result, or a row inside an unfolded folder. `chain` is the
 // key of the folder row it is inside ("" for a result), so the same folder
 // shown twice is two rows; `key` is its identity among the shown rows.
@@ -90,6 +90,13 @@ const plain = (row: Row): Item => {
   const { depth, chain, key, fold, parent, ...item } = row;
   return item;
 };
+// The folder `chain` (a row's chain) re-read: its rows stay shown until the
+// answer comes; `land` is the row the selection goes to when it arrives.
+function rereadFold(s: State, chain: string, land: { provider: string; id: string | null }): { unfolded: State["unfolded"]; effects: Effect[] } {
+  const f = chain === "" ? undefined : s.unfolded[chain];
+  if (!f || f.state !== "ready") return { unfolded: s.unfolded, effects: [] };
+  return { unfolded: { ...s.unfolded, [chain]: { ...f, refresh: land } }, effects: [{ type: "unfold", key: chain, path: f.path }] };
+}
 // The folds still shown over these results: one whose folder row is gone goes,
 // and every fold under it with it. The same object when nothing goes.
 function foldsShown(items: Item[], unfolded: Record<string, Fold>): Record<string, Fold> {
@@ -141,7 +148,7 @@ export type State = {
   kept: boolean; // `items` are the last show's empty-bar rows, on screen until the fresh ones arrive
   tabCompletion: boolean; // the "Tab completion" setting: a grey preview, and no highlight until the rows are moved through
   unfolded: Record<string, Fold>; // the unfolded folders, by their row's key
-  rename: { item: Item; before: { text: string; selected: number; top: number } } | null; // the row being renamed in the bar, and what to restore
+  rename: { item: Item; chain: string; before: { text: string; selected: number; top: number } } | null; // the row being renamed in the bar, and what to restore
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -399,13 +406,15 @@ function step(s: State, e: Event): Result {
       // still being read: a folded folder, changed text or a closed bar drop it,
       // and a late "reading" never undoes an answer.
       const f = s.unfolded[e.key];
-      if (!f || f.path !== e.path || f.state !== "reading") return done(s);
+      // A folder re-read after a delete or rename inside it (`refresh`) answers too.
+      if (!f || f.path !== e.path || (f.state !== "reading" && !f.refresh)) return done(s);
       const next = { ...s, unfolded: { ...s.unfolded, [e.key]: { path: e.path, ...e.reply } } };
       // The rows below change: the selection stays on its row, a menu only on an unmoved row.
       const before = shownRows(s);
       const after = shownRows(next);
       const was = before[s.selected];
-      const at = was ? after.findIndex((r) => r.key === was.key) : -1;
+      const land = f.refresh?.id ? after.findIndex((r) => r.chain === e.key && r.provider === f.refresh?.provider && r.id === f.refresh.id) : -1;
+      const at = land >= 0 ? land : was ? after.findIndex((r) => r.key === was.key) : -1;
       const m = s.menu;
       const menu = m && before[m.index]?.key === after[m.index]?.key ? m : null;
       return done(fit({ ...next, selected: at >= 0 ? at : s.selected, menu }));
@@ -493,7 +502,7 @@ function step(s: State, e: Event): Result {
           if (s.pending) return done(closed);
           const before = { text: s.text, selected: m.index, top: s.top };
           const [start, end] = nameSelection(item.title, item.id.endsWith("\\"));
-          return done({ ...closed, selected: m.index, rename: { item, before }, text: item.title, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
+          return done({ ...closed, selected: m.index, rename: { item, chain: row.chain, before }, text: item.title, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
         }
         default:
           if (s.pending) return done(closed);
@@ -615,18 +624,27 @@ function step(s: State, e: Event): Result {
           { type: "query", text: s.text, scope: s.scope?.name ?? null, keepSelection: true },
         ]);
       }
-      const keep = { provider: r.item.provider, id: e.id, index: r.before.selected };
+      const keep = { provider: r.item.provider, id: e.id, index: r.before.selected, ...(r.chain === "" ? {} : { chain: r.chain }) };
       const left = leaveRename(s);
-      return done(fit({ ...left, pending: false, failure: null, error: s.configError, keep }), [
+      const again = rereadFold(left, r.chain, { provider: r.item.provider, id: e.id });
+      return done(fit({ ...left, unfolded: again.unfolded, pending: false, failure: null, error: s.configError, keep }), [
         { type: "query", text: left.text, scope: s.scope?.name ?? null, keepSelection: true },
+        ...again.effects,
       ]);
     }
     case "deleted": {
       // The file went to the Recycle Bin: ask again for the same text; the
       // selection stays at its index (the list's end clamps it).
-      const keep = { provider: e.item.provider, id: e.item.id, index: s.selected };
-      return done({ ...s, pending: false, armed: null, armedAction: null, menu: null, keep }, [
+      // A row inside an unfolded folder: that folder is read again too.
+      const rows = shownRows(s);
+      const sel = rows[s.selected];
+      const row = sel && sel.provider === e.item.provider && sel.id === e.item.id ? sel : rows.find((r) => r.provider === e.item.provider && r.id === e.item.id);
+      const chain = row?.chain ?? "";
+      const keep = { provider: e.item.provider, id: e.item.id, index: s.selected, ...(chain === "" ? {} : { chain }) };
+      const again = rereadFold(s, chain, { provider: e.item.provider, id: null });
+      return done({ ...s, unfolded: again.unfolded, pending: false, armed: null, armedAction: null, menu: null, keep }, [
         { type: "query", text: s.text, scope: s.scope?.name ?? null, keepSelection: true },
+        ...again.effects,
       ]);
     }
     case "queryFailed":

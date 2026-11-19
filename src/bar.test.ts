@@ -1014,6 +1014,51 @@ describe("mouse and menu", () => {
       expect(run(last, { type: "results", items: [a] }).state.selected).toBe(0);
     });
 
+    describe("inside an unfolded folder", () => {
+      const dirRow: Item = rich("C:/x/d/", { provider: "files", title: "d", folder: "C:/x/d/", actions: [] });
+      const inA = f("C:/x/d/a.txt", "a.txt");
+      const inB = f("C:/x/d/b.txt", "b.txt");
+      const inC = f("C:/x/d/c.txt", "c.txt");
+      // The folder d unfolded over [a, b, c]; the selection on `at` (a row inside).
+      const unfoldedAt = (at: number) => {
+        let s = typed(dirRow);
+        s = run(s, { type: "key", key: "ArrowRight", ctrl: false, shift: false }).state;
+        const fkey = shownRows(s)[0].key;
+        s = run(s, { type: "unfolded", key: fkey, path: "C:/x/d/", reply: { state: "ready", rows: [inA, inB, inC], more: 0, typed: "" } }).state;
+        return { s: run(s, { type: "hover", index: at }).state, fkey };
+      };
+      const reply = (fkey: string, rows: Item[]): Event => ({ type: "unfolded", key: fkey, path: "C:/x/d/", reply: { state: "ready", rows, more: 0, typed: "" } });
+
+      it("delete_inside_an_unfolded_folder_refreshes_that_folder", () => {
+        const { s, fkey } = unfoldedAt(2);
+        expect(shownRows(s)[2].id).toBe(inB.id);
+        const r = run(s, { type: "deleted", item: inB });
+        expect(r.effects).toEqual([
+          { type: "query", text: "x", scope: null, keepSelection: true },
+          { type: "unfold", key: fkey, path: "C:/x/d/" },
+        ]);
+        // The folder answers without the deleted file: its place is taken by the next row.
+        const after = run(r.state, { type: "results", items: [dirRow] }, reply(fkey, [inA, inC])).state;
+        expect(shownRows(after).map((x) => x.id)).toEqual([dirRow.id, inA.id, inC.id]);
+        expect(shownRows(after)[after.selected].id).toBe(inC.id);
+      });
+
+      it("rename_inside_an_unfolded_folder_selects_the_renamed_row", () => {
+        const { s, fkey } = unfoldedAt(1);
+        const started = pick(s, "rename");
+        const sent = run(started.state, { type: "input", text: "z.txt" }, key("Enter")).state;
+        const ok = run(sent, { type: "renamed", id: "C:/x/d/z.txt" });
+        expect(ok.effects).toEqual([
+          { type: "query", text: "x", scope: null, keepSelection: true },
+          { type: "unfold", key: fkey, path: "C:/x/d/" },
+        ]);
+        const z = f("C:/x/d/z.txt", "z.txt");
+        const after = run(ok.state, { type: "results", items: [dirRow] }, reply(fkey, [inB, inC, z])).state;
+        expect(shownRows(after).map((x) => x.id)).not.toContain(inA.id);
+        expect(shownRows(after)[after.selected].id).toBe(z.id);
+      });
+    });
+
     describe("rename", () => {
       const start = (items: Item[] = [a, c], index = 1) => {
         const s = run(typed(...items), { type: "hover", index }).state;
