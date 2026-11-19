@@ -16,6 +16,12 @@ use windows::Win32::Globalization::{
 ///
 /// Both kinds present: the last one is the decimal, the other kind groups in threes.
 pub fn parse_number(s: &str, group: char) -> Option<f64> {
+    plain_number(s, group)?.parse().ok()
+}
+
+/// The typed number `s` (read as [`parse_number`] does) in Rust's own form:
+/// no grouping, `.` as the decimal point, `-` for a negative one.
+pub fn plain_number(s: &str, group: char) -> Option<String> {
     let s = s.trim();
     let (neg, body) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -56,8 +62,7 @@ pub fn parse_number(s: &str, group: char) -> Option<f64> {
         }
         _ => return None,
     };
-    let v: f64 = normalized.parse().ok()?;
-    Some(if neg { -v } else { v })
+    Some(if neg { format!("-{normalized}") } else { normalized })
 }
 
 /// Digit runs split at a grouping separator: the first has one to three

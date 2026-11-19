@@ -1,6 +1,6 @@
 //! Calculator for quick answers: a small recursive-descent parser.
 
-use super::number::parse_number;
+use super::number::plain_number;
 
 /// A successful calculation: the value and the normalised expression for display.
 #[derive(Debug, Clone, PartialEq)]
@@ -42,7 +42,8 @@ fn tokenize(text: &str, group: char) -> Option<Vec<Tok>> {
                 i += 1;
             }
             let s: String = chars[start..i].iter().collect();
-            let mut v = parse_number(&s, group)?;
+            let mantissa = plain_number(&s, group)?;
+            let mut v: f64 = mantissa.parse().ok()?;
             // Scientific notation: `2e3`, `1,5e-3` (no spaces) is one number literal.
             if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
                 let mut j = i + 1;
@@ -56,7 +57,9 @@ fn tokenize(text: &str, group: char) -> Option<Vec<Tok>> {
                 if j > digits {
                     let exp: String = chars[i + 1..j].iter().collect();
                     let mant = v;
-                    v *= 10f64.powi(exp.parse::<i32>().ok()?);
+                    // Read as one literal: exactly rounded, and `12345e-320` or
+                    // `0.001e310` fit although 10^-320 and 10^310 do not.
+                    v = format!("{mantissa}e{exp}").parse().ok()?;
                     // Overflow to inf, or underflow of a nonzero mantissa to 0, is no number.
                     if !v.is_finite() || (v == 0.0 && mant != 0.0) {
                         return None;
@@ -437,6 +440,12 @@ mod tests {
         assert_eq!(v("2e3*2"), Some(4000.0));
         assert_eq!(v("1,5e3 + 0"), Some(1500.0));
         assert_eq!(v("2e-3*1000"), Some(2.0));
+        // Exactly rounded, and fine where 10^exp alone is out of range.
+        assert_eq!(v("1e23*1"), Some(1e23));
+        assert_eq!(v("12345e-320*1"), Some(12345e-320));
+        assert_eq!(v("0.001e310*1"), Some(1e307));
+        assert_eq!(v("1,5e+3*1"), Some(1500.0));
+        assert!(evaluate("1e999999999999*1").is_none(), "overflow still rejected");
         assert!((v("2pi").unwrap() - std::f64::consts::TAU).abs() < 1e-12);
         assert_eq!(v("2(3+1)"), Some(8.0));
         assert_eq!(v("(1+1)(2)"), Some(4.0));
