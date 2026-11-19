@@ -162,7 +162,7 @@ export type Event =
   | { type: "tick" }
   | { type: "liveRowResult"; item: Item }
   | { type: "updateChanged" }
-  | { type: "input"; text: string }
+  | { type: "input"; text: string; composing?: boolean }
   | { type: "results"; items: Item[] }
   | { type: "past"; items: string[] }
   | { type: "hover"; index: number }
@@ -484,7 +484,7 @@ function step(s: State, e: Event): Result {
       // the bar switches to that folder's path, followed by what was added.
       const row = shownRows(s)[s.selected];
       const f = row && row.parent !== null && s.scope === null ? s.unfolded[row.parent] : undefined;
-      const text = f && e.text.length > s.text.length && e.text.startsWith(s.text) ? typedOf(f) + e.text.slice(s.text.length) : e.text;
+      const text = f && !e.composing && e.text.length > s.text.length && e.text.startsWith(s.text) ? typedOf(f) + e.text.slice(s.text.length) : e.text;
       return done(
         fit({
           ...s,
@@ -711,6 +711,16 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
 // Right and Left (and the chevron) are ignored while a menu is open, a row is
 // armed, older results are awaited, an activation is pending, or a panel shows.
 const foldBlocked = (s: State): boolean => s.menu !== null || s.armed !== null || s.awaiting || s.pending || panelItem(s) !== null;
+
+// True exactly when Right or Left would change something; otherwise the key is
+// left to the text field (the caret moves).
+export function sideActs(s: State, right: boolean): boolean {
+  if (foldBlocked(s)) return false;
+  const row = shownRows(s)[s.selected];
+  if (!row) return false;
+  if (right) return row.fold !== "none" || (row.depth > 0 && row.provider === "fold" && row.id === "more");
+  return row.fold === "unfolded" || row.parent !== null;
+}
 
 // Right unfolds a folded folder (the selection stays), steps into an unfolded
 // one, or opens "N more…". Left folds an unfolded folder with everything

@@ -359,11 +359,6 @@ impl Provider for PathProvider {
             example: r"C:\ / ~\Documents\".into(),
             about: "browse a folder by typing its path; Tab completes a name".into(),
             fill: r"~\".into(),
-        },
-        HelpLine {
-            example: "Right / Left".into(),
-            about: "Unfold or fold the selected folder".into(),
-            fill: String::new(),
         }]
     }
 }
@@ -857,10 +852,7 @@ mod tests {
         assert_eq!(help[0].example, r"C:\ / ~\Documents\");
         assert_eq!(help[0].about, "browse a folder by typing its path; Tab completes a name");
         assert_eq!(help[0].fill, r"~\");
-        assert_eq!(help.len(), 2);
-        assert_eq!(help[1].example, "Right / Left");
-        assert_eq!(help[1].about, "Unfold or fold the selected folder");
-        assert_eq!(help[1].fill, "");
+        assert_eq!(help.len(), 1);
         assert!(r.p.empty_query().is_empty());
         assert_eq!(r.p.route(), None);
         assert_eq!(r.p.name(), "path");

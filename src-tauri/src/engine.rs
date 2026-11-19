@@ -407,6 +407,7 @@ impl Engine {
             HelpLine { example: "Ctrl+P".into(), about: "pin or unpin the selected row".into(), fill: String::new() },
             HelpLine { example: "Up".into(), about: "recall past searches (empty bar)".into(), fill: String::new() },
             HelpLine { example: "Tab".into(), about: "show the actions for the selected row".into(), fill: String::new() },
+            HelpLine { example: "Right / Left".into(), about: "unfold or fold the selected folder".into(), fill: String::new() },
         ];
         self.providers
             .iter()
@@ -1335,7 +1336,7 @@ mod tests {
     fn help_word_ignores_case() {
         let (e, _dir) = help_engine();
         let all = e.query("Help", None);
-        assert_eq!(all.len(), 8);
+        assert_eq!(all.len(), 9);
         assert!(all.iter().all(|i| i.provider == HELP));
         let r = e.query("HELP blue", None);
         assert_eq!(r.len(), 1);
@@ -1479,10 +1480,10 @@ mod tests {
         let (e, _dir) = help_engine();
         let r = e.query("help", None);
         let titles: Vec<_> = r.iter().map(|i| i.title.as_str()).collect();
-        assert_eq!(titles, ["blender", "bluetooth", "> ls", "help", "Esc", "Ctrl+P", "Up", "Tab"]);
+        assert_eq!(titles, ["blender", "bluetooth", "> ls", "help", "Esc", "Ctrl+P", "Up", "Tab", "Right / Left"]);
         assert!(r.iter().all(|i| i.provider == HELP && !i.confirm));
         let scores: Vec<_> = r.iter().map(|i| i.score).collect();
-        assert_eq!(scores, [1000, 999, 998, 997, 996, 995, 994, 993]);
+        assert_eq!(scores, [1000, 999, 998, 997, 996, 995, 994, 993, 992]);
         assert_eq!(r[2].id, "> ");
         assert_eq!(r[2].subtitle, "run a command");
         assert_eq!(r[3].subtitle, "show this list");

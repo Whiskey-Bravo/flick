@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { arrowActsOnList, completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
+import { arrowActsOnList, sideActs, completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -1683,6 +1683,46 @@ describe("folder unfolding", () => {
       const r = run(s, { type: "input", text: "projf" });
       expect(r.state.text).toBe("projf");
       expect(r.effects).toEqual([{ type: "query", text: "projf", scope: "web" }]);
+    });
+
+    it("review_fix_composing_input_inside_is_ordinary_text_until_it_ends", () => {
+      const composing = run(at(tree(), 2), { type: "input", text: "projf", composing: true });
+      expect([composing.state.text, composing.state.unfolded]).toEqual(["projf", {}]);
+      expect(composing.effects).toEqual([{ type: "query", text: "projf", scope: null }]);
+      const done = run(at(tree(), 2), { type: "input", text: "projf", composing: false });
+      expect(done.state.text).toBe("~\\Documents\\Projects\\f");
+    });
+  });
+
+  describe("sideActs", () => {
+    it("is_true_exactly_where_right_or_left_would_act", () => {
+      const s = tree(); // D (unfolded), sub (folded), f.txt, b
+      expect(sideActs(at(s, 0), true)).toBe(true); // unfolded folder
+      expect(sideActs(at(s, 0), false)).toBe(true);
+      expect(sideActs(at(s, 1), true)).toBe(true); // folded folder inside
+      expect(sideActs(at(s, 1), false)).toBe(true); // row with a parent
+      expect(sideActs(at(s, 2), true)).toBe(false); // a file inside
+      expect(sideActs(at(s, 2), false)).toBe(true);
+      expect(sideActs(at(s, 3), true)).toBe(false); // any other row
+      expect(sideActs(at(s, 3), false)).toBe(false);
+      expect(sideActs(at(typedIn("proj", D), 0), true)).toBe(true); // folded result
+      expect(sideActs(at(typedIn("proj", D), 0), false)).toBe(false);
+      const more = open(typedIn("proj", D), kD, fold("C:\\D\\", ready([entry("x")], 4)));
+      expect(sideActs(at(more, 2), true)).toBe(true); // the more row
+      expect(sideActs(at(more, 2), false)).toBe(true);
+      expect(sideActs(at(open(typedIn("proj", D), kD, reading("C:\\D\\")), 1), true)).toBe(false); // Reading
+      expect(sideActs({ ...typedIn("proj"), selected: 0 }, true)).toBe(false); // no rows
+    });
+
+    it("is_false_in_every_blocked_state", () => {
+      const s = at(tree(), 0);
+      expect(sideActs(s, true)).toBe(true);
+      const menu = run(s, { type: "menu", index: 0 }).state;
+      expect(sideActs(menu, true)).toBe(false);
+      expect(sideActs({ ...s, armed: "b" }, true)).toBe(false);
+      expect(sideActs({ ...s, awaiting: true }, true)).toBe(false);
+      expect(sideActs({ ...s, pending: true }, true)).toBe(false);
+      expect(sideActs(typedIn("qr x", { ...D, panel: "<svg/>" }), true)).toBe(false);
     });
   });
 

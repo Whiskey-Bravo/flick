@@ -7,7 +7,7 @@ import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
-  arrowActsOnList, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
+  arrowActsOnList, sideActs, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
   panelItem, queryArgs, queryReply, retryArgs, shownRows as allRows, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type Row, type State,
 } from "./bar";
 
@@ -125,6 +125,8 @@ const failedIcons = new Set<string>();
 function renderIcon(item: Item): HTMLSpanElement {
   const box = document.createElement("span");
   box.className = "icon";
+  // The page's own rows (Reading…, N more…) have no picture: an empty box keeps the layout.
+  if (item.provider === "fold") return box;
   const img = document.createElement("img");
   img.alt = "";
   img.draggable = false;
@@ -331,7 +333,7 @@ function renderMenu() {
       at = { x: box.left + 12, y: box.top + 12 };
     } else if (li) {
       const box = li.getBoundingClientRect();
-      at = { x: box.left + (icon?.offsetWidth ?? 0), y: box.bottom };
+      at = { x: icon ? icon.getBoundingClientRect().right : box.left, y: box.bottom };
     }
   }
   // Flip up / shift left when the menu would run past the window edge.
@@ -558,7 +560,9 @@ function run(effect: Effect) {
   }
 }
 
-input.addEventListener("input", () => dispatch({ type: "input", text: input.value }));
+input.addEventListener("input", (e) => dispatch({ type: "input", text: input.value, composing: (e as InputEvent).isComposing }));
+// The composed text is final now: let the reducer treat it as ordinary typing.
+input.addEventListener("compositionend", () => dispatch({ type: "input", text: input.value, composing: false }));
 
 const KEYS = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape", "F1", "p", "Tab"] as const;
 // Browser defaults that make no sense in a launcher: focus change, help, reload, print, find.
@@ -601,7 +605,10 @@ input.addEventListener("keydown", (e) => {
   // Left and Right move the caret unless it sits at the end of the text.
   if (
     (key === "ArrowLeft" || key === "ArrowRight") &&
-    !arrowActsOnList(key, input.selectionStart, input.selectionEnd, input.value.length, e.ctrlKey || e.shiftKey || e.altKey || e.metaKey)
+    !(
+      arrowActsOnList(key, input.selectionStart, input.selectionEnd, input.value.length, e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) &&
+      sideActs(state, key === "ArrowRight")
+    )
   )
     return;
   e.preventDefault();
@@ -655,7 +662,7 @@ document.addEventListener("click", (e) => {
   }
   const index = rowIndex(e);
   if (index !== null && target.closest(".chevron")) {
-    dispatch({ type: "fold", index });
+    dispatch(state.menu ? { type: "menuClose" } : { type: "fold", index });
     return;
   }
   if (index !== null) dispatch({ type: "click", index, ctrl: e.ctrlKey, shift: e.shiftKey });

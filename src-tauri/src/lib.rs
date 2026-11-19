@@ -2346,7 +2346,6 @@ mod tests {
                 "close chrome / quit all",
                 "report.pdf",
                 r"C:\ / ~\Documents\",
-                "Right / Left",
                 "dl",
                 "recent",
                 "v / v invoice",
@@ -2382,9 +2381,10 @@ mod tests {
                 "Ctrl+P",
                 "Up",
                 "Tab",
+                "Right / Left",
             ]
         );
-        let flick = &help[38];
+        let flick = &help[37];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
