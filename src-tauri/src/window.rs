@@ -285,6 +285,10 @@ fn show_as(app: &AppHandle, shown: Shown, mut steps: crate::timing::Steps) {
         take_backdrop(app, &w);
     }
     steps.step("backdrop");
+    // Before the bar is on screen: its WebView is told to use normal memory
+    // again, but only if it was told to use less. Usually one short lock.
+    crate::webview_memory::shown(app);
+    steps.step("webview_normal");
     reveal_window(&w, &mut steps);
     let _ = match shown {
         Shown::Fresh => app.emit_to(LABEL, "bar:shown", ()),
@@ -432,6 +436,9 @@ pub fn hide(app: &AppHandle) {
     crate::taskbar::lower(app);
     // The picture of what was behind the bar is held only while it is open.
     crate::backdrop::clear();
+    // After the window is gone: the WebView gives its memory back once the
+    // bar has stayed hidden for a while.
+    crate::webview_memory::hidden(app);
 }
 
 /// Hide on focus loss; turn close requests (Alt+F4) into hides so the window

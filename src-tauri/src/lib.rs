@@ -38,6 +38,7 @@ mod settings;
 mod settings_window;
 mod status;
 mod updates;
+mod webview_memory;
 mod taskbar;
 mod theme;
 mod timing;
@@ -1217,6 +1218,8 @@ fn setup(app: &AppHandle) {
     updates::start_scheduler(app);
 
     window::install_handlers(app);
+    // The bar starts hidden: the WebView's memory is given back after a while.
+    webview_memory::start(app);
 
     let keys = Arc::new(DirectKeys::new(Arc::new(PluginKeys::new(app.clone(), on_direct_press))));
     app.manage(keys.clone());

@@ -1085,6 +1085,7 @@ dependencies = [
  "tempfile",
  "toml 0.8.2",
  "toml_edit 0.25.19+spec-1.1.0",
+ "webview2-com",
  "windows 0.61.3",
 ]
 
