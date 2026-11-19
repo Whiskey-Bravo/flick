@@ -71,9 +71,10 @@ pub fn apply(app: &AppHandle, accelerator: &str) -> Result<(), String> {
     }
 }
 
+/// The Shortcut for the bar hotkey, read from its normalized spelling like the
+/// direct keys (`Win` as `super`, modifiers first). The error keeps the user's text.
 fn parse(accelerator: &str) -> Result<Shortcut, String> {
-    accelerator
-        .trim()
+    crate::config::normalize_combo(accelerator)
         .parse::<Shortcut>()
         .map_err(|_| format!("hotkey \"{accelerator}\" is not a valid shortcut"))
 }
@@ -150,5 +151,13 @@ mod tests {
         for s in ["Alt+Space", "Ctrl+Shift+K", "F5", "Ctrl+Alt+Super+F12", "Alt+F1", "Ctrl+Alt+Shift+Super+F24"] {
             assert!(parse(s).is_ok(), "{s} should parse");
         }
+    }
+
+    #[test]
+    fn hand_edited_spellings_parse_like_direct_keys() {
+        for s in ["Win+Space", "Space+Alt", "meta+k", "Win+Shift+K", "cmd+e"] {
+            assert!(parse(s).is_ok(), "{s} should parse");
+        }
+        assert_eq!(parse("Win+Spcae"), Err("hotkey \"Win+Spcae\" is not a valid shortcut".to_string()));
     }
 }
