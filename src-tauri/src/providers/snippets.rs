@@ -10,14 +10,12 @@ use crate::config::SnippetDef;
 use crate::dirs::one_line;
 use crate::fuzzy;
 use crate::paste::Sequence;
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
+use crate::provider::{own_name_score, HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
 
 const NAME: &str = "snippets";
 const ICON: &str = "builtin:clipboard";
 /// The word that lists every snippet.
 pub const LIST_WORD: &str = "snippets";
-/// Above a plain name match elsewhere, like a shortcut: you named it yourself.
-const BONUS: u32 = 50;
 /// Characters of the text shown under the name.
 const PREVIEW: usize = 90;
 const GONE: &str = "That snippet is gone.";
@@ -76,7 +74,7 @@ impl Provider for SnippetsProvider {
             return defs.iter().enumerate().map(|(i, d)| row(d, 2000u32.saturating_sub(i as u32))).collect();
         }
         let mut rows: Vec<ResultItem> =
-            defs.iter().filter_map(|d| fuzzy::score(text, &d.name).map(|s| row(d, s + BONUS))).collect();
+            defs.iter().filter_map(|d| fuzzy::score(text, &d.name).map(|s| row(d, own_name_score(s)))).collect();
         rows.sort_by(|a, b| b.score.cmp(&a.score));
         rows
     }
@@ -129,6 +127,14 @@ mod tests {
 
     fn q(text: &str) -> Query {
         Query { text: text.into(), scope: None }
+    }
+
+    #[test]
+    fn its_whole_name_puts_the_snippet_above_an_open_window_that_starts_with_it() {
+        let (p, _) = setup();
+        let window = fuzzy::score("sig", "Signal").unwrap() + crate::providers::windows::WINDOW_BONUS + 300;
+        assert!(p.query(&q("sig"))[0].score > window);
+        assert_eq!(p.query(&q("addr"))[0].score, 900 + 50, "part of a name: as before");
     }
 
     #[test]
