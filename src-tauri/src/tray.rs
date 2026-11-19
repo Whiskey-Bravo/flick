@@ -113,6 +113,15 @@ fn set_start_at_login(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     });
 }
 
+/// Takes the icon out of the notification area, or puts it back. Used while
+/// the updater starts the installer, which may still fail. Waits for the main
+/// thread, so call it with no lock held. No-op until the tray exists.
+pub fn set_visible(app: &AppHandle, visible: bool) {
+    if let Some(tray) = app.tray_by_id(TRAY_ID) {
+        let _ = tray.set_visible(visible);
+    }
+}
+
 /// Puts the tray's "Start at login" check mark on `on`, on the main thread.
 /// No-op until the tray exists.
 pub fn set_login_checked(app: &AppHandle, on: bool) {

@@ -7,6 +7,7 @@
 //! can't be registered. Never both at once.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::Win32::System::TaskScheduler::{
@@ -89,7 +90,36 @@ pub fn is_enabled(s: &dyn LoginStart) -> bool {
 /// the task can't be registered) or off (both removed). Returns whether it
 /// is on afterwards.
 pub fn set(s: &dyn LoginStart, on: bool, exe: &Path) -> bool {
+    set_asked(s, on, exe, &ASKS, ASKS.ask())
+}
+
+/// Numbers the asks to switch Start at login. Threads waiting for `CHANGE`
+/// may get it in any order, so only the latest ask is carried out.
+#[derive(Default)]
+struct Asks(AtomicU64);
+
+impl Asks {
+    /// The number of a new ask, taken before waiting for `CHANGE`.
+    fn ask(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Whether no ask came after `ticket`.
+    fn latest(&self, ticket: u64) -> bool {
+        self.0.load(Ordering::SeqCst) == ticket
+    }
+}
+
+/// The asks of the tray toggle and the Settings switch.
+static ASKS: Asks = Asks(AtomicU64::new(0));
+
+/// `set` for ask `ticket`. A newer ask was made while this one waited for the
+/// lock (two quick clicks): it only reads the state back, so the last click wins.
+fn set_asked(s: &dyn LoginStart, on: bool, exe: &Path, asks: &Asks, ticket: u64) -> bool {
     let _change = CHANGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !asks.latest(ticket) {
+        return is_enabled(s);
+    }
     set_locked(s, on, exe)
 }
 
@@ -223,10 +253,7 @@ mod real {
     };
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-    use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
-        COINIT_DISABLE_OLE1DDE,
-    };
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
     use windows::Win32::System::Registry::{
         RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_ANY, RRF_RT_REG_BINARY,
     };
@@ -237,26 +264,7 @@ mod real {
     use windows::Win32::System::Variant::VARIANT;
 
     use super::*;
-
-    /// COM on the calling thread for the life of the guard. A thread already
-    /// in another apartment keeps it (and COM still works there).
-    struct Com(bool);
-
-    impl Com {
-        fn init() -> Com {
-            // SAFETY: no pointers; balanced by Drop when it succeeded.
-            Com(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok())
-        }
-    }
-
-    impl Drop for Com {
-        fn drop(&mut self) {
-            if self.0 {
-                // SAFETY: pairs a successful CoInitializeEx on this thread.
-                unsafe { CoUninitialize() };
-            }
-        }
-    }
+    use crate::launch::with_com;
 
     fn err(what: &str, e: windows::core::Error) -> String {
         format!("{what}: {}", e.message())
@@ -304,7 +312,7 @@ mod real {
     /// The Task Scheduler on this PC, connected as this user.
     fn service() -> Result<ITaskService, String> {
         // SAFETY: plain COM calls on a thread with COM initialised (callers
-        // hold a Com guard); empty VARIANTs mean "this PC, this user".
+        // run inside `with_com`); empty VARIANTs mean "this PC, this user".
         unsafe {
             let service: ITaskService =
                 CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).map_err(|e| err("Task Scheduler", e))?;
@@ -320,7 +328,11 @@ mod real {
     }
 
     pub fn task_path() -> Result<Option<PathBuf>, String> {
-        let _com = Com::init();
+        with_com(task_path_com)
+    }
+
+    /// `task_path` with COM initialised.
+    fn task_path_com() -> Result<Option<PathBuf>, String> {
         let name = name()?;
         let root = root(&service()?)?;
         // SAFETY: plain COM calls on an initialised thread; collections are 1-based.
@@ -346,7 +358,11 @@ mod real {
     }
 
     pub fn register_task(exe: &Path) -> Result<(), String> {
-        let _com = Com::init();
+        with_com(|| register_task_com(exe))
+    }
+
+    /// `register_task` with COM initialised.
+    fn register_task_com(exe: &Path) -> Result<(), String> {
         let sid = BSTR::from(user_sid()?);
         let name = BSTR::from(task_name(&sid.to_string()));
         let service = service()?;
@@ -387,7 +403,11 @@ mod real {
     }
 
     pub fn delete_task() -> Result<(), String> {
-        let _com = Com::init();
+        with_com(delete_task_com)
+    }
+
+    /// `delete_task` with COM initialised.
+    fn delete_task_com() -> Result<(), String> {
         let name = name()?;
         let root = root(&service()?)?;
         // SAFETY: a plain COM call on an initialised thread.
@@ -513,6 +533,23 @@ mod tests {
         fn log(&self) -> Vec<String> {
             self.0.lock().unwrap().log.clone()
         }
+    }
+
+    #[test]
+    fn an_older_ask_that_waited_only_reads_back() {
+        let exe = Path::new(r"C:\Flick\flick.exe");
+        let asks = Asks::default();
+        let fake = FakeLoginStart::default();
+        // Click 1 (on), then click 2 (off); click 2 gets the lock first.
+        let first = asks.ask();
+        let second = asks.ask();
+        assert!(!set_asked(&fake, false, exe, &asks, second));
+        assert!(!set_asked(&fake, true, exe, &asks, first), "the last click wins");
+        assert_eq!(fake.task(), None);
+        // In order, each one counts.
+        let third = asks.ask();
+        assert!(set_asked(&fake, true, exe, &asks, third));
+        assert_eq!(fake.task(), Some(exe.to_path_buf()));
     }
 
     #[test]
