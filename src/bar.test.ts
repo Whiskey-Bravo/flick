@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { arrowActsOnList, sideActs, completion, failureText, highlighted, initial, menuActions, movedEnough, nameSelection, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
+import { actionFailureText, arrowActsOnList, sideActs, completion, failureText, highlighted, initial, menuActions, movedEnough, nameSelection, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -551,6 +551,17 @@ describe("bar", () => {
   it("activation errors name the item", () => {
     expect(failureText(item("Blender"), "file not found")).toBe("Blender: file not found");
     expect(failureText(item("Blender"), new Error("boom"))).toBe("Blender: Error: boom");
+  });
+
+  it("file menu errors are shown as they come, without the row's name in front", () => {
+    const file = item("a.txt");
+    expect(actionFailureText(file, "delete", "Couldn't delete a.txt")).toBe("Couldn't delete a.txt");
+    expect(actionFailureText(file, "rename", "A file with that name already exists")).toBe("A file with that name already exists");
+    expect(actionFailureText(file, "open_terminal", "Can't open a terminal in a network folder without Windows Terminal")).toBe(
+      "Can't open a terminal in a network folder without Windows Terminal",
+    );
+    // Other menu actions still say which row failed.
+    expect(actionFailureText(item("Blender"), "copy_path", "boom")).toBe("Blender: boom");
   });
   describe("icons, pins and recents", () => {
     const row = (id: string, o: Partial<Item> = {}): Item => ({ ...item(id), ...o });
@@ -1124,6 +1135,29 @@ describe("mouse and menu", () => {
         const esc = run(edited, key("Escape"));
         expect(esc.effects).toEqual([]);
         expect([esc.state.rename, esc.state.text, esc.state.selected]).toEqual([null, "x", 1]);
+      });
+
+      it("rename_esc_while_the_rename_is_on_its_way_does_nothing", () => {
+        // Esc would say "cancelled" while the rename still happens.
+        const sent = run(start().state, { type: "input", text: "new.docx" }, key("Enter")).state;
+        const esc = run(sent, key("Escape"));
+        expect(esc.state).toBe(sent);
+        expect(esc.effects).toEqual([]);
+        expect([esc.state.rename !== null, esc.state.text, esc.state.pending]).toEqual([true, "new.docx", true]);
+      });
+
+      it("an_enter_queued_before_rename_never_fires_in_rename_mode", () => {
+        // Enter pressed while results were on their way, then Rename picked.
+        const s = run(typed(a, c), { type: "hover", index: 1 }, { type: "input", text: "xy" }, key("Enter")).state;
+        expect(s.queued).toBe("none");
+        const r = pick(run(s, { type: "results", items: [a, c] }).state, "rename");
+        expect(r.state.queued).toBeNull();
+        // Rename picked from the pointer's menu while still awaiting: the late results open nothing.
+        const late = run(typed(a, c), { type: "input", text: "xy" }, key("Enter"), { type: "menu", index: 1 }, { type: "menuPick", action: "rename" });
+        expect([late.state.rename !== null, late.state.queued]).toEqual([true, null]);
+        const after = run(late.state, { type: "results", items: [a, c] });
+        expect(after.effects.map((e) => e.type)).not.toContain("activate");
+        expect(after.state.rename).not.toBeNull();
       });
 
       it("rename_failure_keeps_the_mode_with_the_error", () => {

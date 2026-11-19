@@ -35,13 +35,15 @@ Press Tab on a file or folder, or right-click it, for its menu. This works on se
 - Inside a OneDrive or other cloud-synced folder, Keep on this device and Free up space are added.
 - A drive such as `C:\` has no Compress, Rename, Delete or Keep/Free entries.
 
-Delete moves the file to the Recycle Bin, after a second Enter: the row says `Enter again to move to the Recycle Bin`. Any other key disarms it. Flick never deletes for good.
+Delete moves the file to the Recycle Bin, after a second Enter: the row says `Enter again to move to the Recycle Bin`. Any other key disarms it. Flick never deletes for good. When the Recycle Bin can't take an item (on a network share, or too big for it), Windows asks whether to delete it permanently; Flick never does that on its own, and if you answer No the file and its row stay.
 
-Rename puts the name in the bar with the part before the extension selected. Type the new name, press Enter to rename or Esc to cancel. A name that already exists is refused (`A file with that name already exists`) and the bar stays in rename mode. While you rename, the list keys and the menu do nothing.
+Rename puts the name in the bar with the part before the extension selected. Type the new name, press Enter to rename or Esc to cancel (once Enter is pressed, Esc no longer takes it back). A name that already exists is refused (`A file with that name already exists`) and the bar stays in rename mode. While you rename, the list keys and the menu do nothing.
 
 Delete and Rename keep the bar open and refresh the list. Compress, Properties, Open with…, Open in Terminal, Copy and Keep/Free close it.
 
-More options… shows Windows' own menu for the item, with the entries added by installed programs such as OneDrive or PowerToys. The bar closes once you pick a command.
+Open in Terminal uses Windows Terminal when it is installed, otherwise the Command Prompt, which can't start in a network folder: there the bar says `Can't open a terminal in a network folder without Windows Terminal`.
+
+More options… shows Windows' own menu for the item, with the entries added by installed programs such as OneDrive or PowerToys. Windows' own Rename and Delete are left out of it: use the ones in Flick's menu. The bar closes once you pick a command.
 
 <details>
 <summary>What is searched, and how the list is kept up to date</summary>

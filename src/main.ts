@@ -7,7 +7,7 @@ import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
-  arrowActsOnList, sideActs, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
+  actionFailureText, arrowActsOnList, sideActs, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
   panelItem, queryArgs, queryReply, retryArgs, shownRows as allRows, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type Row, type State,
 } from "./bar";
 
@@ -574,7 +574,7 @@ function run(effect: Effect) {
           else dispatch({ type: "outcome", outcome });
         })
         .catch((err) => {
-          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+          if (at === shows) dispatch({ type: "failed", message: actionFailureText(effect.item, effect.action, err) });
         });
       break;
     }
@@ -585,7 +585,7 @@ function run(effect: Effect) {
           if (at === shows) dispatch({ type: "renamed", id });
         })
         .catch((err) => {
-          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+          if (at === shows) dispatch({ type: "failed", message: actionFailureText(effect.item, "rename", err) });
         });
       break;
     }
@@ -600,7 +600,10 @@ function run(effect: Effect) {
           if (!ran) input.focus();
         })
         .catch((err) => {
-          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+          if (at !== shows) return;
+          dispatch({ type: "failed", message: actionFailureText(effect.item, "more_options", err) });
+          // The bar stays, as when the menu is dismissed: it types again.
+          input.focus();
         });
       break;
     }

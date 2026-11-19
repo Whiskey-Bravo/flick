@@ -241,6 +241,27 @@ export function failureText(item: Item, err: unknown): string {
   return `${item.title}: ${String(err)}`;
 }
 
+/** File and folder menu actions whose errors are whole sentences: they name
+ *  the file ("Couldn't delete a.txt") or need no name. */
+const PLAIN_ERRORS: readonly Action[] = [
+  "rename",
+  "delete",
+  "compress",
+  "open_terminal",
+  "properties",
+  "open_with",
+  "copy_file",
+  "keep_offline",
+  "free_up_space",
+  "more_options",
+];
+
+/** The error line for a failed menu action on `item`: as it came for the
+ *  file menu's own actions, else named like an activation's. */
+export function actionFailureText(item: Item, action: Action, err: unknown): string {
+  return PLAIN_ERRORS.includes(action) ? String(err) : failureText(item, err);
+}
+
 /** What the bar selects when a rename starts: the name without its extension
  *  (up to the last dot), the whole name for a folder or a name with no dot
  *  after its first character. */
@@ -505,7 +526,8 @@ function step(s: State, e: Event): Result {
           if (s.pending) return done(closed);
           const before = { text: s.text, selected: m.index, top: s.top };
           const [start, end] = nameSelection(item.title, item.id.endsWith("\\"));
-          return done({ ...closed, selected: m.index, rename: { item, chain: row.chain, before }, text: item.title, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
+          // An Enter queued for results still on their way must not fire in rename mode.
+          return done({ ...closed, selected: m.index, rename: { item, chain: row.chain, before }, text: item.title, queued: null, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
         }
         case "more_options":
           // Windows' own menu, shown under the row: the page measures it.
@@ -601,7 +623,7 @@ function step(s: State, e: Event): Result {
       });
       // An Enter pressed before these results arrived acts on them now, unless
       // it was pressed on a kept row that is no longer there.
-      return s.queued && !gone ? enter(next, s.queued) : done(next);
+      return s.queued && !gone && !s.rename ? enter(next, s.queued) : done(next);
     }
     case "past":
       return done({ ...s, past: e.items });
@@ -712,7 +734,8 @@ function onRenameKey(s: State, r: NonNullable<State["rename"]>, e: Extract<Event
     if (s.pending) return done(s);
     return done({ ...s, pending: true, failure: null, error: s.configError }, [{ type: "rename", item: r.item, name: s.text }]);
   }
-  if (e.key === "Escape") return done(fit({ ...leaveRename(s), pending: false, failure: null, error: s.configError }));
+  // While the rename is on its way Esc can't take it back: it does nothing.
+  if (e.key === "Escape") return s.pending ? done(s) : done(fit({ ...leaveRename(s), pending: false, failure: null, error: s.configError }));
   return done(s);
 }
 
