@@ -1,6 +1,7 @@
 //! Files provider: file and folder names under a few root folders, searched
 //! in memory. The index is built off the query path (a background scan, kept
-//! fresh by a folder watcher and the periodic refresh) and swapped in whole.
+//! fresh by a folder watcher, and by the periodic refresh when the watcher
+//! lost track of something) and swapped in whole.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -16,10 +17,11 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[cfg(test)]
 use super::files_scan::skip_by_attributes;
-use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Slot};
+use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Sizes, Slot};
 use crate::clipboard::Clipboard;
 use crate::fuzzy;
 use crate::launch::Launcher;
+use crate::timing;
 use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -94,7 +96,7 @@ pub fn scan(roots: &[PathBuf]) -> Vec<FileEntry> {
 
 #[cfg(test)]
 fn scan_with_limits(roots: &[PathBuf], max_entries: usize, max_depth: usize, max_per_folder: usize) -> Vec<FileEntry> {
-    scan_index(roots, None, max_entries, max_depth, max_per_folder).entries()
+    scan_index(roots, None, max_entries, max_depth, max_per_folder, Sizes::default()).entries()
 }
 
 /// `dir` with a leading `home` shown as `~`, always with `\` separators
@@ -211,6 +213,88 @@ fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
         )
 }
 
+/// Whether the periodic refresh must rescan: when changes are known to be
+/// unapplied (`dirty`), or when nothing watches the roots (then it is the only
+/// way changes are found).
+fn periodic_due(dirty: bool, watching: bool) -> bool {
+    dirty || !watching
+}
+
+/// What the watcher knows about the index, shared with its callback.
+#[derive(Default)]
+struct WatchState {
+    /// Changes may have happened that no scan has seen yet. Set whenever the
+    /// watcher cannot vouch for the index; cleared when a scan starts.
+    dirty: AtomicBool,
+    /// Every root is under a live watcher.
+    watching: AtomicBool,
+}
+
+impl WatchState {
+    fn periodic_due(&self) -> bool {
+        periodic_due(self.dirty.load(Ordering::SeqCst), self.watching.load(Ordering::SeqCst))
+    }
+}
+
+/// Whether an event the rescan logic ignores could still be a change to the
+/// index (a hidden or system attribute flipped, a kind the backend could not
+/// name). Only plain content writes and reads cannot.
+fn ignored_event_may_matter(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_) | EventKind::Modify(ModifyKind::Data(_)))
+}
+
+/// Whether the event removes or renames one of `roots`, or a folder above it.
+fn event_ends_a_root(kind: &EventKind, paths: &[PathBuf], roots: &[PathBuf]) -> bool {
+    if !matches!(kind, EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))) {
+        return false;
+    }
+    let norm = |p: &Path| p.to_string_lossy().replace('/', r"\").trim_end_matches('\\').to_ascii_lowercase();
+    paths.iter().any(|p| {
+        let p = norm(p);
+        roots.iter().any(|r| {
+            let r = norm(r);
+            r == p || r.starts_with(&format!(r"{p}\"))
+        })
+    })
+}
+
+/// What the watcher callback does with one result. Marks `state` when the
+/// index may have gone stale, and returns the paths of an event that should
+/// trigger a rescan. No disk access.
+fn on_watch_result(
+    state: &WatchState,
+    roots: &Mutex<Vec<PathBuf>>,
+    res: notify::Result<notify::Event>,
+) -> Option<Vec<PathBuf>> {
+    // An error means events were missed.
+    let Ok(event) = res else {
+        state.dirty.store(true, Ordering::SeqCst);
+        return None;
+    };
+    // The backend says it lost track: whatever the kind, wherever the path.
+    if event.need_rescan() {
+        state.dirty.store(true, Ordering::SeqCst);
+    }
+    let triggers = event_triggers_rescan(&event.kind, event.need_rescan());
+    if !triggers && !ignored_event_may_matter(&event.kind) {
+        return None;
+    }
+    let roots = roots.lock().unwrap_or_else(|e| e.into_inner());
+    // A root that goes away is no longer watched, even if it comes back.
+    if event_ends_a_root(&event.kind, &event.paths, &roots) {
+        state.watching.store(false, Ordering::SeqCst);
+        state.dirty.store(true, Ordering::SeqCst);
+    }
+    if !change_is_relevant(&event.paths, &roots) {
+        return None;
+    }
+    drop(roots);
+    // Marked until a scan starts; an event the rescan logic ignores still
+    // stays marked, for the periodic refresh.
+    state.dirty.store(true, Ordering::SeqCst);
+    triggers.then_some(event.paths)
+}
+
 /// When a watcher-triggered rescan wanted at `ready` may start, given when the
 /// last full scan started and how long it took (`None`: none yet): not before
 /// `max(30 s, 3 x duration)` after that scan started.
@@ -299,6 +383,8 @@ pub struct FilesProvider {
     watcher: Mutex<Option<RecommendedWatcher>>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
+    /// What the watcher vouches for; decides whether the periodic refresh scans.
+    watch_state: Arc<WatchState>,
 }
 
 #[derive(Default)]
@@ -353,6 +439,7 @@ impl FilesProvider {
             home: std::env::var_os("USERPROFILE").map(PathBuf::from),
             watcher: Mutex::new(None),
             scanned: AtomicBool::new(scanned),
+            watch_state: Arc::new(WatchState::default()),
         })
     }
 
@@ -362,16 +449,20 @@ impl FilesProvider {
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
         let roots = if roots.is_empty() { default_roots() } else { roots };
         let old = std::mem::replace(&mut *self.roots.lock().unwrap_or_else(|e| e.into_inner()), roots.clone());
+        // The index is stale until the next scan, which clears this when it starts.
+        self.watch_state.dirty.store(true, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(w) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             for r in &old {
                 let _ = w.unwatch(r);
             }
-            // A root that cannot be watched (e.g. missing) only misses
-            // events; the periodic refresh covers them.
+            // A root that cannot be watched (e.g. missing) misses events: the
+            // periodic refresh then rescans every time.
+            let mut all = true;
             for r in &roots {
-                let _ = w.watch(r, RecursiveMode::Recursive);
+                all &= w.watch(r, RecursiveMode::Recursive).is_ok();
             }
+            self.watch_state.watching.store(all, Ordering::SeqCst);
         }
     }
 
@@ -386,13 +477,26 @@ impl FilesProvider {
     /// scans never overlap.
     pub fn refresh(&self) {
         let home = self.home.clone();
-        self.refresh_using(|roots| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER));
+        self.refresh_using(|roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint));
+    }
+
+    /// The periodic refresh: a scan only when [`periodic_due`] says so (the
+    /// watcher lost track of something, or there is none).
+    pub fn refresh_if_due(&self) {
+        let home = self.home.clone();
+        self.refresh_if_due_using(|roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint));
+    }
+
+    fn refresh_if_due_using(&self, scan: impl FnMut(&[PathBuf], Sizes) -> Index) {
+        if self.watch_state.periodic_due() {
+            self.refresh_using(scan);
+        }
     }
 
     /// `refresh` with the scan passed in (tests).
     #[cfg(test)]
     fn refresh_with(&self, mut scan: impl FnMut(&[PathBuf]) -> Vec<FileEntry>) {
-        self.refresh_using(|roots| Index::from_entries(scan(roots)));
+        self.refresh_using(|roots, _| Index::from_entries(scan(roots)));
     }
 
     /// `refresh`, then wait until no refresh or follow-up is running (tests).
@@ -413,7 +517,7 @@ impl FilesProvider {
 
     /// The caller that finds no scan running runs it, then one follow-up if
     /// any was asked for meanwhile (again while more are asked for).
-    fn refresh_using(&self, mut scan: impl FnMut(&[PathBuf]) -> Index) {
+    fn refresh_using(&self, mut scan: impl FnMut(&[PathBuf], Sizes) -> Index) {
         {
             let mut st = self.refresh_state.lock().unwrap_or_else(|e| e.into_inner());
             if st.running {
@@ -437,15 +541,21 @@ impl FilesProvider {
 
     /// Scans until a scan finishes with the roots it started with, and swaps
     /// that one in: a stale result never replaces a newer one.
-    fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf]) -> Index) {
+    fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf], Sizes) -> Index) {
         loop {
             let generation = self.generation.load(Ordering::SeqCst);
+            // Cleared before the walk, so a change during it marks the index dirty again.
+            self.watch_state.dirty.store(false, Ordering::SeqCst);
             let started = Instant::now();
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, None));
-            let fresh = scan(&self.roots());
+            let hint = self.index.read().unwrap_or_else(|e| e.into_inner()).sizes();
+            let fresh = scan(&self.roots(), hint);
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, Some(started.elapsed())));
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
+                if timing::enabled() {
+                    record_memory(&fresh);
+                }
                 let old = std::mem::replace(&mut *index, fresh);
                 self.scanned.store(true, Ordering::SeqCst);
                 drop(index);
@@ -458,32 +568,35 @@ impl FilesProvider {
     /// Watch the roots recursively. Creations, removals and renames trigger
     /// `refresh` once changes have been quiet for 2 s (at most 10 s after the
     /// first change of a burst). If the watcher cannot be created the error
-    /// is returned and the caller relies on its periodic refresh.
+    /// is returned and the periodic refresh rescans every time (see [`periodic_due`]).
     pub fn watch(self: &Arc<Self>) -> notify::Result<()> {
         let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
         let shared_roots = self.roots.clone();
+        let state = self.watch_state.clone();
+        // Not vouching for anything until every root is watched.
+        state.watching.store(false, Ordering::SeqCst);
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            // A watcher error means missed events; the periodic refresh covers them.
-            if let Ok(event) = res {
-                // Events inside skipped folders (AppData, caches, dot-folders)
-                // are dropped here, before they reach the rescan logic. No disk access.
-                if event_triggers_rescan(&event.kind, event.need_rescan()) {
-                    let roots = shared_roots.lock().unwrap_or_else(|e| e.into_inner());
-                    if change_is_relevant(&event.paths, &roots) {
-                        drop(roots);
-                        let _ = tx.send(event.paths);
-                    }
-                }
+            // Events inside skipped folders (AppData, caches, dot-folders)
+            // never reach the rescan logic; whatever the watcher cannot vouch
+            // for marks the index dirty. No disk access.
+            if let Some(paths) = on_watch_result(&state, &shared_roots, res) {
+                let _ = tx.send(paths);
             }
-        })?;
+        })
+        .inspect_err(|_| self.watch_state.dirty.store(true, Ordering::SeqCst))?;
+        let mut all = true;
         for root in self.roots() {
             if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                // A missing root is skipped by the scan too.
+                // A missing root is skipped by the scan too, but is not watched:
+                // it appearing later would go unseen.
+                all = false;
                 if root.exists() {
+                    self.watch_state.dirty.store(true, Ordering::SeqCst);
                     return Err(e);
                 }
             }
         }
+        self.watch_state.watching.store(all, Ordering::SeqCst);
         let weak = Arc::downgrade(self);
         std::thread::spawn(move || {
             // Ends when the watcher (and with it `tx`) or the provider is dropped.
@@ -527,6 +640,15 @@ impl FilesProvider {
         *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
         Ok(())
     }
+}
+
+/// Records the size of a freshly built index when timing is on.
+fn record_memory(index: &Index) {
+    let m = index.memory();
+    timing::mark("index.entries", index.len() as u64);
+    timing::mark("index.used_kb", (m.used / 1024) as u64);
+    timing::mark("index.reserved_kb", (m.reserved / 1024) as u64);
+    timing::mark("index.norms_kb", (m.norms / 1024) as u64);
 }
 
 /// The icon key of a file: `ext:.pdf`, or `builtin:file` when it has none.
@@ -1228,14 +1350,14 @@ mod tests {
         touch(&profile.join("Documents").join("sub").join("b.pdf"));
         touch(&profile.join("top.pdf"));
         let roots = [profile.to_path_buf()];
-        let ranked = scan_index(&roots, Some(profile), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER).entries();
+        let ranked = scan_index(&roots, Some(profile), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).entries();
         let depth = |n: &str| ranked.iter().find(|e| e.name == n).unwrap().depth;
         // As when Documents itself was the root: a.pdf 1, sub 1, b.pdf 2.
         assert_eq!((depth("a.pdf"), depth("sub"), depth("b.pdf")), (1, 1, 2));
         // Directly in the profile: no deeper than that.
         assert!(depth("top.pdf") <= depth("a.pdf"));
         // A configured root that is not the profile keeps counting from itself.
-        let plain = scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER).entries();
+        let plain = scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).entries();
         assert_eq!(plain.iter().find(|e| e.name == "a.pdf").unwrap().depth, 2);
     }
 
@@ -1462,6 +1584,234 @@ mod tests {
         assert!(change_is_relevant(&[], &roots));
     }
 
+    #[test]
+    fn the_periodic_refresh_scans_when_dirty_or_unwatched() {
+        assert!(!periodic_due(false, true));
+        assert!(periodic_due(true, true));
+        assert!(periodic_due(false, false));
+        assert!(periodic_due(true, false));
+    }
+
+    /// A provider whose watcher is alive and clean, and a scan that only counts.
+    fn watched_provider() -> Arc<FilesProvider> {
+        let (p, _) = provider(vec![]);
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        p
+    }
+
+    fn tick(p: &FilesProvider, scans: &mut usize) {
+        p.refresh_if_due_using(|_, _| {
+            *scans += 1;
+            Index::default()
+        });
+    }
+
+    fn event(kind: EventKind, path: &str) -> notify::Result<notify::Event> {
+        Ok(notify::Event::new(kind).add_path(PathBuf::from(path)))
+    }
+
+    #[test]
+    fn a_clean_watched_index_is_not_rescanned_by_the_periodic_tick() {
+        let p = watched_provider();
+        let mut scans = 0;
+        for _ in 0..3 {
+            tick(&p, &mut scans);
+        }
+        assert_eq!(scans, 0);
+    }
+
+    #[test]
+    fn a_watcher_error_marks_the_index_dirty_and_the_next_tick_scans_once() {
+        let p = watched_provider();
+        let mut scans = 0;
+        let sent = on_watch_result(&p.watch_state, &p.roots, Err(notify::Error::generic("lost")));
+        assert!(sent.is_none());
+        tick(&p, &mut scans);
+        assert_eq!(scans, 1);
+        // The scan cleared it: nothing more to do.
+        tick(&p, &mut scans);
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn an_unwatched_provider_rescans_on_every_tick() {
+        let (p, _) = provider(vec![]);
+        let mut scans = 0;
+        tick(&p, &mut scans);
+        tick(&p, &mut scans);
+        assert_eq!(scans, 2);
+    }
+
+    #[test]
+    fn a_change_during_a_scan_is_not_lost_and_a_scan_clears_dirty_when_it_starts() {
+        let p = watched_provider();
+        p.watch_state.dirty.store(true, Ordering::SeqCst);
+        let mut seen_at_start = None;
+        let state = p.watch_state.clone();
+        p.refresh_using(|_, _| {
+            seen_at_start = Some(state.dirty.load(Ordering::SeqCst));
+            // The watcher reports a change while the walk runs.
+            state.dirty.store(true, Ordering::SeqCst);
+            Index::default()
+        });
+        assert_eq!(seen_at_start, Some(false));
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst), "the change made during the scan still counts");
+    }
+
+    #[test]
+    fn what_the_watcher_cannot_vouch_for_marks_dirty() {
+        use notify::event::{AccessKind, CreateKind, DataChange, Flag, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+        let (p, _) = provider(vec![]);
+        let root = PathBuf::from(r"C:\Users\x");
+        *p.roots.lock().unwrap() = vec![root.clone()];
+        let dirty = || p.watch_state.dirty.swap(false, Ordering::SeqCst);
+        let run = |res| on_watch_result(&p.watch_state, &p.roots, res);
+
+        // A change the rescan applies: dirty until the scan starts, and sent on.
+        let sent = run(event(EventKind::Create(CreateKind::File), r"C:\Users\x\a.txt"));
+        assert_eq!(sent, Some(vec![PathBuf::from(r"C:\Users\x\a.txt")]));
+        assert!(dirty());
+        assert!(run(event(EventKind::Remove(RemoveKind::Any), r"C:\Users\x\a.txt")).is_some());
+        assert!(dirty());
+        assert!(run(event(EventKind::Modify(ModifyKind::Name(RenameMode::To)), r"C:\Users\x\b")).is_some());
+        assert!(dirty());
+
+        // The backend lost events: dirty, whatever the kind and even in a skipped folder.
+        let lost = notify::Event::new(EventKind::Any).add_path(PathBuf::from(r"C:\Users\x\AppData\q")).set_flag(Flag::Rescan);
+        assert!(run(Ok(lost)).is_none());
+        assert!(dirty());
+        let lost = notify::Event::new(EventKind::Modify(ModifyKind::Any)).set_flag(Flag::Rescan);
+        assert!(run(Ok(lost)).is_some());
+        assert!(dirty());
+
+        // Ignored by the rescan logic, but could be an attribute change: dirty, not sent.
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            EventKind::Modify(ModifyKind::Other),
+            EventKind::Any,
+        ] {
+            assert!(run(event(kind, r"C:\Users\x\Docs\a.txt")).is_none());
+            assert!(dirty(), "{kind:?}");
+        }
+        // Content writes and reads cannot change the index.
+        for kind in [EventKind::Modify(ModifyKind::Data(DataChange::Content)), EventKind::Access(AccessKind::Any)] {
+            assert!(run(event(kind, r"C:\Users\x\Docs\a.txt")).is_none());
+            assert!(!dirty(), "{kind:?}");
+        }
+        // Inside a skipped folder nothing counts.
+        assert!(run(event(EventKind::Modify(ModifyKind::Any), r"C:\Users\x\AppData\Local\t.tmp")).is_none());
+        assert!(run(event(EventKind::Create(CreateKind::Any), r"C:\Users\x\.git\x")).is_none());
+        assert!(!dirty());
+        // A watcher error always counts.
+        assert!(run(Err(notify::Error::generic("x"))).is_none());
+        assert!(dirty());
+    }
+
+    #[test]
+    fn a_root_that_disappears_stops_vouching() {
+        use notify::event::{ModifyKind, RemoveKind, RenameMode};
+        let (p, _) = provider(vec![]);
+        *p.roots.lock().unwrap() = vec![PathBuf::from(r"C:\Users\x\Docs")];
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        let run = |res| on_watch_result(&p.watch_state, &p.roots, res);
+        // Something inside the root going away does not.
+        run(event(EventKind::Remove(RemoveKind::Folder), r"C:\Users\x\Docs\sub"));
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        // The root itself, or a folder above it, does.
+        run(event(EventKind::Remove(RemoveKind::Folder), r"c:\users\X\docs"));
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        run(event(EventKind::Modify(ModifyKind::Name(RenameMode::From)), r"C:\Users\x"));
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst));
+        assert!(!event_ends_a_root(&EventKind::Create(notify::event::CreateKind::Any), &[PathBuf::from(r"C:\Users\x")], &[PathBuf::from(r"C:\Users\x")]));
+    }
+
+    #[test]
+    fn new_roots_mark_the_index_dirty() {
+        let p = watched_provider();
+        p.set_roots(vec![PathBuf::from(r"C:\elsewhere")]);
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst));
+        let mut scans = 0;
+        tick(&p, &mut scans);
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn a_watcher_that_cannot_start_leaves_the_periodic_refresh_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![dir.path().to_path_buf(), dir.path().join("missing")]);
+        p.watch().unwrap();
+        // A missing root is not watched: the periodic refresh must keep scanning.
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        let mut scans = 0;
+        tick(&p, &mut scans);
+        tick(&p, &mut scans);
+        assert_eq!(scans, 2);
+        // All roots present: the watcher vouches again.
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![dir.path().to_path_buf()]);
+        p.watch().unwrap();
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    fn temp_tree(files: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..files {
+            touch(&dir.path().join(format!("folder number {}", i % 7)).join(format!("some file name {i}.txt")));
+        }
+        dir
+    }
+
+    #[test]
+    fn a_scanned_index_keeps_no_spare_memory() {
+        let dir = temp_tree(60);
+        let roots = [dir.path().to_path_buf()];
+        let scan = |hint| scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint);
+        let first = scan(Sizes::default());
+        let m = first.memory();
+        assert!(first.len() >= 60);
+        assert!(m.used > 0 && m.norms > 0);
+        assert!(m.reserved as f64 <= m.used as f64 * 1.05, "{m:?}");
+        // Sized from a previous index (here a bigger one): still trimmed at the end.
+        let big = Sizes { slots: 5000, names: 200_000, norms: 200_000, dirs: 500 };
+        let hinted = scan(big);
+        assert_eq!(hinted.entries(), first.entries());
+        let m = hinted.memory();
+        assert!(m.reserved as f64 <= m.used as f64 * 1.05, "{m:?}");
+        // The hint from an index of the same tree reserves enough: no regrowth.
+        let again = scan(first.sizes());
+        assert_eq!(again.entries(), first.entries());
+        assert!(again.memory().reserved as f64 <= again.memory().used as f64 * 1.05);
+    }
+
+    #[test]
+    fn memory_grows_with_the_entries() {
+        let small = scan_index(&[temp_tree(10).path().to_path_buf()], None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).memory();
+        let big = scan_index(&[temp_tree(100).path().to_path_buf()], None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).memory();
+        assert!(big.used > small.used && big.reserved > small.reserved && big.norms > small.norms);
+        assert!(small.norms < small.used);
+        assert_eq!(Index::default().memory(), Default::default());
+        assert_eq!(Index::default().sizes(), Sizes::default());
+    }
+
+    #[test]
+    fn a_scan_gets_the_size_of_the_index_it_replaces() {
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\b.txt", false)]);
+        let mut hints = Vec::new();
+        for _ in 0..2 {
+            p.refresh_using(|_, hint| {
+                hints.push(hint);
+                Index::from_entries(vec![entry(r"C:\d\a.txt", false)])
+            });
+        }
+        assert_eq!(hints[0].slots, 2);
+        assert_eq!(hints[1].slots, 1);
+    }
+
     /// Step 5 speed check. Run in release:
     /// `cargo test --release --manifest-path src-tauri/Cargo.toml -- --ignored query_speed_300k --nocapture`
     #[test]
@@ -1519,6 +1869,14 @@ mod tests {
             })
             .collect();
         let (p, _) = provider(entries);
+        {
+            let ix = p.index.read().unwrap();
+            let m = ix.memory();
+            println!(
+                "entries {}: used {} KB, reserved {} KB, norms {} KB ({:.1} % of used)",
+                ix.len(), m.used / 1024, m.reserved / 1024, m.norms / 1024, m.norms as f64 * 100.0 / m.used as f64
+            );
+        }
         let queries = [
             "re", "in", "fi", "ti", "pd", "ca", "img", "rep", "doc", "2023", "notes", "tax", "invoice", "resum", "final pd",
             "meeting", "xq", "zzz", "fact 20", "screensh", "flick la", "statem",

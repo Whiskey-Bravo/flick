@@ -1288,7 +1288,8 @@ fn setup(app: &AppHandle) {
 ///   now, then every 10 minutes;
 /// - bookmarks: now (then whenever the bar shows and they are 5 minutes old);
 /// - shortcuts: the config's definitions now, pick folders every 5 minutes;
-/// - files: the folder watcher, a scan now, then a rescan every 30 minutes.
+/// - files: the folder watcher, a scan now, then every 30 minutes a rescan only if
+///   the watcher lost track of something (or could not start).
 fn start_index_threads(app: &AppHandle, p: Providers) {
     load_answer_stores(app, &p);
 
@@ -1359,12 +1360,15 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
             // moves the watcher).
             let state = handle.state::<AppState>();
             let _config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-            // Without a watcher the periodic rescan still picks changes up.
+            // Without a watcher the periodic rescan (then always due) picks changes up.
             let _ = files.watch();
         }
+        // The first scan always runs. After it, the 30-minute tick scans
+        // only when the watcher lost track of something or there is none.
+        files.refresh();
         loop {
-            files.refresh();
             std::thread::sleep(FILES_REFRESH_INTERVAL);
+            files.refresh_if_due();
         }
     });
 }
