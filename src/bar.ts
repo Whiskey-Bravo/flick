@@ -27,7 +27,7 @@ export function menuActions(item: Item): MenuAction[] {
 }
 
 /** True while the bar shows a row that changes by itself (the clock). No ticks
- *  while the actions menu is open: the answers' re-query would close it. */
+ *  while the actions menu is open. */
 export function wantsTick(s: State): boolean {
   return !s.hidden && !s.menu && s.items.some((i) => i.live);
 }
@@ -74,6 +74,7 @@ export type Effect =
   | { type: "loadPast" }
   | { type: "togglePin"; item: Item }
   | { type: "act"; item: Item; action: Action }
+  | { type: "liveRow"; provider: string; id: string }
   | { type: "hide" };
 export type Event =
   | { type: "shown" }
@@ -83,6 +84,8 @@ export type Event =
   | { type: "blurred" }
   | { type: "hidden" }
   | { type: "answersReady" }
+  | { type: "tick" }
+  | { type: "liveRowResult"; item: Item }
   | { type: "updateChanged" }
   | { type: "input"; text: string }
   | { type: "results"; items: Item[] }
@@ -284,6 +287,25 @@ function step(s: State, e: Event): Result {
       // While typed text is still waiting for its answer, the rows are for older text.
       const keep = sel && !s.awaiting ? { provider: sel.provider, id: sel.id } : null;
       return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }]);
+    }
+    case "tick": {
+      // The clock's second: ask only for the live rows on screen, never the whole query.
+      if (!wantsTick(s)) return done(s);
+      const effects = visibleItems(s)
+        .filter((i) => i.live)
+        .map((i): Effect => ({ type: "liveRow", provider: i.provider, id: i.id }));
+      return done(s, effects);
+    }
+    case "liveRowResult": {
+      // A live row's fresh text replaces the old in place. A row no longer there,
+      // one that is not live any more, a hidden bar or no change: the same state.
+      const at = s.items.findIndex((i) => i.provider === e.item.provider && i.id === e.item.id);
+      if (s.hidden || at < 0 || !e.item.live) return done(s);
+      const old = s.items[at];
+      if (old.title === e.item.title && old.subtitle === e.item.subtitle) return done(s);
+      const items = s.items.slice();
+      items[at] = { ...old, title: e.item.title, subtitle: e.item.subtitle };
+      return done({ ...s, items });
     }
     case "updateChanged": {
       // The update row (found, downloading, failed) lives in the empty bar only.
@@ -598,4 +620,24 @@ function enter(s: State, modifier: Modifier): Result {
   }
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
   return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);
+}
+
+/** The arguments of the back end's `query` command: the page's own number for
+ *  this search rides along, so only a higher number can cancel an older one. */
+export function queryArgs(effect: { text: string; scope: string | null }, seq: number) {
+  return { text: effect.text, scope: effect.scope, seq };
+}
+
+/** The arguments of the one retry: no number (sequence 0), which the back end
+ *  never cancels, so the retry cannot be answered with null and cannot loop. */
+export function retryArgs(effect: { text: string; scope: string | null }) {
+  return queryArgs(effect, 0);
+}
+
+/** What to do with the answer to the CURRENT search. The back end answers null
+ *  only for a search a higher number overtook, which cannot be the current one;
+ *  should it happen anyway, ask again once, unnumbered (see `retryArgs`), rather
+ *  than leave `awaiting` set for ever. */
+export function queryReply(items: Item[] | null): { type: "results"; items: Item[] } | "ask again" {
+  return items ? { type: "results", items } : "ask again";
 }

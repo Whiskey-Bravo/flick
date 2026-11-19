@@ -44,10 +44,16 @@ pub fn toggle(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
     if w.is_visible().unwrap_or(false) {
         hide(app);
-    } else if hotkey_may_show(screen_state()) {
-        show(app);
     } else {
-        crate::tray::set_ignored(app, true);
+        let mut steps = crate::timing::Steps::new("show");
+        let state = screen_state();
+        steps.step("screen_state");
+        if hotkey_may_show(state) {
+            show_as(app, Shown::Fresh, steps);
+        } else {
+            steps.cancel();
+            crate::tray::set_ignored(app, true);
+        }
     }
 }
 
@@ -82,11 +88,15 @@ pub fn toggle_from_win_key(app: &AppHandle) {
         hide(app);
         return;
     }
-    if !hotkey_may_show(screen_state()) {
+    let mut steps = crate::timing::Steps::new("show");
+    let state = screen_state();
+    steps.step("screen_state");
+    if !hotkey_may_show(state) {
+        steps.cancel();
         crate::tray::set_ignored(app, true);
         return;
     }
-    show(app);
+    show_as(app, Shown::Fresh, steps);
     if let Ok(h) = w.hwnd() {
         if take_foreground(HWND(h.0 as _)) {
             // `SetFocus` reached only the frame: focus the page's input the
@@ -222,35 +232,39 @@ enum Shown<'a> {
 /// Centre horizontally, top edge at 25% of the monitor under the mouse cursor;
 /// show; focus; emit `bar:shown`, then `config:error` with the stored error (or null).
 pub fn show(app: &AppHandle) {
-    show_as(app, Shown::Fresh);
+    show_as(app, Shown::Fresh, crate::timing::Steps::new("show"));
 }
 
 /// Like [`show`], but the bar opens with `item` armed (a direct hotkey on an
 /// item that asks for a second Enter): `bar:armed` instead of `bar:shown`.
 pub fn show_armed(app: &AppHandle, item: &ResultItem) {
-    show_as(app, Shown::Armed(item));
+    show_as(app, Shown::Armed(item), crate::timing::Steps::new("show"));
 }
 
 /// Like [`show`], but the bar opens with `text` and `error` under it (a
 /// workspace whose items did not all open): `bar:reopen` instead of `bar:shown`.
 /// An empty `error` shows none (a direct hotkey on an item that needs typing).
 pub fn reopen(app: &AppHandle, text: &str, error: &str) {
-    show_as(app, Shown::Reopen { text, error });
+    show_as(app, Shown::Reopen { text, error }, crate::timing::Steps::new("show"));
 }
 
 /// Like [`show`], but the bar opens in the pick list `scope` under `prompt`,
 /// as after Enter on its row (a direct hotkey on an item that asks to choose).
 pub fn show_step(app: &AppHandle, prompt: &str, scope: &str) {
-    show_as(app, Shown::Step { prompt, scope });
+    show_as(app, Shown::Step { prompt, scope }, crate::timing::Steps::new("show"));
 }
 
-fn show_as(app: &AppHandle, shown: Shown) {
+fn show_as(app: &AppHandle, shown: Shown, mut steps: crate::timing::Steps) {
     // Every open starts fresh: a `v` or `qr` read that raced the last hide
     // is dropped too.
     if let Some(state) = app.try_state::<crate::AppState>() {
         state.providers.on_hide();
     }
-    let Some(w) = bar(app) else { return };
+    steps.step("on_hide");
+    let Some(w) = bar(app) else {
+        steps.cancel();
+        return;
+    };
     // Before the bar takes focus: `v`'s Enter pastes into this window. When
     // the bar is already up (tray Open, a second launch) the foreground is
     // the bar itself, so the window remembered when it opened stays.
@@ -258,17 +272,24 @@ fn show_as(app: &AppHandle, shown: Shown) {
     if hidden {
         crate::paste::remember_foreground();
     }
+    steps.step("remember_foreground");
     SHOWS.fetch_add(1, Ordering::SeqCst);
     set_weather_hidden(app, false);
     if let Some(pos) = placement(app, &w) {
         let _ = w.set_position(pos);
     }
+    steps.step("placement");
     // After the move and before the bar is on screen: Glass shows what is
     // behind it. An already open bar keeps the picture it has.
     if hidden {
         take_backdrop(app, &w);
     }
-    reveal_window(&w);
+    steps.step("backdrop");
+    // Before the bar is on screen: its WebView is told to use normal memory
+    // again, but only if it was told to use less. Usually one short lock.
+    crate::webview_memory::shown(app);
+    steps.step("webview_normal");
+    reveal_window(&w, &mut steps);
     let _ = match shown {
         Shown::Fresh => app.emit_to(LABEL, "bar:shown", ()),
         Shown::Armed(item) => app.emit_to(LABEL, "bar:armed", item),
@@ -287,6 +308,7 @@ fn show_as(app: &AppHandle, shown: Shown) {
     }
     // After the bar is up: a shown bar means the last press is no longer ignored.
     crate::tray::set_ignored(app, false);
+    steps.step("after");
 }
 
 /// Show and focus where it was, without `bar:shown`, so the page keeps its
@@ -294,14 +316,19 @@ fn show_as(app: &AppHandle, shown: Shown) {
 pub fn reveal(app: &AppHandle) {
     set_weather_hidden(app, false);
     if let Some(w) = bar(app) {
-        reveal_window(&w);
+        // The bar comes back without `show_as`: the memory tracker must still
+        // learn that it is visible (and put the WebView back to normal).
+        crate::webview_memory::shown(app);
+        reveal_window(&w, &mut crate::timing::Steps::off());
     }
 }
 
-fn reveal_window(w: &WebviewWindow) {
+fn reveal_window(w: &WebviewWindow, steps: &mut crate::timing::Steps) {
     *LAST_SHOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     let _ = w.show();
+    steps.step("window_show");
     let _ = w.set_focus();
+    steps.step("set_focus");
     // After the bar has the focus: the taskbar comes up without taking it.
     crate::taskbar::raise(w.app_handle());
     watch_focus(w.app_handle());
@@ -412,6 +439,9 @@ pub fn hide(app: &AppHandle) {
     crate::taskbar::lower(app);
     // The picture of what was behind the bar is held only while it is open.
     crate::backdrop::clear();
+    // After the window is gone: the WebView gives its memory back once the
+    // bar has stayed hidden for a while.
+    crate::webview_memory::hidden(app);
 }
 
 /// Hide on focus loss; turn close requests (Alt+F4) into hides so the window

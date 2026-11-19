@@ -21,6 +21,7 @@ mod hotkey_notice;
 mod icon;
 mod item_search;
 mod launch;
+mod mirror;
 mod net;
 mod notifications;
 mod paste;
@@ -37,8 +38,10 @@ mod settings;
 mod settings_window;
 mod status;
 mod updates;
+mod webview_memory;
 mod taskbar;
 mod theme;
+mod timing;
 mod tray;
 mod uninstall;
 mod window;
@@ -111,7 +114,7 @@ use history::History;
 use pins::Pins;
 use ranking::Ranking;
 
-const APPS_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const GAMES_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const FILES_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SHORTCUTS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -224,6 +227,8 @@ impl Providers {
     pub(crate) fn refresh_on_show(&self) {
         self.refresher.request();
         self.bookmarks.refresh_if_stale();
+        // Store installs (and, without a watcher, shortcuts): a background thread.
+        self.apps.refresh_on_show();
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
@@ -520,7 +525,18 @@ pub(crate) struct AppState {
     pub(crate) updates: Arc<Updates>,
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
+    ///
+    /// THE MAIN THREAD NEVER LOCKS THIS. A reload holds it while it waits for
+    /// the main thread (the global-shortcut plugin does its work there), so a
+    /// main-thread lock would hang Flick for good. What the main thread needs
+    /// of the config is read from `mirror`, which `store_config` keeps in step.
+    /// `reload_with` and `change_bar_hotkey` hold it across the hotkey
+    /// registration (which waits for the main thread); that is safe only
+    /// because of the rule above. Nothing else may hold it across a call that
+    /// waits for the main thread (a tray, menu or window call).
     pub(crate) config: Mutex<Config>,
+    /// The settings the main thread reads, copied in by `store_config`.
+    pub(crate) mirror: mirror::ConfigMirror,
     /// Result of the last successful WSL detection; `Unknown` until one
     /// succeeds. Lock order: `config`, then this.
     pub(crate) detected: Mutex<WslState>,
@@ -541,6 +557,13 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    /// Stores `new` into `config` (`slot`, the locked guard's content) and
+    /// into the main thread's copy; the only place a config is stored after
+    /// start. Returns the config it replaced.
+    fn store_config(&self, slot: &mut Config, new: Config) -> Config {
+        self.mirror.store(slot, new)
+    }
+
     pub(crate) fn config_error(&self) -> Option<String> {
         self.config_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -1011,6 +1034,7 @@ pub fn run_helper_if_asked() -> bool {
 }
 
 pub fn run() {
+    timing::init();
     // Everything Flick starts inherits this directory unless told otherwise:
     // the user profile, not wherever Flick happened to be started from (and
     // Flick then holds no handle on that folder).
@@ -1027,10 +1051,13 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::query,
+            commands::live_row,
             commands::activate,
             commands::hide,
             commands::toggle_pin,
             commands::past_searches,
+            timing::timing_enabled,
+            timing::timing_mark,
             commands::act,
             settings::settings_state,
             settings::settings_set,
@@ -1178,6 +1205,7 @@ fn setup(app: &AppHandle) {
         providers: providers.clone(),
         updates,
         config: Mutex::new(loaded.config.clone()),
+        mirror: mirror::ConfigMirror::new(&loaded.config),
         detected: Mutex::new(WslState::Unknown),
         hotkey: Mutex::new(None),
         bar_hotkey: Mutex::new(None),
@@ -1193,6 +1221,8 @@ fn setup(app: &AppHandle) {
     updates::start_scheduler(app);
 
     window::install_handlers(app);
+    // The bar starts hidden: the WebView's memory is given back after a while.
+    webview_memory::start(app);
 
     let keys = Arc::new(DirectKeys::new(Arc::new(PluginKeys::new(app.clone(), on_direct_press))));
     app.manage(keys.clone());
@@ -1242,7 +1272,7 @@ fn setup(app: &AppHandle) {
             reload_config_after_detection(&app, detection);
             let state = app.state::<AppState>();
             let p = &state.providers;
-            p.apps.refresh();
+            p.apps.refresh_now();
             p.games.refresh();
             p.bookmarks.refresh_now();
             p.files.refresh();
@@ -1259,18 +1289,41 @@ fn setup(app: &AppHandle) {
 
 /// The threads that build and refresh the indexes, each doing its disk work
 /// with no lock held that a query needs (build, then swap):
-/// - apps, then games: now, then every 10 minutes;
+/// - apps: now, then when the Start-menu folders change (watcher), and in the
+///   background when the bar opens and the Store list is a minute old; games:
+///   now, then every 10 minutes;
 /// - bookmarks: now (then whenever the bar shows and they are 5 minutes old);
 /// - shortcuts: the config's definitions now, pick folders every 5 minutes;
-/// - files: the folder watcher, a scan now, then a rescan every 30 minutes.
+/// - files: the folder watcher, a scan now, then every 30 minutes a rescan only if
+///   the watcher lost track of something (or could not start).
 fn start_index_threads(app: &AppHandle, p: Providers) {
     load_answer_stores(app, &p);
 
     let (apps, games) = (p.apps, p.games);
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
+        // The Start-menu watcher first, so a shortcut added during the first
+        // scan is not missed; it refreshes the apps once changes are quiet.
+        // The thread keeps it alive. Without one, the apps are refreshed
+        // when the bar opens (`refresh_on_show`).
+        let on_change = apps.clone();
+        let on_lost = apps.clone();
+        // Set before the watcher exists, so an early error is not overwritten.
+        apps.set_watching(true);
+        let _watcher = providers::apps_watch::watch(
+            &providers::apps::start_menu_roots(),
+            providers::apps_watch::QUIET,
+            move || on_change.refresh(),
+            move || on_lost.set_watching(false),
+        )
+        .ok();
+        if _watcher.is_none() {
+            apps.set_watching(false);
+        }
         apps.refresh();
-        games.refresh();
-        std::thread::sleep(APPS_REFRESH_INTERVAL);
+        loop {
+            games.refresh();
+            std::thread::sleep(GAMES_REFRESH_INTERVAL);
+        }
     });
 
     // Its own thread (Firefox's database can be slow to copy), marked as
@@ -1313,12 +1366,15 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
             // moves the watcher).
             let state = handle.state::<AppState>();
             let _config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-            // Without a watcher the periodic rescan still picks changes up.
+            // Without a watcher the periodic rescan (then always due) picks changes up.
             let _ = files.watch();
         }
+        // The first scan always runs. After it, the 30-minute tick scans
+        // only when the watcher lost track of something or there is none.
+        files.refresh();
         loop {
-            files.refresh();
             std::thread::sleep(FILES_REFRESH_INTERVAL);
+            files.refresh_if_due();
         }
     });
 }
@@ -1515,7 +1571,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     if loaded.config.weather_city.trim() != config.weather_city.trim() {
         p.weather.set_home(loaded.config.weather_city.trim());
     }
-    let old = std::mem::replace(&mut *config, loaded.config);
+    let old = state.store_config(&mut config, loaded.config);
     if loaded.error.is_none() {
         state.updates.set_enabled(config.check_updates);
     }
@@ -1552,12 +1608,10 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
 }
 
 /// The theme and animation level of the config in force.
+/// Read from the main thread's copy: the `appearance` command and the setup
+/// run on the main thread, which never locks the config.
 fn current_appearance(state: &AppState) -> theme::Appearance {
-    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-    theme::Appearance {
-        tab_completion: config.tab_completion,
-        ..theme::resolve(&config.theme, &config.custom_theme, &config.animations)
-    }
+    state.mirror.appearance()
 }
 
 /// What a page applies when it loads: the theme's colours and the animation

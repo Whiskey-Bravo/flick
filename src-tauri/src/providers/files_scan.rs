@@ -90,9 +90,103 @@ pub(super) struct Index {
     pub slots: Vec<Slot>,
 }
 
+/// What an index holds, by count: the hint for sizing the next scan.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Sizes {
+    pub slots: usize,
+    pub names: usize,
+    pub norms: usize,
+    pub dirs: usize,
+}
+
+/// Heap bytes of an index: `used` by its contents, `reserved` by its
+/// allocations (capacities), and the bytes of the `norms` arena alone, which
+/// duplicates the names in lower case (part of `used`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(super) struct Memory {
+    pub used: usize,
+    pub reserved: usize,
+    pub norms: usize,
+}
+
+/// Room a scan keeps beyond the previous index's size: a small margin so a few
+/// new entries do not regrow the vector.
+fn with_margin(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n + n / 50 + 64
+    }
+}
+
+/// Whether `cap` exceeds `len` by more than 5 %: only then is shrinking worth a reallocation.
+fn wasteful(len: usize, cap: usize) -> bool {
+    cap > len + len / 20
+}
+
 impl Index {
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    pub fn sizes(&self) -> Sizes {
+        Sizes { slots: self.slots.len(), names: self.names.len(), norms: self.norms.len(), dirs: self.dirs.len() }
+    }
+
+    /// Bytes on the heap, from lengths and capacities (no allocation walk).
+    pub fn memory(&self) -> Memory {
+        use std::mem::size_of;
+        let dir_bytes = |cap: bool| -> usize {
+            self.dirs.iter().map(|d| if cap { d.capacity() } else { d.as_os_str().len() }).sum()
+        };
+        let used = self.slots.len() * size_of::<Slot>()
+            + self.names.len()
+            + self.norms.len()
+            + self.dirs.len() * size_of::<PathBuf>()
+            + dir_bytes(false)
+            + self.depths.len();
+        let reserved = self.slots.capacity() * size_of::<Slot>()
+            + self.names.capacity()
+            + self.norms.capacity()
+            + self.dirs.capacity() * size_of::<PathBuf>()
+            + dir_bytes(true)
+            + self.depths.capacity();
+        Memory { used, reserved, norms: self.norms.len() }
+    }
+
+    fn with_capacity(hint: Sizes) -> Self {
+        Index {
+            dirs: Vec::with_capacity(with_margin(hint.dirs)),
+            depths: Vec::with_capacity(with_margin(hint.dirs)),
+            names: String::with_capacity(with_margin(hint.names)),
+            norms: String::with_capacity(with_margin(hint.norms)),
+            slots: Vec::with_capacity(with_margin(hint.slots)),
+        }
+    }
+
+    /// Gives back capacity beyond 5 % of what is used, per allocation.
+    fn trim(&mut self) {
+        if wasteful(self.slots.len(), self.slots.capacity()) {
+            self.slots.shrink_to_fit();
+        }
+        if wasteful(self.names.len(), self.names.capacity()) {
+            self.names.shrink_to_fit();
+        }
+        if wasteful(self.norms.len(), self.norms.capacity()) {
+            self.norms.shrink_to_fit();
+        }
+        if wasteful(self.depths.len(), self.depths.capacity()) {
+            self.depths.shrink_to_fit();
+        }
+        if wasteful(self.dirs.len(), self.dirs.capacity()) {
+            self.dirs.shrink_to_fit();
+        }
+        let (len, cap) = self.dirs.iter().fold((0, 0), |(l, c), d| (l + d.as_os_str().len(), c + d.capacity()));
+        if wasteful(len, cap) {
+            for d in &mut self.dirs {
+                d.shrink_to_fit();
+            }
+        }
     }
 
     pub fn name(&self, s: &Slot) -> &str {
@@ -167,7 +261,7 @@ impl Index {
             };
             ix.push(id, &e.name, e.is_dir);
         }
-        ix.dirs.shrink_to_fit();
+        ix.trim();
         ix
     }
 
@@ -199,11 +293,22 @@ impl Index {
 /// depth of its entries counts from its sub-folders (as if Desktop, Documents
 /// and the like were roots themselves), so their results rank as before. The
 /// walk limits still count from the root.
-pub(super) fn scan_index(roots: &[PathBuf], profile: Option<&Path>, max_entries: usize, max_depth: usize, max_per_folder: usize) -> Index {
-    let mut ix = Index::default();
+///
+/// `hint` is the size of the previous index (`Sizes::default()` the first
+/// time): the vectors start with that plus a small margin, and give back what
+/// is left over beyond 5 % at the end.
+pub(super) fn scan_index(
+    roots: &[PathBuf],
+    profile: Option<&Path>,
+    max_entries: usize,
+    max_depth: usize,
+    max_per_folder: usize,
+    hint: Sizes,
+) -> Index {
     if roots.is_empty() {
-        return ix;
+        return Index::default();
     }
+    let mut ix = Index::with_capacity(hint);
     let share = max_entries / roots.len();
     for root in roots {
         let root_start = ix.len();
@@ -250,6 +355,7 @@ pub(super) fn scan_index(roots: &[PathBuf], profile: Option<&Path>, max_entries:
             }
         }
     }
+    ix.trim();
     ix
 }
 

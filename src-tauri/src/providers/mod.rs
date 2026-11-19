@@ -1,6 +1,8 @@
 //! Result providers.
 pub mod answers;
 pub mod apps;
+pub mod apps_store;
+pub mod apps_watch;
 pub mod bookmarks;
 pub mod clips;
 pub mod chores;

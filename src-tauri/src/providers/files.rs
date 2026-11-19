@@ -1,6 +1,7 @@
 //! Files provider: file and folder names under a few root folders, searched
 //! in memory. The index is built off the query path (a background scan, kept
-//! fresh by a folder watcher and the periodic refresh) and swapped in whole.
+//! fresh by a folder watcher, and by the periodic refresh when the watcher
+//! lost track of something) and swapped in whole.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -16,10 +17,11 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 #[cfg(test)]
 use super::files_scan::skip_by_attributes;
-use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Slot};
+use super::files_scan::{char_bit, is_junk_dir, scan_index, Index, Memory, Sizes, Slot};
 use crate::clipboard::Clipboard;
 use crate::fuzzy;
 use crate::launch::Launcher;
+use crate::timing;
 use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 
 pub const MAX_ENTRIES: usize = 1_000_000;
@@ -31,6 +33,8 @@ const MAX_RESULTS: usize = 20;
 const PLAIN_SHARE: usize = 5;
 /// Shorter text matches far too much to be useful.
 const MIN_QUERY_CHARS: usize = 2;
+/// A scan asks whether a newer search has begun once per this many slots.
+const CANCEL_CHECK_SLOTS: usize = 4096;
 /// One directory listing adds at most this many entries.
 pub const MAX_PER_FOLDER: usize = 20_000;
 /// A watcher-triggered rescan starts this long after the last relevant change...
@@ -41,6 +45,9 @@ const MAX_WAIT: Duration = Duration::from_secs(10);
 const MIN_RESCAN_GAP: Duration = Duration::from_secs(30);
 /// ...and at least this many times the duration of the last full scan.
 const RESCAN_GAP_FACTOR: u32 = 3;
+/// A clean, watched index is still rescanned by the periodic tick once the
+/// last completed full scan is this old (a watcher that died silently).
+const MAX_CLEAN_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const NOT_FOUND: &str = "file not found";
 
 /// One indexed file or folder in list form, for tests (the provider keeps the
@@ -92,7 +99,7 @@ pub fn scan(roots: &[PathBuf]) -> Vec<FileEntry> {
 
 #[cfg(test)]
 fn scan_with_limits(roots: &[PathBuf], max_entries: usize, max_depth: usize, max_per_folder: usize) -> Vec<FileEntry> {
-    scan_index(roots, None, max_entries, max_depth, max_per_folder).entries()
+    scan_index(roots, None, max_entries, max_depth, max_per_folder, Sizes::default()).entries()
 }
 
 /// `dir` with a leading `home` shown as `~`, always with `\` separators
@@ -133,7 +140,43 @@ fn depth_penalty(depth: u8) -> u32 {
 /// word prefix (3+ chars); substring (4+ chars). Never acronyms, initials or
 /// typos. Below [`PARTIAL_MATCH_MAX_DEPTH`] levels, exact only. Minus
 /// [`depth_penalty`].
+///
+/// A needle of fewer than 3 chars can only be exact, so it is decided by
+/// name and stem alone and the fuzzy ladder never runs for it (the fuzzy
+/// score is 1000 exactly when needle and name are equal).
 fn file_score(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
+    if len < 3 {
+        let exact = !needle.is_empty()
+            && (hay == needle || (!is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle)));
+        if !exact {
+            return None;
+        }
+        let file = if is_dir { 0 } else { FILE_BELOW_FOLDER };
+        return Some(EXACT - file - depth_penalty(depth));
+    }
+    let f = fuzzy::score_prenormalized(needle, hay);
+    let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
+    let tier = if f == Some(1000) || stem_exact {
+        EXACT
+    } else if depth > PARTIAL_MATCH_MAX_DEPTH {
+        return None;
+    } else {
+        match f? {
+            900 => PREFIX,
+            850 => SQUASHED_PREFIX,
+            800 => WORD_PREFIX,
+            _ if len >= 4 && hay.contains(needle) => SUBSTRING,
+            _ => return None,
+        }
+    };
+    let file = if is_dir { 0 } else { FILE_BELOW_FOLDER };
+    Some(tier - file - depth_penalty(depth))
+}
+
+/// The scoring before short needles skipped the fuzzy ladder: what
+/// [`file_score`] must keep returning.
+#[cfg(test)]
+fn file_score_reference(needle: &str, len: usize, hay: &str, is_dir: bool, depth: u8) -> Option<u32> {
     let f = fuzzy::score_prenormalized(needle, hay);
     let stem_exact = !is_dir && hay.rfind('.').is_some_and(|dot| dot > 0 && &hay[..dot] == needle);
     let tier = if f == Some(1000) || stem_exact {
@@ -162,15 +205,163 @@ fn change_is_relevant(paths: &[PathBuf], roots: &[PathBuf]) -> bool {
 /// Whether a watcher event can change the index. The index holds only names
 /// and folder-ness, so only creations, removals and renames count, plus
 /// `Other` and events whose backend lost track (`need_rescan`). Content
-/// writes (`Modify(Any)` on Windows), metadata and access are ignored: a file
-/// written continuously must not rescan the roots over and over. Hidden or
-/// system attribute changes are left to the periodic refresh.
+/// writes (`Modify(Any)` on Windows), metadata and access do not trigger a
+/// rescan: a file written continuously must not rescan the roots over and over.
+/// They still mark the index dirty (except plain content writes and reads, see
+/// [`ignored_event_may_matter`]), so hidden or system attribute changes are
+/// left to the periodic refresh.
 fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
     need_rescan
         || matches!(
             kind,
             EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_)) | EventKind::Other
         )
+}
+
+/// Whether the periodic refresh must rescan: when changes are known to be
+/// unapplied (`dirty`), when nothing watches the roots (then it is the only
+/// way changes are found), or when the last completed full scan is older than
+/// [`MAX_CLEAN_AGE`] (`age`; `None`: no scan yet). The age cap bounds the
+/// damage of a watcher that stopped without telling: on Windows the `notify`
+/// backend never reports a buffer overflow or a vanished root to its handler,
+/// it just stops watching. On a PC in use, ordinary file saves mark the index
+/// dirty, so the saving is mostly while the PC is idle.
+fn periodic_due(dirty: bool, watching: bool, age: Option<Duration>) -> bool {
+    dirty || !watching || age.is_some_and(|a| a >= MAX_CLEAN_AGE)
+}
+
+/// What the watcher knows about the index, shared with its callback.
+#[derive(Default)]
+struct WatchState {
+    /// Changes may have happened that no scan has seen yet. Set whenever the
+    /// watcher cannot vouch for the index; cleared when a scan starts.
+    dirty: AtomicBool,
+    /// Every root is under a live watcher that can be trusted to report.
+    watching: AtomicBool,
+    /// Each root and whether it existed when the watch was set up.
+    seen: Mutex<Vec<(PathBuf, bool)>>,
+}
+
+impl WatchState {
+    /// Called once the watches are set up: remembers which roots exist, and
+    /// vouches (`watching`) only when every root is watched (`all_watched`)
+    /// and is on a local fixed drive (see [`root_is_trusted`]).
+    fn arm(&self, roots: &[PathBuf], all_watched: bool, exists: impl Fn(&Path) -> bool, fixed: impl Fn(char) -> bool) {
+        let trusted = roots.iter().all(|r| root_is_trusted(r, &fixed));
+        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = roots.iter().map(|r| (r.clone(), exists(r))).collect();
+        self.watching.store(all_watched && trusted, Ordering::SeqCst);
+    }
+
+    /// A root that went away, or came back, without the watcher saying so
+    /// (an ejected drive, a dropped share): stops vouching and marks dirty.
+    /// It stays unwatched until the next `watch` or `set_roots`, so every
+    /// tick then scans (today's behaviour).
+    fn check_roots(&self, exists: impl Fn(&Path) -> bool) {
+        // The lock is not held while the disk is asked.
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let changed = seen.iter().any(|(root, was)| exists(root) != *was);
+        if changed {
+            self.dirty.store(true, Ordering::SeqCst);
+            self.watching.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn periodic_due(&self, age: Option<Duration>) -> bool {
+        periodic_due(self.dirty.load(Ordering::SeqCst), self.watching.load(Ordering::SeqCst), age)
+    }
+}
+
+/// Whether events from `root` can be trusted: only a folder on a local fixed
+/// drive. UNC paths (network shares) and anything without a drive letter are
+/// not; `fixed` says whether a drive letter is a fixed disk.
+fn root_is_trusted(root: &Path, fixed: impl Fn(char) -> bool) -> bool {
+    let text = root.to_string_lossy().replace('/', r"\");
+    // `\\?\C:\...` is a drive path; `\\?\UNC\...` and `\\server\...` are not.
+    let text = match text.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None if text.starts_with(r"\\") => return false,
+        None => text,
+    };
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(letter), Some(':')) if letter.is_ascii_alphabetic() => fixed(letter),
+        _ => false,
+    }
+}
+
+/// Whether drive `letter` is a fixed disk (not removable, network or unknown).
+fn os_drive_is_fixed(letter: char) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_FIXED: u32 = 3;
+    unsafe { GetDriveTypeW(&HSTRING::from(format!(r"{letter}:\"))) == DRIVE_FIXED }
+}
+
+fn path_exists(p: &Path) -> bool {
+    p.exists()
+}
+
+/// Whether an event the rescan logic ignores could still be a change to the
+/// index (a hidden or system attribute flipped, a kind the backend could not
+/// name). Only plain content writes and reads cannot.
+fn ignored_event_may_matter(kind: &EventKind) -> bool {
+    !matches!(kind, EventKind::Access(_) | EventKind::Modify(ModifyKind::Data(_)))
+}
+
+/// Whether the event removes or renames one of `roots`, or a folder above it.
+fn event_ends_a_root(kind: &EventKind, paths: &[PathBuf], roots: &[PathBuf]) -> bool {
+    if !matches!(kind, EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))) {
+        return false;
+    }
+    let norm = |p: &Path| p.to_string_lossy().replace('/', r"\").trim_end_matches('\\').to_ascii_lowercase();
+    paths.iter().any(|p| {
+        let p = norm(p);
+        roots.iter().any(|r| {
+            let r = norm(r);
+            r == p || r.starts_with(&format!(r"{p}\"))
+        })
+    })
+}
+
+/// What the watcher callback does with one result. Marks `state` when the
+/// index may have gone stale, and returns the paths of an event that should
+/// trigger a rescan. No disk access.
+fn on_watch_result(
+    state: &WatchState,
+    roots: &Mutex<Vec<PathBuf>>,
+    res: notify::Result<notify::Event>,
+) -> Option<Vec<PathBuf>> {
+    // An error means events were missed. On Windows the backend never reports
+    // runtime errors (a buffer overflow, a vanished root): the watcher can stop
+    // without telling, and the age cap of the periodic tick bounds the damage.
+    let Ok(event) = res else {
+        state.dirty.store(true, Ordering::SeqCst);
+        return None;
+    };
+    // The backend says it lost track: whatever the kind, wherever the path.
+    if event.need_rescan() {
+        state.dirty.store(true, Ordering::SeqCst);
+    }
+    let triggers = event_triggers_rescan(&event.kind, event.need_rescan());
+    if !triggers && !ignored_event_may_matter(&event.kind) {
+        return None;
+    }
+    let roots = roots.lock().unwrap_or_else(|e| e.into_inner());
+    // A root that goes away is no longer watched, even if it comes back: it
+    // stays unwatched until the next `watch`/`set_roots`, so every tick scans
+    // (today's behaviour).
+    if event_ends_a_root(&event.kind, &event.paths, &roots) {
+        state.watching.store(false, Ordering::SeqCst);
+        state.dirty.store(true, Ordering::SeqCst);
+    }
+    if !change_is_relevant(&event.paths, &roots) {
+        return None;
+    }
+    drop(roots);
+    // Marked until a scan starts; an event the rescan logic ignores still
+    // stays marked, for the periodic refresh.
+    state.dirty.store(true, Ordering::SeqCst);
+    triggers.then_some(event.paths)
 }
 
 /// When a watcher-triggered rescan wanted at `ready` may start, given when the
@@ -261,6 +452,8 @@ pub struct FilesProvider {
     watcher: Mutex<Option<RecommendedWatcher>>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
+    /// What the watcher vouches for; decides whether the periodic refresh scans.
+    watch_state: Arc<WatchState>,
 }
 
 #[derive(Default)]
@@ -315,6 +508,7 @@ impl FilesProvider {
             home: std::env::var_os("USERPROFILE").map(PathBuf::from),
             watcher: Mutex::new(None),
             scanned: AtomicBool::new(scanned),
+            watch_state: Arc::new(WatchState::default()),
         })
     }
 
@@ -324,16 +518,20 @@ impl FilesProvider {
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
         let roots = if roots.is_empty() { default_roots() } else { roots };
         let old = std::mem::replace(&mut *self.roots.lock().unwrap_or_else(|e| e.into_inner()), roots.clone());
+        // The index is stale until the next scan, which clears this when it starts.
+        self.watch_state.dirty.store(true, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(w) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             for r in &old {
                 let _ = w.unwatch(r);
             }
-            // A root that cannot be watched (e.g. missing) only misses
-            // events; the periodic refresh covers them.
+            // A root that cannot be watched (e.g. missing) misses events: the
+            // periodic refresh then rescans every time.
+            let mut all = true;
             for r in &roots {
-                let _ = w.watch(r, RecursiveMode::Recursive);
+                all &= w.watch(r, RecursiveMode::Recursive).is_ok();
             }
+            self.watch_state.arm(&roots, all, path_exists, os_drive_is_fixed);
         }
     }
 
@@ -348,13 +546,44 @@ impl FilesProvider {
     /// scans never overlap.
     pub fn refresh(&self) {
         let home = self.home.clone();
-        self.refresh_using(|roots| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER));
+        self.refresh_using(|roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint));
+    }
+
+    /// The periodic refresh: a scan only when [`periodic_due`] says so (the
+    /// watcher lost track of something, there is none, or the last scan is
+    /// older than [`MAX_CLEAN_AGE`]).
+    pub fn refresh_if_due(&self) {
+        let home = self.home.clone();
+        self.refresh_if_due_using(
+            |roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint),
+            path_exists,
+            Instant::now(),
+        );
+    }
+
+    /// How long ago the last completed full scan finished, at `now` (`None`:
+    /// none has completed yet; a running one does not reset the age).
+    fn scan_age(&self, now: Instant) -> Option<Duration> {
+        let last = *self.last_scan.lock().unwrap_or_else(|e| e.into_inner());
+        last.and_then(|(start, took)| took.map(|t| now.saturating_duration_since(start + t)))
+    }
+
+    fn refresh_if_due_using(
+        &self,
+        scan: impl FnMut(&[PathBuf], Sizes) -> Index,
+        exists: impl Fn(&Path) -> bool,
+        now: Instant,
+    ) {
+        self.watch_state.check_roots(exists);
+        if self.watch_state.periodic_due(self.scan_age(now)) {
+            self.refresh_using(scan);
+        }
     }
 
     /// `refresh` with the scan passed in (tests).
     #[cfg(test)]
     fn refresh_with(&self, mut scan: impl FnMut(&[PathBuf]) -> Vec<FileEntry>) {
-        self.refresh_using(|roots| Index::from_entries(scan(roots)));
+        self.refresh_using(|roots, _| Index::from_entries(scan(roots)));
     }
 
     /// `refresh`, then wait until no refresh or follow-up is running (tests).
@@ -375,7 +604,7 @@ impl FilesProvider {
 
     /// The caller that finds no scan running runs it, then one follow-up if
     /// any was asked for meanwhile (again while more are asked for).
-    fn refresh_using(&self, mut scan: impl FnMut(&[PathBuf]) -> Index) {
+    fn refresh_using(&self, mut scan: impl FnMut(&[PathBuf], Sizes) -> Index) {
         {
             let mut st = self.refresh_state.lock().unwrap_or_else(|e| e.into_inner());
             if st.running {
@@ -399,19 +628,27 @@ impl FilesProvider {
 
     /// Scans until a scan finishes with the roots it started with, and swaps
     /// that one in: a stale result never replaces a newer one.
-    fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf]) -> Index) {
+    fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf], Sizes) -> Index) {
         loop {
             let generation = self.generation.load(Ordering::SeqCst);
+            // Cleared before the walk, so a change during it marks the index dirty again.
+            self.watch_state.dirty.store(false, Ordering::SeqCst);
             let started = Instant::now();
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, None));
-            let fresh = scan(&self.roots());
+            let hint = self.index.read().unwrap_or_else(|e| e.into_inner()).sizes();
+            let fresh = scan(&self.roots(), hint);
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, Some(started.elapsed())));
+            // Measured before the write lock is taken (it walks every folder).
+            let measured = timing::enabled().then(|| (fresh.len(), fresh.memory()));
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
                 self.scanned.store(true, Ordering::SeqCst);
                 drop(index);
                 drop(old); // freed outside the lock
+                if let Some((entries, m)) = measured {
+                    record_memory(entries, m);
+                }
                 return;
             }
         }
@@ -420,32 +657,40 @@ impl FilesProvider {
     /// Watch the roots recursively. Creations, removals and renames trigger
     /// `refresh` once changes have been quiet for 2 s (at most 10 s after the
     /// first change of a burst). If the watcher cannot be created the error
-    /// is returned and the caller relies on its periodic refresh.
+    /// is returned and the periodic refresh rescans every time (see [`periodic_due`]).
     pub fn watch(self: &Arc<Self>) -> notify::Result<()> {
+        self.watch_using(os_drive_is_fixed)
+    }
+
+    /// `watch` with the drive-type lookup passed in (tests).
+    fn watch_using(self: &Arc<Self>, fixed: impl Fn(char) -> bool) -> notify::Result<()> {
         let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
         let shared_roots = self.roots.clone();
+        let state = self.watch_state.clone();
+        // Not vouching for anything until every root is watched.
+        state.watching.store(false, Ordering::SeqCst);
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            // A watcher error means missed events; the periodic refresh covers them.
-            if let Ok(event) = res {
-                // Events inside skipped folders (AppData, caches, dot-folders)
-                // are dropped here, before they reach the rescan logic. No disk access.
-                if event_triggers_rescan(&event.kind, event.need_rescan()) {
-                    let roots = shared_roots.lock().unwrap_or_else(|e| e.into_inner());
-                    if change_is_relevant(&event.paths, &roots) {
-                        drop(roots);
-                        let _ = tx.send(event.paths);
-                    }
-                }
+            // Events inside skipped folders (AppData, caches, dot-folders)
+            // never reach the rescan logic; whatever the watcher cannot vouch
+            // for marks the index dirty. No disk access.
+            if let Some(paths) = on_watch_result(&state, &shared_roots, res) {
+                let _ = tx.send(paths);
             }
-        })?;
+        })
+        .inspect_err(|_| self.watch_state.dirty.store(true, Ordering::SeqCst))?;
+        let mut all = true;
         for root in self.roots() {
             if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
-                // A missing root is skipped by the scan too.
+                // A missing root is skipped by the scan too, but is not watched:
+                // it appearing later would go unseen.
+                all = false;
                 if root.exists() {
+                    self.watch_state.dirty.store(true, Ordering::SeqCst);
                     return Err(e);
                 }
             }
         }
+        self.watch_state.arm(&self.roots(), all, path_exists, fixed);
         let weak = Arc::downgrade(self);
         std::thread::spawn(move || {
             // Ends when the watcher (and with it `tx`) or the provider is dropped.
@@ -491,6 +736,16 @@ impl FilesProvider {
     }
 }
 
+/// Records the size of a freshly built index (the caller checks that timing
+/// is on). The `index.*` marks carry a count or kilobytes in the log's
+/// `micros` field, not a time.
+fn record_memory(entries: usize, m: Memory) {
+    timing::mark("index.entries", entries as u64);
+    timing::mark("index.used_kb", (m.used / 1024) as u64);
+    timing::mark("index.reserved_kb", (m.reserved / 1024) as u64);
+    timing::mark("index.norms_kb", (m.norms / 1024) as u64);
+}
+
 /// The icon key of a file: `ext:.pdf`, or `builtin:file` when it has none.
 pub(crate) fn file_icon(name: &str, is_dir: bool) -> String {
     if is_dir {
@@ -503,6 +758,73 @@ pub(crate) fn file_icon(name: &str, is_dir: bool) -> String {
 }
 
 impl FilesProvider {
+    /// Read lock only, no disk: every entry is checked against cheap char
+    /// masks first, `score` ([`file_score`]) runs only on candidates that can
+    /// still make the best 20, and result strings are built for those 20 alone.
+    /// `None` when `gate` says a newer search has begun: checked every 4096
+    /// slots, and the scan stops there. Otherwise the same rows, in the same
+    /// order, as without a gate.
+    fn search(
+        &self,
+        q: &Query,
+        score: impl Fn(&str, usize, &str, bool, u8) -> Option<u32>,
+        gate: Option<&crate::engine::QueryGate>,
+    ) -> Option<Vec<ResultItem>> {
+        let text = q.text.trim();
+        if text.chars().count() < MIN_QUERY_CHARS {
+            return Some(Vec::new());
+        }
+        let needle = fuzzy::normalize(text);
+        if needle.is_empty() {
+            return Some(Vec::new());
+        }
+        let len = needle.chars().count();
+        // Every tier needs each non-break char of the needle somewhere in the name.
+        let need = needle.chars().filter(|&c| !fuzzy::is_word_break(c)).fold(0, |m, c| m | char_bit(c));
+        // Every tier but substring needs a word of the name to start with the
+        // needle's first char (when that char is not itself a word break).
+        let first = needle.chars().next().filter(|&c| !fuzzy::is_word_break(c)).map(char_bit);
+
+        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
+        // Min-heap of (score, Reverse(position)): the top is the entry to drop
+        // next (lowest score, then latest), so equal scores keep index order.
+        let mut best: BinaryHeap<Reverse<(u32, Reverse<usize>)>> = BinaryHeap::with_capacity(MAX_RESULTS + 1);
+        for (i, s) in index.slots.iter().enumerate() {
+            if i % CANCEL_CHECK_SLOTS == 0 && gate.is_some_and(|g| g.superseded()) {
+                return None;
+            }
+            if s.chars & need != need {
+                continue;
+            }
+            let substring_only = first.is_some_and(|b| s.initials & b == 0);
+            if substring_only && len < 4 {
+                continue;
+            }
+            let depth = index.depth(s);
+            if best.len() == MAX_RESULTS {
+                let tier = if substring_only { SUBSTRING } else { EXACT };
+                let file = if s.is_dir { 0 } else { FILE_BELOW_FOLDER };
+                let Some(Reverse((worst, _))) = best.peek() else { continue };
+                if tier - file - depth_penalty(depth) <= *worst {
+                    continue;
+                }
+            }
+            let hay = index.norm(s);
+            if substring_only && !hay.contains(needle.as_str()) {
+                continue;
+            }
+            let Some(score) = score(&needle, len, hay, s.is_dir, depth) else { continue };
+            best.push(Reverse((score, Reverse(i))));
+            if best.len() > MAX_RESULTS {
+                best.pop();
+            }
+        }
+        let mut picked: Vec<(u32, usize)> = best.into_iter().map(|Reverse((score, Reverse(i)))| (score, i)).collect();
+        picked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        Some(picked.into_iter().map(|(score, i)| self.row(&index, &index.slots[i], score)).collect())
+    }
+
+
     fn row(&self, index: &Index, s: &Slot, score: u32) -> ResultItem {
         ResultItem {
             id: index.path(s).to_string_lossy().into_owned(),
@@ -527,64 +849,11 @@ impl Provider for FilesProvider {
         "files"
     }
 
-    /// Read lock only, no disk: every entry is checked against cheap char
-    /// masks first, [`file_score`] runs only on candidates that can still
-    /// make the best 20, and result strings are built for those 20 alone.
+    /// Read lock only, no disk: see [`FilesProvider::search`]. A search that a
+    /// newer one has superseded returns nothing (the engine then drops the
+    /// whole answer; see [`crate::engine::Engine::query_newest`]).
     fn query(&self, q: &Query) -> Vec<ResultItem> {
-        let text = q.text.trim();
-        if text.chars().count() < MIN_QUERY_CHARS {
-            return Vec::new();
-        }
-        let needle = fuzzy::normalize(text);
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        let len = needle.chars().count();
-        // Every tier needs each non-break char of the needle somewhere in the name.
-        let need = needle.chars().filter(|&c| !fuzzy::is_word_break(c)).fold(0, |m, c| m | char_bit(c));
-        // Every tier but substring needs a word of the name to start with the
-        // needle's first char (when that char is not itself a word break).
-        let first = needle.chars().next().filter(|&c| !fuzzy::is_word_break(c)).map(char_bit);
-
-        let index = self.index.read().unwrap_or_else(|e| e.into_inner());
-        // Min-heap of (score, Reverse(position)): the top is the entry to drop
-        // next (lowest score, then latest), so equal scores keep index order.
-        let mut best: BinaryHeap<Reverse<(u32, Reverse<usize>)>> = BinaryHeap::with_capacity(MAX_RESULTS + 1);
-        for (i, s) in index.slots.iter().enumerate() {
-            if s.chars & need != need {
-                continue;
-            }
-            let substring_only = first.is_some_and(|b| s.initials & b == 0);
-            if substring_only && len < 4 {
-                continue;
-            }
-            let depth = index.depth(s);
-            if best.len() == MAX_RESULTS {
-                let tier = if substring_only { SUBSTRING } else { EXACT };
-                let file = if s.is_dir { 0 } else { FILE_BELOW_FOLDER };
-                let Some(Reverse((worst, _))) = best.peek() else { continue };
-                if tier - file - depth_penalty(depth) <= *worst {
-                    continue;
-                }
-            }
-            let hay = index.norm(s);
-            if substring_only && !hay.contains(needle.as_str()) {
-                continue;
-            }
-            let Some(score) = file_score(&needle, len, hay, s.is_dir, depth) else { continue };
-            best.push(Reverse((score, Reverse(i))));
-            if best.len() > MAX_RESULTS {
-                best.pop();
-            }
-        }
-        let mut picked: Vec<(u32, usize)> = best.into_iter().map(|Reverse((score, Reverse(i)))| (score, i)).collect();
-        picked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        picked
-            .into_iter()
-            .map(|(score, i)| {
-                self.row(&index, &index.slots[i], score)
-            })
-            .collect()
+        self.search(q, file_score, crate::engine::current_gate().as_ref()).unwrap_or_default()
     }
 
     fn item(&self, id: &str) -> Option<ResultItem> {
@@ -803,6 +1072,84 @@ mod tests {
         assert!(p.query(&q("a")).is_empty());
         assert!(p.query(&q("  a  ")).is_empty());
         assert_eq!(p.query(&q("ab")).len(), 1);
+    }
+
+    const SHORT_NAMES: [&str; 36] = [
+        "a", "a.txt", "A", "ab", "ab.txt", "fi", "fi.txt", "fi.tar.gz", "file", "File.txt", "files", "final.pdf",
+        "re", "re.md", "report.pdf", "Reports", "Annual Report.docx", "ca", "ca.exe", "Calculator", "calc.exe",
+        "ti", "tidy", "ti-84", "My Fi", "fi fi", ".fi", ".a", "a.", "ca.", "cache", "x-ca", "Café", "résumé.doc",
+        "re.re", "fi.re.ca",
+    ];
+
+    #[test]
+    fn short_needles_score_as_before_without_the_fuzzy_ladder() {
+        for needle in ["a", "fi", "re", "ca", "ti", "ab", "file", "report", "cal", "calc", "fi fi", "annual rep", ".fi"] {
+            let needle = fuzzy::normalize(needle);
+            let len = needle.chars().count();
+            for name in SHORT_NAMES {
+                let hay = fuzzy::normalize(name);
+                for is_dir in [false, true] {
+                    for depth in [1, 2, 6, 7, 9] {
+                        assert_eq!(
+                            file_score(&needle, len, &hay, is_dir, depth),
+                            file_score_reference(&needle, len, &hay, is_dir, depth),
+                            "{needle:?} vs {name:?} dir={is_dir} depth={depth}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(SHORT_NAMES.len() >= 30);
+    }
+
+    /// An index with enough variety for short and long needles.
+    fn varied_provider(count: usize) -> Arc<FilesProvider> {
+        let words = ["fi", "re", "ca", "ti", "file", "report", "Calc", "tidy", "Café", "notes", "a", "final copy"];
+        let entries = (0..count)
+            .map(|i| {
+                let w = words[i % words.len()];
+                let name = match i % 5 {
+                    0 => w.to_string(),
+                    1 => format!("{w}.txt"),
+                    2 => format!("{w} {}.pdf", i % 7),
+                    3 => format!("x{w}y"),
+                    _ => format!("{w}-{w}"),
+                };
+                entry(&format!(r"C:\d{}\e{}\{name}", i % 9, i % 4), i % 6 == 0)
+            })
+            .collect();
+        provider(entries).0
+    }
+
+    #[test]
+    fn a_search_gives_the_rows_and_order_it_gave_before() {
+        let p = varied_provider(9000);
+        let newest = Arc::new(AtomicU64::new(0));
+        let gate = crate::engine::QueryGate::begin_for_test(&newest, 1);
+        let ids = |rows: &[ResultItem]| rows.iter().map(|r| (r.id.clone(), r.score)).collect::<Vec<_>>();
+        for text in ["fi", "re", "ca", "ti", "a", "file", "report", "calc", "tid", "final co", "caf", "zz"] {
+            let old = p.search(&q(text), file_score_reference, None).unwrap();
+            let new = p.search(&q(text), file_score, None).unwrap();
+            let gated = p.search(&q(text), file_score, Some(&gate)).unwrap();
+            assert_eq!(ids(&new), ids(&old), "{text}");
+            assert_eq!(ids(&gated), ids(&old), "{text}");
+            assert_eq!(ids(&p.query(&q(text))), ids(&old), "{text}");
+        }
+        assert!(!p.search(&q("fi"), file_score, None).unwrap().is_empty());
+        assert!(!p.search(&q("file"), file_score, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_superseded_search_stops_and_says_so() {
+        let p = varied_provider(9000);
+        let newest = Arc::new(AtomicU64::new(0));
+        let gate = crate::engine::QueryGate::begin_for_test(&newest, 1);
+        assert!(p.search(&q("file"), file_score, Some(&gate)).is_some());
+        // A newer search begins: this one gives up, and that is not an empty answer.
+        let _newer = crate::engine::QueryGate::begin_for_test(&newest, 2);
+        assert!(p.search(&q("file"), file_score, Some(&gate)).is_none());
+        // A text too short to search is an answer, not a cancellation.
+        assert_eq!(p.search(&q("a"), file_score, Some(&gate)).map(|r| r.len()), Some(0));
     }
 
     /// `file_score` for raw text, as the query path calls it.
@@ -1098,14 +1445,14 @@ mod tests {
         touch(&profile.join("Documents").join("sub").join("b.pdf"));
         touch(&profile.join("top.pdf"));
         let roots = [profile.to_path_buf()];
-        let ranked = scan_index(&roots, Some(profile), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER).entries();
+        let ranked = scan_index(&roots, Some(profile), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).entries();
         let depth = |n: &str| ranked.iter().find(|e| e.name == n).unwrap().depth;
         // As when Documents itself was the root: a.pdf 1, sub 1, b.pdf 2.
         assert_eq!((depth("a.pdf"), depth("sub"), depth("b.pdf")), (1, 1, 2));
         // Directly in the profile: no deeper than that.
         assert!(depth("top.pdf") <= depth("a.pdf"));
         // A configured root that is not the profile keeps counting from itself.
-        let plain = scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER).entries();
+        let plain = scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).entries();
         assert_eq!(plain.iter().find(|e| e.name == "a.pdf").unwrap().depth, 2);
     }
 
@@ -1332,6 +1679,396 @@ mod tests {
         assert!(change_is_relevant(&[], &roots));
     }
 
+    #[test]
+    fn the_periodic_refresh_scans_when_dirty_or_unwatched() {
+        let young = Some(Duration::from_secs(60));
+        assert!(!periodic_due(false, true, young));
+        assert!(!periodic_due(false, true, None));
+        assert!(periodic_due(true, true, young));
+        assert!(periodic_due(false, false, young));
+        assert!(periodic_due(true, false, young));
+        // Age does not matter once it is due anyway.
+        let old = Some(MAX_CLEAN_AGE * 3);
+        assert!(periodic_due(true, false, old));
+    }
+
+    #[test]
+    fn a_clean_watched_index_is_rescanned_once_the_last_scan_is_two_hours_old() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        assert!(!periodic_due(false, true, Some(min(119))));
+        assert!(periodic_due(false, true, Some(min(120))));
+        assert!(periodic_due(false, true, Some(min(121))));
+
+        let p = watched_provider();
+        let mut scans = 0;
+        let t0 = Instant::now();
+        // A completed scan that finished at t0.
+        *p.last_scan.lock().unwrap() = Some((t0, Some(Duration::ZERO)));
+        tick_at(&p, &mut scans, t0 + min(119));
+        assert_eq!(scans, 0);
+        tick_at(&p, &mut scans, t0 + min(120));
+        assert_eq!(scans, 1, "too old: scanned although clean and watched");
+        // The scan reset the age: the next tick, 30 minutes later, has nothing to do.
+        let after = p.last_scan.lock().unwrap().unwrap().0;
+        tick_at(&p, &mut scans, after + min(30));
+        assert_eq!(scans, 1);
+        // A scan still running does not count as completed.
+        *p.last_scan.lock().unwrap() = Some((t0, None));
+        tick_at(&p, &mut scans, t0 + min(500));
+        assert_eq!(scans, 1);
+    }
+
+    fn tick_at(p: &FilesProvider, scans: &mut usize, now: Instant) {
+        p.refresh_if_due_using(
+            |_, _| {
+                *scans += 1;
+                Index::default()
+            },
+            path_exists,
+            now,
+        );
+    }
+
+    /// A provider whose watcher is alive and clean, and a scan that only counts.
+    fn watched_provider() -> Arc<FilesProvider> {
+        let (p, _) = provider(vec![]);
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        p
+    }
+
+    fn tick(p: &FilesProvider, scans: &mut usize) {
+        tick_with(p, scans, path_exists);
+    }
+
+    fn tick_with(p: &FilesProvider, scans: &mut usize, exists: impl Fn(&Path) -> bool) {
+        p.refresh_if_due_using(
+            |_, _| {
+                *scans += 1;
+                Index::default()
+            },
+            exists,
+            Instant::now(),
+        );
+    }
+
+    fn event(kind: EventKind, path: &str) -> notify::Result<notify::Event> {
+        Ok(notify::Event::new(kind).add_path(PathBuf::from(path)))
+    }
+
+    #[test]
+    fn a_clean_watched_index_is_not_rescanned_by_the_periodic_tick() {
+        let p = watched_provider();
+        let mut scans = 0;
+        for _ in 0..3 {
+            tick(&p, &mut scans);
+        }
+        assert_eq!(scans, 0);
+    }
+
+    #[test]
+    fn a_watcher_error_marks_the_index_dirty_and_the_next_tick_scans_once() {
+        let p = watched_provider();
+        let mut scans = 0;
+        let sent = on_watch_result(&p.watch_state, &p.roots, Err(notify::Error::generic("lost")));
+        assert!(sent.is_none());
+        tick(&p, &mut scans);
+        assert_eq!(scans, 1);
+        // The scan cleared it: nothing more to do.
+        tick(&p, &mut scans);
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn an_unwatched_provider_rescans_on_every_tick() {
+        let (p, _) = provider(vec![]);
+        let mut scans = 0;
+        tick(&p, &mut scans);
+        tick(&p, &mut scans);
+        assert_eq!(scans, 2);
+    }
+
+    #[test]
+    fn a_change_during_a_scan_is_not_lost_and_a_scan_clears_dirty_when_it_starts() {
+        let p = watched_provider();
+        p.watch_state.dirty.store(true, Ordering::SeqCst);
+        let mut seen_at_start = None;
+        let state = p.watch_state.clone();
+        p.refresh_using(|_, _| {
+            seen_at_start = Some(state.dirty.load(Ordering::SeqCst));
+            // The watcher reports a change while the walk runs.
+            state.dirty.store(true, Ordering::SeqCst);
+            Index::default()
+        });
+        assert_eq!(seen_at_start, Some(false));
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst), "the change made during the scan still counts");
+    }
+
+    #[test]
+    fn what_the_watcher_cannot_vouch_for_marks_dirty() {
+        use notify::event::{AccessKind, CreateKind, DataChange, Flag, MetadataKind, ModifyKind, RemoveKind, RenameMode};
+        let (p, _) = provider(vec![]);
+        let root = PathBuf::from(r"C:\Users\x");
+        *p.roots.lock().unwrap() = vec![root.clone()];
+        let dirty = || p.watch_state.dirty.swap(false, Ordering::SeqCst);
+        let run = |res| on_watch_result(&p.watch_state, &p.roots, res);
+
+        // A change the rescan applies: dirty until the scan starts, and sent on.
+        let sent = run(event(EventKind::Create(CreateKind::File), r"C:\Users\x\a.txt"));
+        assert_eq!(sent, Some(vec![PathBuf::from(r"C:\Users\x\a.txt")]));
+        assert!(dirty());
+        assert!(run(event(EventKind::Remove(RemoveKind::Any), r"C:\Users\x\a.txt")).is_some());
+        assert!(dirty());
+        assert!(run(event(EventKind::Modify(ModifyKind::Name(RenameMode::To)), r"C:\Users\x\b")).is_some());
+        assert!(dirty());
+
+        // The backend lost events: dirty, whatever the kind and even in a skipped folder.
+        let lost = notify::Event::new(EventKind::Any).add_path(PathBuf::from(r"C:\Users\x\AppData\q")).set_flag(Flag::Rescan);
+        assert!(run(Ok(lost)).is_none());
+        assert!(dirty());
+        let lost = notify::Event::new(EventKind::Modify(ModifyKind::Any)).set_flag(Flag::Rescan);
+        assert!(run(Ok(lost)).is_some());
+        assert!(dirty());
+
+        // Ignored by the rescan logic, but could be an attribute change: dirty, not sent.
+        for kind in [
+            EventKind::Modify(ModifyKind::Any),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime)),
+            EventKind::Modify(ModifyKind::Other),
+            EventKind::Any,
+        ] {
+            assert!(run(event(kind, r"C:\Users\x\Docs\a.txt")).is_none());
+            assert!(dirty(), "{kind:?}");
+        }
+        // Content writes and reads cannot change the index.
+        for kind in [EventKind::Modify(ModifyKind::Data(DataChange::Content)), EventKind::Access(AccessKind::Any)] {
+            assert!(run(event(kind, r"C:\Users\x\Docs\a.txt")).is_none());
+            assert!(!dirty(), "{kind:?}");
+        }
+        // Inside a skipped folder nothing counts.
+        assert!(run(event(EventKind::Modify(ModifyKind::Any), r"C:\Users\x\AppData\Local\t.tmp")).is_none());
+        assert!(run(event(EventKind::Create(CreateKind::Any), r"C:\Users\x\.git\x")).is_none());
+        assert!(!dirty());
+        // A watcher error always counts.
+        assert!(run(Err(notify::Error::generic("x"))).is_none());
+        assert!(dirty());
+    }
+
+    #[test]
+    fn a_root_that_disappears_stops_vouching() {
+        use notify::event::{ModifyKind, RemoveKind, RenameMode};
+        let (p, _) = provider(vec![]);
+        *p.roots.lock().unwrap() = vec![PathBuf::from(r"C:\Users\x\Docs")];
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        let run = |res| on_watch_result(&p.watch_state, &p.roots, res);
+        // Something inside the root going away does not.
+        run(event(EventKind::Remove(RemoveKind::Folder), r"C:\Users\x\Docs\sub"));
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        // The root itself, or a folder above it, does.
+        run(event(EventKind::Remove(RemoveKind::Folder), r"c:\users\X\docs"));
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        run(event(EventKind::Modify(ModifyKind::Name(RenameMode::From)), r"C:\Users\x"));
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst));
+        assert!(!event_ends_a_root(&EventKind::Create(notify::event::CreateKind::Any), &[PathBuf::from(r"C:\Users\x")], &[PathBuf::from(r"C:\Users\x")]));
+    }
+
+    #[test]
+    fn new_roots_mark_the_index_dirty() {
+        let p = watched_provider();
+        p.set_roots(vec![PathBuf::from(r"C:\elsewhere")]);
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst));
+        let mut scans = 0;
+        tick(&p, &mut scans);
+        assert_eq!(scans, 1);
+    }
+
+    #[test]
+    fn a_watcher_that_cannot_start_leaves_the_periodic_refresh_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![dir.path().to_path_buf(), dir.path().join("missing")]);
+        p.watch_using(|_| true).unwrap();
+        // A missing root is not watched: the periodic refresh must keep scanning.
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        let mut scans = 0;
+        tick(&p, &mut scans);
+        tick(&p, &mut scans);
+        assert_eq!(scans, 2);
+        // All roots present: the watcher vouches again.
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![dir.path().to_path_buf()]);
+        p.watch_using(|_| true).unwrap();
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    fn fixed_c_only(letter: char) -> bool {
+        letter.eq_ignore_ascii_case(&'c')
+    }
+
+    #[test]
+    fn only_roots_on_a_local_fixed_drive_are_trusted() {
+        let trusted = |p: &str| root_is_trusted(Path::new(p), fixed_c_only);
+        assert!(trusted(r"C:\Users\x"));
+        assert!(trusted(r"c:\"));
+        assert!(trusted("C:/Users/x"));
+        assert!(trusted(r"\\?\C:\Users\x"));
+        // Another kind of drive (removable, network, unknown).
+        assert!(!trusted(r"D:\Docs"));
+        assert!(!trusted(r"\\?\D:\Docs"));
+        // Network shares, whatever the spelling.
+        assert!(!trusted(r"\\server\share\Docs"));
+        assert!(!trusted("//server/share/Docs"));
+        assert!(!trusted(r"\\?\UNC\server\share"));
+        // No drive letter at all.
+        assert!(!trusted(r"Users\x"));
+        assert!(!trusted(""));
+        assert!(!trusted(r"1:\x"));
+    }
+
+    #[test]
+    fn the_real_drive_lookup_answers_for_the_system_drive() {
+        // A letter that cannot exist is not fixed (no panic either way).
+        assert!(!os_drive_is_fixed('#'));
+    }
+
+    #[test]
+    fn a_root_that_vanishes_between_ticks_is_rescanned_without_any_event() {
+        let (p, _) = provider(vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        p.watch_state.arm(&[root.clone()], true, path_exists, |_| true);
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        let mut scans = 0;
+        // Unchanged root: no scan.
+        tick_with(&p, &mut scans, path_exists);
+        tick_with(&p, &mut scans, path_exists);
+        assert_eq!(scans, 0);
+        // The folder goes away, and no event arrives.
+        fs::remove_dir_all(&root).unwrap();
+        tick_with(&p, &mut scans, path_exists);
+        assert_eq!(scans, 1);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        // Unwatched from now on: every tick scans, as before this round.
+        tick_with(&p, &mut scans, path_exists);
+        assert_eq!(scans, 2);
+    }
+
+    #[test]
+    fn a_root_that_comes_back_is_noticed_too() {
+        let (p, _) = provider(vec![]);
+        let root = PathBuf::from(r"E:\usb\docs");
+        p.watch_state.arm(&[root.clone()], false, |_| false, |_| true);
+        // It was missing when the watch was set up (so not watched) ...
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        p.watch_state.watching.store(true, Ordering::SeqCst);
+        // ... and now it exists: the index is stale and the watch is not vouched for.
+        let mut scans = 0;
+        tick_with(&p, &mut scans, |_| true);
+        assert_eq!(scans, 1);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_network_root_is_never_vouched_for() {
+        let (p, _) = provider(vec![]);
+        let unc = PathBuf::from(r"\\server\share\docs");
+        p.watch_state.arm(&[unc.clone()], true, |_| true, fixed_c_only);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        let mut scans = 0;
+        for _ in 0..3 {
+            tick_with(&p, &mut scans, |_| true);
+        }
+        assert_eq!(scans, 3, "due on every tick while such a root is configured");
+        assert!(periodic_due(false, p.watch_state.watching.load(Ordering::SeqCst), None));
+        // One untrusted root among local ones is enough.
+        p.watch_state.arm(&[PathBuf::from(r"C:\Users\x"), unc], true, |_| true, fixed_c_only);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+        p.watch_state.arm(&[PathBuf::from(r"C:\Users\x")], true, |_| true, fixed_c_only);
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        // Not every root watched: not vouched for either.
+        p.watch_state.arm(&[PathBuf::from(r"C:\Users\x")], false, |_| true, fixed_c_only);
+        assert!(!p.watch_state.watching.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_change_driven_scan_clears_what_the_watcher_marked() {
+        use notify::event::CreateKind;
+        let p = watched_provider();
+        *p.roots.lock().unwrap() = vec![PathBuf::from(r"C:\Users\x")];
+        let sent = on_watch_result(&p.watch_state, &p.roots, event(EventKind::Create(CreateKind::File), r"C:\Users\x\new.txt"));
+        assert!(sent.is_some());
+        assert!(p.watch_state.dirty.load(Ordering::SeqCst));
+        // The throttled rescan the watcher thread starts is `refresh`: same path as here.
+        let mut scans = 0;
+        p.refresh_using(|_, _| {
+            scans += 1;
+            Index::default()
+        });
+        assert_eq!(scans, 1);
+        assert!(!p.watch_state.dirty.load(Ordering::SeqCst));
+        // So the 30-minute tick has nothing left to do.
+        let mut ticks = 0;
+        tick_with(&p, &mut ticks, |_| true);
+        assert_eq!(ticks, 0);
+    }
+
+    fn temp_tree(files: usize) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..files {
+            touch(&dir.path().join(format!("folder number {}", i % 7)).join(format!("some file name {i}.txt")));
+        }
+        dir
+    }
+
+    #[test]
+    fn a_scanned_index_keeps_no_spare_memory() {
+        let dir = temp_tree(60);
+        let roots = [dir.path().to_path_buf()];
+        let scan = |hint| scan_index(&roots, None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint);
+        let first = scan(Sizes::default());
+        let m = first.memory();
+        assert!(first.len() >= 60);
+        assert!(m.used > 0 && m.norms > 0);
+        assert!(m.reserved as f64 <= m.used as f64 * 1.05, "{m:?}");
+        // Sized from a previous index (here a bigger one): still trimmed at the end.
+        let big = Sizes { slots: 5000, names: 200_000, norms: 200_000, dirs: 500 };
+        let hinted = scan(big);
+        assert_eq!(hinted.entries(), first.entries());
+        let m = hinted.memory();
+        assert!(m.reserved as f64 <= m.used as f64 * 1.05, "{m:?}");
+        // The hint from an index of the same tree reserves enough: no regrowth.
+        let again = scan(first.sizes());
+        assert_eq!(again.entries(), first.entries());
+        assert!(again.memory().reserved as f64 <= again.memory().used as f64 * 1.05);
+    }
+
+    #[test]
+    fn memory_grows_with_the_entries() {
+        let small = scan_index(&[temp_tree(10).path().to_path_buf()], None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).memory();
+        let big = scan_index(&[temp_tree(100).path().to_path_buf()], None, MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, Sizes::default()).memory();
+        assert!(big.used > small.used && big.reserved > small.reserved && big.norms > small.norms);
+        assert!(small.norms < small.used);
+        assert_eq!(Index::default().memory(), Default::default());
+        assert_eq!(Index::default().sizes(), Sizes::default());
+    }
+
+    #[test]
+    fn a_scan_gets_the_size_of_the_index_it_replaces() {
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\b.txt", false)]);
+        let mut hints = Vec::new();
+        for _ in 0..2 {
+            p.refresh_using(|_, hint| {
+                hints.push(hint);
+                Index::from_entries(vec![entry(r"C:\d\a.txt", false)])
+            });
+        }
+        assert_eq!(hints[0].slots, 2);
+        assert_eq!(hints[1].slots, 1);
+    }
+
     /// Step 5 speed check. Run in release:
     /// `cargo test --release --manifest-path src-tauri/Cargo.toml -- --ignored query_speed_300k --nocapture`
     #[test]
@@ -1389,8 +2126,16 @@ mod tests {
             })
             .collect();
         let (p, _) = provider(entries);
+        {
+            let ix = p.index.read().unwrap();
+            let m = ix.memory();
+            println!(
+                "entries {}: used {} KB, reserved {} KB, norms {} KB ({:.1} % of used)",
+                ix.len(), m.used / 1024, m.reserved / 1024, m.norms / 1024, m.norms as f64 * 100.0 / m.used as f64
+            );
+        }
         let queries = [
-            "re", "in", "pd", "ca", "img", "rep", "doc", "2023", "notes", "tax", "invoice", "resum", "final pd",
+            "re", "in", "fi", "ti", "pd", "ca", "img", "rep", "doc", "2023", "notes", "tax", "invoice", "resum", "final pd",
             "meeting", "xq", "zzz", "fact 20", "screensh", "flick la", "statem",
         ];
         let mut worst = (0.0f64, "");

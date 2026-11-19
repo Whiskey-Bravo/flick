@@ -10,9 +10,36 @@ use crate::window;
 use crate::AppState;
 
 /// In-memory only. `async` runs it on the async runtime instead of the main thread.
+/// `seq` is the page's number for this search: a search is cancelled only by a
+/// higher number, so the newest one always completes. Its answer is `None` when
+/// a higher number began meanwhile; the page has asked again and drops it, and
+/// it is never shown as "no results". No `seq` (or 0): never cancelled.
 #[tauri::command(async)]
-pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Vec<ResultItem> {
-    state.engine.query(&text, scope.as_deref())
+pub fn query(text: String, scope: Option<String>, seq: Option<u64>, state: State<AppState>) -> Option<Vec<ResultItem>> {
+    let timer = crate::timing::query_timer();
+    let rows = state.engine.query_newest(&text, scope.as_deref(), seq.unwrap_or(0));
+    timer.finish(&text, rows.as_ref().map_or(0, Vec::len));
+    rows
+}
+
+/// The fresh row of a live row (the clock), for the bar's once-a-second refresh.
+/// In-memory only; nothing is ranked, recorded or pinned, and it does not cancel
+/// a search in progress.
+#[tauri::command(async)]
+pub fn live_row(provider: String, id: String, state: State<AppState>) -> Option<ResultItem> {
+    let timer = crate::timing::tick_timer();
+    let item = live_item(&provider, &id, |p, i| state.engine.item(p, i));
+    timer.finish();
+    item
+}
+
+/// Only the `answers` provider has live rows: any other provider is not asked
+/// (`item` can reach providers that read devices or the disk).
+fn live_item(provider: &str, id: &str, ask: impl FnOnce(&str, &str) -> Option<ResultItem>) -> Option<ResultItem> {
+    if provider != "answers" {
+        return None;
+    }
+    ask(provider, id).filter(|i| i.live)
 }
 
 /// Runs a follow-up once the bar has hidden (paste, clipboard history, snip,
@@ -148,6 +175,22 @@ pub fn hide(app: AppHandle) {
 mod tests {
     use super::*;
     use crate::launch;
+
+    #[test]
+    fn live_rows_come_only_from_the_answers_provider() {
+        let live = || Some(ResultItem { live: true, ..Default::default() });
+        // Another provider is not asked at all.
+        let mut asked = false;
+        let out = live_item("devices", "connect:headset", |_, _| {
+            asked = true;
+            live()
+        });
+        assert!(out.is_none());
+        assert!(!asked, "the engine must not be called for another provider");
+        // `answers` is asked, and only a live row comes back.
+        assert!(live_item("answers", "clock", |_, _| live()).is_some());
+        assert!(live_item("answers", "clock", |_, _| Some(ResultItem::default())).is_none());
+    }
 
     #[test]
     fn cancelled_elevation_hides_silently() {

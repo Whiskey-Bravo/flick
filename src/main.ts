@@ -8,7 +8,7 @@ import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } f
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
-  panelItem, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  panelItem, queryArgs, queryReply, retryArgs, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -98,8 +98,21 @@ const svgUrl = (name: string): string => {
   return url;
 };
 
+// Opt-in timing (the back end's FLICK_TIMING): asked once; off means no calls at all.
+let timingOn = false;
+invoke<boolean>("timing_enabled").then((on) => (timingOn = on), () => {});
+/// Reports `name` with the time since `since` (a `performance.now()` value) once the next frame comes.
+const reportAtFrame = (name: "page.shown_to_paint" | "page.query_to_paint" | "page.tick", since: number) => {
+  if (!timingOn) return;
+  requestAnimationFrame(() => {
+    invoke("timing_mark", { name, micros: Math.round((performance.now() - since) * 1000) }).catch(() => {});
+  });
+};
+
 let state: State = initial;
-let querySeq = 0;
+// Rises with every search and starts from the clock, so a reloaded page never
+// restarts below the numbers the back end has already seen.
+let querySeq = Date.now();
 /// Bumped on every `bar:shown`: an activation answered after the bar was
 /// shown again belongs to an old session and is dropped.
 let shows = 0;
@@ -232,6 +245,7 @@ function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "result";
   li.dataset.index = String(index);
+  li.dataset.key = rowKey(item);
   if (fresh) {
     li.classList.add("fresh");
     li.style.setProperty("--at", String(index - state.top));
@@ -350,7 +364,7 @@ function scheduleTick() {
   if (tickTimer !== null) return;
   tickTimer = window.setTimeout(() => {
     tickTimer = null;
-    dispatch({ type: "answersReady" });
+    dispatch({ type: "tick" });
   }, 1000 - (Date.now() % 1000) + 5);
 }
 
@@ -400,24 +414,75 @@ function render() {
   panel.classList.toggle("closed", state.hidden);
 }
 
+/// A live row's new text, written into its element: the rows, the marker, the
+/// icons and the animations stay as they are. False when the row's element is
+/// not on screen (the caller then renders normally).
+function patchLiveRow(item: Item): boolean {
+  const key = rowKey(item);
+  const li = Array.from(list.children).find((c): c is HTMLElement => c instanceof HTMLElement && c.dataset.key === key);
+  const shown = state.items.find((i) => rowKey(i) === key);
+  const title = li?.querySelector(".title");
+  const sub = li?.querySelector(".subtitle");
+  if (!shown || !title || !sub) return false;
+  title.textContent = shown.title;
+  if (state.armed !== shown.id) sub.textContent = shown.subtitle;
+  return true;
+}
+
 function dispatch(event: Event) {
   const { state: next, effects } = reduce(state, event);
+  const before = state;
   state = next;
-  render();
+  if (next !== before) {
+    if (event.type === "liveRowResult" && patchLiveRow(event.item)) scheduleTick();
+    else render();
+  } else scheduleTick();
   effects.forEach(run);
 }
+
+/// Rows with a `liveRow` request on its way: a slow reply is never overtaken by another ask.
+const liveInFlight = new Set<string>();
 
 function run(effect: Effect) {
   switch (effect.type) {
     case "query": {
       const seq = ++querySeq;
-      invoke<Item[]>("query", { text: effect.text, scope: effect.scope })
-        .then((items) => {
-          if (seq === querySeq) dispatch({ type: "results", items });
+      const sent = performance.now();
+      // `again`: an unnumbered retry is allowed (once; it is never cancelled).
+      const ask = (args: ReturnType<typeof queryArgs>, again: boolean): void => {
+        invoke<Item[] | null>("query", args)
+          .then((items) => {
+            if (seq !== querySeq) return;
+            const reply = queryReply(items);
+            if (reply === "ask again") {
+              if (again) ask(retryArgs(effect), false);
+              else dispatch({ type: "queryFailed", message: "no answer" });
+              return;
+            }
+            dispatch(reply);
+            reportAtFrame("page.query_to_paint", sent);
+          })
+          .catch((err) => {
+            if (seq === querySeq) dispatch({ type: "queryFailed", message: String(err) });
+          });
+      };
+      ask(queryArgs(effect, seq), true);
+      break;
+    }
+    case "liveRow": {
+      const key = `${effect.provider}\u0000${effect.id}`;
+      if (liveInFlight.has(key)) break;
+      liveInFlight.add(key);
+      const at = shows;
+      const sent = performance.now();
+      invoke<Item | null>("live_row", { provider: effect.provider, id: effect.id })
+        .then((item) => {
+          liveInFlight.delete(key);
+          if (at !== shows || !item) return;
+          dispatch({ type: "liveRowResult", item });
+          reportAtFrame("page.tick", sent);
         })
-        .catch((err) => {
-          if (seq === querySeq) dispatch({ type: "queryFailed", message: String(err) });
-        });
+        .catch(() => liveInFlight.delete(key));
       break;
     }
     case "activate": {
@@ -566,10 +631,12 @@ document.addEventListener("mousedown", (e) => {
 const listenFailed = (err: unknown) => dispatch({ type: "failed", message: `Event listener failed: ${err}` });
 
 const afterShow = (event: Event) => {
+  const handled = performance.now();
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
   jumpNext = true; // nothing glides in from where it was when the bar closed
   dispatch(event);
+  reportAtFrame("page.shown_to_paint", handled);
   input.focus();
   // The opening animation of the medium and high levels, played from its
   // start on every show (a no-op under Minimal).

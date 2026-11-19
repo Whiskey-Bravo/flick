@@ -39,9 +39,14 @@ pub struct Taken {
 /// `height` physical pixels, and keeps it as the current backdrop. `None`
 /// when the screen could not be read (the page then shows its plain tint).
 pub fn take(x: i32, y: i32, width: u32, height: u32) -> Option<Taken> {
-    let pixels = screen::read(x, y, width, height)?;
+    let capture = crate::timing::span("backdrop.capture");
+    let pixels = screen::read(x, y, width, height);
+    drop(capture);
+    let pixels = pixels?;
+    let convert = crate::timing::span("backdrop.convert");
     let bmp = bmp_from_bgra(width, height, &pixels)?;
     let brightness = mean_brightness(&pixels);
+    drop(convert);
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(bmp));
     Some(Taken { id: TAKEN.fetch_add(1, Ordering::SeqCst) + 1, brightness })
 }
@@ -70,6 +75,7 @@ pub fn clear() {
 /// Answers a request on the scheme: the current picture, or 404 when there
 /// is none.
 pub fn response() -> Response<Vec<u8>> {
+    let _serve = crate::timing::span("backdrop.serve");
     let current = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (status, body) = match current {
         Some(bmp) => (200, bmp.as_ref().clone()),
