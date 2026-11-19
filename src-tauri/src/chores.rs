@@ -48,13 +48,6 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn windows_dir() -> PathBuf {
-    std::env::var_os("WINDIR")
-        .or_else(|| std::env::var_os("SystemRoot"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| r"C:\Windows".into())
-}
-
 /// True when an Explorer process that ran before the restart (`before`) still
 /// runs (`now`): it never stopped. Unknown lists (`None`) tell nothing.
 fn never_stopped(before: Option<&[u32]>, now: Option<&[u32]>) -> bool {
@@ -292,26 +285,29 @@ mod win {
                 continue;
             }
             let letter = (b'A' + i) as char;
-            let root = wide(&format!(r"{letter}:\"));
-            // SAFETY: `root` is NUL-terminated.
-            let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
-            // Removable volumes on USB (sticks; a built-in USB card reader
-            // can't be told apart and is kept) or SD/MMC; fixed disks on USB.
-            // The bus is read only for those two kinds: a network or optical
-            // drive is never opened.
-            let wanted = match kind {
-                DRIVE_REMOVABLE => bus_type(letter).is_some_and(|b| b == BusTypeUsb || b == BusTypeSd || b == BusTypeMmc),
-                DRIVE_FIXED => bus_type(letter) == Some(BusTypeUsb),
-                _ => false,
-            };
-            if !wanted {
+            if !ejectable(letter) {
                 continue;
             }
+            let root = wide(&format!(r"{letter}:\"));
             if let Some(label) = label(&root) {
                 out.push(Drive { letter, label });
             }
         }
         Ok(out)
+    }
+
+    /// Removable volumes on USB (sticks; a built-in USB card reader can't be
+    /// told apart and is kept) or SD/MMC; fixed disks on USB. The bus is read
+    /// only for those two kinds: a network or optical drive is never opened.
+    fn ejectable(letter: char) -> bool {
+        let root = wide(&format!(r"{letter}:\"));
+        // SAFETY: `root` is NUL-terminated.
+        let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+        match kind {
+            DRIVE_REMOVABLE => bus_type(letter).is_some_and(|b| b == BusTypeUsb || b == BusTypeSd || b == BusTypeMmc),
+            DRIVE_FIXED => bus_type(letter) == Some(BusTypeUsb),
+            _ => false,
+        }
     }
 
     /// The devnode of the disk whose device number matches the volume's.
@@ -359,6 +355,11 @@ mod win {
     }
 
     pub fn eject(letter: char) -> Result<(), EjectError> {
+        // The drive list is cached: the letter may now name another drive
+        // (the stick was pulled and the letter reused), so check it again.
+        if !ejectable(letter) {
+            return Err(EjectError::Failed);
+        }
         let path = volume_path(letter);
         let number = {
             let h = open(PCWSTR(path.as_ptr())).ok_or(EjectError::Failed)?;
@@ -462,15 +463,15 @@ impl Chores for SystemChores {
     }
 
     fn flush_dns(&self) -> Result<(), String> {
-        let exe = windows_dir().join(r"System32\ipconfig.exe");
+        let exe = PathBuf::from(crate::quote::system32("ipconfig.exe"));
         crate::process::run_hidden(&exe, &["/flushdns"], FLUSH_TIMEOUT)
             .map(|_| ())
             .map_err(|e| format!("ipconfig: {e:?}"))
     }
 
     fn restart_explorer(&self) -> Result<(), String> {
-        let exe = windows_dir().join("explorer.exe");
-        win::restart_explorer(&exe.to_string_lossy())
+        let exe = format!(r"{}\explorer.exe", crate::quote::windows_dir());
+        win::restart_explorer(&exe)
     }
 }
 
