@@ -21,6 +21,9 @@ mod hotkey_notice;
 mod icon;
 mod item_search;
 mod launch;
+// Until Settings, the tray and first run use is_enabled, set and migrate.
+#[allow(dead_code)]
+mod login_task;
 mod mirror;
 mod net;
 mod notifications;
@@ -1021,9 +1024,15 @@ fn reminders_path() -> PathBuf {
 }
 
 /// Runs the Win-key helper when this process was started as one (see
-/// winkey_helper.rs) and returns true; false for a normal start.
+/// winkey_helper.rs) and returns true; false for a normal start. Also handles
+/// `--remove-login-task` (the uninstaller's: removes the sign-in task and the
+/// Run value, then exits without a window).
 pub fn run_helper_if_asked() -> bool {
     let args: Vec<String> = std::env::args().collect();
+    if login_task::wants_remove_login_task(&args) {
+        login_task::remove_all(&login_task::WindowsLoginStart);
+        return true;
+    }
     match winkey_helper::helper_parent(&args) {
         Some(parent) => {
             winkey_helper::helper_main(parent);
