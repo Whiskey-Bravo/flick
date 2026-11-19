@@ -165,7 +165,7 @@ pub(crate) fn zip_time(local: &windows::Win32::Foundation::SYSTEMTIME) -> Option
 /// today's.
 fn zip_time_of(meta: &std::fs::Metadata) -> Option<zip::DateTime> {
     use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
-    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx, GetDynamicTimeZoneInformation, DYNAMIC_TIME_ZONE_INFORMATION};
     let since = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
     let ticks = FILETIME_UNIX_EPOCH + since.as_secs() * 10_000_000 + u64::from(since.subsec_nanos()) / 100;
     let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
@@ -175,7 +175,11 @@ fn zip_time_of(meta: &std::fs::Metadata) -> Option<zip::DateTime> {
     // the current one, with its rules for the date in `utc_time`.
     unsafe {
         FileTimeToSystemTime(&utc, &mut utc_time).ok()?;
-        SystemTimeToTzSpecificLocalTime(None, &utc_time, &mut local).ok()?;
+        let mut zone = DYNAMIC_TIME_ZONE_INFORMATION::default();
+        if GetDynamicTimeZoneInformation(&mut zone) == u32::MAX {
+            return None;
+        }
+        SystemTimeToTzSpecificLocalTimeEx(Some(&zone), &utc_time, &mut local).ok()?;
     }
     zip_time(&local)
 }
@@ -740,6 +744,14 @@ mod tests {
         assert_eq!(zip_time(&at(1999, 12, 31, 23, 59, 58)), Some(zip::DateTime::from_date_and_time(1999, 12, 31, 23, 59, 58).unwrap()));
         assert_eq!(zip_time(&at(1970, 1, 1, 0, 0, 0)), None, "1970: before what a zip holds");
         assert_eq!(zip_time(&SYSTEMTIME::default()), None);
+    }
+
+    #[test]
+    fn a_fresh_file_has_a_zip_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("t.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(zip_time_of(&std::fs::metadata(&file).unwrap()).is_some());
     }
 
     #[test]
