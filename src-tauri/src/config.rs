@@ -608,9 +608,6 @@ pub enum Field {
     Name,
     Aliases,
     Target,
-    /// No rule reports it yet; kept so the Settings form has a name for the field.
-    #[allow(dead_code)]
-    Terminal,
     Admin,
     Pick,
     Choices,

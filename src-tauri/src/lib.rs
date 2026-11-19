@@ -1424,15 +1424,17 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
 }
 
 /// Reads `rates.json` and `weather.json`, then gives the weather store the home
-/// city of the current config. Under the config lock, so a reload never sets
-/// the home city between these steps.
+/// city of the current config. The weather steps run under the config lock,
+/// so a reload never sets the home city between them; the rates, which a
+/// reload never touches, are read before it, so a reload waits for one file
+/// at most.
 fn load_answer_stores(app: &AppHandle, p: &Providers) {
     let (rates, weather) = (p.rates.clone(), p.weather.clone());
     let handle = app.clone();
     std::thread::spawn(move || {
+        rates.load();
         let state = handle.state::<AppState>();
         let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-        rates.load();
         weather.load();
         weather.set_home(config.weather_city.trim());
     });

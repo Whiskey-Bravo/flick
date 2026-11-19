@@ -1861,6 +1861,18 @@ describe("folder unfolding", () => {
       // Never while hidden.
       expect(run({ ...s, hidden: true }, { type: "answersReady" }).effects).toEqual([]);
     });
+
+    it("a_folder_that_could_not_be_opened_is_asked_again_and_takes_its_rows_once_read", () => {
+      // A slow network folder answers "denied" after 3 s while its read goes on.
+      const denied: Fold = { path: "C:\\D\\", state: "denied", rows: [], more: 0, typed: "" };
+      const s = open(typedIn("proj", D), kD, denied);
+      expect(run(s, { type: "answersReady" }).effects).toContainEqual({ type: "unfold", key: kD, path: "C:\\D\\" });
+      // The read finished: its rows replace "Can't open this folder".
+      const after = run(s, { type: "unfolded", key: kD, path: "C:\\D\\", reply: ready([entry("x")]) }).state;
+      expect(after.unfolded[kD].state).toBe("ready");
+      // A "reading" answer never turns it back into "Reading…".
+      unchanged(s, { type: "unfolded", key: kD, path: "C:\\D\\", reply: { state: "reading", rows: [], more: 0, typed: "" } });
+    });
   });
 
   describe("rows made by the page", () => {

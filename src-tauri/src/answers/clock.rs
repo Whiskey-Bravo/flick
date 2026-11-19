@@ -147,14 +147,8 @@ pub fn shift(d: Date, amount: i64, unit: Span) -> Option<Date> {
     d.checked_add(span).ok()
 }
 
-/// The place's local date and time, and how many minutes it is ahead of the PC's zone.
-#[allow(dead_code)] // the bar uses `time_in_from` with the zone it read at start
-pub fn time_in(place: &Place, now: Timestamp) -> Option<(DateTime, i64)> {
-    static LOCAL: std::sync::OnceLock<TimeZone> = std::sync::OnceLock::new();
-    time_in_from(place, now, LOCAL.get_or_init(TimeZone::system))
-}
-
-/// Like [`time_in`] with an explicit "local" zone, so tests do not depend on the PC.
+/// The place's local date and time, and how many minutes it is ahead of
+/// `local` (the PC's zone, read once at start; a fixed one in tests).
 pub fn time_in_from(place: &Place, now: Timestamp, local: &TimeZone) -> Option<(DateTime, i64)> {
     let zone = TimeZone::get(place.zone).ok()?;
     let ahead = i64::from(zone.to_offset(now).seconds() - local.to_offset(now).seconds()) / 60;
@@ -349,8 +343,8 @@ mod tests {
     fn time_in_tokyo_with_dst_elsewhere() {
         let now: Timestamp = "2026-07-01T12:00:00Z".parse().unwrap();
         let p = place;
-        assert_eq!(time_in(p("time tokyo"), now).unwrap().0.time(), jiff::civil::time(21, 0, 0, 0));
-        assert_eq!(time_in(p("time london"), now).unwrap().0.time(), jiff::civil::time(13, 0, 0, 0)); // BST
+        assert_eq!(time_in_from(p("time tokyo"), now, &TimeZone::UTC).unwrap().0.time(), jiff::civil::time(21, 0, 0, 0));
+        assert_eq!(time_in_from(p("time london"), now, &TimeZone::UTC).unwrap().0.time(), jiff::civil::time(13, 0, 0, 0)); // BST
         assert_eq!(p("time france").name, "Paris");
     }
 

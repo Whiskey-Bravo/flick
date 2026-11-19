@@ -342,7 +342,7 @@ fn shown(toks: &[Tok], number: &dyn Fn(f64) -> String) -> String {
 
 /// Evaluates `text` when the whole of it is a calculation (not a bare number or word).
 /// `shown` writes numbers with Rust's `Display`; see [`evaluate_with`].
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn evaluate(text: &str) -> Option<Calc> {
     evaluate_with(text, &|n| n.to_string())
 }

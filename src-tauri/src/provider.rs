@@ -150,6 +150,10 @@ pub enum Outcome {
     },
     /// Done, bar stays.
     Keep,
+    /// Done: the row's item is gone (deleted to the Recycle Bin), and the
+    /// bar stays so its list can be asked again. A delete the user declined
+    /// in Windows' prompt is `Keep` instead: nothing changed.
+    Removed,
     /// Show `prompt`; next queries carry `scope`.
     Step { prompt: String, scope: String },
     /// Put `text` in the bar and keep it open (picked help lines).

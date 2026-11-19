@@ -217,7 +217,7 @@ pub(crate) fn run_entry_action(ops: &dyn FileOps, path: &str, action: Action) ->
         // The bar stays: the rows refresh, and the engine forgets the item.
         Action::Delete => {
             ops.recycle(p)?;
-            return Ok(Outcome::Keep);
+            return Ok(Outcome::Removed);
         }
         Action::Compress => return later(Then::Compress { path: path.to_string() }),
         Action::KeepOffline => return later(Then::CloudPin { path: path.to_string(), keep: true }),
@@ -636,7 +636,7 @@ mod tests {
         }
         assert_eq!(r.p.act(r"C:\", Delete), Err("can't do that here".to_string()));
         assert!(r.ops.calls().is_empty());
-        assert_eq!(r.p.act(r"C:\a.txt", Delete), Ok(Outcome::Keep));
+        assert_eq!(r.p.act(r"C:\a.txt", Delete), Ok(Outcome::Removed));
         assert_eq!(r.ops.calls(), [r"recycle C:\a.txt"]);
     }
 

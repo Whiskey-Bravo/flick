@@ -75,6 +75,7 @@ impl FileEntry {
         Self { path, name, name_norm, is_dir, depth: 1 }
     }
 
+    #[cfg(test)]
     pub fn at_depth(self, depth: u8) -> Self {
         Self { depth, ..self }
     }

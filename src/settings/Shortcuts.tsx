@@ -201,7 +201,7 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
   const moreRef = useRef<HTMLDetailsElement>(null);
   const errField = saveError && typeof saveError === "object" ? saveError.field : check?.key === key ? check.error?.field : undefined;
   useEffect(() => {
-    if (moreRef.current && errField && ["admin", "terminal", "pick", "choices"].includes(errField)) {
+    if (moreRef.current && errField && ["admin", "pick", "choices"].includes(errField)) {
       moreRef.current.open = true;
     }
   }, [errField, open]);
@@ -359,7 +359,6 @@ export function Shortcuts({ state, guard }: { state: SettingsState; guard: Leave
                 <option value="no">No</option>
               </select>
               {reasons.terminal && <small>({reasons.terminal})</small>}
-              {shown("terminal")}
             </label>
 
             <div class="sc-field">

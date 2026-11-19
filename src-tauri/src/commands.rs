@@ -80,7 +80,7 @@ fn settle(result: Result<Outcome, String>, modifier: Modifier) -> (Result<Outcom
         Ok(Outcome::Hide) => (Ok(Outcome::Hide), After::Hide),
         Ok(Outcome::HideThen { then }) => (Ok(Outcome::Hide), After::Then(then)),
         // The bar stays: it shows the filled text, the next step, or stays as is.
-        Ok(outcome @ (Outcome::Fill { .. } | Outcome::Step { .. } | Outcome::Keep)) => (Ok(outcome), After::Leave),
+        Ok(outcome @ (Outcome::Fill { .. } | Outcome::Step { .. } | Outcome::Keep | Outcome::Removed)) => (Ok(outcome), After::Leave),
         Err(e) if e == launch::CANCELLED => (Ok(Outcome::Hide), After::Hide),
         Err(e) if modifier == Modifier::CtrlShift => (Err(e), After::Reveal),
         Err(e) => (Err(e), After::Leave),
@@ -197,7 +197,8 @@ fn declined_as_none(r: Result<String, String>) -> Result<Option<String>, String>
 }
 
 /// Shows Windows' own menu for a file or folder row (More options…) with its
-/// corner at screen pixels `x, y`, and runs what is picked: `true` when a
+/// corner at `x, y` physical pixels from the bar window's top-left corner,
+/// and runs what is picked: `true` when a
 /// command ran (the bar then hides), `false` when the menu was dismissed (the
 /// bar stays and takes the keyboard back). The bar is held open while the
 /// menu shows; no time limit, since the user may keep it open. On an error
@@ -213,6 +214,7 @@ pub async fn more_options(
 ) -> Result<bool, String> {
     let engine = state.engine.clone();
     let started = window::shows();
+    let (x, y) = window::to_screen(&app, x, y);
     let result = tauri::async_runtime::spawn_blocking(move || {
         engine.more_options(&provider, &id, |path| window::holding_open(|| crate::shell_menu::show(path, x, y)))
     })

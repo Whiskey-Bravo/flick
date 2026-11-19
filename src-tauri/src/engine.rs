@@ -806,11 +806,11 @@ mod tests {
         assert_eq!(dl_rows(), ["x.zip", "y.zip"]);
 
         // Delete: the very next ask has the row gone, no `Reading…` in between.
-        assert_eq!(e.act("path", r"C:\Work\a.txt", Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(e.act("path", r"C:\Work\a.txt", Action::Delete), Ok(Outcome::Removed));
         assert_eq!(typed(&e), [r"C:\Work\", "b.txt", "c.txt"]);
         let u = e.unfold(r"C:\Work\");
         assert_eq!((u.state, u.rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>()), ("ready", vec!["b.txt", "c.txt"]));
-        assert_eq!(e.act("downloads", r"C:\Dl\x.zip", Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(e.act("downloads", r"C:\Dl\x.zip", Action::Delete), Ok(Outcome::Removed));
         assert_eq!(dl_rows(), ["y.zip"]);
 
         // Rename: the row is there at once under its new name.
@@ -1810,7 +1810,7 @@ mod tests {
         // Another provider's entry for the same file (and in another letter case) goes too.
         d.pins.toggle("path", &a.to_uppercase());
         d.ranking.record("path", &a.to_lowercase());
-        assert_eq!(d.e.act("files", &a, Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(d.e.act("files", &a, Action::Delete), Ok(Outcome::Removed));
         assert_eq!(d.ops.calls(), [format!("recycle {a}")]);
         assert_eq!(d.remembered(&a), (false, 0, false));
         assert_eq!(d.ranking.boost("path", &a.to_lowercase()), 0);

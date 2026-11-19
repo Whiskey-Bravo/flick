@@ -107,7 +107,7 @@ export type Setting =
   | { key: "animations"; value: string }
   | { key: "custom_theme"; value: CustomTheme };
 
-export type ShortcutField = "name" | "aliases" | "target" | "terminal" | "admin" | "pick" | "choices";
+export type ShortcutField = "name" | "aliases" | "target" | "admin" | "pick" | "choices";
 
 export type FieldError = { field: ShortcutField; message: string };
 
