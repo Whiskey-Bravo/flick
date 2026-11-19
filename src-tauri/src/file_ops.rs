@@ -83,19 +83,53 @@ pub(crate) fn zip_target(path: &Path, is_dir: bool, exists: &dyn Fn(&Path) -> bo
         .expect("an unbounded range ends at a free name")
 }
 
-/// The arguments that make `tar` write `zip` from `name` inside `parent`. The
-/// `./` keeps a name starting with `-` from reading as an option; every value
-/// is one argument, never text for a shell.
-pub(crate) fn tar_args(parent: &Path, name: &str, zip: &Path) -> Vec<OsString> {
-    vec![
-        "-a".into(),
-        "-c".into(),
-        "-f".into(),
-        zip.as_os_str().to_owned(),
-        "-C".into(),
-        parent.as_os_str().to_owned(),
-        format!("./{name}").into(),
-    ]
+/// The name of `item` inside a zip made from `base`: its path below `base`
+/// with `/` separators and no `.` or `..` parts. `None` when `item` is not
+/// below `base`.
+pub(crate) fn zip_entry_name(base: &Path, item: &Path) -> Option<String> {
+    let rest = item.strip_prefix(base).ok()?;
+    let parts: Vec<String> = rest
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// Writes `zip` holding `item` (a file, or a folder with everything in it)
+/// under its own name, relative to `parent`. Symlinks and junctions are left
+/// out, never followed. Names are stored as UTF-8, contents deflated.
+fn write_zip(parent: &Path, item: &Path, zip: &Path) -> Result<(), String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    // `create_new`: never replaces a zip that appeared since the name was picked.
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(zip).map_err(|e| short(&e))?;
+    let mut writer = zip::ZipWriter::new(file);
+    let mut stack = vec![item.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let meta = std::fs::symlink_metadata(&current).map_err(|e| short(&e))?;
+        let Some(name) = zip_entry_name(parent, &current) else { return Err("outside".into()) };
+        if meta.file_type().is_symlink() {
+            if current == item {
+                return Err("link".into());
+            }
+            continue;
+        }
+        if meta.is_dir() {
+            writer.add_directory(format!("{name}/"), options).map_err(|e| e.to_string())?;
+            for child in std::fs::read_dir(&current).map_err(|e| short(&e))? {
+                stack.push(child.map_err(|e| short(&e))?.path());
+            }
+        } else {
+            writer.start_file(name, options).map_err(|e| e.to_string())?;
+            let mut source = std::fs::File::open(&current).map_err(|e| short(&e))?;
+            std::io::copy(&mut source, &mut writer).map_err(|e| short(&e))?;
+        }
+    }
+    writer.finish().map_err(|e| e.to_string())?.flush().map_err(|e| short(&e))
 }
 
 /// The program and arguments for a terminal in the current directory:
@@ -262,30 +296,15 @@ impl FileOps for SystemFileOps {
     }
 
     fn compress(&self, path: &Path) -> Result<PathBuf, String> {
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Err("can't compress this".into()) };
-        let zip = zip_target(path, path.is_dir(), &|p| p.exists());
-        let output = Command::new(crate::quote::system32("tar.exe"))
-            .args(tar_args(parent, &name.to_string_lossy(), &zip))
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| short(&e))?;
-        if output.status.success() {
-            return Ok(zip);
-        }
-        let _ = std::fs::remove_file(&zip);
-        let said = String::from_utf8_lossy(&output.stderr);
-        Err(said
-            .lines()
-            .next()
-            .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty())
-            .unwrap_or_else(|| "could not compress".into()))
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let (Some(parent), false) = (path.parent(), name.is_empty()) else { return Err("can't compress this".into()) };
+        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+        let zip = zip_target(path, is_dir, &|p| p.exists());
+        write_zip(parent, path, &zip).map_err(|_| {
+            let _ = std::fs::remove_file(&zip);
+            format!("Couldn't compress {name}")
+        })?;
+        Ok(zip)
     }
 
     fn set_cloud_pin(&self, path: &Path, keep: bool) -> Result<(), String> {
@@ -428,23 +447,18 @@ mod tests {
         assert_eq!(zip_target(Path::new(r"C:\d\archive.tar.gz"), false, &none), PathBuf::from(r"C:\d\archive.tar.zip"));
     }
 
+    #[test]
+    fn zip_entry_names_are_relative_with_slashes() {
+        let base = Path::new(r"C:\d");
+        assert_eq!(zip_entry_name(base, Path::new(r"C:\d\ł😀 b&c.txt")).as_deref(), Some("ł😀 b&c.txt"));
+        assert_eq!(zip_entry_name(base, Path::new(r"C:\d\Ä dir\sub\x.txt")).as_deref(), Some("Ä dir/sub/x.txt"));
+        assert_eq!(zip_entry_name(base, Path::new(r"C:\d\-x")).as_deref(), Some("-x"));
+        assert_eq!(zip_entry_name(base, base), None);
+        assert_eq!(zip_entry_name(base, Path::new(r"C:\other\a.txt")), None);
+    }
+
     fn strings(args: &[OsString]) -> Vec<String> {
         args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
-    }
-
-    #[test]
-    fn tar_args_guard_a_leading_dash() {
-        let args = tar_args(Path::new(r"C:\d"), "-x", Path::new(r"C:\d\-x.zip"));
-        assert_eq!(strings(&args), ["-a", "-c", "-f", r"C:\d\-x.zip", "-C", r"C:\d", "./-x"]);
-    }
-
-    #[test]
-    fn tar_args_keep_unicode_and_spaces() {
-        let args = tar_args(Path::new(r"C:\Ü ser"), "Ä b&c", Path::new(r"C:\Ü ser\Ä b&c.zip"));
-        assert_eq!(args.len(), 7);
-        assert_eq!(args[6], OsString::from("./Ä b&c"));
-        assert_eq!(args[5], OsString::from(r"C:\Ü ser"));
-        assert_eq!(args[3], OsString::from(r"C:\Ü ser\Ä b&c.zip"));
     }
 
     #[test]
@@ -465,22 +479,36 @@ mod tests {
         assert_eq!(pin_attributes(0x20, true), 0x20 | pinned);
     }
 
-    /// Real copy to the clipboard and real zip, in a fresh temp folder that is
+    /// Real copy to the clipboard and real zips, in a fresh temp folder that is
     /// deleted at the end. Run by hand: `cargo test -- --ignored real_copy_file_and_zip_probe`.
     #[test]
-    #[ignore = "uses the real clipboard and tar.exe"]
+    #[ignore = "uses the real clipboard"]
     fn real_copy_file_and_zip_probe() {
+        let entry_names = |zip: &Path| -> Vec<String> {
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(zip).unwrap()).unwrap();
+            let mut names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().unwrap().into_owned()).collect();
+            names.sort();
+            names
+        };
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("Ä b&c.txt");
+        let file = dir.path().join("ł😀 b&c.txt");
         std::fs::write(&file, b"hello").unwrap();
+        let folder = dir.path().join("Ä dir");
+        std::fs::create_dir_all(folder.join("empty")).unwrap();
+        std::fs::write(folder.join("ü.txt"), b"x").unwrap();
         let ops = SystemFileOps;
         ops.copy_file(&file).expect("copy_file");
-        let zip = ops.compress(&file).expect("compress");
-        assert_eq!(zip, dir.path().join("Ä b&c.zip"));
-        assert!(std::fs::metadata(&zip).unwrap().len() > 0, "the zip is not empty");
+
+        let zip = ops.compress(&file).expect("compress file");
+        assert_eq!(zip, dir.path().join("ł😀 b&c.zip"));
+        assert_eq!(entry_names(&zip), ["ł😀 b&c.txt"]);
         // A second zip does not overwrite the first.
-        assert_eq!(ops.compress(&file).unwrap(), dir.path().join("Ä b&c (2).zip"));
-        println!("probe: copied {} and zipped it to {}", file.display(), zip.display());
+        assert_eq!(ops.compress(&file).unwrap(), dir.path().join("ł😀 b&c (2).zip"));
+
+        let zip = ops.compress(&folder).expect("compress folder");
+        assert_eq!(zip, dir.path().join("Ä dir.zip"));
+        assert_eq!(entry_names(&zip), ["Ä dir/", "Ä dir/empty/", "Ä dir/ü.txt"]);
+        println!("probe: zip entries read back: {:?}", entry_names(&zip));
         dir.close().unwrap();
     }
 
