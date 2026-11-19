@@ -20,6 +20,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyMenu, DestroyWindow, GetMenuItemCount, GetMenuItemID,
+    GetMenuItemInfoW, MENUITEMINFOW, MFT_SEPARATOR, MIIM_FTYPE, MF_BYPOSITION,
     PostMessageW, RegisterClassW, MF_BYCOMMAND,
     SetForegroundWindow, TrackPopupMenuEx, HMENU, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -143,6 +144,34 @@ fn drop_own_entries(menu: &IContextMenu, popup: &Popup) {
                 let _ = DeleteMenu(popup.0, offset + FIRST_ID, MF_BYCOMMAND);
             }
         }
+        tidy_separators(popup);
+    }
+}
+
+/// The positions of separators to remove so the menu has none first or last
+/// and never two in a row. `is_separator[i]` says whether item `i` is one.
+fn separators_to_drop(is_separator: &[bool]) -> Vec<usize> {
+    let first = is_separator.iter().position(|&s| !s);
+    let Some(first) = first else { return (0..is_separator.len()).collect() };
+    let last = is_separator.iter().rposition(|&s| !s).unwrap_or(first);
+    (0..is_separator.len()).filter(|&i| is_separator[i] && (i < first || i > last || is_separator[i - 1])).collect()
+}
+
+/// Applies [`separators_to_drop`] to the menu's top level, from the end so
+/// positions stay valid.
+///
+/// # Safety
+/// `popup.0` must be a live menu of this thread.
+unsafe fn tidy_separators(popup: &Popup) {
+    let count = GetMenuItemCount(Some(popup.0)).max(0) as u32;
+    let kinds: Vec<bool> = (0..count)
+        .map(|pos| {
+            let mut info = MENUITEMINFOW { cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32, fMask: MIIM_FTYPE, ..Default::default() };
+            GetMenuItemInfoW(popup.0, pos, true, &mut info).is_ok() && info.fType.0 & MFT_SEPARATOR.0 != 0
+        })
+        .collect();
+    for pos in separators_to_drop(&kinds).into_iter().rev() {
+        let _ = DeleteMenu(popup.0, pos as u32, MF_BYPOSITION);
     }
 }
 
@@ -338,6 +367,25 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn separators_are_tidied_to_none_first_last_or_doubled() {
+        const S: bool = true;
+        const I: bool = false;
+        let cases: [(&[bool], &[usize]); 8] = [
+            (&[], &[]),
+            (&[I, S, I], &[]),
+            (&[S, I, I], &[0]),
+            (&[I, I, S], &[2]),
+            (&[I, S, S, I], &[2]),
+            (&[S, S, I, S, S, S, I, S], &[0, 1, 4, 5, 7]),
+            (&[S, S, S], &[0, 1, 2]),
+            (&[I, S, S, S, I], &[2, 3]),
+        ];
+        for (kinds, want) in cases {
+            assert_eq!(separators_to_drop(kinds), want, "{kinds:?}");
+        }
+    }
 
     #[test]
     fn windows_own_rename_and_delete_are_left_out() {
