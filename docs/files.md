@@ -26,6 +26,23 @@ An unfolded folder shows up to 15 items, folders first. If there are more, the l
 
 Typing while the selection is on an item inside a folder switches the bar to that folder's path, followed by what you typed, so you can narrow the folder from there. Folders fold again when the text changes or the bar closes; Flick does not remember what was unfolded.
 
+### The actions menu
+
+Press Tab on a file or folder, or right-click it, for its menu. This works on search results, typed paths, unfolded folders, `dl`, `recent` and pinned rows.
+
+- Files: Open file location, Open with…, Copy (the file itself, to paste in Explorer), Copy path, Rename, Delete, More options…, then Pin.
+- Folders: Open in Explorer, Open in Terminal, Copy path, Compress to zip, Properties, More options…, then Pin.
+- Inside a OneDrive or other cloud-synced folder, Keep on this device and Free up space are added.
+- A drive such as `C:\` has no Compress, Rename, Delete or Keep/Free entries.
+
+Delete moves the file to the Recycle Bin, after a second Enter: the row says `Enter again to move to the Recycle Bin`. Any other key disarms it. Flick never deletes for good.
+
+Rename puts the name in the bar with the part before the extension selected. Type the new name, press Enter to rename or Esc to cancel. A name that already exists is refused (`A file with that name already exists`) and the bar stays in rename mode. While you rename, the list keys and the menu do nothing.
+
+Delete and Rename keep the bar open and refresh the list. Compress, Properties, Open with…, Open in Terminal, Copy and Keep/Free close it.
+
+More options… shows Windows' own menu for the item, with the entries added by installed programs such as OneDrive or PowerToys. The bar closes once you pick a command.
+
 <details>
 <summary>What is searched, and how the list is kept up to date</summary>
 

@@ -122,7 +122,7 @@ export type State = {
   items: Item[];
   selected: number; // index into the shown rows (`shownRows`)
   armed: string | null; // id awaiting a second Enter
-  armedAction: "uninstall" | null; // what the armed second Enter does, besides activating
+  armedAction: "uninstall" | "delete" | null; // what the armed second Enter does, besides activating
   scope: { name: string; prompt: string } | null;
   error: string | null; // what the UI should display
   configError: string | null; // last config error from the back end
@@ -136,11 +136,12 @@ export type State = {
   menu: Menu | null; // the right-click menu, when open
   hidden: boolean; // the bar was hidden (Esc, focus loss) and not shown or typed into since
   queried: { text: string; scope: string | null } | null; // what the last query asked for
-  keep: { provider: string; id: string; chain?: string } | null; // row to stay on when the re-query's results arrive; `chain` only for a row inside a folder
+  keep: { provider: string; id: string; chain?: string; index?: number } | null; // row to stay on when the re-query's results arrive; `chain` only for a row inside a folder; `index`: where to go when that row is gone (a deleted one)
   browsed: boolean; // the rows were moved through (arrows or mouse) since the bar opened or the text changed: Up no longer recalls
   kept: boolean; // `items` are the last show's empty-bar rows, on screen until the fresh ones arrive
   tabCompletion: boolean; // the "Tab completion" setting: a grey preview, and no highlight until the rows are moved through
   unfolded: Record<string, Fold>; // the unfolded folders, by their row's key
+  rename: { item: Item; before: { text: string; selected: number; top: number } } | null; // the row being renamed in the bar, and what to restore
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -149,6 +150,8 @@ export type Effect =
   | { type: "togglePin"; item: Item }
   | { type: "act"; item: Item; action: Action }
   | { type: "liveRow"; provider: string; id: string }
+  | { type: "rename"; item: Item; name: string }
+  | { type: "selectName"; start: number; end: number }
   | { type: "unfold"; key: string; path: string }
   | { type: "hide" };
 export type Event =
@@ -185,6 +188,8 @@ export type Event =
         | { kind: "fill"; text: string };
     }
   | { type: "failed"; message: string }
+  | { type: "renamed"; id: string }
+  | { type: "deleted"; item: Item }
   | { type: "queryFailed"; message: string }
   | { type: "configError"; message: string | null }
   | { type: "options"; tabCompletion: boolean };
@@ -213,6 +218,7 @@ export const initial: State = {
   kept: false,
   tabCompletion: false,
   unfolded: {},
+  rename: null,
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -226,6 +232,18 @@ export function movedEnough(prev: Point | null, next: Point): boolean {
 export function failureText(item: Item, err: unknown): string {
   return `${item.title}: ${String(err)}`;
 }
+
+/** What the bar selects when a rename starts: the name without its extension
+ *  (up to the last dot), the whole name for a folder or a name with no dot
+ *  after its first character. */
+export function nameSelection(title: string, isFolder: boolean): [number, number] {
+  const dot = title.lastIndexOf(".");
+  return [0, isFolder || dot <= 0 ? title.length : dot];
+}
+
+// A rename ends: the text, the selection and the window are what they were.
+const leaveRename = (s: State): State =>
+  s.rename === null ? s : { ...s, rename: null, text: s.rename.before.text, selected: s.rename.before.selected, top: s.rename.before.top };
 
 // The window shows 8 rows, or 7 when the error line takes a row's worth of space.
 export const MAX_ROWS = 8;
@@ -356,9 +374,9 @@ function step(s: State, e: Event): Result {
         ],
       );
     case "hidden":
-      return done({ ...s, hidden: true, unfolded: {} });
+      return done({ ...leaveRename(s), hidden: true, unfolded: {} });
     case "blurred":
-      return done({ ...s, armed: null, queued: null, menu: null });
+      return done(fit({ ...leaveRename(s), armed: null, queued: null, menu: null }));
     case "answersReady": {
       // A folder read finished, or a rate or forecast arrived: ask again for
       // every folder still being read, and for the rows when the text is still
@@ -369,7 +387,7 @@ function step(s: State, e: Event): Result {
             .filter(([, f]) => f.state === "reading")
             .map(([key, f]): Effect => ({ type: "unfold", key, path: f.path }));
       const q = s.queried;
-      if (s.hidden || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s, again);
+      if (s.hidden || s.rename || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s, again);
       if (s.text.trim() === "" && !s.scope) return done(s, again);
       const sel = shownRows(s)[s.selected];
       // While typed text is still waiting for its answer, the rows are for older text.
@@ -394,6 +412,7 @@ function step(s: State, e: Event): Result {
     }
     case "fold": {
       // The chevron: unfolds or folds that row, as Right or Left on it would.
+      if (s.rename) return done(s);
       const row = shownRows(s)[e.index];
       if (!row || row.fold === "none" || foldBlocked(s)) return done(s);
       return side(fit({ ...s, selected: e.index }), row.fold === "folded");
@@ -419,7 +438,7 @@ function step(s: State, e: Event): Result {
     }
     case "updateChanged": {
       // The update row (found, downloading, failed) lives in the empty bar only.
-      if (s.hidden || s.text.trim() !== "" || s.scope) return done(s);
+      if (s.hidden || s.rename || s.text.trim() !== "" || s.scope) return done(s);
       const sel = shownRows(s)[s.selected];
       const keep = sel ? keepOf(sel) : null;
       return done({ ...s, keep }, [{ type: "query", text: "", scope: null, keepSelection: true }]);
@@ -427,9 +446,10 @@ function step(s: State, e: Event): Result {
     case "menuClose":
       return done({ ...s, menu: null });
     case "hover":
-      if (s.menu || !shownRows(s)[e.index] || e.index === s.selected) return done(s);
+      if (s.menu || s.rename || !shownRows(s)[e.index] || e.index === s.selected) return done(s);
       return done(fit({ ...s, selected: e.index, armed: null, browsed: true }));
     case "click": {
+      if (s.rename) return done(s);
       if (s.menu) return done({ ...s, menu: null });
       if (!shownRows(s)[e.index]) return done(s);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
@@ -440,7 +460,7 @@ function step(s: State, e: Event): Result {
     }
     case "menu": {
       const item = shownRows(s)[e.index];
-      if (!item) return done(s);
+      if (!item || s.rename) return done(s);
       const actions = menuActions(item);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
       if (actions.length === 0) return done({ ...sel, menu: null });
@@ -449,15 +469,15 @@ function step(s: State, e: Event): Result {
     case "savePanel": {
       // Ctrl+S on the QR panel: its "Save as picture" without the menu.
       const item = panelItem(s);
-      if (!item || s.pending || !item.actions.includes("save_picture")) return done(s);
+      if (!item || s.rename || s.pending || !item.actions.includes("save_picture")) return done(s);
       return done({ ...s, menu: null, pending: true }, [{ type: "act", item, action: "save_picture" }]);
     }
     case "menuPick": {
       const m = s.menu;
       const row = m && shownRows(s)[m.index];
       const item = row && plain(row);
-      // Only picking Uninstall keeps (or sets) the arm: any other pick must never fire it.
-      const closed = { ...s, menu: null, ...(e.action === "uninstall" ? {} : { armed: null, armedAction: null }) };
+      // Only picking Uninstall or Delete keeps (or sets) the arm: any other pick must never fire it.
+      const closed = { ...s, menu: null, ...(e.action === "uninstall" || e.action === "delete" ? {} : { armed: null, armedAction: null }) };
       if (!m || !item || !m.actions.includes(e.action)) return done(closed);
       switch (e.action) {
         case "pin":
@@ -467,6 +487,14 @@ function step(s: State, e: Event): Result {
           return enter({ ...closed, selected: m.index }, "ctrl_shift");
         case "uninstall":
           return done({ ...closed, selected: m.index, armed: item.id, armedAction: "uninstall" });
+        case "delete":
+          return done({ ...closed, selected: m.index, armed: item.id, armedAction: "delete" });
+        case "rename": {
+          if (s.pending) return done(closed);
+          const before = { text: s.text, selected: m.index, top: s.top };
+          const [start, end] = nameSelection(item.title, item.id.endsWith("\\"));
+          return done({ ...closed, selected: m.index, rename: { item, before }, text: item.title, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
+        }
         default:
           if (s.pending) return done(closed);
           return done({ ...closed, pending: true }, [{ type: "act", item, action: e.action }]);
@@ -480,6 +508,8 @@ function step(s: State, e: Event): Result {
     case "configError":
       return done(fit({ ...s, configError: e.message, error: s.failure ?? e.message }));
     case "input": {
+      // Rename mode: typing edits the name only, nothing is searched.
+      if (s.rename) return done(fit({ ...s, text: e.text, failure: null, error: s.configError }));
       // Text added at the end while the selection is inside an unfolded folder:
       // the bar switches to that folder's path, followed by what was added.
       const row = shownRows(s)[s.selected];
@@ -524,7 +554,7 @@ function step(s: State, e: Event): Result {
         const menu = s.menu && was && now && was.key === now.key ? s.menu : null;
         // A result that is gone: back to the first. A row inside a folder that
         // folded: the row that took its place.
-        const selected = at >= 0 ? at : k.chain !== undefined ? s.selected : 0;
+        const selected = at >= 0 ? at : k.index ?? (k.chain !== undefined ? s.selected : 0);
         return done(fit({ ...fresh, selected, armed, awaiting: false, menu, keep: null }));
       }
       // The result at this index of `e.items`, counted in shown rows.
@@ -575,6 +605,30 @@ function step(s: State, e: Event): Result {
     case "failed":
       // A failed activation brings the bar back.
       return done(fit({ ...s, armed: null, pending: false, hidden: false, failure: e.message, error: e.message }));
+    case "renamed": {
+      // The new name took: leave rename mode and ask again for the text from
+      // before it, staying on the renamed row (or where it was).
+      const r = s.rename;
+      if (!r) {
+        // Cancelled while the rename was on its way: the list still needs the new name.
+        return done({ ...s, pending: false, keep: { provider: "files", id: e.id, index: s.selected } }, [
+          { type: "query", text: s.text, scope: s.scope?.name ?? null, keepSelection: true },
+        ]);
+      }
+      const keep = { provider: r.item.provider, id: e.id, index: r.before.selected };
+      const left = leaveRename(s);
+      return done(fit({ ...left, pending: false, failure: null, error: s.configError, keep }), [
+        { type: "query", text: left.text, scope: s.scope?.name ?? null, keepSelection: true },
+      ]);
+    }
+    case "deleted": {
+      // The file went to the Recycle Bin: ask again for the same text; the
+      // selection stays at its index (the list's end clamps it).
+      const keep = { provider: e.item.provider, id: e.item.id, index: s.selected };
+      return done({ ...s, pending: false, armed: null, armedAction: null, menu: null, keep }, [
+        { type: "query", text: s.text, scope: s.scope?.name ?? null, keepSelection: true },
+      ]);
+    }
     case "queryFailed":
       // Leaves `pending` alone: an activation may still be in flight.
       return done(fit({ ...s, armed: null, awaiting: false, queued: null, failure: e.message, error: e.message }));
@@ -627,7 +681,18 @@ function onMenuKey(s: State, m: Menu, e: Extract<Event, { type: "key" }>): Resul
   }
 }
 
+// Rename mode owns Enter and Esc; the list keys do nothing, the rest is the text field's.
+function onRenameKey(s: State, r: NonNullable<State["rename"]>, e: Extract<Event, { type: "key" }>): Result {
+  if (e.key === "Enter") {
+    if (s.pending) return done(s);
+    return done({ ...s, pending: true, failure: null, error: s.configError }, [{ type: "rename", item: r.item, name: s.text }]);
+  }
+  if (e.key === "Escape") return done(fit({ ...leaveRename(s), pending: false, failure: null, error: s.configError }));
+  return done(s);
+}
+
 function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
+  if (s.rename) return onRenameKey(s, s.rename, e);
   if (s.menu) return onMenuKey(s, s.menu, e);
   switch (e.key) {
     case "ArrowUp":
@@ -710,7 +775,7 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
 
 // Right and Left (and the chevron) are ignored while a menu is open, a row is
 // armed, older results are awaited, an activation is pending, or a panel shows.
-const foldBlocked = (s: State): boolean => s.menu !== null || s.armed !== null || s.awaiting || s.pending || panelItem(s) !== null;
+const foldBlocked = (s: State): boolean => s.rename !== null || s.menu !== null || s.armed !== null || s.awaiting || s.pending || panelItem(s) !== null;
 
 // True exactly when Right or Left would change something; otherwise the key is
 // left to the text field (the caret moves).
@@ -803,8 +868,8 @@ function enter(s: State, modifier: Modifier): Result {
     return row.id === "more" && f ? fill(s, typedOf(f)) : done(s);
   }
   const item = plain(row);
-  if (s.armed === item.id && s.armedAction === "uninstall") {
-    return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: "uninstall" }]);
+  if (s.armed === item.id && (s.armedAction === "uninstall" || s.armedAction === "delete")) {
+    return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: s.armedAction }]);
   }
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
   return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);

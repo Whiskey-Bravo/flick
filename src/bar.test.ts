@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { arrowActsOnList, sideActs, completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
+import { arrowActsOnList, sideActs, completion, failureText, highlighted, initial, menuActions, movedEnough, nameSelection, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -968,6 +968,135 @@ describe("mouse and menu", () => {
       expect([kept.armed, kept.armedAction]).toEqual(["u", "uninstall"]);
       const lost = run(s, { type: "results", items: [item("x")] }).state;
       expect([lost.armed, lost.armedAction]).toEqual([null, null]);
+    });
+  });
+
+  describe("delete and rename", () => {
+    const f = (id: string, title = id): Item => rich(id, { provider: "files", title, actions: ["rename", "delete"] });
+    const a = f("C:/x/a.txt", "a.txt");
+    const b = f("C:/x/b.txt", "b.txt");
+    const c = f("C:/x/report.final.docx", "report.final.docx");
+    const typed = (...items: Item[]) =>
+      run(initial, { type: "shown" }, { type: "input", text: "x" }, { type: "results", items }).state;
+    const pick = (s: State, action: "delete" | "rename") => run(s, key("Tab"), { type: "menuPick", action });
+
+    it("delete_needs_a_second_enter", () => {
+      const first = pick(typed(a), "delete");
+      expect(first.effects).toEqual([]);
+      expect([first.state.armed, first.state.armedAction, first.state.pending]).toEqual([a.id, "delete", false]);
+      const second = run(first.state, key("Enter"));
+      expect(second.effects).toEqual([{ type: "act", item: a, action: "delete" }]);
+      expect([second.state.armed, second.state.armedAction, second.state.pending]).toEqual([null, null, true]);
+      // Moving off the row disarms it, so Enter opens whatever is selected.
+      const moved = run(typed(a, b), key("Tab"), { type: "menuPick", action: "delete" }, key("ArrowDown"));
+      expect([moved.state.armed, moved.state.armedAction]).toEqual([null, null]);
+      expect(run(moved.state, key("Enter")).effects.map((e) => e.type)).toEqual(["activate"]);
+    });
+
+    it("delete_arm_follows_the_row_not_the_index", () => {
+      const s = run(pick(typed(a, b), "delete").state, { type: "answersReady" }).state;
+      const moved = run(s, { type: "results", items: [b, a] }).state;
+      expect([moved.armed, moved.armedAction, moved.selected]).toEqual([a.id, "delete", 1]);
+      expect(run(moved, key("Enter")).effects).toEqual([{ type: "act", item: a, action: "delete" }]);
+      const gone = run(s, { type: "results", items: [b] }).state;
+      expect([gone.armed, gone.armedAction]).toEqual([null, null]);
+    });
+
+    it("a successful delete asks again for the same text and stays at the index", () => {
+      const s = run(typed(a, b, c), { type: "hover", index: 1 }).state;
+      const r = run(s, { type: "deleted", item: b });
+      expect(r.effects).toEqual([{ type: "query", text: "x", scope: null, keepSelection: true }]);
+      expect(r.state.pending).toBe(false);
+      const after = run(r.state, { type: "results", items: [a, c] }).state;
+      expect(after.selected).toBe(1);
+      // At the end of the list the selection is clamped.
+      const last = run(run(typed(a, b), { type: "hover", index: 1 }).state, { type: "deleted", item: b }).state;
+      expect(run(last, { type: "results", items: [a] }).state.selected).toBe(0);
+    });
+
+    describe("rename", () => {
+      const start = (items: Item[] = [a, c], index = 1) => {
+        const s = run(typed(...items), { type: "hover", index }).state;
+        return pick(s, "rename");
+      };
+      const kind = (r: ReturnType<typeof run>) => r.effects.map((e) => e.type);
+
+      it("rename_mode_selects_the_base_name", () => {
+        expect(nameSelection("report.final.docx", false)).toEqual([0, 12]);
+        expect(nameSelection(".gitignore", false)).toEqual([0, 10]);
+        expect(nameSelection("a.b", true)).toEqual([0, 3]);
+        expect(nameSelection("README", false)).toEqual([0, 6]);
+        const r = start();
+        expect(r.state.text).toBe("report.final.docx");
+        expect(r.effects).toEqual([{ type: "selectName", start: 0, end: 12 }]);
+        // A folder row (its id ends in a backslash) selects the whole name.
+        const dir = f("C:/x/a.b" + String.fromCharCode(92), "a.b");
+        expect(start([dir], 0).effects).toEqual([{ type: "selectName", start: 0, end: 3 }]);
+      });
+
+      it("rename_enter_sends_the_new_name_for_the_original_row", () => {
+        const r = start();
+        // A re-query arrives that moves the rows: the name still goes to the row renamed.
+        const moved = run(r.state, { type: "results", items: [c, a] }).state;
+        const typedName = run(moved, { type: "input", text: "new.docx" }).state;
+        const sent = run(typedName, key("Enter"));
+        expect(sent.effects).toEqual([{ type: "rename", item: c, name: "new.docx" }]);
+        expect(sent.state.pending).toBe(true);
+        expect(sent.state.rename).not.toBeNull();
+      });
+
+      it("rename_esc_restores_text_and_selection", () => {
+        const r = start();
+        const edited = run(r.state, { type: "input", text: "zzz" }).state;
+        const esc = run(edited, key("Escape"));
+        expect(esc.effects).toEqual([]);
+        expect([esc.state.rename, esc.state.text, esc.state.selected]).toEqual([null, "x", 1]);
+      });
+
+      it("rename_failure_keeps_the_mode_with_the_error", () => {
+        const sent = run(start().state, key("Enter")).state;
+        const failed = run(sent, { type: "failed", message: "A file with that name already exists" }).state;
+        expect(failed.rename).not.toBeNull();
+        expect(failed.pending).toBe(false);
+        expect(failed.error).toContain("already exists");
+        // Typing again clears the error and keeps the mode.
+        const again = run(failed, { type: "input", text: "other.docx" }).state;
+        expect([again.rename === null, again.error]).toEqual([false, null]);
+      });
+
+      it("rename_success_selects_the_renamed_row", () => {
+        const sent = run(start().state, { type: "input", text: "new.docx" }, key("Enter")).state;
+        const ok = run(sent, { type: "renamed", id: "C:/x/new.docx" });
+        expect(ok.effects).toEqual([{ type: "query", text: "x", scope: null, keepSelection: true }]);
+        expect([ok.state.rename, ok.state.text, ok.state.pending]).toEqual([null, "x", false]);
+        const renamed = rich("C:/x/new.docx", { provider: "files", title: "new.docx" });
+        const after = run(ok.state, { type: "results", items: [renamed, a] }).state;
+        expect(after.selected).toBe(0);
+      });
+
+      it("typing_in_rename_mode_sends_no_query", () => {
+        const r = start();
+        const t = run(r.state, { type: "input", text: "q" });
+        expect(t.effects).toEqual([]);
+        expect(t.state.text).toBe("q");
+        expect(t.state.rename).not.toBeNull();
+        // The list, the menu and the mouse do nothing meanwhile.
+        for (const e of [key("Tab"), key("ArrowDown"), key("ArrowUp"), key("p", true), key("F1")]) {
+          const k = run(t.state, e);
+          expect([kind(k), k.state.selected, k.state.menu, k.state.text]).toEqual([[], 1, null, "q"]);
+        }
+        for (const e of [{ type: "menu", index: 0 }, { type: "click", index: 0, ctrl: false, shift: false }, { type: "hover", index: 0 }] as Event[]) {
+          expect(run(t.state, e).state).toBe(t.state);
+        }
+        expect(sideActs(t.state, true)).toBe(false);
+      });
+
+      it("hiding leaves rename mode", () => {
+        for (const e of [{ type: "blurred" }, { type: "hidden" }] as Event[]) {
+          const s = run(start().state, e).state;
+          expect([s.rename, s.text]).toEqual([null, "x"]);
+        }
+      });
     });
   });
 

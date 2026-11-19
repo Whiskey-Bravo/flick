@@ -264,11 +264,16 @@ function renderItem(item: Row, index: number, fresh: boolean): HTMLLIElement {
   title.textContent = item.title;
   const sub = document.createElement("span");
   sub.className = "subtitle";
-  sub.textContent = !armed
+  const renaming = state.rename !== null && state.rename.item.provider === item.provider && state.rename.item.id === item.id;
+  sub.textContent = renaming
+    ? "Enter renames, Esc cancels"
+    : !armed
     ? item.subtitle
     : state.armedAction === "uninstall"
       ? `Uninstall ${item.title}? Enter again`
-      : "Press Enter again to confirm";
+      : state.armedAction === "delete"
+        ? "Enter again to move to the Recycle Bin"
+        : "Press Enter again to confirm";
   li.append(renderIcon(item), title, sub);
   if (item.pinned) {
     const star = document.createElement("img");
@@ -395,8 +400,8 @@ function render() {
     input.value = state.text;
     input.setSelectionRange(state.text.length, state.text.length);
   }
-  pill.hidden = !state.scope;
-  pill.textContent = state.scope?.prompt ?? "";
+  pill.hidden = !state.scope && !state.rename;
+  pill.textContent = state.rename ? "Rename" : state.scope?.prompt ?? "";
   input.placeholder = state.scope ? "" : "Search apps and settings";
   errorLine.hidden = !state.error;
   errorLine.textContent = state.error ?? "";
@@ -553,13 +558,30 @@ function run(effect: Effect) {
       const at = shows;
       invoke<Outcome>("act", { provider: effect.item.provider, id: effect.item.id, action: effect.action })
         .then((outcome) => {
-          if (at === shows) dispatch({ type: "outcome", outcome });
+          if (at !== shows) return;
+          // A delete that kept the bar open: the list asks again, the row is gone.
+          if (effect.action === "delete" && outcome.kind === "keep") dispatch({ type: "deleted", item: effect.item });
+          else dispatch({ type: "outcome", outcome });
         })
         .catch((err) => {
           if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
         });
       break;
     }
+    case "rename": {
+      const at = shows;
+      invoke<string>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
+        .then((id) => {
+          if (at === shows) dispatch({ type: "renamed", id });
+        })
+        .catch((err) => {
+          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+        });
+      break;
+    }
+    case "selectName":
+      input.setSelectionRange(effect.start, effect.end);
+      break;
     case "hide":
       invoke("hide").catch(() => {});
       break;

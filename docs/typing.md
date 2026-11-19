@@ -79,7 +79,7 @@ Each result shows the icon of its app, file or folder. Icons load in the backgro
 
 - Moving the mouse over a row selects it.
 - A click opens it.
-- A right click (or Tab) opens a menu of the row's own actions: Open file location, Open in Explorer, Copy path, Run as administrator, Uninstall (asks for a second Enter), Close, Close window, Pin or Unpin. Entries that do not apply to that row are left out.
+- A right click (or Tab) opens a menu of the row's own actions: Open file location, Open in Explorer, Copy path, Run as administrator, Uninstall (asks for a second Enter), Close, Close window, Pin or Unpin. Entries that do not apply to that row are left out. Files and folders have more entries: see [Files and folders](files.md#the-actions-menu).
 
 ## Tab completion
 
