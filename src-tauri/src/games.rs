@@ -368,11 +368,14 @@ pub fn rockstar_games(programs: &[Program]) -> Vec<Game> {
         }
         let Some(folder) = Path::new(&program).parent() else { continue };
         let exe = folder.join("Launcher.exe").to_string_lossy().into_owned();
+        // A trailing `\` before the closing quote would escape it.
+        let location_text = location.to_string_lossy();
+        let in_folder = location_text.trim_end_matches(['\\', '/']);
         out.push(Game {
             id,
             name: p.name.clone(),
             store: Store::Rockstar,
-            start: Start::Exe { exe: exe.clone(), params: format!("-launchTitleInFolder \"{}\"", location.display()) },
+            start: Start::Exe { exe: exe.clone(), params: format!("-launchTitleInFolder \"{in_folder}\"") },
             folder: Some(location.clone()),
             icon: format!("file:{exe}"),
         });
@@ -718,6 +721,16 @@ mod tests {
         );
         assert_eq!(g.folder, Some(PathBuf::from(r"D:\Games\GTAV")));
         assert_eq!(g.icon, r"file:C:\Program Files\Rockstar Games\Launcher\Launcher.exe");
+    }
+
+    /// A trailing backslash in the install folder would escape the closing
+    /// quote (`"D:\Games\GTAV\"`), so it is dropped.
+    #[test]
+    fn rockstar_folder_drops_a_trailing_backslash() {
+        let un = r#""C:\Program Files\Rockstar Games\Launcher\uninstall.exe" -uninstall=gta5"#;
+        let games = rockstar_games(&[program("Grand Theft Auto V", Some(r"D:\Games\GTAV\"), un)]);
+        let Start::Exe { params, .. } = &games[0].start else { panic!("{games:?}") };
+        assert_eq!(params, r#"-launchTitleInFolder "D:\Games\GTAV""#);
     }
 
     #[test]
