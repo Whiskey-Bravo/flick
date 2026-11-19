@@ -409,6 +409,7 @@ mod tests {
         assert_eq!(rows[0].actions, [Action::Reveal, Action::CopyPath]);
         assert_eq!(rows[1].id, format!(r"{DOCS}\"));
         assert_eq!(rows[1].actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!((rows[0].folder.as_str(), rows[1].folder.as_str()), ("", format!(r"{DOCS}\").as_str()));
         assert_eq!(titles(&ready(&r.p, &r.rx, "doc")), ["Documents"]);
     }
 

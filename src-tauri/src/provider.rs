@@ -73,6 +73,9 @@ pub struct ResultItem {
     pub panel: String,
     /// The row changes by itself: the bar asks again every second while it shows.
     pub live: bool,
+    /// Absolute path ending in `\` when the row is a folder the bar can unfold
+    /// ("" = not a folder).
+    pub folder: String,
     /// A computed answer: in plain queries the engine puts it above every other row.
     #[serde(skip)]
     pub top: bool,

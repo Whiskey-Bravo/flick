@@ -6,6 +6,7 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::launch;
 use crate::provider::{Action, Modifier, Outcome, ResultItem, Then};
+use crate::providers::path::Unfolded;
 use crate::window;
 use crate::AppState;
 
@@ -31,6 +32,13 @@ pub fn live_row(provider: String, id: String, state: State<AppState>) -> Option<
     let item = live_item(&provider, &id, |p, i| state.engine.item(p, i));
     timer.finish();
     item
+}
+
+/// What a folder row has to show under it: memory only, the read runs on the
+/// loader's threads. Nothing is ranked or recorded and no search is cancelled.
+#[tauri::command(async)]
+pub fn unfold(path: String, state: State<AppState>) -> Unfolded {
+    state.engine.unfold(&path)
 }
 
 /// Only the `answers` provider has live rows: any other provider is not asked

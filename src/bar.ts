@@ -13,6 +13,7 @@ export type Item = {
   complete: string; // text Tab puts in the bar, "" = none
   panel: string; // SVG markup from Flick's backend to show large instead of the list, "" = none
   live: boolean; // the row changes by itself: ask again every second while it shows
+  folder: string; // absolute path ending in a backslash when the row is a folder that can unfold, "" = not
 };
 export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";

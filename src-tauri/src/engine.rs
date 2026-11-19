@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::fuzzy;
 use crate::history::History;
 use crate::pins::Pins;
+use crate::providers::path::{PathProvider, Unfolded};
 use crate::provider::{Action, HelpLine, Modifier, Origin, Outcome, Provider, Query, ResultItem, Route};
 use crate::ranking::Ranking;
 
@@ -141,6 +142,8 @@ pub struct Engine {
     pins: Arc<Pins>,
     /// Highest number of any cancellable search begun (see [`Engine::query_newest`]).
     newest: Arc<AtomicU64>,
+    /// The provider that unfolds a folder's contents (see [`Engine::unfold`]).
+    path: Option<Arc<PathProvider>>,
 }
 
 impl Engine {
@@ -150,7 +153,23 @@ impl Engine {
         history: Arc<History>,
         pins: Arc<Pins>,
     ) -> Self {
-        Self { providers, ranking, history, pins, newest: Arc::new(AtomicU64::new(0)) }
+        Self { providers, ranking, history, pins, newest: Arc::new(AtomicU64::new(0)), path: None }
+    }
+
+    /// The path provider `unfold` asks (it also sits among `providers`).
+    pub fn with_path(mut self, path: Arc<PathProvider>) -> Self {
+        self.path = Some(path);
+        self
+    }
+
+    /// The contents of a folder row, for the bar to show under it. Memory
+    /// only: nothing is ranked, recorded or pinned, and no search is cancelled.
+    /// Without a path provider every folder is `missing`.
+    pub fn unfold(&self, folder: &str) -> Unfolded {
+        match &self.path {
+            Some(path) => path.unfold(folder),
+            None => Unfolded { state: "missing", rows: Vec::new(), more: 0, typed: String::new() },
+        }
     }
 
     /// Pins or unpins an item; returns the new pinned state. Unpinning always
@@ -650,6 +669,32 @@ mod tests {
         let pins = Arc::new(Pins::load(dir.path().join("pins.json")));
         let e = Engine::new(providers, ranking.clone(), history.clone(), pins.clone());
         (e, ranking, history, pins, dir)
+    }
+
+    #[test]
+    fn unfold_reaches_the_path_provider_and_records_nothing() {
+        use crate::clipboard::FakeClipboard;
+        use crate::dirs::testing::{file, FakeFs};
+        use crate::dirs::{Loader, FRESH, SLOW};
+        use crate::launch::testing::RecordingLauncher;
+
+        let fs = Arc::new(FakeFs::default());
+        fs.add_dir(r"C:\Work", vec![file("a.txt", 10)]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let dirs = Loader::new(Arc::new(move || {
+            let _ = tx.lock().unwrap().send(());
+        }), FRESH, SLOW);
+        let path = Arc::new(PathProvider::new(dirs, fs, None, Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default())));
+        let (e, ranking, history, pins, _dir) = engine_stores(Vec::new());
+        let e = e.with_path(path);
+        assert_eq!(e.unfold(r"C:\Work\").state, "reading");
+        rx.recv_timeout(std::time::Duration::from_secs(1)).expect("on_ready");
+        let u = e.unfold(r"C:\Work\");
+        assert_eq!((u.state, u.rows.len(), u.rows[0].id.as_str(), u.typed.as_str()), ("ready", 1, r"C:\Work\a.txt", r"C:\Work\"));
+        assert_eq!(ranking.boost("path", r"C:\Work\a.txt"), 0);
+        assert!(history.searches().is_empty() && pins.list().is_empty());
+        assert_eq!(Engine::new(Vec::new(), ranking, history, pins).unfold(r"C:\Work\").state, "missing");
     }
 
     /// A welcome-like provider `w` (one empty-bar row), then `a`.

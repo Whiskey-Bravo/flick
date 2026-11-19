@@ -3,7 +3,7 @@ import { completion, failureText, highlighted, initial, menuActions, movedEnough
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
-  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false,
+  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false, folder: "",
 });
 const run = (s: State, ...events: Event[]) => {
   let state = s;
