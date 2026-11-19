@@ -14,7 +14,8 @@ use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize,
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, SHBindToParent, SHParseDisplayName, CMF_EXTENDEDVERBS,
-    CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, SEE_MASK_UNICODE,
+    CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, SEE_MASK_NOASYNC,
+    SEE_MASK_UNICODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, PostMessageW, RegisterClassW,
@@ -27,8 +28,10 @@ const NO_MENU: &str = "Windows' menu can't be shown for this item";
 /// What the user picked could not run.
 const FAILED: &str = "That command didn't run";
 
-/// `CMIC_MASK_UNICODE` is `SEE_MASK_UNICODE` (shobjidl.h); the crate has only the latter.
+/// `CMIC_MASK_UNICODE` and `CMIC_MASK_NOASYNC` are `SEE_MASK_UNICODE` and
+/// `SEE_MASK_NOASYNC` (shobjidl.h); the crate has only the latter.
 const CMIC_MASK_UNICODE: u32 = SEE_MASK_UNICODE;
+const CMIC_MASK_NOASYNC: u32 = SEE_MASK_NOASYNC;
 
 /// The ids the menu's entries are numbered from and up to.
 const FIRST_ID: u32 = 1;
@@ -121,7 +124,10 @@ fn command_offset(picked: i32) -> Option<u32> {
 fn invoke(menu: &IContextMenu, owner: HWND, offset: u32, x: i32, y: i32) -> Result<bool, String> {
     let info = CMINVOKECOMMANDINFOEX {
         cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-        fMask: CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE,
+        // NOASYNC: the menu's thread (its COM apartment and owner window) ends
+        // once this returns, so an extension that works asynchronously must
+        // finish first.
+        fMask: CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE | CMIC_MASK_NOASYNC,
         hwnd: owner,
         // MAKEINTRESOURCE(offset): the verb is the entry's offset, not text.
         lpVerb: PCSTR(offset as usize as *const u8),
