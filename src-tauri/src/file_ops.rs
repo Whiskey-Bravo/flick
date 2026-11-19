@@ -13,7 +13,12 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::DataExchange::{EmptyClipboard, RegisterClipboardFormatW, SetClipboardData};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
 use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY};
-use windows::Win32::UI::Shell::{SHObjectProperties, SHOpenWithDialog, DROPFILES, OAIF_EXEC, OPENASINFO, SHOP_FILEPATH};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::UI::Shell::{
+    FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, SHObjectProperties, SHOpenWithDialog, DROPFILES,
+    FILEOPERATION_FLAGS, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+    OAIF_EXEC, OPENASINFO, SHOP_FILEPATH,
+};
 
 use crate::provider::Action;
 
@@ -32,11 +37,9 @@ pub trait FileOps: Send + Sync {
     fn compress(&self, path: &Path) -> Result<PathBuf, String>;
     /// Cloud files: always keep on this device (`keep`) or online only.
     fn set_cloud_pin(&self, path: &Path, keep: bool) -> Result<(), String>;
-    /// To the Recycle Bin. Not called until Delete is built.
-    #[allow(dead_code)]
+    /// To the Recycle Bin.
     fn recycle(&self, path: &Path) -> Result<(), String>;
-    /// Renames within the same folder; the new path. Not called until Rename is built.
-    #[allow(dead_code)]
+    /// Renames within the same folder; the new path.
     fn rename(&self, path: &Path, new_name: &str) -> Result<PathBuf, String>;
 }
 
@@ -57,6 +60,55 @@ pub(crate) fn menu(is_dir: bool, cloud: bool, drive_root: bool) -> Vec<Action> {
         actions.retain(|a| !matches!(a, Action::Compress | Action::Rename | Action::Delete | Action::KeepOffline | Action::FreeUpSpace));
     }
     actions
+}
+
+/// Whether `name` can be the new name of a file or folder: the error is a
+/// short sentence for the bar.
+pub(crate) fn valid_new_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("Type a name".into());
+    }
+    if name.chars().any(|c| c.is_control() || r#"\/:*?"<>|"#.contains(c)) {
+        return Err(r#"A name can't contain \ / : * ? " < > |"#.into());
+    }
+    if name.ends_with([' ', '.']) {
+        return Err("A name can't end with a space or a dot".into());
+    }
+    // Windows reserves these with any extension (`con.txt`, `NUL.tar.gz`).
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    let numbered = |prefix: &str| stem.strip_prefix(prefix).is_some_and(|n| matches!(n.as_bytes(), [b'1'..=b'9']));
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT") {
+        return Err("That name is reserved by Windows".into());
+    }
+    Ok(())
+}
+
+/// A row id without the `\` a folder's id ends with.
+fn bare(id: &str) -> &str {
+    id.trim_end_matches('\\')
+}
+
+/// Whether two row ids name the same item: equal without regard to case, a
+/// folder's id with or without its trailing `\`.
+pub(crate) fn same_item(a: &str, b: &str) -> bool {
+    bare(a).to_lowercase() == bare(b).to_lowercase()
+}
+
+/// The id `id` gets when `old` becomes `new` (paths of items, folders with or
+/// without a trailing `\`): `new` itself for `old`, and for anything below
+/// `old` the same rest below `new`. `None` for any other id. A folder id keeps
+/// its trailing `\`.
+pub(crate) fn moved_id(id: &str, old: &str, new: &str) -> Option<String> {
+    let (id_bare, old_bare) = (bare(id), bare(old));
+    if old_bare.is_empty() {
+        return None;
+    }
+    let head = id_bare.get(..old_bare.len())?;
+    if head.to_lowercase() != old_bare.to_lowercase() {
+        return None;
+    }
+    let rest = &id_bare[old_bare.len()..];
+    (rest.is_empty() || rest.starts_with('\\')).then(|| format!("{}{rest}{}", bare(new), &id[id_bare.len()..]))
 }
 
 /// Whether `path` is a drive root: `C:\` or `C:`, any letter case.
@@ -205,6 +257,39 @@ fn pin_one(path: &Path, keep: bool) -> Result<(), String> {
     }
 }
 
+fn wide_str(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// One shell file operation on `path`, with `flags`, run to the end on this
+/// thread (COM is set up for the call). `queue` adds the work to the operation.
+fn shell_operation(
+    path: &Path,
+    flags: FILEOPERATION_FLAGS,
+    queue: impl FnOnce(&IFileOperation, &IShellItem) -> windows::core::Result<()>,
+) -> Result<(), String> {
+    let name = wide(path);
+    crate::launch::with_com(|| {
+        // SAFETY: `name` is NUL-terminated and outlives the calls; the interfaces
+        // are used on this thread only and released when they go out of scope.
+        unsafe {
+            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
+            op.SetOperationFlags(flags).map_err(|e| e.to_string())?;
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None).map_err(|e| e.to_string())?;
+            queue(&op, &item).map_err(|e| e.to_string())?;
+            op.PerformOperations().map_err(|e| e.to_string())?;
+            if op.GetAnyOperationsAborted().map_err(|e| e.to_string())?.as_bool() {
+                return Err("aborted".to_string());
+            }
+            Ok(())
+        }
+    })
+}
+
 /// The real calls.
 pub struct SystemFileOps;
 
@@ -314,12 +399,27 @@ impl FileOps for SystemFileOps {
         }
     }
 
-    fn recycle(&self, _path: &Path) -> Result<(), String> {
-        Err("not yet".into())
+    /// Asks for a confirmation only when the item is too big for the bin
+    /// (it would be deleted for good): never silently.
+    fn recycle(&self, path: &Path) -> Result<(), String> {
+        let flags = FOFX_RECYCLEONDELETE | FOF_ALLOWUNDO | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT;
+        shell_operation(path, flags, |op, item| unsafe { op.DeleteItem(item, None) })
+            .map_err(|_| format!("Couldn't delete {}", file_name_of(path)))
     }
 
-    fn rename(&self, _path: &Path, _new_name: &str) -> Result<PathBuf, String> {
-        Err("not yet".into())
+    fn rename(&self, path: &Path, new_name: &str) -> Result<PathBuf, String> {
+        valid_new_name(new_name)?;
+        let target = path.with_file_name(new_name);
+        let same_name = path.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase() == new_name.to_lowercase());
+        // The shell would ask or number the new name: refuse before it can.
+        if !same_name && std::fs::symlink_metadata(&target).is_ok() {
+            return Err("A file with that name already exists".into());
+        }
+        let flags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+        let new = wide_str(new_name);
+        shell_operation(path, flags, |op, item| unsafe { op.RenameItem(item, PCWSTR(new.as_ptr()), None) })
+            .map_err(|_| format!("Couldn't rename {}", file_name_of(path)))?;
+        Ok(target)
     }
 }
 
@@ -409,6 +509,29 @@ mod tests {
     fn menu_on_a_drive_root_drops_changes() {
         assert_eq!(menu(true, false, true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
         assert_eq!(menu(true, true, true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
+    }
+
+    #[test]
+    fn name_rules() {
+        let refused = |name: &str| valid_new_name(name).unwrap_err();
+        for blank in ["", " ", "   ", "\t"] {
+            assert_eq!(refused(blank), "Type a name", "{blank:?}");
+        }
+        let chars = r#"A name can't contain \ / : * ? " < > |"#;
+        for bad in ["a\\b", "a/b", "a:b", "a*b", "a?b", "a\"b", "a<b", "a>b", "a|b", "a\u{1}b", "a\nb", "a\u{7f}b"] {
+            assert_eq!(refused(bad), chars, "{bad:?}");
+        }
+        let ending = "A name can't end with a space or a dot";
+        for bad in [".", "..", "a.", "a ", "a. ", "report.final."] {
+            assert_eq!(refused(bad), ending, "{bad:?}");
+        }
+        let reserved = "That name is reserved by Windows";
+        for bad in ["CON", "con", "Prn", "aux", "NUL", "COM1", "com9", "LPT1", "lpt9", "con.txt", "NUL.tar.gz", "Aux.TXT"] {
+            assert_eq!(refused(bad), reserved, "{bad:?}");
+        }
+        for good in ["report.final.docx", "a.b", ".gitignore", "Ä ß 😀.txt", "console", "com10", "com0", "lpt", "a b", "-x", "100%", "a&b^c"] {
+            assert_eq!(valid_new_name(good), Ok(()), "{good:?}");
+        }
     }
 
     #[test]
@@ -509,6 +632,40 @@ mod tests {
         assert_eq!(zip, dir.path().join("Ä dir.zip"));
         assert_eq!(entry_names(&zip), ["Ä dir/", "Ä dir/empty/", "Ä dir/ü.txt"]);
         println!("probe: zip entries read back: {:?}", entry_names(&zip));
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn moved_ids_follow_a_rename_without_regard_to_case() {
+        let m = |id: &str| moved_id(id, r"C:\d\Sub", r"C:\d\New");
+        assert_eq!(m(r"C:\d\sub").as_deref(), Some(r"C:\d\New"));
+        assert_eq!(m(r"C:\D\SUB\").as_deref(), Some(r"C:\d\New\"));
+        assert_eq!(m(r"C:\d\sub\x\y.txt").as_deref(), Some(r"C:\d\New\x\y.txt"));
+        assert_eq!(m(r"C:\d\sub2\x.txt"), None);
+        assert_eq!(m(r"C:\d"), None);
+        assert!(same_item(r"C:\d\Sub\", r"c:\D\sub"));
+        assert!(!same_item(r"C:\d\a", r"C:\d\b"));
+    }
+
+    /// Real rename and recycle in a fresh temp folder; the file lands in the
+    /// Recycle Bin. Run by hand: `cargo test -- --ignored real_rename_and_recycle_probe --nocapture`.
+    #[test]
+    #[ignore = "puts a file in the real Recycle Bin"]
+    fn real_rename_and_recycle_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("flick-probe-a.txt");
+        std::fs::write(&a, b"probe").unwrap();
+        let ops = SystemFileOps;
+        let renamed = ops.rename(&a, "flick-probe-Ä b.txt").expect("rename");
+        assert_eq!(renamed, dir.path().join("flick-probe-Ä b.txt"));
+        assert!(renamed.exists() && !a.exists());
+        std::fs::write(&a, b"other").unwrap();
+        assert_eq!(ops.rename(&a, "flick-probe-ä B.txt"), Err("A file with that name already exists".to_string()));
+        std::fs::remove_file(&a).unwrap();
+        ops.recycle(&renamed).expect("recycle");
+        assert!(!renamed.exists(), "gone from the folder");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        println!("probe: renamed to {renamed:?}, recycled, folder empty");
         dir.close().unwrap();
     }
 

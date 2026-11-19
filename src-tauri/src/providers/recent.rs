@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use super::path::{act_on_entry, entry_row, inert_row, item_from_id, loaded, open_entry, score_in_order, FOLDER_NOT_FOUND};
+use super::path::{act_on_entry, entry_row, inert_row, item_from_id, loaded, open_entry, rename_entry, score_in_order, FOLDER_NOT_FOUND};
 use crate::clipboard::Clipboard;
 use crate::file_ops::FileOps;
 use crate::dirs::{ago, folder_key, size_text, Clock, DirEntry, FileSystem, Links, Loader, ReadError};
@@ -97,6 +97,10 @@ impl Provider for DownloadsProvider {
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
         act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
+    }
+
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        rename_entry(&|p| self.fs.kind(p), &*self.ops, id, new_name)
     }
 
     /// Typed lists are never learned.
@@ -213,6 +217,10 @@ impl Provider for RecentProvider {
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
         act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
+    }
+
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        rename_entry(&|p| self.fs.kind(p), &*self.ops, id, new_name)
     }
 
     fn rank_key(&self, _id: &str) -> Option<String> {

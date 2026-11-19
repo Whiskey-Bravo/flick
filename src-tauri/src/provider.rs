@@ -210,6 +210,14 @@ pub trait Provider: Send + Sync {
     fn claims(&self, _text: &str) -> bool {
         false
     }
+    /// Renames the file or folder row `id` to `new_name` within its folder;
+    /// the new row id. Only file and folder providers do.
+    fn rename(&self, _id: &str, _new_name: &str) -> Result<String, String> {
+        Err("can't do that here".to_string())
+    }
+    /// A file or folder moved to `new` (`None`: it was deleted), done through
+    /// Flick: indexes that hold paths follow at once.
+    fn moved(&self, _old: &std::path::Path, _new: Option<&std::path::Path>) {}
 }
 
 /// Lets a provider that is also used elsewhere (e.g. apps, refreshed by a
@@ -256,6 +264,12 @@ impl<P: Provider + ?Sized> Provider for Arc<P> {
     }
     fn claims(&self, text: &str) -> bool {
         (**self).claims(text)
+    }
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        (**self).rename(id, new_name)
+    }
+    fn moved(&self, old: &std::path::Path, new: Option<&std::path::Path>) {
+        (**self).moved(old, new)
     }
 }
 

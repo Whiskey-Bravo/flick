@@ -134,7 +134,7 @@ pub(crate) fn inert_row(provider: &'static str, title: &str, subtitle: String) -
 
 /// The path in an entry id and whether it names a folder: a trailing `\`,
 /// dropped unless the path is a drive root.
-fn split_id(id: &str) -> (&str, bool) {
+pub(crate) fn split_id(id: &str) -> (&str, bool) {
     match id.strip_suffix('\\') {
         Some(path) if !path.is_empty() && !path.ends_with(':') => (path, true),
         Some(_) => (id, true),
@@ -186,8 +186,9 @@ pub(crate) fn act_on_entry(
     Ok(Outcome::Hide)
 }
 
-/// Whether the actions menu of the row `id` handles `action` (Rename, Delete
-/// and More options are not built yet; a drive root cannot be changed).
+/// Whether the actions menu of the row `id` handles `action` (Rename is the
+/// `rename` command and More options is not built yet; a drive root cannot be
+/// changed).
 pub(crate) fn handled(id: &str, action: Action) -> bool {
     match action {
         Action::Reveal
@@ -197,7 +198,7 @@ pub(crate) fn handled(id: &str, action: Action) -> bool {
         | Action::Properties
         | Action::OpenWith
         | Action::CopyFile => true,
-        Action::Compress | Action::KeepOffline | Action::FreeUpSpace => !file_ops::is_drive_root(id),
+        Action::Compress | Action::KeepOffline | Action::FreeUpSpace | Action::Delete => !file_ops::is_drive_root(id),
         _ => false,
     }
 }
@@ -212,12 +213,51 @@ pub(crate) fn run_entry_action(ops: &dyn FileOps, path: &str, action: Action) ->
         Action::Properties => ops.properties(p)?,
         Action::OpenWith => ops.open_with(p)?,
         Action::CopyFile => ops.copy_file(p)?,
+        // The bar stays: the rows refresh, and the engine forgets the item.
+        Action::Delete => {
+            ops.recycle(p)?;
+            return Ok(Outcome::Keep);
+        }
         Action::Compress => return later(Then::Compress { path: path.to_string() }),
         Action::KeepOffline => return later(Then::CloudPin { path: path.to_string(), keep: true }),
         Action::FreeUpSpace => return later(Then::CloudPin { path: path.to_string(), keep: false }),
         _ => return Err(CANT_DO.into()),
     }
     Ok(Outcome::Hide)
+}
+
+/// The text of the refusal to rename onto a name that is taken.
+const NAME_TAKEN: &str = "A file with that name already exists";
+
+/// Renames the file or folder row `id` to `new_name` in its folder; the new
+/// row id (a folder's ends with `\`). `kind` says what is at a path now
+/// (`Some(true)` folder, `Some(false)` file, `None` nothing). The name is
+/// checked first; then the row must still be there as the same kind and the
+/// name free (a change of letter case alone is fine); nothing else happens
+/// on a refusal.
+pub(crate) fn rename_entry(
+    kind: &dyn Fn(&Path) -> Option<bool>,
+    ops: &dyn FileOps,
+    id: &str,
+    new_name: &str,
+) -> Result<String, String> {
+    file_ops::valid_new_name(new_name)?;
+    let (path, is_dir) = split_id(id);
+    if id.starts_with(INERT) || file_ops::is_drive_root(path) || kind(Path::new(path)) != Some(is_dir) {
+        return Err(NOT_FOUND.into());
+    }
+    let old = Path::new(path);
+    let name = old.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name == new_name {
+        return Ok(id.to_string());
+    }
+    let target = old.with_file_name(new_name);
+    if name.to_lowercase() != new_name.to_lowercase() && kind(&target).is_some() {
+        return Err(NAME_TAKEN.into());
+    }
+    let renamed = ops.rename(old, new_name)?;
+    let renamed = renamed.to_string_lossy();
+    Ok(if is_dir { format!("{}\\", renamed.trim_end_matches('\\')) } else { renamed.into_owned() })
 }
 
 /// The row for `id` without touching the disk: a folder iff it ends with `\`.
@@ -400,6 +440,10 @@ impl Provider for PathProvider {
         act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
     }
 
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        rename_entry(&|p| self.fs.kind(p), &*self.ops, id, new_name)
+    }
+
     /// Typed paths are never learned.
     fn rank_key(&self, _id: &str) -> Option<String> {
         None
@@ -553,12 +597,15 @@ mod tests {
         assert_eq!(row(r"C:\Cloud\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
         assert_eq!(row(r"C:\CloudBackup\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
         assert_eq!(row(r"C:\", true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
-        // Rename, Delete and More options are not handled yet.
+        // Rename is the rename command and More options is not handled yet; a drive root cannot be deleted.
         let r = rig();
-        for action in [Rename, Delete, MoreOptions] {
+        for action in [Rename, MoreOptions] {
             assert_eq!(r.p.act(r"C:\a.txt", action), Err("can't do that here".to_string()));
         }
+        assert_eq!(r.p.act(r"C:\", Delete), Err("can't do that here".to_string()));
         assert!(r.ops.calls().is_empty());
+        assert_eq!(r.p.act(r"C:\a.txt", Delete), Ok(Outcome::Keep));
+        assert_eq!(r.ops.calls(), [r"recycle C:\a.txt"]);
     }
 
     #[test]

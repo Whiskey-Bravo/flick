@@ -218,6 +218,50 @@ impl Index {
         self.slots.iter().find(|s| self.name(s) == name && self.dir(s) == dir)
     }
 
+    /// A copy of the index after `old` (and what is below it) moved to `new`,
+    /// or, with `None`, was removed. Built beside the live one: the caller
+    /// swaps it in. Names are compared without regard to case.
+    pub fn patched(&self, old: &Path, new: Option<&Path>) -> Index {
+        let key = |p: &Path| p.to_string_lossy().replace('/', r"\").trim_end_matches('\\').to_lowercase();
+        let old_key = key(old);
+        // Whether a folder is `old` or below it, and where it goes.
+        let below = |dir: &Path| {
+            let k = key(dir);
+            k == old_key || k.strip_prefix(&old_key).is_some_and(|rest| rest.starts_with('\\'))
+        };
+        let mut out = Index::with_capacity(self.sizes());
+        out.dirs = self
+            .dirs
+            .iter()
+            .map(|d| match new {
+                Some(new) if below(d) => {
+                    let rest = d.to_string_lossy().get(old.to_string_lossy().trim_end_matches('\\').len()..).unwrap_or("").to_string();
+                    PathBuf::from(format!("{}{rest}", new.to_string_lossy().trim_end_matches('\\')))
+                }
+                _ => d.clone(),
+            })
+            .collect();
+        out.depths = self.depths.clone();
+        let gone: Vec<bool> = self.dirs.iter().map(|d| new.is_none() && below(d)).collect();
+        let old_parent = old.parent().map(key);
+        let old_name = old.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let beside: Vec<bool> = self.dirs.iter().map(|d| Some(key(d)) == old_parent).collect();
+        for s in &self.slots {
+            let is_old = beside[s.parent as usize] && self.name(s).to_lowercase() == old_name;
+            if is_old {
+                // The entry itself: dropped, or under its new name (folder unchanged).
+                if let Some(new) = new {
+                    let name = new.file_name().and_then(|n| n.to_str()).unwrap_or_else(|| self.name(s));
+                    out.push(s.parent, name, s.is_dir);
+                }
+            } else if !gone[s.parent as usize] {
+                out.push(s.parent, self.name(s), s.is_dir);
+            }
+        }
+        out.trim();
+        out
+    }
+
     fn add_dir(&mut self, path: PathBuf, depth: u8) -> u32 {
         self.dirs.push(path);
         self.depths.push(depth);

@@ -174,6 +174,17 @@ pub async fn act(
     result
 }
 
+/// Renames a file or folder row; the new row id. The bar stays. The shell
+/// call can block, so it runs on a blocking-pool thread.
+#[tauri::command]
+pub async fn rename(provider: String, id: String, new_name: String, state: State<'_, AppState>) -> Result<String, String> {
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.rename(&provider, &id, &new_name))
+        .await
+        .map_err(|e| format!("rename failed: {e}"))
+        .and_then(|r| r)
+}
+
 #[tauri::command]
 pub fn hide(app: AppHandle) {
     window::hide(&app);

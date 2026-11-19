@@ -1071,6 +1071,7 @@ pub fn run() {
             timing::timing_enabled,
             timing::timing_mark,
             commands::act,
+            commands::rename,
             settings::settings_state,
             settings::settings_set,
             settings::settings_save_shortcut,

@@ -456,7 +456,38 @@ impl Engine {
     /// Runs a row's menu action. Nothing is ranked or recorded: an action is
     /// not a launch.
     pub fn act(&self, provider: &str, id: &str, action: Action) -> Result<Outcome, String> {
-        self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action)
+        let outcome = self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action)?;
+        // Gone for good (to the Recycle Bin): what Flick knows about it goes too.
+        if action == Action::Delete {
+            self.pins.forget(id);
+            self.ranking.forget(id);
+            self.history.forget(id);
+            self.moved(id, None);
+        }
+        Ok(outcome)
+    }
+
+    /// The item `old` (a row id) now is `new`, or gone: every provider that
+    /// keeps paths follows.
+    fn moved(&self, old: &str, new: Option<&str>) {
+        let path = |id: &str| std::path::PathBuf::from(crate::providers::path::split_id(id).0);
+        let new = new.map(path);
+        for p in &self.providers {
+            p.moved(&path(old), new.as_deref());
+        }
+    }
+
+    /// Renames a file or folder row; the new row id. Pins, picks and recent
+    /// launches follow it (and, for a folder, those of what is inside).
+    pub fn rename(&self, provider: &str, id: &str, new_name: &str) -> Result<String, String> {
+        let new_id = self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.rename(id, new_name)?;
+        if new_id != id {
+            self.pins.rename(id, &new_id);
+            self.ranking.rename(id, &new_id);
+            self.history.rename(id, &new_id);
+            self.moved(id, Some(&new_id));
+        }
+        Ok(new_id)
     }
 
     /// Runs an item like Enter on its row (no modifier) for a workspace or a
@@ -1618,5 +1649,207 @@ mod tests {
         assert_eq!(e.open_item("nowhere", "x"), Err("not found".to_string()));
         assert_eq!(e.open_item(HELP, "timer"), Err("not found".to_string()));
         assert!(c.activated.lock().unwrap().is_empty() && a.activated.lock().unwrap().is_empty());
+    }
+
+    /// Files on disk (`a.txt`, `b.txt`, `sub\`, `sub\inner.txt`) behind a real
+    /// files provider with recording ops, and an engine over it.
+    struct Disk {
+        e: Engine,
+        ops: Arc<crate::file_ops::FakeFileOps>,
+        ranking: Arc<Ranking>,
+        history: Arc<History>,
+        pins: Arc<Pins>,
+        dir: tempfile::TempDir,
+        _stores: tempfile::TempDir,
+    }
+
+    impl Disk {
+        fn id(&self, rel: &str) -> String {
+            self.dir.path().join(rel).to_string_lossy().into_owned()
+        }
+
+        /// Pinned, picked and recently launched.
+        fn remember(&self, id: &str) {
+            self.pins.toggle("files", id);
+            self.ranking.record("files", id);
+            self.history.record_launch("files", id);
+        }
+
+        fn remembered(&self, id: &str) -> (bool, u32, bool) {
+            (
+                self.pins.list().iter().any(|(p, i)| p == "files" && i == id),
+                self.ranking.boost("files", id),
+                self.history.recents().iter().any(|(_, i)| i == id),
+            )
+        }
+
+        fn found(&self, text: &str) -> Vec<String> {
+            self.e.query(text, None).into_iter().filter(|r| r.provider == "files").map(|r| r.id).collect()
+        }
+    }
+
+    fn disk() -> Disk {
+        use crate::launch::testing::RecordingLauncher;
+        use crate::providers::files::{FileEntry, FilesProvider};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for f in ["a.txt", "b.txt", r"sub\inner.txt"] {
+            std::fs::write(root.join(f), b"").unwrap();
+        }
+        let entries = vec![
+            FileEntry::new(root.join("a.txt"), false),
+            FileEntry::new(root.join("b.txt"), false),
+            FileEntry::new(root.join("sub"), true),
+            FileEntry::new(root.join(r"sub\inner.txt"), false).at_depth(2),
+        ];
+        let ops = Arc::new(crate::file_ops::FakeFileOps::default());
+        let files = FilesProvider::with_ops(Arc::new(RecordingLauncher::default()), ops.clone(), entries);
+        let (e, ranking, history, pins, stores) = engine_stores(vec![Box::new(files)]);
+        Disk { e, ops, ranking, history, pins, dir, _stores: stores }
+    }
+
+    #[test]
+    fn delete_recycles_and_forgets_records() {
+        let d = disk();
+        let (a, b) = (d.id("a.txt"), d.id("b.txt"));
+        d.remember(&a);
+        d.remember(&b);
+        // Another provider's entry for the same file (and in another letter case) goes too.
+        d.pins.toggle("path", &a.to_uppercase());
+        d.ranking.record("path", &a.to_lowercase());
+        assert_eq!(d.e.act("files", &a, Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(d.ops.calls(), [format!("recycle {a}")]);
+        assert_eq!(d.remembered(&a), (false, 0, false));
+        assert_eq!(d.ranking.boost("path", &a.to_lowercase()), 0);
+        assert_eq!(d.pins.list(), [("files".to_string(), b.clone())]);
+        assert_eq!(d.remembered(&b), (true, 15, true), "other items keep theirs");
+        assert!(d.found("a.txt").is_empty(), "the index dropped it: {:?}", d.found("a.txt"));
+        assert_eq!(d.found("b.txt"), [b]);
+    }
+
+    #[test]
+    fn delete_missing_file_fails_and_keeps_records() {
+        let d = disk();
+        let a = d.id("a.txt");
+        d.remember(&a);
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(d.e.act("files", &a, Action::Delete), Err("file not found".to_string()));
+        assert!(d.ops.calls().is_empty());
+        assert_eq!(d.remembered(&a), (true, 15, true));
+        assert_eq!(d.found("a.txt"), [a.clone()], "the index is untouched too");
+        // A failing recycle keeps them as well.
+        let b = d.id("b.txt");
+        d.remember(&b);
+        d.ops.fail("recycle", "in use");
+        assert_eq!(d.e.act("files", &b, Action::Delete), Err("in use".to_string()));
+        assert_eq!(d.remembered(&b), (true, 15, true));
+        assert_eq!(d.found("b.txt"), [b]);
+    }
+
+    #[test]
+    fn rename_moves_pins_ranking_and_history() {
+        let d = disk();
+        let (a, b) = (d.id("a.txt"), d.id("b.txt"));
+        d.remember(&a);
+        d.remember(&b);
+        d.ranking.record("files", &a);
+        // Case differs in the stored id: still the same item.
+        d.pins.toggle("path", &a.to_uppercase());
+        let new = d.e.rename("files", &a, "Ä b.txt").unwrap();
+        assert_eq!(new, d.id("Ä b.txt"));
+        assert_eq!(d.ops.calls(), [format!("rename {a} Ä b.txt")]);
+        assert_eq!(d.remembered(&a), (false, 0, false));
+        assert_eq!(d.remembered(&new), (true, 30, true));
+        // The pins keep their places; the other provider's pin followed too.
+        assert_eq!(
+            d.pins.list(),
+            [("files".to_string(), new.clone()), ("files".to_string(), b.clone()), ("path".to_string(), new.clone())]
+        );
+        // Recent launches keep their places as well (newest first).
+        assert_eq!(d.history.recents(), [("files".to_string(), b.clone()), ("files".to_string(), new.clone())]);
+        // Saved: a restart sees the same.
+        assert_eq!(Pins::load(d._stores.path().join("pins.json")).list().len(), 3);
+        assert_eq!(History::load(d._stores.path().join("history.json"), true).recents().len(), 2);
+    }
+
+    #[test]
+    fn rename_refuses_an_existing_name() {
+        let d = disk();
+        let (a, b) = (d.id("a.txt"), d.id("b.txt"));
+        d.remember(&a);
+        assert_eq!(d.e.rename("files", &a, "b.txt"), Err("A file with that name already exists".to_string()));
+        assert_eq!(d.e.rename("files", &a, "B.TXT"), Err("A file with that name already exists".to_string()));
+        assert!(d.ops.calls().is_empty());
+        assert_eq!(d.remembered(&a), (true, 15, true));
+        assert_eq!(d.found("a.txt"), [a]);
+        assert_eq!(d.found("b.txt"), [b]);
+    }
+
+    #[test]
+    fn rename_allows_a_case_change() {
+        let d = disk();
+        let a = d.id("a.txt");
+        d.remember(&a);
+        let new = d.e.rename("files", &a, "A.TXT").unwrap();
+        assert_eq!(new, d.id("A.TXT"));
+        assert_eq!(d.ops.calls(), [format!("rename {a} A.TXT")]);
+        assert_eq!(d.remembered(&new), (true, 15, true));
+        assert_eq!(d.found("a.txt"), [new]);
+    }
+
+    #[test]
+    fn rename_patches_the_files_index() {
+        let d = disk();
+        let a = d.id("a.txt");
+        assert_eq!(d.found("a.txt"), [a.clone()]);
+        let new = d.e.rename("files", &a, "Ä b.txt").unwrap();
+        assert_eq!(d.found("Ä b"), [new]);
+        assert!(d.found("a.txt").is_empty(), "{:?}", d.found("a.txt"));
+        // The row is rebuilt for the new id, and the old id is gone.
+        assert!(d.e.item("files", &d.id("Ä b.txt")).is_some());
+        assert!(d.e.item("files", &a).is_none());
+    }
+
+    #[test]
+    fn rename_of_a_folder_keeps_the_trailing_backslash() {
+        let d = disk();
+        let (folder, inner) = (format!("{}\\", d.id("sub")), d.id(r"sub\inner.txt"));
+        d.remember(&folder);
+        d.remember(&inner);
+        let new = d.e.rename("files", &folder, "Sub 2").unwrap();
+        assert_eq!(new, format!("{}\\", d.id("Sub 2")));
+        assert_eq!(d.ops.calls(), [format!("rename {} Sub 2", d.id("sub"))]);
+        assert_eq!(d.remembered(&folder), (false, 0, false));
+        assert_eq!(d.remembered(&new), (true, 15, true));
+        // What is inside moves with it, in the records and in the index.
+        let moved_inner = d.id(r"Sub 2\inner.txt");
+        assert_eq!(d.remembered(&inner), (false, 0, false));
+        assert_eq!(d.remembered(&moved_inner), (true, 15, true));
+        assert_eq!(d.found("inner"), [moved_inner]);
+        // The files index names a folder row without the trailing backslash.
+        assert_eq!(d.found("sub 2").first().map(String::as_str), Some(new.trim_end_matches('\\')));
+    }
+
+    #[test]
+    fn rename_refuses_an_invalid_name_without_calling_ops() {
+        let d = disk();
+        let a = d.id("a.txt");
+        d.remember(&a);
+        for (name, why) in [
+            ("", "Type a name"),
+            ("a/b.txt", r#"A name can't contain \ / : * ? " < > |"#),
+            ("a.", "A name can't end with a space or a dot"),
+            ("con.txt", "That name is reserved by Windows"),
+        ] {
+            assert_eq!(d.e.rename("files", &a, name), Err(why.to_string()), "{name:?}");
+        }
+        assert!(d.ops.calls().is_empty());
+        assert_eq!(d.remembered(&a), (true, 15, true));
+        assert_eq!(d.found("a.txt"), [a.clone()]);
+        // Nothing indexed under that id, or no such provider: a short error, and no call either.
+        assert_eq!(d.e.rename("files", &d.id("zzz.txt"), "ok.txt"), Err("file not found".to_string()));
+        assert_eq!(d.e.rename("nowhere", &a, "ok.txt"), Err("unknown provider: nowhere".to_string()));
+        assert!(d.ops.calls().is_empty());
     }
 }

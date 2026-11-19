@@ -8,6 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::file_ops::{moved_id, same_item};
 use crate::ranking::save_json;
 
 const MAX_SEARCHES: usize = 50;
@@ -88,6 +89,29 @@ impl History {
         self.change(|data| {
             data.recents.retain(|r| !(r.provider == provider && r.id == id));
         });
+    }
+
+    /// The item `old` (and anything below it, for a folder) is now at `new`:
+    /// its recent launches, of every provider, keep their places. One that
+    /// lands on another already there is dropped.
+    pub fn rename(&self, old: &str, new: &str) {
+        self.change(|data| {
+            let mut kept: Vec<Recent> = Vec::with_capacity(data.recents.len());
+            for mut r in data.recents.drain(..) {
+                if let Some(id) = moved_id(&r.id, old, new) {
+                    r.id = id;
+                }
+                if !kept.contains(&r) {
+                    kept.push(r);
+                }
+            }
+            data.recents = kept;
+        });
+    }
+
+    /// Drops the recent launches of the item `id`, of every provider.
+    pub fn forget(&self, id: &str) {
+        self.change(|data| data.recents.retain(|r| !same_item(&r.id, id)));
     }
 
     /// Drops the pairs from memory now and saves on a spawned thread, for the

@@ -458,6 +458,8 @@ pub struct FilesProvider {
     watcher: Mutex<Option<RecommendedWatcher>>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
+    /// Bumped by every swap of `index`: a patch built from an older one is not swapped in.
+    epoch: AtomicU64,
     /// What the watcher vouches for; decides whether the periodic refresh scans.
     watch_state: Arc<WatchState>,
 }
@@ -503,7 +505,7 @@ impl FilesProvider {
 
     /// Like [`Self::with_entries`], with the file ops the entries act through.
     #[cfg(test)]
-    fn with_ops(launcher: Arc<dyn Launcher>, ops: Arc<dyn FileOps>, e: Vec<FileEntry>) -> Arc<Self> {
+    pub(crate) fn with_ops(launcher: Arc<dyn Launcher>, ops: Arc<dyn FileOps>, e: Vec<FileEntry>) -> Arc<Self> {
         Self::with_index(launcher, Arc::new(crate::clipboard::FakeClipboard::default()), ops, Index::from_entries(e), true)
     }
 
@@ -530,6 +532,7 @@ impl FilesProvider {
             home: std::env::var_os("USERPROFILE").map(PathBuf::from),
             watcher: Mutex::new(None),
             scanned: AtomicBool::new(scanned),
+            epoch: AtomicU64::new(0),
             watch_state: Arc::new(WatchState::default()),
         })
     }
@@ -665,6 +668,7 @@ impl FilesProvider {
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
+                self.epoch.fetch_add(1, Ordering::SeqCst);
                 self.scanned.store(true, Ordering::SeqCst);
                 drop(index);
                 drop(old); // freed outside the lock
@@ -915,10 +919,37 @@ impl Provider for FilesProvider {
                 if !Path::new(id).exists() {
                     return Err(NOT_FOUND.into());
                 }
-                return super::path::run_entry_action(&*self.ops, id, action);
+                return super::path::run_entry_action(&*self.ops, super::path::split_id(id).0, action);
             }
         }
         Ok(Outcome::Hide)
+    }
+
+    /// Only for indexed paths. The disk is asked here, never on the query path.
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        file_ops::valid_new_name(new_name)?;
+        let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(super::path::split_id(id).0)).is_some();
+        if !known {
+            return Err(NOT_FOUND.into());
+        }
+        let kind = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| m.is_dir());
+        super::path::rename_entry(&kind, &*self.ops, id, new_name)
+    }
+
+    fn moved(&self, old: &Path, new: Option<&Path>) {
+        loop {
+            let epoch = self.epoch.load(Ordering::SeqCst);
+            // Built beside the live index, which keeps answering meanwhile.
+            let patched = self.index.read().unwrap_or_else(|e| e.into_inner()).patched(old, new);
+            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+            // A scan that swapped in meanwhile is newer than what this was built from.
+            if self.epoch.load(Ordering::SeqCst) == epoch {
+                let before = std::mem::replace(&mut *index, patched);
+                drop(index);
+                drop(before); // freed outside the lock
+                return;
+            }
+        }
     }
 
     fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {

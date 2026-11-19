@@ -8,6 +8,8 @@ use std::{
 
 use serde::Serialize;
 
+use crate::file_ops::{moved_id, same_item};
+
 const MAX_COUNTED_PICKS: u32 = 20;
 const BOOST_PER_PICK: u32 = 15;
 
@@ -37,6 +39,48 @@ impl Ranking {
             let mut picks = self.picks.lock().unwrap_or_else(|e| e.into_inner());
             let count = picks.entry(key(provider, id)).or_insert(0);
             *count = count.saturating_add(1);
+            picks.clone()
+        };
+        let _ = save_json(&self.path, &snapshot);
+    }
+
+    /// The item `old` (and anything below it, for a folder) is now at `new`:
+    /// the picks of every provider move with it, added up where `new` already
+    /// had some. Saved like `record`.
+    pub fn rename(&self, old: &str, new: &str) {
+        let _saving = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut picks = self.picks.lock().unwrap_or_else(|e| e.into_inner());
+            let moves: Vec<(String, String)> = picks
+                .keys()
+                .filter_map(|k| {
+                    let (provider, id) = k.split_once(':')?;
+                    Some((k.clone(), key(provider, &moved_id(id, old, new)?)))
+                })
+                .collect();
+            if moves.is_empty() {
+                return;
+            }
+            for (from, to) in moves {
+                let count = picks.remove(&from).unwrap_or(0);
+                let slot = picks.entry(to).or_insert(0);
+                *slot = slot.saturating_add(count);
+            }
+            picks.clone()
+        };
+        let _ = save_json(&self.path, &snapshot);
+    }
+
+    /// Drops the picks of the item `id`, of every provider. Saved like `record`.
+    pub fn forget(&self, id: &str) {
+        let _saving = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut picks = self.picks.lock().unwrap_or_else(|e| e.into_inner());
+            let before = picks.len();
+            picks.retain(|k, _| !k.split_once(':').is_some_and(|(_, i)| same_item(i, id)));
+            if picks.len() == before {
+                return;
+            }
             picks.clone()
         };
         let _ = save_json(&self.path, &snapshot);
