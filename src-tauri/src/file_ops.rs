@@ -66,11 +66,13 @@ pub(crate) fn is_drive_root(path: &str) -> bool {
 }
 
 
-/// Where the zip of `path` goes: `<name>.zip` next to it, else `<name> (2).zip`,
+/// Where the zip of `path` goes (`is_dir`: a folder): `<name>.zip` next to it, else `<name> (2).zip`,
 /// `(3)` and so on, the first one `exists` does not know.
-pub(crate) fn zip_target(path: &Path, exists: &dyn Fn(&Path) -> bool) -> PathBuf {
+pub(crate) fn zip_target(path: &Path, is_dir: bool, exists: &dyn Fn(&Path) -> bool) -> PathBuf {
     let parent = path.parent().unwrap_or(Path::new(""));
-    let stem = path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
+    // A folder keeps its whole name; a file drops its extension.
+    let name = if is_dir { path.file_name() } else { path.file_stem() };
+    let stem = name.unwrap_or(path.as_os_str()).to_string_lossy().into_owned();
     let first = parent.join(format!("{stem}.zip"));
     if !exists(&first) {
         return first;
@@ -264,7 +266,7 @@ impl FileOps for SystemFileOps {
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else { return Err("can't compress this".into()) };
-        let zip = zip_target(path, &|p| p.exists());
+        let zip = zip_target(path, path.is_dir(), &|p| p.exists());
         let output = Command::new(crate::quote::system32("tar.exe"))
             .args(tar_args(parent, &name.to_string_lossy(), &zip))
             .creation_flags(CREATE_NO_WINDOW)
@@ -402,13 +404,28 @@ mod tests {
     #[test]
     fn zip_target_numbers_taken_names() {
         let taken = |names: &'static [&'static str]| move |p: &Path| names.contains(&p.to_string_lossy().as_ref());
-        assert_eq!(zip_target(Path::new(r"C:\d\a.txt"), &taken(&[])), PathBuf::from(r"C:\d\a.zip"));
-        assert_eq!(zip_target(Path::new(r"C:\d\Photos"), &taken(&[])), PathBuf::from(r"C:\d\Photos.zip"));
-        assert_eq!(zip_target(Path::new(r"C:\d\a.txt"), &taken(&[r"C:\d\a.zip"])), PathBuf::from(r"C:\d\a (2).zip"));
+        assert_eq!(zip_target(Path::new(r"C:\d\a.txt"), false, &taken(&[])), PathBuf::from(r"C:\d\a.zip"));
+        assert_eq!(zip_target(Path::new(r"C:\d\Photos"), true, &taken(&[])), PathBuf::from(r"C:\d\Photos.zip"));
+        assert_eq!(zip_target(Path::new(r"C:\d\a.txt"), false, &taken(&[r"C:\d\a.zip"])), PathBuf::from(r"C:\d\a (2).zip"));
         assert_eq!(
-            zip_target(Path::new(r"C:\d\a.txt"), &taken(&[r"C:\d\a.zip", r"C:\d\a (2).zip"])),
+            zip_target(Path::new(r"C:\d\a.txt"), false, &taken(&[r"C:\d\a.zip", r"C:\d\a (2).zip"])),
             PathBuf::from(r"C:\d\a (3).zip")
         );
+    }
+
+    #[test]
+    fn zip_target_keeps_a_dotted_folder_name() {
+        let none = |_: &Path| false;
+        assert_eq!(zip_target(Path::new(r"C:\d\v1.2"), true, &none), PathBuf::from(r"C:\d\v1.2.zip"));
+        assert_eq!(zip_target(Path::new(r"C:\d\v1.2"), false, &none), PathBuf::from(r"C:\d\v1.zip"));
+    }
+
+    #[test]
+    fn zip_target_of_a_dotfile() {
+        let none = |_: &Path| false;
+        assert_eq!(zip_target(Path::new(r"C:\d\.gitignore"), false, &none), PathBuf::from(r"C:\d\.gitignore.zip"));
+        assert_eq!(zip_target(Path::new(r"C:\d\.config"), true, &none), PathBuf::from(r"C:\d\.config.zip"));
+        assert_eq!(zip_target(Path::new(r"C:\d\archive.tar.gz"), false, &none), PathBuf::from(r"C:\d\archive.tar.zip"));
     }
 
     fn strings(args: &[OsString]) -> Vec<String> {
