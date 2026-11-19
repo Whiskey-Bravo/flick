@@ -406,7 +406,10 @@ function step(s: State, e: Event): Result {
     case "hidden":
       return done({ ...leaveRename(s), hidden: true, unfolded: {} });
     case "blurred":
-      return done(fit({ ...leaveRename(s), armed: null, queued: null, menu: null }));
+      // A rename on its way stays in rename mode: Windows' own prompt
+      // (overwrite, change the extension) takes the focus, and a No to it
+      // leaves the typed name in the field.
+      return done(fit({ ...(s.rename && s.pending ? s : leaveRename(s)), armed: null, queued: null, menu: null }));
     case "answersReady": {
       // A folder read finished, or a rate or forecast arrived: ask again for
       // every folder still being read, and for the rows when the text is still
@@ -477,7 +480,8 @@ function step(s: State, e: Event): Result {
       // The update row (found, downloading, failed) lives in the empty bar only.
       if (s.hidden || s.rename || s.text.trim() !== "" || s.scope) return done(s);
       const sel = shownRows(s)[s.selected];
-      const keep = sel ? keepOf(sel) : null;
+      // While typed text is still waiting for its answer, the rows are for older text.
+      const keep = sel && !s.awaiting ? keepOf(sel) : null;
       return done({ ...s, keep }, [{ type: "query", text: "", scope: null, keepSelection: true }]);
     }
     case "menuClose":
@@ -790,8 +794,11 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       if (s.pending) return done(s);
       const modifier: Modifier = e.ctrl && e.shift ? "ctrl_shift" : e.ctrl ? "ctrl" : "none";
       // The shown items are for older text: wait for the answer to what was typed.
-      // Not for a pick list still loading: its first entry was never seen.
-      if (s.awaiting) return done({ ...s, queued: s.scope && s.text === "" ? null : modifier });
+      // Not for a pick list still loading, nor an empty bar with no rows on
+      // screen (after Esc out of a pick list): the row it would open was never
+      // seen. As on a fresh show, Enter does nothing until the rows arrive.
+      const unseen = s.text === "" && (s.scope !== null || s.items.length === 0);
+      if (s.awaiting) return done({ ...s, queued: unseen ? null : modifier });
       return enter(s, modifier);
     }
     case "Tab": {
@@ -813,7 +820,8 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       if (item.depth === 0 && s.items.some((i) => i.provider === "path")) return done(s);
       const actions = menuActions(item);
       if (actions.length === 0) return done(s);
-      return done({ ...s, menu: { index: s.selected, actions, selected: 0, at: "row" } });
+      // The wheel may have scrolled the row out of view: the menu opens under it, so it comes back.
+      return done(fit({ ...s, menu: { index: s.selected, actions, selected: 0, at: "row" } }));
     }
     case "Escape": {
       const t = { ...s, queued: null };
