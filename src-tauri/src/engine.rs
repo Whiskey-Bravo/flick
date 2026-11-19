@@ -1995,6 +1995,18 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_found_by_search_can_be_renamed() {
+        let d = disk();
+        // Search names a folder without the trailing backslash a typed path has.
+        let folder = d.id("sub");
+        assert_eq!(d.found("sub").first(), Some(&folder));
+        let new = d.e.rename("files", &folder, "Sub 2").unwrap();
+        assert_eq!(new, d.id("Sub 2"), "the new id is in search's form too");
+        assert_eq!(d.ops.calls(), [format!("rename {} Sub 2", d.id("sub"))]);
+        assert_eq!(d.found("sub 2").first(), Some(&new));
+    }
+
+    #[test]
     fn rename_of_a_folder_keeps_the_trailing_backslash() {
         let d = disk();
         let (folder, inner) = (format!("{}\\", d.id("sub")), d.id(r"sub\inner.txt"));

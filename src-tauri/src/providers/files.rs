@@ -988,13 +988,19 @@ impl Provider for FilesProvider {
     }
 
     /// Only for indexed paths. The disk is asked here, never on the query path.
+    /// A folder found by search has no trailing `\` in its id (a typed
+    /// path's has): the index says it is a folder, and the new id keeps the
+    /// form it came in.
     fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
-        let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(super::path::split_id(id).0)).is_some();
-        if !known {
-            return Err(NOT_FOUND.into());
-        }
+        let (path, slash) = super::path::split_id(id);
+        let is_dir = match self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(path)) {
+            Some(slot) => slot.is_dir,
+            None => return Err(NOT_FOUND.into()),
+        };
         let kind = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| m.is_dir());
-        super::path::rename_entry(&kind, &*self.ops, id, new_name)
+        let as_typed = if is_dir && !slash { format!("{path}\\") } else { id.to_string() };
+        let new = super::path::rename_entry(&kind, &*self.ops, &as_typed, new_name)?;
+        Ok(if slash { new } else { new.trim_end_matches('\\').to_string() })
     }
 
     /// Nothing to do when `old` is not in the index. Noted for a scan that
