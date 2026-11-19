@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, type Effect, type Event, type Item, type State } from "./bar";
+import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, reduce, rowsFromWheel, visibleItems, wantsTick, type Effect, type Event, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
-  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "",
+  icon: "builtin:app", origin: "search", pinned: false, pinnable: false, actions: [], complete: "", panel: "", live: false,
 });
 const run = (s: State, ...events: Event[]) => {
   let state = s;
@@ -1021,6 +1021,69 @@ describe("mouse and menu", () => {
     });
   });
 
+  describe("live rows", () => {
+    const clock: Item = { ...item("now:local"), provider: "answers", actions: ["copy"], live: true };
+    const shown = (...items: Item[]) =>
+      run(initial, { type: "shown" }, { type: "input", text: "time" }, { type: "results", items }).state;
+
+    it("wants_a_tick_only_while_a_live_row_shows", () => {
+      expect(wantsTick(shown(clock))).toBe(true);
+      expect(wantsTick(run(shown(clock), { type: "hidden" }).state)).toBe(false);
+      expect(wantsTick(shown(item("a")))).toBe(false);
+      expect(wantsTick(initial)).toBe(false);
+    });
+
+    it("no_tick_while_the_menu_is_open", () => {
+      const open = run(shown(clock), key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      expect(wantsTick(open)).toBe(false);
+      expect(wantsTick(run(open, { type: "menuClose" }).state)).toBe(true);
+    });
+
+    it("a_full_tick_keeps_an_armed_live_row_armed_and_selected", () => {
+      const u = { ...item("now:u"), provider: "answers", actions: ["uninstall" as const], live: true };
+      const armed = run(shown(item("a"), u), key("ArrowDown"), key("Tab"), { type: "menuPick", action: "uninstall" }).state;
+      expect([armed.armed, armed.selected]).toEqual(["now:u", 1]);
+      const after = run(armed, { type: "answersReady" }, { type: "results", items: [item("a"), u] }).state;
+      expect([after.armed, after.selected]).toEqual(["now:u", 1]);
+    });
+
+    it("a_tick_requeries_and_keeps_the_selected_live_row", () => {
+      const r = run(shown(clock, item("a")), { type: "answersReady" });
+      expect(r.effects).toEqual([{ type: "query", text: "time", scope: null, keepSelection: true }]);
+      expect(r.state.keep).toEqual({ provider: "answers", id: "now:local" });
+    });
+
+    it("a_tick_leaves_the_menu_and_the_armed_row_alone", () => {
+      const open = run(shown(clock), key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      expect(run(open, { type: "answersReady" }).state.menu).toEqual(open.menu);
+      const u = { ...item("u"), actions: ["uninstall" as const] };
+      const armed = run(shown(clock, u), key("ArrowDown"), key("Tab"), { type: "menuPick", action: "uninstall" }).state;
+      expect(armed.armed).toBe("u");
+      expect(run(armed, { type: "answersReady" }).state.armed).toBe("u");
+    });
+
+    it("a_menu_opened_after_the_tick_survives_its_reply_when_the_row_is_the_same", () => {
+      const ticked = run(shown(clock, item("a")), { type: "answersReady" }).state;
+      const open = run(ticked, key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      const after = run(open, { type: "results", items: [clock, item("a")] }).state;
+      expect(after.menu).toEqual(open.menu);
+    });
+
+    it("a_menu_opened_after_the_tick_closes_when_its_row_is_gone", () => {
+      const ticked = run(shown(clock, item("a")), { type: "answersReady" }).state;
+      const open = run(ticked, key("Tab")).state;
+      expect(open.menu).not.toBeNull();
+      expect(run(open, { type: "results", items: [item("a"), clock] }).state.menu).toBeNull();
+    });
+
+    it("no_tick_effect_once_hidden", () => {
+      expect(run(shown(clock), { type: "hidden" }, { type: "answersReady" }).effects).toEqual([]);
+    });
+  });
+
   describe("answers ready", () => {
     const typed = (text: string, ...items: Item[]) =>
       run(initial, { type: "shown" }, { type: "input", text }, { type: "results", items }).state;
@@ -1115,6 +1178,21 @@ describe("mouse and menu", () => {
     expect(panelItem(withItems(qr))).toEqual(qr);
     expect(panelItem(withItems(qr, item("b")))).toBeNull();
     expect(panelItem(withItems(item("a")))).toBeNull();
+  });
+
+  it("save_panel_acts_on_the_panel_row_only_when_it_offers_saving", () => {
+    const qr = { ...item("q"), panel: "<svg/>", actions: ["save_picture" as const] };
+    const r = run(withItems(qr), { type: "savePanel" });
+    expect(r.effects).toEqual([{ type: "act", item: qr, action: "save_picture" }]);
+    expect(run(withItems(item("a")), { type: "savePanel" }).effects).toEqual([]);
+    expect(run(withItems({ ...qr, actions: [] }), { type: "savePanel" }).effects).toEqual([]);
+    expect(run(withItems(qr, item("b")), { type: "savePanel" }).effects).toEqual([]);
+  });
+
+  it("tab_on_the_panel_row_opens_a_menu_with_save_picture", () => {
+    const qr = { ...item("q"), panel: "<svg/>", actions: ["save_picture" as const] };
+    const r = run(withItems(qr), key("Tab"));
+    expect(r.state.menu).toEqual({ index: 0, actions: ["save_picture"], selected: 0, at: "row" });
   });
 
   it("enter_on_a_panel_row_activates_it", () => {

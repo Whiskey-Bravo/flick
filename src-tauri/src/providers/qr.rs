@@ -1,13 +1,15 @@
 //! `qr`: the clipboard (or the typed text) as a QR code the bar draws as a panel.
 //! The clipboard is read on a [`Loader`] thread; nothing is stored or logged.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use qrcodegen::{QrCode, QrCodeEcc};
 
 use crate::clipboard::{Clipboard, ClipboardText};
 use crate::dirs::{one_line, Load, Loader, ReadError, NEVER_STALE, SLOW};
-use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route};
+use crate::notifications::{Notifier, TITLE};
+use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Route, Then};
 
 /// `qr` / `qr some text`.
 pub const ROUTE: Route = Route { prefix: "qr", needs_space: true };
@@ -23,13 +25,28 @@ const CANT_READ: &str = "Can't read the clipboard";
 /// Blank modules around the code.
 const QUIET: i32 = 4;
 
+/// The file name the Save window starts with (never derived from the text).
+pub const SUGGESTED_NAME: &str = "qr-code.png";
+
+/// Pixels a saved picture is at least wide.
+const PNG_MIN: i32 = 1024;
+
+const COULD_NOT_SAVE: &str = "Could not save the QR code";
+
+/// The code for `text` and the side of the drawing in modules (quiet zone
+/// included), shared by the SVG and the PNG. `None` when it does not fit.
+fn layout(text: &str) -> Option<(QrCode, i32)> {
+    let code = QrCode::encode_text(text, QrCodeEcc::Low).ok()?;
+    let side = code.size() + 2 * QUIET;
+    Some((code, side))
+}
+
 /// `text` as SVG: a white square and one black cell per dark module, with a
 /// quiet zone. `None` when the text does not fit a code. Only module
 /// positions reach the markup, never the text.
 pub fn qr_svg(text: &str) -> Option<String> {
-    let code = QrCode::encode_text(text, QrCodeEcc::Low).ok()?;
+    let (code, side) = layout(text)?;
     let n = code.size();
-    let side = n + 2 * QUIET;
     let mut svg = format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {side} {side}\" shape-rendering=\"crispEdges\">\
          <rect width=\"{side}\" height=\"{side}\" fill=\"#fff\"/><path fill=\"#000\" d=\""
@@ -43,6 +60,68 @@ pub fn qr_svg(text: &str) -> Option<String> {
     }
     svg.push_str("\"/></svg>");
     Some(svg)
+}
+
+/// `text` as a grayscale PNG, black on white, with the same quiet zone as the
+/// SVG and at least 1024 pixels a side. `None` when the text does not fit.
+pub fn qr_png(text: &str) -> Option<Vec<u8>> {
+    let (code, side) = layout(text)?;
+    let scale = (PNG_MIN + side - 1) / side;
+    let px = (side * scale) as usize;
+    let mut pixels = vec![255u8; px * px];
+    for y in 0..code.size() {
+        for x in 0..code.size() {
+            if !code.get_module(x, y) {
+                continue;
+            }
+            for row in (y + QUIET) * scale..(y + QUIET + 1) * scale {
+                let start = row as usize * px + ((x + QUIET) * scale) as usize;
+                pixels[start..start + scale as usize].fill(0);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, px as u32, px as u32);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(&pixels).ok()?;
+    writer.finish().ok()?;
+    Some(out)
+}
+
+/// Where the picture goes: a path with no extension gets `.png`; one the user
+/// typed with another extension stays as typed.
+fn with_png(mut path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("png");
+    }
+    path
+}
+
+/// Writes `bytes` to `<path>.tmp`, then renames it over `path`, so a failed
+/// write never leaves a cut-off file where a good one was. The temp file is
+/// removed on failure.
+fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let temp = path.with_file_name(name);
+    let result = std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Asks where to save the code for `text` (`ask` gets [`SUGGESTED_NAME`]) and
+/// writes it; says so when it cannot. Cancelling does nothing. Blocks on `ask`.
+pub fn save_qr(text: &str, ask: &dyn Fn(&str) -> Option<PathBuf>, notify: &dyn Notifier) {
+    let Some(path) = ask(SUGGESTED_NAME) else { return };
+    let path = with_png(path);
+    let saved = qr_png(text).is_some_and(|png| write_whole(&path, &png).is_ok());
+    if !saved {
+        let _ = notify.show(TITLE, COULD_NOT_SAVE);
+    }
 }
 
 pub struct QrProvider {
@@ -89,6 +168,7 @@ fn code_row(text: &str) -> ResultItem {
             title: one_line(text, MAX_PREVIEW),
             icon: "builtin:clipboard".into(),
             panel: svg,
+            actions: vec![Action::SavePicture],
             ..Default::default()
         },
         None => inert(TOO_LONG),
@@ -131,6 +211,13 @@ impl Provider for QrProvider {
                 Ok(Outcome::Hide)
             }
             None => Ok(Outcome::Keep),
+        }
+    }
+
+    fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
+        match (action, id.strip_prefix("qr:")) {
+            (Action::SavePicture, Some(text)) => Ok(Outcome::HideThen { then: Then::SaveQr { text: text.to_string() } }),
+            _ => Err("can't do that here".to_string()),
         }
     }
 
@@ -370,8 +457,108 @@ mod tests {
         assert_eq!(t.p.rank_key(&row.id), None);
         assert!(t.p.item(&row.id).is_none());
         assert!(!row.pinnable);
-        assert!(row.actions.is_empty());
+        assert_eq!(row.actions, vec![Action::SavePicture]);
+        assert!(t.p.query(&q(&"a".repeat(3000)))[0].actions.is_empty());
         assert_eq!(t.p.name(), "qr");
         assert_eq!(t.p.route(), Some(Route { prefix: "qr", needs_space: true }));
+    }
+
+    fn decode(bytes: &[u8]) -> (png::OutputInfo, Vec<u8>) {
+        let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        (info, buf)
+    }
+
+    #[test]
+    fn png_is_the_code_scaled_up_with_the_quiet_zone() {
+        let (info, px) = decode(&qr_png("hello").unwrap());
+        assert_eq!((info.width, info.height), (1044, 1044), "29 modules x 36 pixels");
+        let at = |x: usize, y: usize| px[y * 1044 + x];
+        assert_eq!(at(4 * 36 + 18, 4 * 36 + 18), 0, "centre of the finder's corner module");
+        assert_eq!(at(0, 0), 255);
+    }
+
+    #[test]
+    fn png_capacity_matches_the_svg() {
+        let big = qr_png(&"a".repeat(2953)).unwrap();
+        assert!(decode(&big).0.width >= 1024);
+        assert!(qr_png(&"a".repeat(2954)).is_none());
+    }
+
+    #[test]
+    fn save_picture_hides_then_saves() {
+        let t = qr(None);
+        assert_eq!(
+            t.p.act("qr:hi", Action::SavePicture),
+            Ok(Outcome::HideThen { then: Then::SaveQr { text: "hi".into() } })
+        );
+        assert!(t.p.act("inert:x", Action::SavePicture).is_err());
+        assert!(t.p.act("qr:hi", Action::Copy).is_err());
+    }
+
+    #[test]
+    fn save_adds_png_to_a_bare_name_and_asks_with_the_suggestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out");
+        let asked = Mutex::new(Vec::new());
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr(
+            "hi",
+            &|name| {
+                asked.lock().unwrap().push(name.to_string());
+                Some(target.clone())
+            },
+            &notes,
+        );
+        assert_eq!(*asked.lock().unwrap(), ["qr-code.png"]);
+        assert_eq!(decode(&std::fs::read(dir.path().join("out.png")).unwrap()).0.width, 1044);
+        assert!(notes.shown().is_empty());
+    }
+
+    #[test]
+    fn save_keeps_an_extension_the_user_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| Some(dir.path().join("x.jpg")), &notes);
+        assert!(dir.path().join("x.jpg").exists());
+        assert!(!dir.path().join("x.jpg.png").exists());
+    }
+
+    #[test]
+    fn cancelling_the_save_does_nothing() {
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| None, &notes);
+        assert!(notes.shown().is_empty());
+    }
+
+    #[test]
+    fn a_save_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| Some(dir.path().join("out.png")), &notes);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["out.png"]);
+    }
+
+    #[test]
+    fn a_failed_overwrite_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.png");
+        std::fs::write(&target, b"old picture").unwrap();
+        // The temp path is a directory: the write cannot happen.
+        std::fs::create_dir(dir.path().join("out.png.tmp")).unwrap();
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| Some(target.clone()), &notes);
+        assert_eq!(std::fs::read(&target).unwrap(), b"old picture");
+        assert_eq!(notes.shown().len(), 1);
+    }
+
+    #[test]
+    fn a_failed_write_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let notes = crate::notifications::FakeNotifier::default();
+        save_qr("hi", &|_| Some(dir.path().join("missing").join("out")), &notes);
+        assert_eq!(notes.shown(), [("Flick".to_string(), "Could not save the QR code".to_string())]);
     }
 }

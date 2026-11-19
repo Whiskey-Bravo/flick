@@ -5,7 +5,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::Globalization::{
     GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_LONGDATE, DATE_SHORTDATE,
-    LOCALE_IMEASURE, LOCALE_SDECIMAL, LOCALE_SINTLSYMBOL, LOCALE_STHOUSAND, TIME_NOSECONDS,
+    LOCALE_IMEASURE, LOCALE_SDECIMAL, LOCALE_SINTLSYMBOL, LOCALE_STHOUSAND, TIME_FORMAT_FLAGS,
 };
 
 /// Parses a typed number. `,` and `.` both work as the decimal separator; a single
@@ -129,10 +129,21 @@ pub fn format_number(x: f64, decimal: char, group: char) -> String {
 pub trait Formats: Send + Sync {
     fn number(&self, x: f64) -> String;
     fn date(&self, d: Date, long: bool) -> String;
-    fn time(&self, t: Time) -> String;
+    /// The time of day with seconds, in the user's format.
+    fn time_seconds(&self, t: Time) -> String;
     fn fahrenheit(&self) -> bool;
     /// ISO code of the user's currency, when known.
     fn currency(&self) -> Option<String>;
+}
+
+fn plain_time_seconds(t: Time) -> String {
+    format!("{:02}:{:02}:{:02}", t.hour(), t.minute(), t.second())
+}
+
+/// Whether `formatted` shows the seconds of `t` as two ASCII digits. A format
+/// without seconds (or with other digits) would make a ticking row look still.
+fn shows_seconds(formatted: &str, t: Time) -> bool {
+    formatted.contains(&format!("{:02}", t.second()))
 }
 
 /// The user's Windows locale, read once.
@@ -161,7 +172,7 @@ fn systemtime(d: Date, t: Time) -> SYSTEMTIME {
         wDay: d.day() as u16,
         wHour: t.hour() as u16,
         wMinute: t.minute() as u16,
-        wSecond: 0,
+        wSecond: t.second() as u16,
         wMilliseconds: 0,
     }
 }
@@ -209,23 +220,28 @@ impl Formats for WindowsFormats {
         String::from_utf16_lossy(&buf[..n as usize - 1])
     }
 
-    fn time(&self, t: Time) -> String {
+    fn time_seconds(&self, t: Time) -> String {
         let st = systemtime(Date::constant(2000, 1, 1), t);
         let mut buf = [0u16; 64];
         // SAFETY: st and buf outlive the call; null locale = user default.
         let n = unsafe {
             GetTimeFormatEx(
                 PCWSTR::null(),
-                TIME_NOSECONDS,
+                TIME_FORMAT_FLAGS(0),
                 Some(&st),
                 PCWSTR::null(),
                 Some(&mut buf),
             )
         };
         if n <= 1 {
-            return format!("{:02}:{:02}", t.hour(), t.minute());
+            return plain_time_seconds(t);
         }
-        String::from_utf16_lossy(&buf[..n as usize - 1])
+        let text = String::from_utf16_lossy(&buf[..n as usize - 1]);
+        if shows_seconds(&text, t) {
+            text
+        } else {
+            plain_time_seconds(t)
+        }
     }
 
     fn fahrenheit(&self) -> bool {
@@ -237,7 +253,7 @@ impl Formats for WindowsFormats {
     }
 }
 
-/// Fixed formats for tests: `Wed 1 Jan 2027` / `01.01.2027`, `HH:MM`, EUR, Celsius.
+/// Fixed formats for tests: `Wed 1 Jan 2027` / `01.01.2027`, `HH:MM:SS`, EUR, Celsius.
 #[cfg(test)]
 pub(crate) struct TestFormats {
     pub decimal: char,
@@ -258,8 +274,8 @@ impl Formats for TestFormats {
         }
     }
 
-    fn time(&self, t: Time) -> String {
-        format!("{:02}:{:02}", t.hour(), t.minute())
+    fn time_seconds(&self, t: Time) -> String {
+        plain_time_seconds(t)
     }
 
     fn fahrenheit(&self) -> bool {
@@ -329,7 +345,26 @@ mod tests {
         let f = TestFormats { decimal: ',', group: '.' };
         assert_eq!(f.date(Date::constant(2027, 1, 1), true), "Fri 1 Jan 2027");
         assert_eq!(f.date(Date::constant(2027, 1, 1), false), "01.01.2027");
-        assert_eq!(f.time(Time::constant(9, 5, 0, 0)), "09:05");
+    }
+
+    #[test]
+    fn time_with_seconds() {
+        let f = TestFormats { decimal: ',', group: '.' };
+        assert_eq!(f.time_seconds(Time::constant(12, 5, 9, 0)), "12:05:09");
+        let w = WindowsFormats::new();
+        // Whatever the machine's format is, the seconds show.
+        assert!(w.time_seconds(Time::constant(12, 5, 9, 0)).contains("09"));
+    }
+
+    #[test]
+    fn a_time_without_seconds_falls_back_to_plain() {
+        let t = Time::constant(12, 5, 9, 0);
+        assert!(shows_seconds("12:05:09", t));
+        assert!(shows_seconds("12:05:09 PM", t));
+        assert!(!shows_seconds("12:05", t));
+        assert!(!shows_seconds("12:05 PM", t));
+        // Not ASCII digits: the tick would not be readable as seconds.
+        assert!(!shows_seconds("\u{0661}\u{0662}:\u{0660}\u{0665}:\u{0660}\u{0669}", t));
     }
 
     #[test]
@@ -337,6 +372,6 @@ mod tests {
         let f = WindowsFormats::new();
         assert!(!f.number(1234.5).is_empty());
         assert!(!f.date(Date::constant(2027, 1, 1), true).is_empty());
-        assert!(!f.time(Time::constant(9, 5, 0, 0)).is_empty());
+        assert!(!f.time_seconds(Time::constant(9, 5, 0, 0)).is_empty());
     }
 }

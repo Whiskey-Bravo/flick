@@ -8,7 +8,7 @@ import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } f
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
-  panelItem, type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  panelItem, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -271,6 +271,7 @@ const MENU_LABELS: Record<MenuAction, string> = {
   close: "Close",
   close_window: "Close window",
   copy: "Copy",
+  save_picture: "Save as picture",
 };
 /// Where the right-click happened, in window coordinates.
 let menuAt: Point = { x: 0, y: 0 };
@@ -298,7 +299,13 @@ function renderMenu() {
     // Under the selected row, past its icon.
     const li = list.querySelector<HTMLElement>("li.result.selected");
     const icon = li?.querySelector<HTMLElement>(".icon");
-    if (li) {
+    if (panelItem(state)) {
+      // The QR panel stands in for its row (which is rendered but hidden, so
+      // it has no box): the menu opens in the panel's top-left corner, clear
+      // of the input.
+      const box = qrPanel.getBoundingClientRect();
+      at = { x: box.left + 12, y: box.top + 12 };
+    } else if (li) {
       const box = li.getBoundingClientRect();
       at = { x: box.left + (icon?.offsetWidth ?? 0), y: box.bottom };
     }
@@ -328,6 +335,23 @@ function renderQr(item: Item) {
     else qrHolder.replaceChildren();
   }
   qrCaption.textContent = item.title;
+}
+
+// Live rows (the clock) ask again at the start of each wall-clock second. One
+// timer at most; it clears itself once no live row shows.
+let tickTimer: number | null = null;
+
+function scheduleTick() {
+  if (!wantsTick(state)) {
+    if (tickTimer !== null) clearTimeout(tickTimer);
+    tickTimer = null;
+    return;
+  }
+  if (tickTimer !== null) return;
+  tickTimer = window.setTimeout(() => {
+    tickTimer = null;
+    dispatch({ type: "answersReady" });
+  }, 1000 - (Date.now() % 1000) + 5);
 }
 
 function render() {
@@ -370,6 +394,7 @@ function render() {
     thumb.style.top = `${(state.top / len) * 100}%`;
   }
   renderMenu();
+  scheduleTick();
   // Invisible while hidden (medium and high levels), so the next open starts
   // from nothing; anything that brings the bar back clears it.
   panel.classList.toggle("closed", state.hidden);
@@ -447,6 +472,10 @@ const SWALLOWED = ["Tab", "F1", "F5"];
 const SWALLOWED_CTRL = ["p", "f", "r"];
 document.addEventListener("keydown", (e) => {
   if (SWALLOWED.includes(e.key) || (e.ctrlKey && SWALLOWED_CTRL.includes(e.key.toLowerCase()))) e.preventDefault();
+  if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "s" && !e.repeat) {
+    e.preventDefault();
+    dispatch({ type: "savePanel" });
+  }
 });
 const rowIndex = (e: Event_): number | null => {
   const li = (e.target as Element | null)?.closest<HTMLElement>("li.result");
@@ -454,6 +483,11 @@ const rowIndex = (e: Event_): number | null => {
 };
 document.addEventListener("contextmenu", (e) => {
   e.preventDefault();
+  if ((e.target as Element | null)?.closest(".qr-panel") && panelItem(state)) {
+    menuAt = { x: e.clientX, y: e.clientY };
+    dispatch({ type: "menu", index: 0 });
+    return;
+  }
   const index = rowIndex(e);
   if (index === null) {
     if (state.menu) dispatch({ type: "menuClose" });

@@ -17,6 +17,7 @@ mod fuzzy;
 mod games;
 mod history;
 mod hotkey;
+mod hotkey_notice;
 mod icon;
 mod item_search;
 mod launch;
@@ -1085,6 +1086,18 @@ pub fn run() {
         });
 }
 
+/// The Save window for a QR code, with no parent (the bar is hidden by then).
+/// Blocks until the window closes, so it runs only on the follow-up's thread.
+fn save_qr_window(app: AppHandle, notifier: Arc<dyn Notifier>) -> impl Fn(&str) + Send + Sync + 'static {
+    move |text: &str| {
+        use tauri_plugin_dialog::DialogExt;
+        let ask = |name: &str| {
+            app.dialog().file().add_filter("PNG picture", &["png"]).set_file_name(name).blocking_save_file()?.into_path().ok()
+        };
+        providers::qr::save_qr(text, &ask, notifier.as_ref());
+    }
+}
+
 /// Startup order: config → providers and engine → background index threads →
 /// hotkey → tray → config watcher. Nothing here may stop startup, and nothing
 /// here scans the disk: every index is built on a background thread.
@@ -1108,6 +1121,8 @@ fn setup(app: &AppHandle) {
     // Reminders that ring and direct hotkeys that fail say so in a notification.
     let notifier: Arc<dyn Notifier> = Arc::new(SystemNotifier);
     app.manage(notifier.clone());
+    app.manage(hotkey_notice::HotkeyNotice::default());
+    let saved_notifier = notifier.clone();
     let fire: Fire = Arc::new(move |body: &str| {
         let _ = notifier.show(TITLE, body);
     });
@@ -1122,6 +1137,7 @@ fn setup(app: &AppHandle) {
         launcher: launcher.clone(),
         previous: paste::previous,
         pick_color: Box::new(|| picker::start(Arc::new(picker::GdiScreen), Arc::new(WindowsClipboard))),
+        save_qr: Box::new(save_qr_window(app.clone(), saved_notifier)),
         settle: after_hide::settle,
         shows: window::shows,
     }));
@@ -1180,7 +1196,7 @@ fn setup(app: &AppHandle) {
 
     let keys = Arc::new(DirectKeys::new(Arc::new(PluginKeys::new(app.clone(), on_direct_press))));
     app.manage(keys.clone());
-    let hotkey_error = apply_hotkey(app, &loaded.config.hotkey);
+    let hotkey_error = apply_hotkey(app, &loaded.config.hotkey, true);
     // After the bar hotkey, against the one that registered: it always wins.
     keys.apply(&registered_bar(app, &loaded.config.hotkey), &loaded.config.direct_hotkeys);
 
@@ -1214,7 +1230,7 @@ fn setup(app: &AppHandle) {
     if first_run && !cfg!(debug_assertions) {
         let _ = app.autolaunch().enable();
     }
-    let _ = tray::build(app, &tooltip(hotkey_error.as_deref()), |app| {
+    let _ = tray::build(app, hotkey_error.as_deref(), |app| {
         let app = app.clone();
         // Off the main thread: all of these can block. Config first, so a
         // slow PowerShell or file scan never delays it.
@@ -1322,9 +1338,10 @@ fn load_answer_stores(app: &AppHandle, p: &Providers) {
     });
 }
 
-/// Registers `accelerator`, records the result and updates the tray tooltip.
+/// Registers `accelerator`, records the result and tells the tray and the user
+/// when it did not work (`announce` false: not for a Settings attempt that was refused).
 /// Returns the user-facing error text on failure.
-pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String> {
+pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str, announce: bool) -> Option<String> {
     let result = hotkey::apply(app, accelerator);
     let state = app.state::<AppState>();
     *state.hotkey.lock().unwrap_or_else(|e| e.into_inner()) = result.is_ok().then(|| accelerator.to_string());
@@ -1332,8 +1349,31 @@ pub(crate) fn apply_hotkey(app: &AppHandle, accelerator: &str) -> Option<String>
         *state.bar_hotkey.lock().unwrap_or_else(|e| e.into_inner()) = Some(accelerator.to_string());
     }
     let error = result.err();
-    tray::set_tooltip(app, &tooltip(error.as_deref()));
+    if reports_hotkey(announce, error.as_deref()) {
+        tray::set_error(app, error.as_deref());
+        announce_hotkey_error(app, accelerator, error.as_deref());
+    }
     error
+}
+
+/// Whether a hotkey result goes to the tray and the notification. A refused
+/// attempt from the Settings window (`announce` false) does not: the window
+/// shows the error itself and the old hotkey is back in use.
+fn reports_hotkey(announce: bool, error: Option<&str>) -> bool {
+    announce || error.is_none()
+}
+
+/// Says in a notification that the bar hotkey does not work, once per distinct
+/// error. Shown on its own thread (the toast can take a moment), and a failure
+/// to show it changes nothing.
+fn announce_hotkey_error(app: &AppHandle, accelerator: &str, error: Option<&str>) {
+    let Some(notice) = app.try_state::<hotkey_notice::HotkeyNotice>() else { return };
+    let Some((title, body)) = notice.update(accelerator, error) else { return };
+    let Some(notifier) = app.try_state::<Arc<dyn Notifier>>() else { return };
+    let notifier = notifier.inner().clone();
+    std::thread::spawn(move || {
+        let _ = notifier.show(&title, &body);
+    });
 }
 
 /// The bar hotkey registered now, or `configured` when none has registered
@@ -1429,14 +1469,6 @@ fn quit_cleanup(reminders: Option<&Reminders>) {
     notifications::remove_balloons();
 }
 
-/// Tray tooltip: "Flick", or "Flick — <hotkey error>".
-fn tooltip(error: Option<&str>) -> String {
-    match error {
-        Some(e) => format!("{} \u{2014} {e}", tray::DEFAULT_TOOLTIP),
-        None => tray::DEFAULT_TOOLTIP.to_string(),
-    }
-}
-
 /// Reload with last-good fallback; push a successfully loaded config into the
 /// providers (rescanning files in the background when their folders changed);
 /// re-apply the hotkey if it changed (or the last attempt failed); emit
@@ -1499,7 +1531,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
         &old,
         &config,
         hotkey_needs_apply(applied.as_deref(), &config.hotkey),
-        |accelerator| apply_hotkey(app, accelerator),
+        |accelerator| apply_hotkey(app, accelerator, true),
         || registered_bar(app, &config.hotkey),
     );
     // Under the config lock, so concurrent reloads report in order.
@@ -1599,7 +1631,7 @@ pub(crate) fn change_bar_hotkey(app: &AppHandle, wanted: &str) -> Result<(), Str
     let applied = state.hotkey.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let keys = app.state::<Arc<DirectKeys>>();
     settings::set_hotkey(&config::config_path(), applied.as_deref(), wanted, |h| {
-        swap_bar_hotkey(&keys, h, &config.direct_hotkeys, |a| apply_hotkey(app, a), || registered_bar(app, &config.hotkey))
+        swap_bar_hotkey(&keys, h, &config.direct_hotkeys, |a| apply_hotkey(app, a, false), || registered_bar(app, &config.hotkey))
             .map_or(Ok(()), Err)
     })
 }
@@ -2017,7 +2049,7 @@ mod tests {
         fn date(&self, d: jiff::civil::Date, _long: bool) -> String {
             d.to_string()
         }
-        fn time(&self, t: jiff::civil::Time) -> String {
+        fn time_seconds(&self, t: jiff::civil::Time) -> String {
             t.to_string()
         }
         fn fahrenheit(&self) -> bool {
@@ -2548,12 +2580,11 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_prefixes_errors_with_flick() {
-        assert_eq!(tooltip(None), "Flick");
-        assert_eq!(
-            tooltip(Some("hotkey \"X\" is not a valid shortcut")),
-            "Flick \u{2014} hotkey \"X\" is not a valid shortcut"
-        );
+    fn a_refused_settings_attempt_is_not_reported_but_a_good_one_is() {
+        assert!(reports_hotkey(true, Some("in use")));
+        assert!(reports_hotkey(true, None));
+        assert!(!reports_hotkey(false, Some("in use")));
+        assert!(reports_hotkey(false, None));
     }
 
     #[test]

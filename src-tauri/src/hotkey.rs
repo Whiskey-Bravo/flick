@@ -40,8 +40,8 @@ pub fn set_paused(app: &AppHandle, paused: bool) {
 
 /// Unregisters the previous hotkey, then registers `accelerator` (e.g. "Alt+Space").
 /// Fails when the accelerator is invalid or taken by another program; the error
-/// is the text shown in the bar (the tray tooltip adds "Flick — "). On failure the previous hotkey is registered
-/// again, so a typo in the config never leaves the user without one.
+/// is the text shown in the bar (`tray::tooltip_text` builds the tray tooltip from it). On failure the previous
+/// hotkey is registered again, so a typo in the config never leaves the user without one.
 ///
 /// Never call this on the main thread while another thread may be inside it:
 /// the plugin blocks on the main thread while the lock is held.

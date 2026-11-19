@@ -32,6 +32,8 @@ const WAIT: &str = "wait";
 /// "Set your city": Enter opens the config.
 const CONFIG: &str = "config";
 const COPY: &str = "copy:";
+const NOW: &str = "now:";
+const LOCAL_NOW: &str = "now:local";
 const OPEN: &str = "open:";
 
 /// Default for `search_engine`.
@@ -113,6 +115,11 @@ fn row(id: String, title: String, subtitle: String, icon: Icon, top: bool) -> Re
 /// A row whose Enter copies `copy`.
 fn copy_row(copy: &str, title: String, subtitle: String, icon: Icon, top: bool) -> ResultItem {
     row(format!("{COPY}{copy}"), title, subtitle, icon, top)
+}
+
+/// A clock row: Enter copies the time of the keypress, and the bar redraws it every second.
+fn live_row(id: String, title: String, subtitle: String, top: bool) -> ResultItem {
+    ResultItem { live: true, ..row(id, title, subtitle, Icon::Time, top) }
 }
 
 /// An inert row (placeholder or error).
@@ -267,16 +274,14 @@ impl AnswersProvider {
         match ask {
             ClockAsk::LocalTime => {
                 let here = now.to_zoned(self.local.clone());
-                let time = self.formats.time(here.time());
-                let title = format!("{time} {}", here.strftime("%a"));
-                Some(copy_row(&time, title, self.formats.date(today, true), Icon::Time, false))
+                let title = format!("{} {}", self.formats.time_seconds(here.time()), here.strftime("%a"));
+                Some(live_row(LOCAL_NOW.into(), title, self.formats.date(today, true), false))
             }
             ClockAsk::TimeIn(place) => {
                 let (there, ahead) = clock::time_in_from(place, now, &self.local)?;
-                let time = self.formats.time(there.time());
-                let title = format!("{time} {}", there.strftime("%a"));
+                let title = format!("{} {}", self.formats.time_seconds(there.time()), there.strftime("%a"));
                 let subtitle = format!("{} · {}", place_name(place), offset_text(ahead));
-                Some(copy_row(&time, title, subtitle, Icon::Time, true))
+                Some(live_row(format!("{NOW}{}", place.name), title, subtitle, true))
             }
             ClockAsk::Shift { amount, unit } => {
                 let date = self.formats.date(clock::shift(today, amount, unit)?, true);
@@ -422,6 +427,17 @@ impl Provider for AnswersProvider {
             (self.open_config)()?;
             return Ok(Outcome::Hide);
         }
+        if let Some(which) = id.strip_prefix(NOW) {
+            let now = (self.clock)();
+            let time = if id == LOCAL_NOW {
+                now.to_zoned(self.local.clone()).time()
+            } else {
+                let place = clock::PLACES.iter().find(|p| p.name == which).ok_or("unknown place")?;
+                clock::time_in_from(place, now, &self.local).ok_or("unknown place")?.0.time()
+            };
+            self.clipboard.set_text(&self.formats.time_seconds(time))?;
+            return Ok(Outcome::Hide);
+        }
         if let Some(text) = id.strip_prefix(COPY) {
             self.clipboard.set_text(text)?;
             return Ok(Outcome::Hide);
@@ -479,6 +495,8 @@ mod tests {
         opened: Arc<AtomicUsize>,
         fetch: Arc<FakeFetch>,
         ready: mpsc::Receiver<()>,
+        /// The provider's clock: tests move it.
+        now: Arc<Mutex<jiff::Timestamp>>,
         _dir: tempfile::TempDir,
     }
 
@@ -519,6 +537,8 @@ mod tests {
         let clipboard = Arc::new(FakeClipboard::default());
         let launcher = Arc::new(RecordingLauncher::default());
         let opened = Arc::new(AtomicUsize::new(0));
+        let clock = Arc::new(Mutex::new(now()));
+        let clock_source = clock.clone();
         let counter = opened.clone();
         let answers = AnswersProvider::with_zone(
             Arc::new(TestFormats { decimal: ',', group: '.' }),
@@ -530,11 +550,11 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),
-            Arc::new(now),
+            Arc::new(move || *clock_source.lock().unwrap()),
             jiff::tz::TimeZone::get("Europe/Berlin").unwrap(),
         );
         answers.set_config(&config(online, city));
-        Rig { answers, clipboard, launcher, opened, fetch, ready, _dir: dir }
+        Rig { answers, clipboard, launcher, opened, fetch, ready, now: clock, _dir: dir }
     }
 
     fn ask(r: &Rig, text: &str) -> Vec<ResultItem> {
@@ -753,7 +773,7 @@ mod tests {
         let row = one(&r, "time");
         assert!(!row.top);
         assert_eq!(row.score, 900);
-        assert_eq!(row.title, "19:00 Tue");
+        assert_eq!(row.title, "19:00:00 Tue");
         assert_eq!(row.icon, "builtin:time");
         let dir = tempfile::tempdir().unwrap();
         let (e, _, _) = engine(r.answers.clone(), App("Time Tracker", 950), &dir);
@@ -764,7 +784,7 @@ mod tests {
     #[test]
     fn time_and_date_rows() {
         let r = rig(true, "", None);
-        assert_eq!(titled(&r, "time tokyo"), ("03:00 Wed".into(), "Tokyo · 8 h ahead".into()));
+        assert_eq!(titled(&r, "time tokyo"), ("03:00:00 Wed".into(), "Tokyo · 8 h ahead".into()));
         assert_eq!(one(&r, "time berlin").subtitle, "Berlin · same time");
         assert_eq!(one(&r, "time london").subtitle, "London · 1 h behind");
         assert_eq!(one(&r, "time india").subtitle, "Delhi · 4 h 30 min ahead");
@@ -773,7 +793,7 @@ mod tests {
         let row = one(&r, "time tokyo");
         assert!(row.top);
         r.answers.activate(&row.id, Modifier::None).unwrap();
-        assert_eq!(*r.clipboard.0.lock().unwrap(), ["03:00"]);
+        assert_eq!(*r.clipboard.0.lock().unwrap(), ["03:00:00"]);
 
         assert_eq!(titled(&r, "in 45 days"), ("Fri 1 Jan 2027".into(), "in 45 days".into()));
         assert_eq!(one(&r, "in 1 week").subtitle, "in 1 week");
@@ -781,6 +801,33 @@ mod tests {
         assert_eq!(titled(&r, "days until 24.12."), ("37 days".into(), "until Thu 24 Dec 2026".into()));
         assert_eq!(one(&r, "in 45 days").icon, "builtin:time");
         assert!(ask(&r, "in 100000000 years").is_empty());
+    }
+
+    #[test]
+    fn time_rows_tick_and_copy_the_moment_of_enter() {
+        let r = rig(true, "", None);
+        // Berlin and Paris share the summer offset.
+        *r.now.lock().unwrap() = "2026-07-01T12:00:07Z".parse().unwrap();
+        let here = one(&r, "time");
+        assert_eq!((here.title.as_str(), here.id.as_str(), here.live), ("14:00:07 Wed", "now:local", true));
+        let tokyo = one(&r, "time tokyo");
+        assert_eq!((tokyo.title.as_str(), tokyo.id.as_str(), tokyo.live), ("21:00:07 Wed", "now:Tokyo", true));
+        assert_eq!(tokyo.subtitle, "Tokyo · 7 h ahead");
+        assert!(!one(&r, "in 45 days").live);
+        assert!(!one(&r, "12*7").live);
+        assert!(!one(&r, "5 km in miles").live);
+        assert!(!one(&r, "20 usd in eur").live);
+        assert_eq!(r.answers.rank_key(&here.id), None);
+
+        *r.now.lock().unwrap() = "2026-07-01T12:00:09Z".parse().unwrap();
+        assert_eq!(r.answers.activate("now:local", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(r.clipboard.0.lock().unwrap().last().unwrap(), "14:00:09");
+        assert_eq!(r.answers.activate("now:Tokyo", Modifier::None), Ok(Outcome::Hide));
+        assert_eq!(r.clipboard.0.lock().unwrap().last().unwrap(), "21:00:09");
+
+        let before = r.clipboard.0.lock().unwrap().len();
+        assert!(r.answers.activate("now:Nowhere", Modifier::None).is_err());
+        assert_eq!(r.clipboard.0.lock().unwrap().len(), before);
     }
 
     #[test]

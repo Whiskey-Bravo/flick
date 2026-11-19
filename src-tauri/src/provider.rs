@@ -42,6 +42,8 @@ pub enum Action {
     CloseWindow,
     /// Copy the row's value to the clipboard.
     Copy,
+    /// Save the row's picture (the QR code) to a file.
+    SavePicture,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize)]
@@ -69,6 +71,8 @@ pub struct ResultItem {
     /// SVG markup the bar shows in place of the list ("" = none). Built only
     /// by Rust code (QR module positions), never from user text.
     pub panel: String,
+    /// The row changes by itself: the bar asks again every second while it shows.
+    pub live: bool,
     /// A computed answer: in plain queries the engine puts it above every other row.
     #[serde(skip)]
     pub top: bool,
@@ -94,7 +98,7 @@ pub struct HelpLine {
 }
 
 /// What runs after the bar has hidden.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Then {
     /// Paste what was just put on the clipboard; `before` is the clipboard
     /// sequence number read before it was put there.
@@ -104,6 +108,8 @@ pub enum Then {
     PickColor,
     /// Opens the real Start menu.
     StartMenu,
+    /// Asks where to save the QR code for `text`, then saves it.
+    SaveQr { text: String },
 }
 
 #[derive(Debug, PartialEq, serde::Serialize)]
@@ -258,6 +264,7 @@ mod tests {
     fn copy_action_serialises_as_copy() {
         assert_eq!(serde_json::to_value(Action::Copy).unwrap(), json!("copy"));
         assert_eq!(serde_json::from_value::<Action>(json!("copy")).unwrap(), Action::Copy);
+        assert_eq!(serde_json::to_value(Action::SavePicture).unwrap(), json!("save_picture"));
     }
 
     #[test]

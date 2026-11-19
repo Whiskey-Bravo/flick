@@ -12,8 +12,9 @@ export type Item = {
   actions: Action[]; // what the row's actions menu offers, in order
   complete: string; // text Tab puts in the bar, "" = none
   panel: string; // SVG markup from Flick's backend to show large instead of the list, "" = none
+  live: boolean; // the row changes by itself: ask again every second while it shows
 };
-export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy";
+export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
 export type MenuAction = Action | "pin" | "unpin";
 export type Menu = { index: number; actions: MenuAction[]; selected: number; at: "pointer" | "row" };
@@ -23,6 +24,12 @@ export function menuActions(item: Item): MenuAction[] {
   const actions: MenuAction[] = [...item.actions];
   if (item.pinnable) actions.push(item.pinned ? "unpin" : "pin");
   return actions;
+}
+
+/** True while the bar shows a row that changes by itself (the clock). No ticks
+ *  while the actions menu is open: the answers' re-query would close it. */
+export function wantsTick(s: State): boolean {
+  return !s.hidden && !s.menu && s.items.some((i) => i.live);
 }
 
 // The row shown as a panel (a QR code): the only item, with markup.
@@ -84,6 +91,7 @@ export type Event =
   | { type: "click"; index: number; ctrl: boolean; shift: boolean }
   | { type: "menu"; index: number }
   | { type: "menuPick"; action: MenuAction }
+  | { type: "savePanel" }
   | { type: "menuClose" }
   | { type: "wheel"; rows: number }
   | { type: "pinned"; provider: string; id: string; pinned: boolean }
@@ -306,6 +314,12 @@ function step(s: State, e: Event): Result {
       if (actions.length === 0) return done({ ...sel, menu: null });
       return done({ ...sel, menu: { index: e.index, actions, selected: 0, at: "pointer" } });
     }
+    case "savePanel": {
+      // Ctrl+S on the QR panel: its "Save as picture" without the menu.
+      const item = panelItem(s);
+      if (!item || s.pending || !item.actions.includes("save_picture")) return done(s);
+      return done({ ...s, menu: null, pending: true }, [{ type: "act", item, action: "save_picture" }]);
+    }
     case "menuPick": {
       const m = s.menu;
       const item = m && s.items[m.index];
@@ -359,7 +373,11 @@ function step(s: State, e: Event): Result {
         const k = s.keep;
         const at = e.items.findIndex((i) => i.provider === k.provider && i.id === k.id);
         const armed = at >= 0 && s.armed === k.id ? s.armed : null;
-        return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu: null, keep: null }));
+        // A menu opened after the tick was sent stays when its row is still at that place.
+        const was = s.menu ? s.items[s.menu.index] : undefined;
+        const now = s.menu ? e.items[s.menu.index] : undefined;
+        const menu = s.menu && was && now && was.provider === now.provider && was.id === now.id ? s.menu : null;
+        return done(fit({ ...s, items: e.items, selected: Math.max(0, at), armed, awaiting: false, menu, keep: null }));
       }
       if (s.text === "" && !s.scope) selected = emptyBarSelection(e.items);
       // Rows kept from the last show were on screen: a row the user moved to
