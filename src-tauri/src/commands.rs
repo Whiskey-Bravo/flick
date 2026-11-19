@@ -174,6 +174,50 @@ pub async fn act(
     result
 }
 
+/// Renames a file or folder row; the new row id. The bar stays. The shell
+/// call can block, so it runs on a blocking-pool thread.
+#[tauri::command]
+pub async fn rename(provider: String, id: String, new_name: String, state: State<'_, AppState>) -> Result<String, String> {
+    let engine = state.engine.clone();
+    tauri::async_runtime::spawn_blocking(move || engine.rename(&provider, &id, &new_name))
+        .await
+        .map_err(|e| format!("rename failed: {e}"))
+        .and_then(|r| r)
+}
+
+/// Shows Windows' own menu for a file or folder row (More options…) with its
+/// corner at screen pixels `x, y`, and runs what is picked: `true` when a
+/// command ran (the bar then hides), `false` when the menu was dismissed (the
+/// bar stays and takes the keyboard back). The bar is held open while the
+/// menu shows; no time limit, since the user may keep it open. On an error
+/// the bar stays too, and the page shows it.
+#[tauri::command]
+pub async fn more_options(
+    provider: String,
+    id: String,
+    x: i32,
+    y: i32,
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<bool, String> {
+    let engine = state.engine.clone();
+    let started = window::shows();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        engine.more_options(&provider, &id, |path| window::holding_open(|| crate::shell_menu::show(path, x, y)))
+    })
+    .await
+    .map_err(|e| format!("More options failed: {e}"))
+    .and_then(|r| r);
+    // A bar shown again meanwhile belongs to a new session: left alone.
+    if window::shows() == started {
+        match result {
+            Ok(true) => window::hide(&app),
+            _ => window::refocus(&app),
+        }
+    }
+    result
+}
+
 #[tauri::command]
 pub fn hide(app: AppHandle) {
     window::hide(&app);

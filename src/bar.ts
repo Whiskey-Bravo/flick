@@ -15,7 +15,7 @@ export type Item = {
   live: boolean; // the row changes by itself: ask again every second while it shows
   folder: string; // absolute path ending in a backslash when the row is a folder that can unfold, "" = not
 };
-export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture";
+export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture" | "open_terminal" | "compress" | "properties" | "open_with" | "copy_file" | "rename" | "delete" | "keep_offline" | "free_up_space" | "more_options";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
 export type MenuAction = Action | "pin" | "unpin";
 export type Menu = { index: number; actions: MenuAction[]; selected: number; at: "pointer" | "row" };
@@ -39,7 +39,7 @@ export function panelItem(s: State): Item | null {
 }
 
 // An unfolded folder: what the back end answered for it, and the path it was asked for.
-export type Fold = { path: string; state: "reading" | "ready" | "missing" | "denied"; rows: Item[]; more: number; typed: string };
+export type Fold = { path: string; state: "reading" | "ready" | "missing" | "denied"; rows: Item[]; more: number; typed: string; refresh?: { provider: string; id: string | null } };
 // A row as shown: a result, or a row inside an unfolded folder. `chain` is the
 // key of the folder row it is inside ("" for a result), so the same folder
 // shown twice is two rows; `key` is its identity among the shown rows.
@@ -90,6 +90,13 @@ const plain = (row: Row): Item => {
   const { depth, chain, key, fold, parent, ...item } = row;
   return item;
 };
+// The folder `chain` (a row's chain) re-read: its rows stay shown until the
+// answer comes; `land` is the row the selection goes to when it arrives.
+function rereadFold(s: State, chain: string, land: { provider: string; id: string | null }): { unfolded: State["unfolded"]; effects: Effect[] } {
+  const f = chain === "" ? undefined : s.unfolded[chain];
+  if (!f || f.state !== "ready") return { unfolded: s.unfolded, effects: [] };
+  return { unfolded: { ...s.unfolded, [chain]: { ...f, refresh: land } }, effects: [{ type: "unfold", key: chain, path: f.path }] };
+}
 // The folds still shown over these results: one whose folder row is gone goes,
 // and every fold under it with it. The same object when nothing goes.
 function foldsShown(items: Item[], unfolded: Record<string, Fold>): Record<string, Fold> {
@@ -122,7 +129,7 @@ export type State = {
   items: Item[];
   selected: number; // index into the shown rows (`shownRows`)
   armed: string | null; // id awaiting a second Enter
-  armedAction: "uninstall" | null; // what the armed second Enter does, besides activating
+  armedAction: "uninstall" | "delete" | null; // what the armed second Enter does, besides activating
   scope: { name: string; prompt: string } | null;
   error: string | null; // what the UI should display
   configError: string | null; // last config error from the back end
@@ -136,11 +143,12 @@ export type State = {
   menu: Menu | null; // the right-click menu, when open
   hidden: boolean; // the bar was hidden (Esc, focus loss) and not shown or typed into since
   queried: { text: string; scope: string | null } | null; // what the last query asked for
-  keep: { provider: string; id: string; chain?: string } | null; // row to stay on when the re-query's results arrive; `chain` only for a row inside a folder
+  keep: { provider: string; id: string; chain?: string; index?: number } | null; // row to stay on when the re-query's results arrive; `chain` only for a row inside a folder; `index`: where to go when that row is gone (a deleted one)
   browsed: boolean; // the rows were moved through (arrows or mouse) since the bar opened or the text changed: Up no longer recalls
   kept: boolean; // `items` are the last show's empty-bar rows, on screen until the fresh ones arrive
   tabCompletion: boolean; // the "Tab completion" setting: a grey preview, and no highlight until the rows are moved through
   unfolded: Record<string, Fold>; // the unfolded folders, by their row's key
+  rename: { item: Item; chain: string; before: { text: string; selected: number; top: number } } | null; // the row being renamed in the bar, and what to restore
 };
 export type Effect =
   | { type: "query"; text: string; scope: string | null; keepSelection?: true }
@@ -148,7 +156,10 @@ export type Effect =
   | { type: "loadPast" }
   | { type: "togglePin"; item: Item }
   | { type: "act"; item: Item; action: Action }
+  | { type: "moreOptions"; item: Item; index: number }
   | { type: "liveRow"; provider: string; id: string }
+  | { type: "rename"; item: Item; name: string }
+  | { type: "selectName"; start: number; end: number }
   | { type: "unfold"; key: string; path: string }
   | { type: "hide" };
 export type Event =
@@ -185,6 +196,8 @@ export type Event =
         | { kind: "fill"; text: string };
     }
   | { type: "failed"; message: string }
+  | { type: "renamed"; id: string }
+  | { type: "deleted"; item: Item }
   | { type: "queryFailed"; message: string }
   | { type: "configError"; message: string | null }
   | { type: "options"; tabCompletion: boolean };
@@ -213,6 +226,7 @@ export const initial: State = {
   kept: false,
   tabCompletion: false,
   unfolded: {},
+  rename: null,
 };
 
 // A mousemove counts only when the pointer really moved: rows changing under a
@@ -226,6 +240,39 @@ export function movedEnough(prev: Point | null, next: Point): boolean {
 export function failureText(item: Item, err: unknown): string {
   return `${item.title}: ${String(err)}`;
 }
+
+/** File and folder menu actions whose errors are whole sentences: they name
+ *  the file ("Couldn't delete a.txt") or need no name. */
+const PLAIN_ERRORS: readonly Action[] = [
+  "rename",
+  "delete",
+  "compress",
+  "open_terminal",
+  "properties",
+  "open_with",
+  "copy_file",
+  "keep_offline",
+  "free_up_space",
+  "more_options",
+];
+
+/** The error line for a failed menu action on `item`: as it came for the
+ *  file menu's own actions, else named like an activation's. */
+export function actionFailureText(item: Item, action: Action, err: unknown): string {
+  return PLAIN_ERRORS.includes(action) ? String(err) : failureText(item, err);
+}
+
+/** What the bar selects when a rename starts: the name without its extension
+ *  (up to the last dot), the whole name for a folder or a name with no dot
+ *  after its first character. */
+export function nameSelection(title: string, isFolder: boolean): [number, number] {
+  const dot = title.lastIndexOf(".");
+  return [0, isFolder || dot <= 0 ? title.length : dot];
+}
+
+// A rename ends: the text, the selection and the window are what they were.
+const leaveRename = (s: State): State =>
+  s.rename === null ? s : { ...s, rename: null, text: s.rename.before.text, selected: s.rename.before.selected, top: s.rename.before.top };
 
 // The window shows 8 rows, or 7 when the error line takes a row's worth of space.
 export const MAX_ROWS = 8;
@@ -356,9 +403,9 @@ function step(s: State, e: Event): Result {
         ],
       );
     case "hidden":
-      return done({ ...s, hidden: true, unfolded: {} });
+      return done({ ...leaveRename(s), hidden: true, unfolded: {} });
     case "blurred":
-      return done({ ...s, armed: null, queued: null, menu: null });
+      return done(fit({ ...leaveRename(s), armed: null, queued: null, menu: null }));
     case "answersReady": {
       // A folder read finished, or a rate or forecast arrived: ask again for
       // every folder still being read, and for the rows when the text is still
@@ -366,14 +413,17 @@ function step(s: State, e: Event): Result {
       const again = s.hidden
         ? []
         : Object.entries(s.unfolded)
-            .filter(([, f]) => f.state === "reading")
+            .filter(([, f]) => f.state === "reading" || f.refresh)
             .map(([key, f]): Effect => ({ type: "unfold", key, path: f.path }));
       const q = s.queried;
-      if (s.hidden || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s, again);
+      if (s.hidden || s.rename || !q || q.text !== s.text || q.scope !== (s.scope?.name ?? null)) return done(s, again);
       if (s.text.trim() === "" && !s.scope) return done(s, again);
       const sel = shownRows(s)[s.selected];
       // While typed text is still waiting for its answer, the rows are for older text.
-      const keep = sel && !s.awaiting ? keepOf(sel) : null;
+      // A keep still waiting for its re-query (after a delete or rename: where the
+      // selection lands when its row is gone or renamed) is kept, not replaced by
+      // the row that is about to go.
+      const keep = s.keep ?? (sel && !s.awaiting ? keepOf(sel) : null);
       return done({ ...s, keep }, [{ type: "query", text: q.text, scope: q.scope, keepSelection: true }, ...again]);
     }
     case "unfolded": {
@@ -381,19 +431,24 @@ function step(s: State, e: Event): Result {
       // still being read: a folded folder, changed text or a closed bar drop it,
       // and a late "reading" never undoes an answer.
       const f = s.unfolded[e.key];
-      if (!f || f.path !== e.path || f.state !== "reading") return done(s);
+      // A folder re-read after a delete or rename inside it (`refresh`) answers too.
+      if (!f || f.path !== e.path || (f.state !== "reading" && !f.refresh)) return done(s);
+      // The folder is being read again: its rows stay until the new listing is ready.
+      if (f.refresh && e.reply.state === "reading") return done(s);
       const next = { ...s, unfolded: { ...s.unfolded, [e.key]: { path: e.path, ...e.reply } } };
       // The rows below change: the selection stays on its row, a menu only on an unmoved row.
       const before = shownRows(s);
       const after = shownRows(next);
       const was = before[s.selected];
-      const at = was ? after.findIndex((r) => r.key === was.key) : -1;
+      const land = f.refresh?.id ? after.findIndex((r) => r.chain === e.key && r.provider === f.refresh?.provider && r.id === f.refresh.id) : -1;
+      const at = land >= 0 ? land : was ? after.findIndex((r) => r.key === was.key) : -1;
       const m = s.menu;
       const menu = m && before[m.index]?.key === after[m.index]?.key ? m : null;
       return done(fit({ ...next, selected: at >= 0 ? at : s.selected, menu }));
     }
     case "fold": {
       // The chevron: unfolds or folds that row, as Right or Left on it would.
+      if (s.rename) return done(s);
       const row = shownRows(s)[e.index];
       if (!row || row.fold === "none" || foldBlocked(s)) return done(s);
       return side(fit({ ...s, selected: e.index }), row.fold === "folded");
@@ -419,7 +474,7 @@ function step(s: State, e: Event): Result {
     }
     case "updateChanged": {
       // The update row (found, downloading, failed) lives in the empty bar only.
-      if (s.hidden || s.text.trim() !== "" || s.scope) return done(s);
+      if (s.hidden || s.rename || s.text.trim() !== "" || s.scope) return done(s);
       const sel = shownRows(s)[s.selected];
       const keep = sel ? keepOf(sel) : null;
       return done({ ...s, keep }, [{ type: "query", text: "", scope: null, keepSelection: true }]);
@@ -427,9 +482,10 @@ function step(s: State, e: Event): Result {
     case "menuClose":
       return done({ ...s, menu: null });
     case "hover":
-      if (s.menu || !shownRows(s)[e.index] || e.index === s.selected) return done(s);
+      if (s.menu || s.rename || !shownRows(s)[e.index] || e.index === s.selected) return done(s);
       return done(fit({ ...s, selected: e.index, armed: null, browsed: true }));
     case "click": {
+      if (s.rename) return done(s);
       if (s.menu) return done({ ...s, menu: null });
       if (!shownRows(s)[e.index]) return done(s);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
@@ -440,7 +496,7 @@ function step(s: State, e: Event): Result {
     }
     case "menu": {
       const item = shownRows(s)[e.index];
-      if (!item) return done(s);
+      if (!item || s.rename) return done(s);
       const actions = menuActions(item);
       const sel = e.index === s.selected ? s : fit({ ...s, selected: e.index, armed: null });
       if (actions.length === 0) return done({ ...sel, menu: null });
@@ -449,15 +505,15 @@ function step(s: State, e: Event): Result {
     case "savePanel": {
       // Ctrl+S on the QR panel: its "Save as picture" without the menu.
       const item = panelItem(s);
-      if (!item || s.pending || !item.actions.includes("save_picture")) return done(s);
+      if (!item || s.rename || s.pending || !item.actions.includes("save_picture")) return done(s);
       return done({ ...s, menu: null, pending: true }, [{ type: "act", item, action: "save_picture" }]);
     }
     case "menuPick": {
       const m = s.menu;
       const row = m && shownRows(s)[m.index];
       const item = row && plain(row);
-      // Only picking Uninstall keeps (or sets) the arm: any other pick must never fire it.
-      const closed = { ...s, menu: null, ...(e.action === "uninstall" ? {} : { armed: null, armedAction: null }) };
+      // Only picking Uninstall or Delete keeps (or sets) the arm: any other pick must never fire it.
+      const closed = { ...s, menu: null, ...(e.action === "uninstall" || e.action === "delete" ? {} : { armed: null, armedAction: null }) };
       if (!m || !item || !m.actions.includes(e.action)) return done(closed);
       switch (e.action) {
         case "pin":
@@ -467,6 +523,19 @@ function step(s: State, e: Event): Result {
           return enter({ ...closed, selected: m.index }, "ctrl_shift");
         case "uninstall":
           return done({ ...closed, selected: m.index, armed: item.id, armedAction: "uninstall" });
+        case "delete":
+          return done({ ...closed, selected: m.index, armed: item.id, armedAction: "delete" });
+        case "rename": {
+          if (s.pending) return done(closed);
+          const before = { text: s.text, selected: m.index, top: s.top };
+          const [start, end] = nameSelection(item.title, item.id.endsWith("\\"));
+          // An Enter queued for results still on their way must not fire in rename mode.
+          return done({ ...closed, selected: m.index, rename: { item, chain: row.chain, before }, text: item.title, queued: null, failure: null, error: s.configError }, [{ type: "selectName", start, end }]);
+        }
+        case "more_options":
+          // Windows' own menu, shown under the row: the page measures it.
+          if (s.pending) return done(closed);
+          return done({ ...closed, pending: true }, [{ type: "moreOptions", item, index: m.index }]);
         default:
           if (s.pending) return done(closed);
           return done({ ...closed, pending: true }, [{ type: "act", item, action: e.action }]);
@@ -480,6 +549,8 @@ function step(s: State, e: Event): Result {
     case "configError":
       return done(fit({ ...s, configError: e.message, error: s.failure ?? e.message }));
     case "input": {
+      // Rename mode: typing edits the name only, nothing is searched.
+      if (s.rename) return done(fit({ ...s, text: e.text, failure: null, error: s.configError }));
       // Text added at the end while the selection is inside an unfolded folder:
       // the bar switches to that folder's path, followed by what was added.
       const row = shownRows(s)[s.selected];
@@ -524,7 +595,7 @@ function step(s: State, e: Event): Result {
         const menu = s.menu && was && now && was.key === now.key ? s.menu : null;
         // A result that is gone: back to the first. A row inside a folder that
         // folded: the row that took its place.
-        const selected = at >= 0 ? at : k.chain !== undefined ? s.selected : 0;
+        const selected = at >= 0 ? at : k.index ?? (k.chain !== undefined ? s.selected : 0);
         return done(fit({ ...fresh, selected, armed, awaiting: false, menu, keep: null }));
       }
       // The result at this index of `e.items`, counted in shown rows.
@@ -555,7 +626,7 @@ function step(s: State, e: Event): Result {
       });
       // An Enter pressed before these results arrived acts on them now, unless
       // it was pressed on a kept row that is no longer there.
-      return s.queued && !gone ? enter(next, s.queued) : done(next);
+      return s.queued && !gone && !s.rename ? enter(next, s.queued) : done(next);
     }
     case "past":
       return done({ ...s, past: e.items });
@@ -575,6 +646,39 @@ function step(s: State, e: Event): Result {
     case "failed":
       // A failed activation brings the bar back.
       return done(fit({ ...s, armed: null, pending: false, hidden: false, failure: e.message, error: e.message }));
+    case "renamed": {
+      // The new name took: leave rename mode and ask again for the text from
+      // before it, staying on the renamed row (or where it was).
+      const r = s.rename;
+      if (!r) {
+        // Cancelled while the rename was on its way: the list still needs the new name.
+        return done({ ...s, pending: false, keep: { provider: "files", id: e.id, index: s.selected } }, [
+          { type: "query", text: s.text, scope: s.scope?.name ?? null, keepSelection: true },
+        ]);
+      }
+      const keep = { provider: r.item.provider, id: e.id, index: r.before.selected, ...(r.chain === "" ? {} : { chain: r.chain }) };
+      const left = leaveRename(s);
+      const again = rereadFold(left, r.chain, { provider: r.item.provider, id: e.id });
+      return done(fit({ ...left, unfolded: again.unfolded, pending: false, failure: null, error: s.configError, keep }), [
+        { type: "query", text: left.text, scope: s.scope?.name ?? null, keepSelection: true },
+        ...again.effects,
+      ]);
+    }
+    case "deleted": {
+      // The file went to the Recycle Bin: ask again for the same text; the
+      // selection stays at its index (the list's end clamps it).
+      // A row inside an unfolded folder: that folder is read again too.
+      const rows = shownRows(s);
+      const sel = rows[s.selected];
+      const row = sel && sel.provider === e.item.provider && sel.id === e.item.id ? sel : rows.find((r) => r.provider === e.item.provider && r.id === e.item.id);
+      const chain = row?.chain ?? "";
+      const keep = { provider: e.item.provider, id: e.item.id, index: s.selected, ...(chain === "" ? {} : { chain }) };
+      const again = rereadFold(s, chain, { provider: e.item.provider, id: null });
+      return done({ ...s, unfolded: again.unfolded, pending: false, armed: null, armedAction: null, menu: null, keep }, [
+        { type: "query", text: s.text, scope: s.scope?.name ?? null, keepSelection: true },
+        ...again.effects,
+      ]);
+    }
     case "queryFailed":
       // Leaves `pending` alone: an activation may still be in flight.
       return done(fit({ ...s, armed: null, awaiting: false, queued: null, failure: e.message, error: e.message }));
@@ -627,7 +731,19 @@ function onMenuKey(s: State, m: Menu, e: Extract<Event, { type: "key" }>): Resul
   }
 }
 
+// Rename mode owns Enter and Esc; the list keys do nothing, the rest is the text field's.
+function onRenameKey(s: State, r: NonNullable<State["rename"]>, e: Extract<Event, { type: "key" }>): Result {
+  if (e.key === "Enter") {
+    if (s.pending) return done(s);
+    return done({ ...s, pending: true, failure: null, error: s.configError }, [{ type: "rename", item: r.item, name: s.text }]);
+  }
+  // While the rename is on its way Esc can't take it back: it does nothing.
+  if (e.key === "Escape") return s.pending ? done(s) : done(fit({ ...leaveRename(s), pending: false, failure: null, error: s.configError }));
+  return done(s);
+}
+
 function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
+  if (s.rename) return onRenameKey(s, s.rename, e);
   if (s.menu) return onMenuKey(s, s.menu, e);
   switch (e.key) {
     case "ArrowUp":
@@ -710,7 +826,7 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
 
 // Right and Left (and the chevron) are ignored while a menu is open, a row is
 // armed, older results are awaited, an activation is pending, or a panel shows.
-const foldBlocked = (s: State): boolean => s.menu !== null || s.armed !== null || s.awaiting || s.pending || panelItem(s) !== null;
+const foldBlocked = (s: State): boolean => s.rename !== null || s.menu !== null || s.armed !== null || s.awaiting || s.pending || panelItem(s) !== null;
 
 // True exactly when Right or Left would change something; otherwise the key is
 // left to the text field (the caret moves).
@@ -803,8 +919,8 @@ function enter(s: State, modifier: Modifier): Result {
     return row.id === "more" && f ? fill(s, typedOf(f)) : done(s);
   }
   const item = plain(row);
-  if (s.armed === item.id && s.armedAction === "uninstall") {
-    return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: "uninstall" }]);
+  if (s.armed === item.id && (s.armedAction === "uninstall" || s.armedAction === "delete")) {
+    return done({ ...s, armed: null, armedAction: null, pending: true }, [{ type: "act", item, action: s.armedAction }]);
   }
   if (item.confirm && s.armed !== item.id) return done({ ...s, armed: item.id });
   return done({ ...s, armed: null, pending: true }, [{ type: "activate", item, modifier, text: s.text, scope: s.scope?.name ?? null }]);

@@ -4,6 +4,7 @@ mod backdrop;
 mod bookmarks;
 mod clipboard;
 mod cliphistory;
+mod cloud_roots;
 mod chores;
 mod commands;
 mod config;
@@ -13,6 +14,7 @@ mod devices;
 mod dirs;
 mod direct_keys;
 mod engine;
+mod file_ops;
 mod fuzzy;
 mod games;
 mod history;
@@ -37,6 +39,7 @@ mod refresh;
 mod reminders;
 mod settings;
 mod settings_window;
+mod shell_menu;
 mod status;
 mod updates;
 mod webview_memory;
@@ -194,7 +197,7 @@ impl Providers {
             windows: control.windows,
             system: control.system,
             status: control.status,
-            files: FilesProvider::new(launcher.clone(), Arc::new(WindowsClipboard)),
+            files: FilesProvider::new(launcher.clone(), Arc::new(WindowsClipboard), Arc::new(file_ops::SystemFileOps)),
             path: browse.path,
             downloads: browse.downloads,
             recent: browse.recent,
@@ -227,6 +230,7 @@ impl Providers {
     pub(crate) fn refresh_on_show(&self) {
         self.refresher.request();
         self.bookmarks.refresh_if_stale();
+        cloud_roots::shared().refresh_if_due();
         // Store installs (and, without a watcher, shortcuts): a background thread.
         self.apps.refresh_on_show();
     }
@@ -406,16 +410,17 @@ impl Browse {
         let store = Loader::new(on_ready, dirs::FRESH, dirs::SLOW);
         let clipboard: Arc<dyn clipboard::Clipboard> = Arc::new(WindowsClipboard);
         Browse {
-            path: Arc::new(PathProvider::new(dirs.clone(), fs.clone(), home, launcher.clone(), clipboard.clone())),
+            path: Arc::new(PathProvider::new(dirs.clone(), fs.clone(), home, launcher.clone(), clipboard.clone(), Arc::new(file_ops::SystemFileOps))),
             downloads: Arc::new(DownloadsProvider::new(
                 dirs,
                 fs.clone(),
                 downloads,
                 launcher.clone(),
                 clipboard.clone(),
+                Arc::new(file_ops::SystemFileOps),
                 now.clone(),
             )),
-            recent: Arc::new(RecentProvider::new(store, fs, links, recent, launcher, clipboard, now)),
+            recent: Arc::new(RecentProvider::new(store, fs, links, recent, launcher, clipboard, Arc::new(file_ops::SystemFileOps), now)),
         }
     }
 }
@@ -1067,6 +1072,8 @@ pub fn run() {
             timing::timing_enabled,
             timing::timing_mark,
             commands::act,
+            commands::rename,
+            commands::more_options,
             settings::settings_state,
             settings::settings_set,
             settings::settings_save_shortcut,
@@ -1139,6 +1146,7 @@ fn save_qr_window(app: AppHandle, notifier: Arc<dyn Notifier>) -> impl Fn(&str) 
 fn setup(app: &AppHandle) {
     let path = config::config_path();
     let first_run = !path.exists();
+    cloud_roots::shared().refresh_if_due();
     let loaded = config::load(&path, None);
 
     // One launcher for every provider that starts something.
@@ -1175,6 +1183,11 @@ fn setup(app: &AppHandle) {
         save_qr: Box::new(save_qr_window(app.clone(), saved_notifier)),
         settle: after_hide::settle,
         shows: window::shows,
+        ops: Arc::new(file_ops::SystemFileOps),
+        reopen: {
+            let app = app.clone();
+            Box::new(move |error| window::reopen(&app, "", error))
+        },
     }));
     let updates = Arc::new(Updates::new(Arc::new(PluginSource::new(app.clone())), updates::on_change(app.clone())));
     updates.set_enabled(loaded.config.check_updates);

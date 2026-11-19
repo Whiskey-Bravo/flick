@@ -7,7 +7,7 @@ import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
-  arrowActsOnList, sideActs, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
+  actionFailureText, arrowActsOnList, sideActs, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
   panelItem, queryArgs, queryReply, retryArgs, shownRows as allRows, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type Row, type State,
 } from "./bar";
 
@@ -264,11 +264,16 @@ function renderItem(item: Row, index: number, fresh: boolean): HTMLLIElement {
   title.textContent = item.title;
   const sub = document.createElement("span");
   sub.className = "subtitle";
-  sub.textContent = !armed
+  const renaming = state.rename !== null && state.rename.item.provider === item.provider && state.rename.item.id === item.id;
+  sub.textContent = renaming
+    ? "Enter renames, Esc cancels"
+    : !armed
     ? item.subtitle
     : state.armedAction === "uninstall"
       ? `Uninstall ${item.title}? Enter again`
-      : "Press Enter again to confirm";
+      : state.armedAction === "delete"
+        ? "Enter again to move to the Recycle Bin"
+        : "Press Enter again to confirm";
   li.append(renderIcon(item), title, sub);
   if (item.pinned) {
     const star = document.createElement("img");
@@ -298,6 +303,16 @@ const MENU_LABELS: Record<MenuAction, string> = {
   close_window: "Close window",
   copy: "Copy",
   save_picture: "Save as picture",
+  open_terminal: "Open in Terminal",
+  compress: "Compress to zip",
+  properties: "Properties",
+  open_with: "Open with…",
+  copy_file: "Copy",
+  rename: "Rename",
+  delete: "Delete",
+  keep_offline: "Keep on this device",
+  free_up_space: "Free up space",
+  more_options: "More options…",
 };
 /// Where the right-click happened, in window coordinates.
 let menuAt: Point = { x: 0, y: 0 };
@@ -385,8 +400,8 @@ function render() {
     input.value = state.text;
     input.setSelectionRange(state.text.length, state.text.length);
   }
-  pill.hidden = !state.scope;
-  pill.textContent = state.scope?.prompt ?? "";
+  pill.hidden = !state.scope && !state.rename;
+  pill.textContent = state.rename ? "Rename" : state.scope?.prompt ?? "";
   input.placeholder = state.scope ? "" : "Search apps and settings";
   errorLine.hidden = !state.error;
   errorLine.textContent = state.error ?? "";
@@ -451,6 +466,16 @@ function dispatch(event: Event) {
     else render();
   } else scheduleTick();
   effects.forEach(run);
+}
+
+/// Where Windows' menu for row `index` opens: the row's left edge and bottom,
+/// in screen pixels. The page's own window position (the bar's capability
+/// grants no window calls), scaled like the row's box.
+function moreOptionsAt(index: number): { x: number; y: number } {
+  const li = list.querySelector<HTMLElement>(`li.result[data-index="${index}"]`);
+  const box = li?.getBoundingClientRect() ?? input.getBoundingClientRect();
+  const scale = window.devicePixelRatio || 1;
+  return { x: Math.round((window.screenX + box.left) * scale), y: Math.round((window.screenY + box.bottom) * scale) };
 }
 
 /// Rows with a `liveRow` request on its way: a slow reply is never overtaken by another ask.
@@ -543,13 +568,48 @@ function run(effect: Effect) {
       const at = shows;
       invoke<Outcome>("act", { provider: effect.item.provider, id: effect.item.id, action: effect.action })
         .then((outcome) => {
-          if (at === shows) dispatch({ type: "outcome", outcome });
+          if (at !== shows) return;
+          // A delete that kept the bar open: the list asks again, the row is gone.
+          if (effect.action === "delete" && outcome.kind === "keep") dispatch({ type: "deleted", item: effect.item });
+          else dispatch({ type: "outcome", outcome });
         })
         .catch((err) => {
-          if (at === shows) dispatch({ type: "failed", message: failureText(effect.item, err) });
+          if (at === shows) dispatch({ type: "failed", message: actionFailureText(effect.item, effect.action, err) });
         });
       break;
     }
+    case "rename": {
+      const at = shows;
+      invoke<string>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
+        .then((id) => {
+          if (at === shows) dispatch({ type: "renamed", id });
+        })
+        .catch((err) => {
+          if (at === shows) dispatch({ type: "failed", message: actionFailureText(effect.item, "rename", err) });
+        });
+      break;
+    }
+    case "moreOptions": {
+      const at = shows;
+      const { x, y } = moreOptionsAt(effect.index);
+      invoke<boolean>("more_options", { provider: effect.item.provider, id: effect.item.id, x, y })
+        .then((ran) => {
+          if (at !== shows) return;
+          // A command ran: the back end hides the bar. Dismissed: the bar stays and types again.
+          dispatch({ type: "outcome", outcome: { kind: ran ? "hide" : "keep" } });
+          if (!ran) input.focus();
+        })
+        .catch((err) => {
+          if (at !== shows) return;
+          dispatch({ type: "failed", message: actionFailureText(effect.item, "more_options", err) });
+          // The bar stays, as when the menu is dismissed: it types again.
+          input.focus();
+        });
+      break;
+    }
+    case "selectName":
+      input.setSelectionRange(effect.start, effect.end);
+      break;
     case "hide":
       invoke("hide").catch(() => {});
       break;

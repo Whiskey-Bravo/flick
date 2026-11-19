@@ -4,6 +4,7 @@ use std::{path::PathBuf, sync::Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::file_ops::{moved_id, same_item};
 use crate::ranking::save_json;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -71,6 +72,50 @@ impl Pins {
             let j = if up { i.checked_sub(1) } else { Some(i + 1).filter(|&j| j < pins.len()) };
             let Some(j) = j else { return };
             pins.swap(i, j);
+            pins.clone()
+        };
+        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+    }
+
+    /// The item `old` (and anything below it, for a folder) is now at `new`:
+    /// its pins, of every provider, keep their places. A pin that lands on
+    /// one already there is dropped. Saved like `toggle`.
+    pub fn rename(&self, old: &str, new: &str) {
+        let _saving = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+            let mut changed = false;
+            for pin in pins.iter_mut() {
+                if let Some(id) = moved_id(&pin.id, old, new) {
+                    pin.id = id;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return;
+            }
+            let mut seen: Vec<Pin> = Vec::with_capacity(pins.len());
+            for pin in pins.drain(..) {
+                if !seen.contains(&pin) {
+                    seen.push(pin);
+                }
+            }
+            *pins = seen;
+            pins.clone()
+        };
+        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+    }
+
+    /// Unpins the item `id`, of every provider. Saved like `toggle`.
+    pub fn forget(&self, id: &str) {
+        let _saving = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
+            let before = pins.len();
+            pins.retain(|p| !same_item(&p.id, id));
+            if pins.len() == before {
+                return;
+            }
             pins.clone()
         };
         let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });

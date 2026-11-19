@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use super::path::{act_on_entry, entry_row, inert_row, item_from_id, loaded, open_entry, score_in_order, FOLDER_NOT_FOUND};
+use super::path::{act_on_entry, entry_row, inert_row, item_from_id, loaded, open_entry, rename_entry, score_in_order, FOLDER_NOT_FOUND};
 use crate::clipboard::Clipboard;
+use crate::file_ops::FileOps;
 use crate::dirs::{ago, folder_key, size_text, Clock, DirEntry, FileSystem, Links, Loader, ReadError};
 use crate::fuzzy;
 use crate::launch::Launcher;
@@ -40,6 +41,7 @@ pub struct DownloadsProvider {
     folder: Option<PathBuf>,
     launcher: Arc<dyn Launcher>,
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
     now: Clock,
 }
 
@@ -50,9 +52,10 @@ impl DownloadsProvider {
         folder: Option<PathBuf>,
         launcher: Arc<dyn Launcher>,
         clipboard: Arc<dyn Clipboard>,
+        ops: Arc<dyn FileOps>,
         now: Clock,
     ) -> Self {
-        Self { dirs, fs, folder, launcher, clipboard, now }
+        Self { dirs, fs, folder, launcher, clipboard, ops, now }
     }
 }
 
@@ -93,7 +96,11 @@ impl Provider for DownloadsProvider {
     }
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
-        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, id, action)
+        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
+    }
+
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        rename_entry(&|p| self.fs.kind(p), &*self.ops, id, new_name)
     }
 
     /// Typed lists are never learned.
@@ -145,6 +152,25 @@ fn read_recent(fs: &dyn FileSystem, links: &dyn Links, folder: &Path) -> Result<
     Ok(out)
 }
 
+/// The Recent list after `old` was renamed to `new` (`None`: deleted): an
+/// entry for it, or for something inside it, follows or goes.
+fn moved_recent(entries: &[RecentEntry], old: &Path, new: Option<&Path>) -> Vec<RecentEntry> {
+    let old = old.to_string_lossy();
+    let new = new.map(|n| n.to_string_lossy().into_owned());
+    entries
+        .iter()
+        .filter_map(|e| {
+            let path = e.path.to_string_lossy();
+            // `old` itself as the target: does the entry lie at or under it?
+            match (crate::file_ops::moved_id(&path, &old, new.as_deref().unwrap_or(&old)), &new) {
+                (None, _) => Some(e.clone()),
+                (Some(moved), Some(_)) => Some(RecentEntry { path: PathBuf::from(moved), ..e.clone() }),
+                (Some(_), None) => None,
+            }
+        })
+        .collect()
+}
+
 /// The name of the folder holding `path` (the whole folder path for a drive root).
 fn parent_name(path: &Path) -> String {
     let Some(parent) = path.parent() else { return String::new() };
@@ -158,6 +184,7 @@ pub struct RecentProvider {
     folder: Option<PathBuf>,
     launcher: Arc<dyn Launcher>,
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
     now: Clock,
 }
 
@@ -169,9 +196,10 @@ impl RecentProvider {
         folder: Option<PathBuf>,
         launcher: Arc<dyn Launcher>,
         clipboard: Arc<dyn Clipboard>,
+        ops: Arc<dyn FileOps>,
         now: Clock,
     ) -> Self {
-        Self { store, fs, links, folder, launcher, clipboard, now }
+        Self { store, fs, links, folder, launcher, clipboard, ops, now }
     }
 }
 
@@ -207,7 +235,11 @@ impl Provider for RecentProvider {
     }
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
-        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, id, action)
+        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
+    }
+
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        rename_entry(&|p| self.fs.kind(p), &*self.ops, id, new_name)
     }
 
     fn rank_key(&self, _id: &str) -> Option<String> {
@@ -222,6 +254,13 @@ impl Provider for RecentProvider {
         item_from_id(self.name(), id)
     }
 
+    /// The list read is patched in memory, so the row goes or is renamed on
+    /// the very next ask, not when the list is read again.
+    fn moved(&self, old: &Path, new: Option<&Path>) {
+        let Some(folder) = &self.folder else { return };
+        self.store.patch(&folder_key(folder), |entries| moved_recent(entries, old, new));
+    }
+
     fn help(&self) -> Vec<HelpLine> {
         vec![HelpLine { example: "recent".into(), about: "files you opened recently".into(), fill: "recent".into() }]
     }
@@ -231,6 +270,7 @@ impl Provider for RecentProvider {
 mod tests {
     use super::*;
     use crate::clipboard::FakeClipboard;
+    use crate::file_ops::FakeFileOps;
     use crate::dirs::testing::{file, folder, FakeFolders, FakeFs, FakeLinks};
     use crate::dirs::{KnownFolders, FRESH, SLOW};
     use crate::launch::testing::RecordingLauncher;
@@ -299,7 +339,7 @@ mod tests {
         let (dirs, rx) = loader();
         let launcher = Arc::new(RecordingLauncher::default());
         let clip = Arc::new(FakeClipboard::default());
-        let p = DownloadsProvider::new(dirs, fs, folders.downloads(), launcher.clone(), clip.clone(), clock());
+        let p = DownloadsProvider::new(dirs, fs, folders.downloads(), launcher.clone(), clip.clone(), Arc::new(FakeFileOps::default()), clock());
         Dl { p, rx, launcher, clip }
     }
 
@@ -379,6 +419,7 @@ mod tests {
             known().recent(),
             Arc::new(RecordingLauncher::default()),
             Arc::new(FakeClipboard::default()),
+            Arc::new(FakeFileOps::default()),
             clock(),
         );
         Rc { p, rx }
@@ -406,11 +447,34 @@ mod tests {
         let rows = ready(&r.p, &r.rx, "");
         assert_eq!(titles(&rows), ["a.txt", "Documents"]);
         assert_eq!(rows[0].id, format!(r"{DOCS}\a.txt"));
-        assert_eq!(rows[0].actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(rows[0].actions, crate::file_ops::menu(false, false, false));
         assert_eq!(rows[1].id, format!(r"{DOCS}\"));
-        assert_eq!(rows[1].actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(rows[1].actions, crate::file_ops::menu(true, false, false));
         assert_eq!((rows[0].folder.as_str(), rows[1].folder.as_str()), ("", format!(r"{DOCS}\").as_str()));
         assert_eq!(titles(&ready(&r.p, &r.rx, "doc")), ["Documents"]);
+    }
+
+    #[test]
+    fn recent_rows_follow_a_delete_or_rename_at_once() {
+        let entries = vec![
+            DirEntry { modified: mins_ago(1), ..file("a.lnk", 1) },
+            DirEntry { modified: mins_ago(2), ..file("b.lnk", 1) },
+            DirEntry { modified: mins_ago(3), ..file("in.lnk", 1) },
+        ];
+        let r = recent_rig(entries, |fs, links| {
+            for (l, target, dir) in [("a.lnk", r"\a.txt", false), ("b.lnk", r"\Sub", true), ("in.lnk", r"\Sub\x.txt", false)] {
+                fs.set_kind(&format!("{DOCS}{target}"), Some(dir));
+                links.add(&lnk(l), &format!("{DOCS}{target}"));
+            }
+        });
+        assert_eq!(titles(&ready(&r.p, &r.rx, "")), ["a.txt", "Sub", "x.txt"]);
+        r.p.moved(&Path::new(DOCS).join("A.TXT"), None);
+        assert_eq!(titles(&r.p.query(&q(""))), ["Sub", "x.txt"], "gone at once");
+        r.p.moved(&Path::new(DOCS).join("Sub"), Some(&Path::new(DOCS).join("New")));
+        let rows = r.p.query(&q(""));
+        assert_eq!(titles(&rows), ["New", "x.txt"]);
+        assert_eq!(rows[1].id, format!(r"{DOCS}\New\x.txt"), "what is inside follows");
+        assert!(r.rx.recv_timeout(Duration::from_millis(100)).is_err(), "nothing read again");
     }
 
     #[test]
@@ -448,6 +512,7 @@ mod tests {
             None,
             Arc::new(RecordingLauncher::default()),
             Arc::new(FakeClipboard::default()),
+            Arc::new(FakeFileOps::default()),
             clock(),
         );
         assert_eq!(titles(&p.query(&q(""))), [FOLDER_NOT_FOUND]);
@@ -464,7 +529,7 @@ mod tests {
         let rows = ready(&d.p, &d.rx, "");
         let id = rows[0].id.clone();
         assert_eq!(d.p.rank_key(&id), None);
-        assert_eq!(rows[0].actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(rows[0].actions, crate::file_ops::menu(false, false, false));
         assert!(rows[0].pinnable);
         assert_eq!(rows[0].provider, "downloads");
         assert_eq!(d.p.item(&id).unwrap().title, "a.zip");

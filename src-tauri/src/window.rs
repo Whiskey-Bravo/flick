@@ -1,6 +1,6 @@
 //! The `bar` window: created once by Tauri at startup, then only shown and hidden.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -341,9 +341,11 @@ const FOCUS_CHECKS_MS: [u64; 3] = [300, 700, 1500];
 /// Whether an open bar has to take the keyboard again: it is on screen but
 /// another window is in front, so nothing typed reaches it and no focus loss
 /// will ever hide it. `same_show` is false once the bar has been shown again
-/// (that show has its own checks).
-fn must_refocus(same_show: bool, visible: bool, in_front: bool) -> bool {
-    same_show && visible && !in_front
+/// (that show has its own checks). `held`: the bar is held open (Windows' own
+/// menu or prompt for a row is in front on purpose); taking the foreground
+/// then would close that menu.
+fn must_refocus(same_show: bool, visible: bool, in_front: bool, held: bool) -> bool {
+    same_show && visible && !in_front && !held
 }
 
 /// Windows sometimes refuses the bar the foreground (another window took it
@@ -369,7 +371,7 @@ fn watch_focus(app: &AppHandle) {
                 let visible = w.is_visible().unwrap_or(false);
                 // SAFETY: no arguments.
                 let in_front = unsafe { GetForegroundWindow() } == hwnd;
-                if must_refocus(shows() == show, visible, in_front) {
+                if must_refocus(shows() == show, visible, in_front, held_open()) {
                     let _ = w.set_focus();
                     take_foreground(hwnd);
                     let _ = w.set_focus();
@@ -448,14 +450,86 @@ pub fn hide(app: &AppHandle) {
 /// is never destroyed.
 pub fn install_handlers(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
+    if let Ok(h) = w.hwnd() {
+        BAR_HWND.store(h.0 as isize, Ordering::SeqCst);
+    }
     let handle = app.clone();
     w.on_window_event(move |event| match event {
-        WindowEvent::Focused(false) if !within_blur_grace() => hide(&handle),
+        WindowEvent::Focused(false) if hides_on_blur(held_open(), within_blur_grace()) => hide(&handle),
         WindowEvent::CloseRequested { api, .. } => {
             api.prevent_close();
             hide(&handle);
         }
         _ => {}
+    });
+}
+
+/// The bar window's handle once its handlers are installed (0 before).
+static BAR_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// The bar window's handle, for a Windows prompt that the bar should own
+/// (so it opens in front of it, not behind other windows).
+pub fn bar_hwnd() -> Option<HWND> {
+    match BAR_HWND.load(Ordering::SeqCst) {
+        0 => None,
+        h => Some(HWND(h as _)),
+    }
+}
+
+/// How many holds are on: while any is, a focus loss does not hide the bar
+/// (Windows' own menu for a row takes the foreground while it shows).
+static HOLDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Switches a hold on or off; see [`HOLDS`]. Prefer [`holding_open`], which
+/// always switches it off again.
+pub fn hold_open(on: bool) {
+    if on {
+        HOLDS.fetch_add(1, Ordering::SeqCst);
+    } else {
+        let _ = HOLDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+    }
+}
+
+fn held_open() -> bool {
+    HOLDS.load(Ordering::SeqCst) > 0
+}
+
+/// Runs `f` with the bar held open; the hold is released however `f` ends
+/// (an error or a panic included).
+pub fn holding_open<T>(f: impl FnOnce() -> T) -> T {
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            hold_open(false);
+        }
+    }
+    hold_open(true);
+    let _release = Release;
+    f()
+}
+
+/// Whether a focus loss hides the bar: not while it is held open, nor within
+/// the grace after a show.
+fn hides_on_blur(held: bool, in_grace: bool) -> bool {
+    !held && !in_grace
+}
+
+/// Gives the keyboard back to a bar that is still on screen (after Windows'
+/// own menu was dismissed: the bar lost the foreground while held open, so no
+/// focus loss will come to hide it, and nothing typed would reach it).
+pub fn refocus(app: &AppHandle) {
+    let handle = app.clone();
+    // The window's own thread: `SetFocus` needs it.
+    let _ = app.run_on_main_thread(move || {
+        let Some(w) = bar(&handle) else { return };
+        if !w.is_visible().unwrap_or(false) {
+            return;
+        }
+        let _ = w.set_focus();
+        if let Ok(h) = w.hwnd() {
+            take_foreground(HWND(h.0 as _));
+            let _ = w.set_focus();
+        }
     });
 }
 
@@ -495,14 +569,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hold_open_suppresses_blur_hide_and_is_released_on_error() {
+        assert!(hides_on_blur(false, false), "a plain focus loss hides the bar");
+        assert!(!hides_on_blur(false, true), "inside the show's grace");
+        assert!(!hides_on_blur(true, false), "held open while Windows' menu shows");
+        assert!(!hides_on_blur(true, true));
+        // Released when the work fails, and when it panics.
+        let out: Result<bool, String> = holding_open(|| {
+            assert!(held_open());
+            Err("File not found".into())
+        });
+        assert_eq!(out, Err("File not found".to_string()));
+        assert!(!held_open());
+        let panicked = std::panic::catch_unwind(|| holding_open(|| -> bool { panic!("menu failed") }));
+        assert!(panicked.is_err());
+        assert!(!held_open());
+        // Switched off more often than on: never below zero.
+        hold_open(false);
+        assert!(!held_open());
+    }
+
+    #[test]
     fn an_open_bar_that_is_not_in_front_takes_the_keyboard_again() {
-        assert!(must_refocus(true, true, false), "on screen, another window in front");
-        assert!(!must_refocus(true, true, true), "it has the keyboard");
-        assert!(!must_refocus(true, false, false), "hidden: nothing to take");
-        assert!(!must_refocus(false, true, false), "shown again since: that show checks itself");
+        assert!(must_refocus(true, true, false, false), "on screen, another window in front");
+        assert!(!must_refocus(true, true, true, false), "it has the keyboard");
+        assert!(!must_refocus(true, false, false, false), "hidden: nothing to take");
+        assert!(!must_refocus(false, true, false, false), "shown again since: that show checks itself");
         // The first look comes after the grace in which a focus loss is ignored.
         assert!(Duration::from_millis(FOCUS_CHECKS_MS[0]) > BLUR_GRACE);
         assert!(FOCUS_CHECKS_MS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn a_held_bar_never_takes_the_foreground_back() {
+        // Windows' More options menu or its permanent-delete prompt is in front
+        // on purpose: taking the foreground would close it.
+        assert!(!must_refocus(true, true, false, true));
     }
 
     #[test]

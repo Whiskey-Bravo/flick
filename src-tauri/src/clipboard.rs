@@ -23,7 +23,7 @@ pub struct WindowsClipboard;
 const FAILED: &str = "could not copy to the clipboard";
 
 /// Closes the clipboard when dropped.
-struct Open;
+pub(crate) struct Open;
 
 impl Drop for Open {
     fn drop(&mut self) {
@@ -33,7 +33,7 @@ impl Drop for Open {
 }
 
 /// Another program may hold the clipboard for a moment: a few short retries.
-fn open() -> Result<Open, String> {
+pub(crate) fn open() -> Result<Open, String> {
     for attempt in 0..5 {
         // SAFETY: no owner window; the clipboard is closed again by `Open`.
         if unsafe { OpenClipboard(None) }.is_ok() {

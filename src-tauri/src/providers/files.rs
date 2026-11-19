@@ -12,6 +12,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::cloud_roots::{self, CloudRoots};
+use crate::file_ops::FileOps;
+use crate::file_ops;
 use notify::event::ModifyKind;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -436,7 +439,10 @@ pub struct FilesProvider {
     launcher: Arc<dyn Launcher>,
     /// For the Copy path action.
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
     index: RwLock<Index>,
+    /// Decides which rows offer the cloud actions.
+    cloud: Arc<CloudRoots>,
     roots: Arc<Mutex<Vec<PathBuf>>>,
     /// Bumped by `set_roots`; a scan started before the bump is thrown away.
     generation: AtomicU64,
@@ -452,6 +458,8 @@ pub struct FilesProvider {
     watcher: Mutex<Option<RecommendedWatcher>>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
+    /// Bumped by every swap of `index`: a patch built from an older one is not swapped in.
+    epoch: AtomicU64,
     /// What the watcher vouches for; decides whether the periodic refresh scans.
     watch_state: Arc<WatchState>,
 }
@@ -480,8 +488,8 @@ impl Drop for ClearOnPanic<'_> {
 }
 
 impl FilesProvider {
-    pub fn new(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>) -> Arc<Self> {
-        Self::with_index(launcher, clipboard, Index::default(), false)
+    pub fn new(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, ops: Arc<dyn FileOps>) -> Arc<Self> {
+        Self::with_index(launcher, clipboard, ops, Index::default(), false)
     }
 
     /// An index that counts as scanned already, and a fake clipboard (tests).
@@ -492,14 +500,30 @@ impl FilesProvider {
 
     #[cfg(test)]
     pub fn with_clipboard(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, e: Vec<FileEntry>) -> Arc<Self> {
-        Self::with_index(launcher, clipboard, Index::from_entries(e), true)
+        Self::with_index(launcher, clipboard, Arc::new(crate::file_ops::FakeFileOps::default()), Index::from_entries(e), true)
     }
 
-    fn with_index(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, index: Index, scanned: bool) -> Arc<Self> {
+    /// Like [`Self::with_entries`], with the file ops the entries act through.
+    #[cfg(test)]
+    pub(crate) fn with_ops(launcher: Arc<dyn Launcher>, ops: Arc<dyn FileOps>, e: Vec<FileEntry>) -> Arc<Self> {
+        Self::with_index(launcher, Arc::new(crate::clipboard::FakeClipboard::default()), ops, Index::from_entries(e), true)
+    }
+
+    /// Like [`Self::with_clipboard`], with the cloud roots rows are judged by.
+    #[cfg(test)]
+    fn with_cloud(launcher: Arc<dyn Launcher>, cloud: Arc<CloudRoots>, e: Vec<FileEntry>) -> Arc<Self> {
+        let mut p = Self::with_ops(launcher, Arc::new(crate::file_ops::FakeFileOps::default()), e);
+        Arc::get_mut(&mut p).expect("not shared yet").cloud = cloud;
+        p
+    }
+
+    fn with_index(launcher: Arc<dyn Launcher>, clipboard: Arc<dyn Clipboard>, ops: Arc<dyn FileOps>, index: Index, scanned: bool) -> Arc<Self> {
         Arc::new(Self {
             launcher,
             clipboard,
+            ops,
             index: RwLock::new(index),
+            cloud: Arc::clone(cloud_roots::shared()),
             roots: Arc::new(Mutex::new(default_roots())),
             generation: AtomicU64::new(0),
             refresh_state: Mutex::new(RefreshState::default()),
@@ -508,6 +532,7 @@ impl FilesProvider {
             home: std::env::var_os("USERPROFILE").map(PathBuf::from),
             watcher: Mutex::new(None),
             scanned: AtomicBool::new(scanned),
+            epoch: AtomicU64::new(0),
             watch_state: Arc::new(WatchState::default()),
         })
     }
@@ -643,6 +668,7 @@ impl FilesProvider {
             let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
+                self.epoch.fetch_add(1, Ordering::SeqCst);
                 self.scanned.store(true, Ordering::SeqCst);
                 drop(index);
                 drop(old); // freed outside the lock
@@ -843,10 +869,10 @@ impl FilesProvider {
             score,
             icon: file_icon(index.name(s), s.is_dir),
             pinnable: true,
-            actions: if s.is_dir {
-                vec![Action::OpenFolder, Action::CopyPath]
-            } else {
-                vec![Action::Reveal, Action::CopyPath]
+            actions: {
+                let full = index.path(s);
+                let path = full.to_string_lossy();
+                file_ops::menu(s.is_dir, self.cloud.contains(&path), file_ops::is_drive_root(&path))
             },
             ..Default::default()
         }
@@ -881,13 +907,51 @@ impl Provider for FilesProvider {
         if !known {
             return Err(NOT_FOUND.into());
         }
+        if !super::path::handled(id, action) {
+            return Err("can't do that here".into());
+        }
         match action {
             Action::Reveal => self.launcher.reveal(id)?,
             Action::OpenFolder => self.launcher.open(id)?,
             Action::CopyPath => self.clipboard.set_text(id)?,
-            _ => return Err("can't do that here".into()),
+            _ => {
+                // Checking the disk is fine here: act is not the query path.
+                if !Path::new(id).exists() {
+                    return Err(NOT_FOUND.into());
+                }
+                return super::path::run_entry_action(&*self.ops, super::path::split_id(id).0, action);
+            }
         }
         Ok(Outcome::Hide)
+    }
+
+    /// Only for indexed paths. The disk is asked here, never on the query path.
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        file_ops::valid_new_name(new_name)?;
+        let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(super::path::split_id(id).0)).is_some();
+        if !known {
+            return Err(NOT_FOUND.into());
+        }
+        let kind = |p: &Path| std::fs::symlink_metadata(p).ok().map(|m| m.is_dir());
+        super::path::rename_entry(&kind, &*self.ops, id, new_name)
+    }
+
+    /// Nothing to do when `old` is not in the index.
+    fn moved(&self, old: &Path, new: Option<&Path>) {
+        loop {
+            let epoch = self.epoch.load(Ordering::SeqCst);
+            // Built beside the live index, which keeps answering meanwhile.
+            let Some(patched) = self.index.read().unwrap_or_else(|e| e.into_inner()).patched(old, new) else { return };
+            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
+            // A scan that swapped in meanwhile is newer than what this was built from.
+            if self.epoch.load(Ordering::SeqCst) == epoch {
+                let before = std::mem::replace(&mut *index, patched);
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+                drop(index);
+                drop(before); // freed outside the lock
+                return;
+            }
+        }
     }
 
     fn activate(&self, id: &str, modifier: Modifier) -> Result<Outcome, String> {
@@ -928,8 +992,9 @@ mod tests {
     use super::*;
     use crate::fuzzy;
     use crate::clipboard::FakeClipboard;
+    use crate::file_ops::FakeFileOps;
     use crate::launch::testing::RecordingLauncher;
-    use crate::provider::Action;
+    use crate::provider::{Action, Then};
     use std::fs;
     use std::path::Path;
 
@@ -961,6 +1026,28 @@ mod tests {
         use windows::core::HSTRING;
         use windows::Win32::Storage::FileSystem::{SetFileAttributesW, FILE_FLAGS_AND_ATTRIBUTES};
         unsafe { SetFileAttributesW(&HSTRING::from(path.as_os_str()), FILE_FLAGS_AND_ATTRIBUTES(attrs)) }.unwrap();
+    }
+
+    #[test]
+    fn moved_leaves_the_index_alone_when_the_path_is_not_in_it() {
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\Sub", true), entry(r"C:\d\Sub\x.txt", false).at_depth(2)]);
+        let epoch = p.epoch.load(Ordering::SeqCst);
+        p.moved(Path::new(r"C:\d\zzz.txt"), None);
+        p.moved(Path::new(r"C:\elsewhere\a.txt"), Some(Path::new(r"C:\elsewhere\b.txt")));
+        assert_eq!(p.epoch.load(Ordering::SeqCst), epoch, "not rebuilt, not swapped");
+        assert_eq!(p.index.read().unwrap().len(), 3);
+        // Indexed: patched and swapped in, the epoch moves on.
+        p.moved(Path::new(r"C:\D\SUB"), Some(Path::new(r"C:\d\New")));
+        assert_eq!(p.epoch.load(Ordering::SeqCst), epoch + 1);
+        let index = p.index.read().unwrap();
+        let mut paths: Vec<PathBuf> = index.slots.iter().map(|s| index.path(s)).collect();
+        paths.sort();
+        assert_eq!(paths, [PathBuf::from(r"C:\d\New"), PathBuf::from(r"C:\d\New\x.txt"), PathBuf::from(r"C:\d\a.txt")]);
+        // Copied entries keep their normalised names: still found by them.
+        let x = index.slots.iter().find(|s| index.name(s) == "x.txt").unwrap();
+        assert_eq!(index.norm(x), crate::fuzzy::normalize("x.txt"));
+        let renamed = index.slots.iter().find(|s| index.name(s) == "New").unwrap();
+        assert_eq!(index.norm(renamed), crate::fuzzy::normalize("New"));
     }
 
     #[test]
@@ -1337,7 +1424,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("a.txt"));
-        let p = FilesProvider::new(Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()));
+        let p = FilesProvider::new(Arc::new(RecordingLauncher::default()), Arc::new(FakeClipboard::default()), Arc::new(FakeFileOps::default()));
         assert!(!p.ready());
         p.set_roots(vec![dir.path().to_path_buf()]);
         p.refresh_blocking();
@@ -1358,17 +1445,82 @@ mod tests {
     #[test]
     fn rows_offer_location_or_explorer_and_copy() {
         let (p, _) = provider(vec![entry(r"C:\x\notes.txt", false), entry(r"C:\x\notes", true)]);
-        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, [Action::Reveal, Action::CopyPath]);
-        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, file_ops::menu(false, false, false));
+        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, file_ops::menu(true, false, false));
         let rows = p.query(&q("notes"));
         assert_eq!(rows.len(), 2);
         for r in rows {
-            let first = if r.icon == "folder" { Action::OpenFolder } else { Action::Reveal };
-            assert_eq!(r.actions, [first, Action::CopyPath], "{}", r.id);
+            assert_eq!(r.actions, file_ops::menu(r.icon == "folder", false, false), "{}", r.id);
             assert_eq!(r.complete, "");
         }
     }
 
+    #[test]
+    fn files_rows_carry_the_new_menu() {
+        use Action::*;
+        let cloud = Arc::new(CloudRoots::default());
+        cloud.set(vec![PathBuf::from(r"C:\Cloud")]);
+        let entries = vec![entry(r"C:\Cloud\a.txt", false), entry(r"C:\Cloud\dir", true), entry(r"C:\x\b.txt", false)];
+        let p = FilesProvider::with_cloud(Arc::new(RecordingLauncher::default()), cloud, entries);
+        assert_eq!(
+            p.item(r"C:\Cloud\a.txt").unwrap().actions,
+            [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]
+        );
+        assert_eq!(
+            p.item(r"C:\Cloud\dir").unwrap().actions,
+            [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]
+        );
+        assert_eq!(p.item(r"C:\x\b.txt").unwrap().actions, [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
+        assert_eq!(p.act(r"C:\x\b.txt", Rename), Err("can't do that here".to_string()));
+    }
+
+
+    #[test]
+    fn entries_act_through_the_ops() {
+        use Action::*;
+        let dir = tempfile::tempdir().unwrap();
+        let (file, folder, gone) = (dir.path().join("a.txt"), dir.path().join("sub"), dir.path().join("gone.txt"));
+        touch(&file);
+        fs::create_dir(&folder).unwrap();
+        let (file_id, folder_id, gone_id) = (file.to_string_lossy().into_owned(), folder.to_string_lossy().into_owned(), gone.to_string_lossy().into_owned());
+        let entries = vec![FileEntry::new(file, false), FileEntry::new(folder, true), FileEntry::new(gone, false)];
+        let ops = Arc::new(FakeFileOps::default());
+        let p = FilesProvider::with_ops(Arc::new(RecordingLauncher::default()), ops.clone(), entries);
+
+        assert_eq!(p.act(&folder_id, OpenTerminal), Ok(Outcome::Hide));
+        assert_eq!(p.act(&file_id, Properties), Ok(Outcome::Hide));
+        assert_eq!(p.act(&file_id, OpenWith), Ok(Outcome::Hide));
+        assert_eq!(p.act(&file_id, CopyFile), Ok(Outcome::Hide));
+        assert_eq!(
+            p.act(&folder_id, Compress),
+            Ok(Outcome::HideThen { then: Then::Compress { path: folder_id.clone() } })
+        );
+        assert_eq!(
+            p.act(&file_id, KeepOffline),
+            Ok(Outcome::HideThen { then: Then::CloudPin { path: file_id.clone(), keep: true } })
+        );
+        assert_eq!(
+            p.act(&file_id, FreeUpSpace),
+            Ok(Outcome::HideThen { then: Then::CloudPin { path: file_id.clone(), keep: false } })
+        );
+        assert_eq!(
+            ops.calls(),
+            [
+                format!("open_terminal {folder_id}"),
+                format!("properties {file_id}"),
+                format!("open_with {file_id}"),
+                format!("copy_file {file_id}")
+            ]
+        );
+
+        // Indexed but gone from the disk, or not indexed at all: nothing is called.
+        for id in [gone_id.as_str(), r"C:\not\indexed.txt"] {
+            for action in [OpenTerminal, Properties, OpenWith, CopyFile, Compress, KeepOffline, FreeUpSpace] {
+                assert_eq!(p.act(id, action), Err("file not found".to_string()), "{id} {action:?}");
+            }
+        }
+        assert_eq!(ops.calls().len(), 4);
+    }
     #[test]
     fn a_folder_hit_says_it_can_be_unfolded() {
         let (p, _) = provider(vec![entry(r"C:\x\notes.txt", false), entry(r"C:\x\notes", true)]);

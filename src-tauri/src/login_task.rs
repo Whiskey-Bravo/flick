@@ -209,8 +209,7 @@ impl LoginStart for WindowsLoginStart {
     }
 }
 
-#[cfg(test)]
-use real::user_sid;
+pub(crate) use real::user_sid;
 
 mod real {
     use std::ffi::OsString;

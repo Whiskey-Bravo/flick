@@ -10,10 +10,12 @@ use std::sync::Arc;
 
 use super::files::file_icon;
 use crate::clipboard::Clipboard;
+use crate::cloud_roots::{self, CloudRoots};
+use crate::file_ops::{self, FileOps};
 use crate::dirs::{folder_key, size_text, DirEntry, FileSystem, Load, Loader};
 use crate::fuzzy;
 use crate::launch::Launcher;
-use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
+use crate::provider::{Action, HelpLine, Modifier, Outcome, Provider, Query, ResultItem, Then};
 
 const NAME: &str = "path";
 pub(crate) const READING: &str = "Reading…";
@@ -83,8 +85,22 @@ pub fn parse_path(text: &str, home: Option<&Path>) -> Option<PathQuery> {
 /// A file or folder row: the id is the path (folders end with `\`), the
 /// title its name (a drive or share root shows the whole path).
 pub(crate) fn entry_row(provider: &'static str, path: &Path, is_dir: bool, subtitle: String, score: u32, complete: String) -> ResultItem {
+    entry_row_in(cloud_roots::shared(), provider, path, is_dir, subtitle, score, complete)
+}
+
+/// [`entry_row`] with the cloud roots to consult.
+pub(crate) fn entry_row_in(
+    roots: &CloudRoots,
+    provider: &'static str,
+    path: &Path,
+    is_dir: bool,
+    subtitle: String,
+    score: u32,
+    complete: String,
+) -> ResultItem {
     let text = path.to_string_lossy().into_owned();
     let title = path.file_name().map_or_else(|| text.clone(), |n| n.to_string_lossy().into_owned());
+    let text_for_menu = text.clone();
     let mut id = text;
     if is_dir && !id.ends_with('\\') {
         id.push('\\');
@@ -98,7 +114,7 @@ pub(crate) fn entry_row(provider: &'static str, path: &Path, is_dir: bool, subti
         subtitle,
         score,
         pinnable: true,
-        actions: if is_dir { vec![Action::OpenFolder, Action::CopyPath] } else { vec![Action::Reveal, Action::CopyPath] },
+        actions: file_ops::menu(is_dir, roots.contains(&text_for_menu), file_ops::is_drive_root(&text_for_menu)),
         complete,
         ..Default::default()
     }
@@ -119,7 +135,7 @@ pub(crate) fn inert_row(provider: &'static str, title: &str, subtitle: String) -
 
 /// The path in an entry id and whether it names a folder: a trailing `\`,
 /// dropped unless the path is a drive root.
-fn split_id(id: &str) -> (&str, bool) {
+pub(crate) fn split_id(id: &str) -> (&str, bool) {
     match id.strip_suffix('\\') {
         Some(path) if !path.is_empty() && !path.ends_with(':') => (path, true),
         Some(_) => (id, true),
@@ -150,17 +166,99 @@ pub(crate) fn open_entry(fs: &dyn FileSystem, launcher: &dyn Launcher, id: &str,
 }
 
 /// The actions menu of a file or folder row.
-pub(crate) fn act_on_entry(fs: &dyn FileSystem, launcher: &dyn Launcher, clipboard: &dyn Clipboard, id: &str, action: Action) -> Result<Outcome, String> {
-    if id.starts_with(INERT) || !matches!(action, Action::Reveal | Action::OpenFolder | Action::CopyPath) {
+pub(crate) fn act_on_entry(
+    fs: &dyn FileSystem,
+    launcher: &dyn Launcher,
+    clipboard: &dyn Clipboard,
+    ops: &dyn FileOps,
+    id: &str,
+    action: Action,
+) -> Result<Outcome, String> {
+    if id.starts_with(INERT) || !handled(id, action) {
         return Err(CANT_DO.into());
     }
     let path = checked(fs, id)?;
     match action {
         Action::Reveal => launcher.reveal(path)?,
         Action::OpenFolder => launcher.open(id)?,
-        _ => clipboard.set_text(path)?,
+        Action::CopyPath => clipboard.set_text(path)?,
+        _ => return run_entry_action(ops, path, action),
     }
     Ok(Outcome::Hide)
+}
+
+/// Whether the actions menu of the row `id` handles `action` (Rename is the
+/// `rename` command and More options is not built yet; a drive root cannot be
+/// changed).
+pub(crate) fn handled(id: &str, action: Action) -> bool {
+    match action {
+        Action::Reveal
+        | Action::OpenFolder
+        | Action::CopyPath
+        | Action::OpenTerminal
+        | Action::Properties
+        | Action::OpenWith
+        | Action::CopyFile => true,
+        Action::Compress | Action::KeepOffline | Action::FreeUpSpace | Action::Delete => !file_ops::is_drive_root(id),
+        _ => false,
+    }
+}
+
+/// The actions that go through [`FileOps`], on `path` (already checked to
+/// exist). Compress and the cloud pair run once the bar has hidden.
+pub(crate) fn run_entry_action(ops: &dyn FileOps, path: &str, action: Action) -> Result<Outcome, String> {
+    let p = Path::new(path);
+    let later = |then| Ok(Outcome::HideThen { then });
+    match action {
+        Action::OpenTerminal => ops.open_terminal(p)?,
+        Action::Properties => ops.properties(p)?,
+        Action::OpenWith => ops.open_with(p)?,
+        Action::CopyFile => ops.copy_file(p)?,
+        // The bar stays: the rows refresh, and the engine forgets the item.
+        Action::Delete => {
+            ops.recycle(p)?;
+            return Ok(Outcome::Keep);
+        }
+        Action::Compress => return later(Then::Compress { path: path.to_string() }),
+        Action::KeepOffline => return later(Then::CloudPin { path: path.to_string(), keep: true }),
+        Action::FreeUpSpace => return later(Then::CloudPin { path: path.to_string(), keep: false }),
+        _ => return Err(CANT_DO.into()),
+    }
+    Ok(Outcome::Hide)
+}
+
+/// The text of the refusal to rename onto a name that is taken.
+const NAME_TAKEN: &str = "A file with that name already exists";
+
+/// Renames the file or folder row `id` to `new_name` in its folder; the new
+/// row id (a folder's ends with `\`). `kind` says what is at a path now
+/// (`Some(true)` folder, `Some(false)` file, `None` nothing). The name is
+/// checked first; then the row must still be there as the same kind and the
+/// name free (a change of letter case alone is fine); nothing else happens
+/// on a refusal.
+pub(crate) fn rename_entry(
+    kind: &dyn Fn(&Path) -> Option<bool>,
+    ops: &dyn FileOps,
+    id: &str,
+    new_name: &str,
+) -> Result<String, String> {
+    file_ops::valid_new_name(new_name)?;
+    let (path, is_dir) = split_id(id);
+    if id.starts_with(INERT) || file_ops::is_drive_root(path) || kind(Path::new(path)) != Some(is_dir) {
+        return Err(NOT_FOUND.into());
+    }
+    let old = Path::new(path);
+    let name = old.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if name == new_name {
+        return Ok(id.to_string());
+    }
+    let target = old.with_file_name(new_name);
+    if name.to_lowercase() != new_name.to_lowercase() && kind(&target).is_some() {
+        return Err(NAME_TAKEN.into());
+    }
+    let renamed = ops.rename(old, new_name)?;
+    let renamed = renamed.to_string_lossy();
+    Ok(if is_dir { format!("{}\\", renamed.trim_end_matches('\\')) } else { renamed.into_owned() })
 }
 
 /// The row for `id` without touching the disk: a folder iff it ends with `\`.
@@ -190,6 +288,20 @@ pub(crate) fn score_in_order(rows: &mut [ResultItem]) {
     for (i, row) in rows.iter_mut().enumerate() {
         row.score = TOP_SCORE.saturating_sub(i as u32);
     }
+}
+
+/// A folder's listing after its entry `old` (any letter case) was renamed to
+/// `new` (`None`: deleted): the entry keeps its place, kind, size and time.
+pub(crate) fn moved_entries(entries: &[DirEntry], old: &str, new: Option<&str>) -> Vec<DirEntry> {
+    let old = old.to_lowercase();
+    entries
+        .iter()
+        .filter_map(|e| match (e.name.to_lowercase() == old, new) {
+            (false, _) => Some(e.clone()),
+            (true, Some(new)) => Some(DirEntry { name: new.to_string(), ..e.clone() }),
+            (true, None) => None,
+        })
+        .collect()
 }
 
 /// The most rows an unfolded folder shows.
@@ -233,6 +345,7 @@ pub struct PathProvider {
     home: Option<PathBuf>,
     launcher: Arc<dyn Launcher>,
     clipboard: Arc<dyn Clipboard>,
+    ops: Arc<dyn FileOps>,
 }
 
 impl PathProvider {
@@ -242,8 +355,26 @@ impl PathProvider {
         home: Option<PathBuf>,
         launcher: Arc<dyn Launcher>,
         clipboard: Arc<dyn Clipboard>,
+        ops: Arc<dyn FileOps>,
     ) -> Self {
-        Self { dirs, fs, home, launcher, clipboard }
+        Self { dirs, fs, home, launcher, clipboard, ops }
+    }
+
+    /// `old` was renamed to `new` (`None`: deleted) through Flick. The listing
+    /// of the folder holding it is patched in memory, so a typed path, `dl`
+    /// and an unfolded folder answer at once (not `Reading…`) with the entry
+    /// gone or renamed in place; what was read below `old` is forgotten.
+    pub fn entry_moved(&self, old: &Path, new: Option<&Path>) {
+        if let (Some(parent), Some(name)) = (old.parent(), old.file_name()) {
+            let name = name.to_string_lossy();
+            // A new name in the same folder; anything else leaves the folder.
+            let renamed = new
+                .filter(|n| n.parent().is_some_and(|p| folder_key(p) == folder_key(parent)))
+                .and_then(|n| n.file_name())
+                .map(|n| n.to_string_lossy().into_owned());
+            self.dirs.patch(&folder_key(parent), |entries| moved_entries(entries, &name, renamed.as_deref()));
+        }
+        self.dirs.forget_under(&folder_key(old));
     }
 
     /// What the folder under a row has to show: memory only, like `query`. A
@@ -338,7 +469,11 @@ impl Provider for PathProvider {
     }
 
     fn act(&self, id: &str, action: Action) -> Result<Outcome, String> {
-        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, id, action)
+        act_on_entry(&*self.fs, &*self.launcher, &*self.clipboard, &*self.ops, id, action)
+    }
+
+    fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
+        rename_entry(&|p| self.fs.kind(p), &*self.ops, id, new_name)
     }
 
     /// Typed paths are never learned.
@@ -369,6 +504,7 @@ mod tests {
     use crate::clipboard::FakeClipboard;
     use crate::dirs::testing::{file, folder, FakeFs};
     use crate::dirs::{ReadError, FRESH, SLOW};
+    use crate::file_ops::FakeFileOps;
     use crate::launch::testing::RecordingLauncher;
     use std::sync::mpsc::{self, Receiver};
     use std::sync::Mutex;
@@ -381,6 +517,7 @@ mod tests {
         fs: Arc<FakeFs>,
         launcher: Arc<RecordingLauncher>,
         clip: Arc<FakeClipboard>,
+        ops: Arc<FakeFileOps>,
         rx: Receiver<()>,
     }
 
@@ -404,6 +541,7 @@ mod tests {
         let fs = Arc::new(fs);
         let launcher = Arc::new(RecordingLauncher::default());
         let clip = Arc::new(FakeClipboard::default());
+        let ops = Arc::new(FakeFileOps::default());
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
         let dirs = Loader::new(
@@ -413,8 +551,8 @@ mod tests {
             FRESH,
             slow,
         );
-        let p = PathProvider::new(dirs, fs.clone(), Some(PathBuf::from(HOME)), launcher.clone(), clip.clone());
-        Rig { p, fs, launcher, clip, rx }
+        let p = PathProvider::new(dirs, fs.clone(), Some(PathBuf::from(HOME)), launcher.clone(), clip.clone(), ops.clone());
+        Rig { p, fs, launcher, clip, ops, rx }
     }
 
     /// `C:\` holds two folders and two files; the home folder `Documents` and `notes.txt`.
@@ -482,6 +620,81 @@ mod tests {
     }
 
     #[test]
+    fn path_rows_carry_the_new_menu() {
+        use Action::*;
+        let roots = CloudRoots::default();
+        roots.set(vec![PathBuf::from(r"C:\Cloud")]);
+        let row = |p: &str, dir| entry_row_in(&roots, "path", Path::new(p), dir, String::new(), 0, String::new()).actions;
+        assert_eq!(row(r"C:\Cloud\a.txt", false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(row(r"C:\Cloud\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(row(r"C:\CloudBackup\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
+        assert_eq!(row(r"C:\", true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
+        // Rename is the rename command and More options is not handled yet; a drive root cannot be deleted.
+        let r = rig();
+        for action in [Rename, MoreOptions] {
+            assert_eq!(r.p.act(r"C:\a.txt", action), Err("can't do that here".to_string()));
+        }
+        assert_eq!(r.p.act(r"C:\", Delete), Err("can't do that here".to_string()));
+        assert!(r.ops.calls().is_empty());
+        assert_eq!(r.p.act(r"C:\a.txt", Delete), Ok(Outcome::Keep));
+        assert_eq!(r.ops.calls(), [r"recycle C:\a.txt"]);
+    }
+
+    #[test]
+    fn act_dispatches_each_entry() {
+        use Action::*;
+        let r = rig();
+        let a = r.ready(r"C:\").into_iter().find(|x| x.id == r"C:\a.txt").unwrap();
+        let games = r.ready(r"C:\").into_iter().find(|x| x.id == r"C:\Games\").unwrap();
+        assert_eq!(r.p.act(&games.id, OpenTerminal), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&games.id, Properties), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&a.id, Properties), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&a.id, OpenWith), Ok(Outcome::Hide));
+        assert_eq!(r.p.act(&a.id, CopyFile), Ok(Outcome::Hide));
+        assert_eq!(
+            r.ops.calls(),
+            [
+                r"open_terminal C:\Games",
+                r"properties C:\Games",
+                r"properties C:\a.txt",
+                r"open_with C:\a.txt",
+                r"copy_file C:\a.txt"
+            ]
+        );
+        assert!(r.launcher.calls().is_empty() && r.clip.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn compress_and_cloud_run_after_hide() {
+        use Action::*;
+        let r = rig();
+        let then = |action, id: &str| match r.p.act(id, action) {
+            Ok(Outcome::HideThen { then }) => then,
+            other => panic!("{action:?}: {other:?}"),
+        };
+        assert_eq!(then(Compress, r"C:\Games\"), Then::Compress { path: r"C:\Games".into() });
+        assert_eq!(then(KeepOffline, r"C:\a.txt"), Then::CloudPin { path: r"C:\a.txt".into(), keep: true });
+        assert_eq!(then(FreeUpSpace, r"C:\a.txt"), Then::CloudPin { path: r"C:\a.txt".into(), keep: false });
+        assert!(r.ops.calls().is_empty(), "the work waits for the bar to hide");
+        // A drive root cannot be compressed or kept offline.
+        for action in [Compress, KeepOffline, FreeUpSpace] {
+            assert_eq!(r.p.act(r"C:\", action), Err("can't do that here".to_string()));
+        }
+    }
+
+    #[test]
+    fn act_on_a_missing_path_fails_without_calling_ops() {
+        use Action::*;
+        let r = rig();
+        r.fs.set_kind(r"C:\a.txt", None);
+        for action in [OpenTerminal, Properties, OpenWith, CopyFile, Compress, KeepOffline, FreeUpSpace] {
+            assert_eq!(r.p.act(r"C:\a.txt", action), Err(NOT_FOUND.to_string()), "{action:?}");
+            assert_eq!(r.p.act(r"C:\gone\", action), Err(NOT_FOUND.to_string()), "{action:?}");
+        }
+        assert!(r.ops.calls().is_empty());
+    }
+
+    #[test]
     fn entries_list_folders_first_with_the_folder_itself_on_top() {
         let r = rig();
         let rows = r.ready(r"C:\");
@@ -490,12 +703,12 @@ mod tests {
         assert_eq!(subs, ["This folder", "Folder", "Folder", "10 B", "2.0 KB"]);
         assert_eq!(rows[0].id, r"C:\");
         assert_eq!(rows[0].complete, "");
-        assert_eq!(rows[0].actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(rows[0].actions, file_ops::menu(true, false, true));
         assert_eq!(rows[1].id, r"C:\Games\");
         assert_eq!(rows[1].icon, "folder");
         assert_eq!(rows[3].id, r"C:\a.txt");
         assert_eq!(rows[3].icon, "ext:.txt");
-        assert_eq!(rows[3].actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(rows[3].actions, file_ops::menu(false, false, false));
         assert!(rows.iter().all(|r| r.provider == "path" && r.pinnable));
         assert_scores_fall(&rows);
     }
@@ -623,10 +836,10 @@ mod tests {
         let before = r.fs.reads();
         let row = r.p.item(r"C:\Games\").unwrap();
         assert_eq!((row.id.as_str(), row.title.as_str(), row.provider), (r"C:\Games\", "Games", "path"));
-        assert_eq!(row.actions, [Action::OpenFolder, Action::CopyPath]);
+        assert_eq!(row.actions, file_ops::menu(true, false, false));
         assert!(row.pinnable);
         let row = r.p.item(r"C:\a.txt").unwrap();
-        assert_eq!(row.actions, [Action::Reveal, Action::CopyPath]);
+        assert_eq!(row.actions, file_ops::menu(false, false, false));
         assert_eq!(r.p.item(r"C:\").unwrap().title, r"C:\");
         assert!(r.p.item("notes").is_none());
         assert_eq!(r.fs.reads(), before);
@@ -843,6 +1056,38 @@ mod tests {
         let a = u.rows.iter().find(|x| x.title == "a.txt").unwrap();
         r.fs.set_kind(r"C:\a.txt", None);
         assert_eq!(r.p.activate(&a.id, Modifier::None), Err(NOT_FOUND.to_string()));
+    }
+
+    #[test]
+    fn a_delete_or_rename_patches_the_typed_listing_and_it_answers_at_once() {
+        let r = rig();
+        assert_eq!(titles(&r.ready(r"C:\")), [r"C:\", "Games", "Users", "a.txt", "b.txt"]);
+        let reads = r.fs.reads();
+        r.p.entry_moved(Path::new(r"C:\A.TXT"), None);
+        assert_eq!(titles(&r.q(r"C:\")), [r"C:\", "Games", "Users", "b.txt"], "not Reading…");
+        r.p.entry_moved(Path::new(r"C:\b.txt"), Some(Path::new(r"C:\c.txt")));
+        let rows = r.q(r"C:\");
+        assert_eq!(titles(&rows), [r"C:\", "Games", "Users", "c.txt"]);
+        assert_eq!(rows[3].id, r"C:\c.txt");
+        assert_eq!(rows[3].subtitle, "2.0 KB", "size kept");
+        // A folder renamed: the same row, the new name; its own listing is read again.
+        r.fs.add_dir(r"C:\Games", vec![file("save.dat", 1)]);
+        assert_eq!(r.unfold_ready(r"C:\Games\").state, "ready");
+        r.p.entry_moved(Path::new(r"C:\Games"), Some(Path::new(r"C:\Play")));
+        assert_eq!(titles(&r.q(r"C:\")), [r"C:\", "Play", "Users", "c.txt"]);
+        assert_eq!(r.fs.reads(), reads + 1, "only the unfold read the disk");
+        assert_eq!(r.p.unfold(r"C:\Games\").state, "reading", "forgotten below the old name");
+        r.rx.recv_timeout(Duration::from_secs(1)).expect("on_ready");
+    }
+
+    #[test]
+    fn moved_entries_drop_or_rename_in_place() {
+        let entries = vec![folder("Sub"), file("a.txt", 5), file("b.txt", 6)];
+        let names = |v: Vec<DirEntry>| v.into_iter().map(|e| e.name).collect::<Vec<_>>();
+        assert_eq!(names(moved_entries(&entries, "A.TXT", None)), ["Sub", "b.txt"]);
+        let renamed = moved_entries(&entries, "sub", Some("New"));
+        assert_eq!(renamed[0], DirEntry { name: "New".into(), ..folder("Sub") });
+        assert_eq!(names(moved_entries(&entries, "zzz", None)), ["Sub", "a.txt", "b.txt"]);
     }
 
     #[test]
