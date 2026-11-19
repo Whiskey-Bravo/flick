@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use super::apps_store::{self, StoreSource};
 
 use crate::fuzzy;
 use crate::launch::{self, Launcher};
@@ -52,6 +54,9 @@ pub struct AppEntry {
 /// match (700) ranks below a name word-prefix (800) or acronym (750) match;
 /// an exact alias match (800) ties a name word-prefix match.
 pub const ALIAS_PENALTY: u32 = 200;
+
+/// The bar opening re-reads what may have changed when the last read is older than this.
+pub const SHOW_REFRESH_AGE: Duration = Duration::from_secs(60);
 
 /// `scan_store_apps` gives up (and kills PowerShell) after this long.
 pub const STORE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -163,7 +168,7 @@ fn add_shortcut_aliases(entries: &mut [AppEntry]) -> Targets {
 }
 
 /// What reading the shortcuts yields besides aliases.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Targets {
     /// Each shortcut's exe, by shortcut path.
     pub exes: HashMap<String, String>,
@@ -361,18 +366,25 @@ fn parse_start_apps(json: &str) -> Vec<AppEntry> {
         .filter_map(|item| {
             let name = item.get("Name")?.as_str()?.trim();
             let app_id = item.get("AppID")?.as_str()?;
-            (!name.is_empty() && app_id.contains('!')).then(|| AppEntry {
-                name: name.to_string(),
-                target: format!("shell:AppsFolder\\{app_id}"),
-                kind: AppKind::Store,
-                aliases: store_aliases(name, app_id),
-            })
+            store_entry(name, app_id)
         })
         .collect()
 }
 
+/// The Store entry for a listed app, or `None` for an empty name or an id
+/// without `!` (not a packaged app). Shared by every source of the list.
+pub(crate) fn store_entry(name: &str, app_id: &str) -> Option<AppEntry> {
+    let name = name.trim();
+    (!name.is_empty() && app_id.contains('!')).then(|| AppEntry {
+        name: name.to_string(),
+        target: format!("{STORE_PREFIX}{app_id}"),
+        kind: AppKind::Store,
+        aliases: store_aliases(name, app_id),
+    })
+}
+
 /// Per-user Start menu first, then all-users (so per-user wins in `dedupe`).
-fn start_menu_roots() -> Vec<PathBuf> {
+pub(crate) fn start_menu_roots() -> Vec<PathBuf> {
     ["APPDATA", "ProgramData"]
         .iter()
         .filter_map(std::env::var_os)
@@ -390,6 +402,19 @@ pub struct AppsProvider {
     launcher: Arc<dyn Launcher>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
+    /// Where the Store list comes from.
+    source: Arc<dyn StoreSource>,
+    /// The clock, replaceable in tests.
+    now: Arc<dyn Fn() -> Instant + Send + Sync>,
+    /// When the last Store listing started (`None`: never).
+    last_store_at: Mutex<Option<Instant>>,
+    /// A background refresh is queued or running: further requests collapse into it.
+    queued: AtomicBool,
+    /// The Start-menu folders are watched, so shortcuts need no polling.
+    watching: AtomicBool,
+    /// Shortcuts and targets of the last refresh, reused by a Store-only refresh.
+    last_start: Mutex<Vec<AppEntry>>,
+    last_targets: Mutex<Targets>,
     /// How each app is uninstalled; swapped by `refresh`, read by queries.
     plans: RwLock<HashMap<String, Uninstall>>,
     /// Each shortcut's exe, from the last refresh.
@@ -444,7 +469,87 @@ impl RowCtx<'_> {
 
 impl AppsProvider {
     pub fn new(launcher: Arc<dyn Launcher>) -> Arc<Self> {
-        Self::build(launcher, Vec::new(), false, real_programs())
+        Self::build(launcher, Vec::new(), false, real_programs(), apps_store::default_source(), Arc::new(Instant::now))
+    }
+
+    /// The Start-menu folders are watched (set once the watcher exists).
+    pub fn set_watching(&self, on: bool) {
+        self.watching.store(on, Ordering::SeqCst);
+    }
+
+    /// The bar opened: refresh in the background what may have changed and is
+    /// older than `SHOW_REFRESH_AGE`. With the folders watched that is the
+    /// Store list (Store installs leave no file behind); without a watcher,
+    /// everything. Never blocks.
+    pub fn refresh_on_show(self: &Arc<Self>) {
+        if self.watching.load(Ordering::SeqCst) {
+            self.refresh_store_if_older(SHOW_REFRESH_AGE);
+        } else {
+            self.refresh_if_older(SHOW_REFRESH_AGE);
+        }
+    }
+
+    /// Re-read the Store apps unless that was done within `max_age`, on a
+    /// thread of its own. Requests that overlap collapse into one run.
+    pub fn refresh_store_if_older(self: &Arc<Self>, max_age: Duration) {
+        if let Some(job) = self.due_job(max_age, false) {
+            std::thread::spawn(job);
+        }
+    }
+
+    /// As `refresh_store_if_older`, for a full refresh (no watcher).
+    pub fn refresh_if_older(self: &Arc<Self>, max_age: Duration) {
+        if let Some(job) = self.due_job(max_age, true) {
+            std::thread::spawn(job);
+        }
+    }
+
+    /// The job behind `refresh_store_if_older` (or the full one), or `None`
+    /// when the last Store listing is younger than `max_age` or a job is queued.
+    fn due_job(self: &Arc<Self>, max_age: Duration, full: bool) -> Option<Box<dyn FnOnce() + Send>> {
+        let now = (self.now)();
+        let last = *self.last_store_at.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| now.saturating_duration_since(t) < max_age) {
+            return None;
+        }
+        if self.queued.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let me = self.clone();
+        Some(Box::new(move || {
+            // Clears `queued` even when the work panics.
+            struct Clear<'a>(&'a AtomicBool);
+            impl Drop for Clear<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = Clear(&me.queued);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if full {
+                    me.refresh();
+                } else {
+                    me.refresh_store_only();
+                }
+            }));
+        }))
+    }
+
+    /// Read the Store list again and publish it with the shortcuts of the last
+    /// refresh. Nothing before the first refresh has finished.
+    fn refresh_store_only(&self) {
+        let _queue = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.scanned.load(Ordering::SeqCst) {
+            return;
+        }
+        *self.last_store_at.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.now)());
+        let Some(fresh) = self.source.list() else { return };
+        let start = self.last_start.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let targets = self.last_targets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let programs = self.programs.programs();
+        self.set_plans(&start, &fresh, &targets, &programs);
+        self.publish(&start, &fresh);
+        *self.store.lock().unwrap_or_else(|e| e.into_inner()) = fresh;
     }
 
     /// Where `Close` looks for open windows. Set once, at startup.
@@ -468,13 +573,24 @@ impl AppsProvider {
 
     #[cfg(test)]
     pub fn with_launcher(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>) -> Arc<Self> {
-        Self::build(launcher, e, true, real_programs())
+        Self::build(launcher, e, true, real_programs(), apps_store::default_source(), Arc::new(Instant::now))
+    }
+
+    /// As `with_launcher`, with the Store list read from `source` and time from `now` (tests).
+    #[cfg(test)]
+    pub fn with_store_source(
+        source: Arc<dyn StoreSource>,
+        now: Arc<dyn Fn() -> Instant + Send + Sync>,
+        e: Vec<AppEntry>,
+    ) -> Arc<Self> {
+        let launcher = Arc::new(crate::launch::testing::RecordingLauncher::default());
+        Self::build(launcher, e, true, real_programs(), source, now)
     }
 
     /// As `with_launcher`, with the uninstall list read from `programs` on refresh (tests).
     #[cfg(test)]
     pub fn with_source(launcher: Arc<dyn Launcher>, e: Vec<AppEntry>, programs: Arc<dyn ProgramSource>) -> Arc<Self> {
-        Self::build(launcher, e, true, programs)
+        Self::build(launcher, e, true, programs, apps_store::default_source(), Arc::new(Instant::now))
     }
 
     /// Entries with their exes and the uninstall list already applied; the
@@ -486,7 +602,7 @@ impl AppsProvider {
         exes: Vec<(&str, &str)>,
         programs: Vec<Program>,
     ) -> Arc<Self> {
-        let p = Self::build(launcher, entries, true, Arc::new(NoPrograms));
+        let p = Self::build(launcher, entries, true, Arc::new(NoPrograms), apps_store::default_source(), Arc::new(Instant::now));
         let targets = Targets {
             exes: exes.into_iter().map(|(l, e)| (l.to_string(), e.to_string())).collect(),
             with_args: HashSet::new(),
@@ -503,6 +619,8 @@ impl AppsProvider {
         e: Vec<AppEntry>,
         scanned: bool,
         programs: Arc<dyn ProgramSource>,
+        source: Arc<dyn StoreSource>,
+        now: Arc<dyn Fn() -> Instant + Send + Sync>,
     ) -> Arc<Self> {
         #[cfg(test)]
         let (windows_dir, own_dir, broad) = (
@@ -529,6 +647,13 @@ impl AppsProvider {
             refreshing: Mutex::new(()),
             launcher,
             scanned: AtomicBool::new(scanned),
+            source,
+            now,
+            last_store_at: Mutex::new(None),
+            queued: AtomicBool::new(false),
+            watching: AtomicBool::new(false),
+            last_start: Mutex::new(Vec::new()),
+            last_targets: Mutex::new(Targets::default()),
         })
     }
 
@@ -538,7 +663,7 @@ impl AppsProvider {
     pub fn refresh(&self) {
         let _queue = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
         let start = scan_start_menu(&start_menu_roots());
-        self.refresh_locked(start, add_shortcut_aliases, scan_store_apps);
+        self.refresh_locked(start, add_shortcut_aliases, || self.source.list());
     }
 
     /// `refresh` with every stage passed in (tests).
@@ -589,6 +714,9 @@ impl AppsProvider {
         self.set_plans(&start, &last_store, &targets, &programs);
         *self.exes.write().unwrap_or_else(|e| e.into_inner()) = targets.exes.clone();
         self.publish(&start, &last_store);
+        *self.last_start.lock().unwrap_or_else(|e| e.into_inner()) = start.clone();
+        *self.last_targets.lock().unwrap_or_else(|e| e.into_inner()) = targets.clone();
+        *self.last_store_at.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.now)());
         if let Some(fresh) = scan_store() {
             self.set_plans(&start, &fresh, &targets, &programs);
             self.publish(&start, &fresh);
@@ -1228,6 +1356,66 @@ mod tests {
         // A later successful scan replaces the list.
         p.refresh_from(vec![], || Some(vec![]));
         assert!(p.query(&q("calc")).is_empty());
+    }
+
+    #[test]
+    fn a_first_ever_missing_store_list_leaves_the_desktop_apps() {
+        let p = AppsProvider::with_entries(vec![]);
+        p.refresh_from(vec![shortcut("Blender", r"C:\b.lnk")], || None);
+        assert_eq!(p.query(&q("blender")).len(), 1);
+        assert!(p.query(&q("calc")).is_empty());
+    }
+
+    use crate::providers::apps_store::testing::{Clock, Counting};
+
+    fn calc_store() -> AppEntry {
+        store("Calculator", "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+    }
+
+    #[test]
+    fn store_refresh_does_nothing_when_the_last_read_is_recent() {
+        let clock = Clock::new();
+        let source = Counting::new(Some(vec![calc_store()]));
+        let p = AppsProvider::with_store_source(source.clone(), clock.as_fn(), vec![]);
+        p.refresh_from(vec![shortcut("Blender", r"C:\b.lnk")], || None);
+        let age = Duration::from_secs(60);
+        assert!(p.due_job(age, false).is_none());
+        clock.advance(Duration::from_secs(59));
+        assert!(p.due_job(age, false).is_none());
+        assert_eq!(source.calls(), 0);
+        clock.advance(Duration::from_secs(2));
+        let job = p.due_job(age, false).expect("61 s old: due");
+        job();
+        assert_eq!(source.calls(), 1);
+        // The Store list joins the shortcuts of the last refresh.
+        assert_eq!(p.query(&q("calc")).len(), 1);
+        assert_eq!(p.query(&q("blender")).len(), 1);
+        // Just read: not due again.
+        assert!(p.due_job(age, false).is_none());
+    }
+
+    #[test]
+    fn overlapping_store_refresh_requests_collapse_into_one() {
+        let clock = Clock::new();
+        let source = Counting::new(Some(vec![calc_store()]));
+        let p = AppsProvider::with_store_source(source.clone(), clock.as_fn(), vec![]);
+        let first = p.due_job(Duration::from_secs(60), false).expect("never read: due");
+        assert!(p.due_job(Duration::from_secs(60), false).is_none());
+        first();
+        assert_eq!(source.calls(), 1);
+        clock.advance(Duration::from_secs(61));
+        assert!(p.due_job(Duration::from_secs(60), false).is_some());
+    }
+
+    #[test]
+    fn a_failed_store_only_refresh_keeps_the_last_list() {
+        let clock = Clock::new();
+        let p = AppsProvider::with_store_source(Counting::new(None), clock.as_fn(), vec![]);
+        p.refresh_from(vec![shortcut("Blender", r"C:\b.lnk")], || Some(vec![calc_store()]));
+        clock.advance(Duration::from_secs(61));
+        p.due_job(Duration::from_secs(60), false).unwrap()();
+        assert_eq!(p.query(&q("calc")).len(), 1);
+        assert_eq!(p.query(&q("blender")).len(), 1);
     }
 
     #[test]

@@ -113,7 +113,7 @@ use history::History;
 use pins::Pins;
 use ranking::Ranking;
 
-const APPS_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const GAMES_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const FILES_REFRESH_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SHORTCUTS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
@@ -226,6 +226,8 @@ impl Providers {
     pub(crate) fn refresh_on_show(&self) {
         self.refresher.request();
         self.bookmarks.refresh_if_stale();
+        // Store installs (and, without a watcher, shortcuts): a background thread.
+        self.apps.refresh_on_show();
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
@@ -1280,7 +1282,9 @@ fn setup(app: &AppHandle) {
 
 /// The threads that build and refresh the indexes, each doing its disk work
 /// with no lock held that a query needs (build, then swap):
-/// - apps, then games: now, then every 10 minutes;
+/// - apps: now, then when the Start-menu folders change (watcher), and in the
+///   background when the bar opens and the Store list is a minute old; games:
+///   now, then every 10 minutes;
 /// - bookmarks: now (then whenever the bar shows and they are 5 minutes old);
 /// - shortcuts: the config's definitions now, pick folders every 5 minutes;
 /// - files: the folder watcher, a scan now, then a rescan every 30 minutes.
@@ -1288,10 +1292,24 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
     load_answer_stores(app, &p);
 
     let (apps, games) = (p.apps, p.games);
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
+        // The Start-menu watcher first, so a shortcut added during the first
+        // scan is not missed; it refreshes the apps once changes are quiet.
+        // The thread keeps it alive. Without one, the apps are refreshed
+        // when the bar opens (`refresh_on_show`).
+        let on_change = apps.clone();
+        let _watcher = providers::apps_watch::watch(
+            &providers::apps::start_menu_roots(),
+            providers::apps_watch::QUIET,
+            move || on_change.refresh(),
+        )
+        .ok();
+        apps.set_watching(_watcher.is_some());
         apps.refresh();
-        games.refresh();
-        std::thread::sleep(APPS_REFRESH_INTERVAL);
+        loop {
+            games.refresh();
+            std::thread::sleep(GAMES_REFRESH_INTERVAL);
+        }
     });
 
     // Its own thread (Firefox's database can be slow to copy), marked as
