@@ -26,13 +26,12 @@ pub struct Found {
 }
 
 /// Decode `wsl.exe` output: UTF-16LE (with or without BOM) as it normally
-/// writes to a pipe, else UTF-8.
+/// writes to a pipe, else UTF-8. UTF-8 text has no NUL bytes, while UTF-16
+/// has one in every ASCII character (distro names, spaces, line ends), also
+/// when the header is in a non-Latin script.
 fn decode(raw: &[u8]) -> String {
     let raw = raw.strip_prefix(&[0xFF, 0xFE]).unwrap_or(raw);
-    let first_line = raw.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let utf16 = raw.len() % 2 == 0
-        && first_line.len() >= 2
-        && first_line.iter().skip(1).step_by(2).all(|&b| b == 0);
+    let utf16 = raw.len() % 2 == 0 && raw.iter().skip(1).step_by(2).any(|&b| b == 0);
     if utf16 {
         let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&units)
@@ -135,6 +134,14 @@ mod tests {
         assert_eq!(parse_list(&utf16(LIST, true)), want);
         assert_eq!(parse_list(&utf16(LIST, false)), want);
         assert_eq!(parse_list(LIST.as_bytes()), want);
+    }
+
+    #[test]
+    fn parses_utf16_with_a_non_latin_header() {
+        let list = "  ИМЯ               СОСТОЯНИЕ       ВЕРСИЯ\r\n* Ubuntu            Остановлено     2\r\n";
+        let want = vec![("Ubuntu".to_string(), true)];
+        assert_eq!(parse_list(&utf16(list, false)), want);
+        assert_eq!(parse_list(list.as_bytes()), want);
     }
 
     #[test]

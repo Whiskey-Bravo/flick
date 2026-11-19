@@ -128,11 +128,6 @@ fn template(def: &ShortcutDef) -> &str {
     def.run.as_deref().or(def.wsl.as_deref()).or(def.open.as_deref()).unwrap_or("")
 }
 
-/// `{x}` -> `FLICK_X`, as `bind_windows` / `bind_bash` name them.
-fn variable(name: &str) -> String {
-    format!("FLICK_{}", name.to_ascii_uppercase())
-}
-
 /// `template` with each `{x}` in `values` replaced by its value, in one pass
 /// (an inserted value is never scanned again).
 fn insert_plain(template: &str, values: &[(&str, String)]) -> String {
@@ -210,7 +205,10 @@ pub fn prepare(def: &ShortcutDef, sub: &Substitution, distro: &str) -> Result<Pr
         }
         let names: Vec<&str> = values.iter().map(|(n, _)| *n).collect();
         let command = bind_windows(command, &names)?;
-        let env = values.into_iter().map(|(n, v)| (variable(n), v)).collect();
+        let env = values
+            .into_iter()
+            .map(|(n, v)| Ok((crate::quote::variable(n)?, v)))
+            .collect::<Result<_, String>>()?;
         return Ok(Prepared::Run { command, env, keep_open, admin: false, cwd });
     }
 
