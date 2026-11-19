@@ -1,3 +1,12 @@
+/**
+ * The row Enter picks: the selected one, but only when the rows are the
+ * answer to the text now in the box (`asked` is the text they answer). While
+ * the answer to newer text is on its way, Enter picks nothing.
+ */
+export function enterRow<T>(rows: T[], sel: number, asked: string, text: string): T | null {
+  return asked === text ? (rows[sel] ?? null) : null;
+}
+
 /** How long after an empty answer the picker asks once more. */
 export const REASK_MS = 1000;
 
