@@ -21,7 +21,10 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Battery {
     pub percent: u8,
+    /// Taking charge (not held by a charge limit).
     pub charging: bool,
+    /// On AC power, charging or not.
+    pub plugged_in: bool,
     pub minutes_left: Option<u32>,
 }
 
@@ -87,7 +90,7 @@ fn battery_line(b: Option<Battery>) -> (String, String) {
         return ("No battery".into(), String::new());
     };
     let mut text = format!("{}%", b.percent);
-    if b.charging && b.percent >= 100 {
+    if (b.charging && b.percent >= 100) || (b.plugged_in && !b.charging) {
         text.push_str(" · plugged in");
     } else {
         if b.charging {
@@ -243,6 +246,22 @@ impl StatusStore {
     }
 }
 
+/// The battery from `SYSTEM_POWER_STATUS` fields; `None` for no battery or an
+/// unknown state. AC power alone is not charging: a charge limit (battery care)
+/// can hold a plugged-in laptop at 80%.
+fn power_battery(ac_line: u8, flag: u8, percent: u8, seconds_left: u32) -> Option<Battery> {
+    // BatteryFlag: 8 = charging, 128 = no battery, 255 = unknown; BatteryLifePercent 255 = unknown.
+    if flag & 128 != 0 || flag == 255 || percent > 100 {
+        return None;
+    }
+    Some(Battery {
+        percent,
+        charging: flag & 8 != 0,
+        plugged_in: ac_line == 1,
+        minutes_left: (seconds_left != u32::MAX).then_some(seconds_left / 60),
+    })
+}
+
 /// The real machine, through Win32.
 pub struct SystemStatus;
 
@@ -252,15 +271,7 @@ impl StatusSource for SystemStatus {
         let mut s = SYSTEM_POWER_STATUS::default();
         // SAFETY: `s` is a valid out-pointer for the call.
         unsafe { GetSystemPowerStatus(&mut s) }.ok()?;
-        // BatteryFlag: 128 = no battery, 255 = unknown; BatteryLifePercent 255 = unknown.
-        if s.BatteryFlag & 128 != 0 || s.BatteryFlag == 255 || s.BatteryLifePercent > 100 {
-            return None;
-        }
-        Some(Battery {
-            percent: s.BatteryLifePercent,
-            charging: s.ACLineStatus == 1,
-            minutes_left: (s.BatteryLifeTime != u32::MAX).then_some(s.BatteryLifeTime / 60),
-        })
+        power_battery(s.ACLineStatus, s.BatteryFlag, s.BatteryLifePercent, s.BatteryLifeTime)
     }
 
     fn memory(&self) -> Memory {
@@ -470,15 +481,33 @@ mod tests {
     }
 
     #[test]
+    fn charging_is_the_battery_flag_not_ac_power() {
+        let b = |ac, flag| power_battery(ac, flag, 80, u32::MAX).map(|b| (b.charging, b.plugged_in));
+        assert_eq!(b(1, 8 | 1), Some((true, true)));
+        assert_eq!(b(1, 1), Some((false, true)), "a charge limit holds it");
+        assert_eq!(b(0, 2), Some((false, false)));
+        assert_eq!(b(1, 128), None);
+        assert_eq!(b(1, 255), None);
+        assert_eq!(power_battery(0, 0, 255, 0), None);
+        assert_eq!(power_battery(0, 0, 50, 2700).and_then(|b| b.minutes_left), Some(45));
+    }
+
+    #[test]
     fn battery_formats() {
         let cases = [
             (
-                Some(Battery { percent: 82, charging: true, minutes_left: Some(80) }),
+                Some(Battery { percent: 82, charging: true, plugged_in: true, minutes_left: Some(80) }),
                 "82% · charging · about 1 h 20 min left",
             ),
-            (Some(Battery { percent: 100, charging: true, minutes_left: None }), "100% · plugged in"),
-            (Some(Battery { percent: 40, charging: false, minutes_left: Some(45) }), "40% · about 45 min left"),
-            (Some(Battery { percent: 55, charging: false, minutes_left: None }), "55%"),
+            (Some(Battery { percent: 100, charging: true, plugged_in: true, minutes_left: None }), "100% · plugged in"),
+            (Some(Battery { percent: 100, charging: false, plugged_in: true, minutes_left: None }), "100% · plugged in"),
+            // Held at 80% by a charge limit: on AC, not charging.
+            (Some(Battery { percent: 80, charging: false, plugged_in: true, minutes_left: None }), "80% · plugged in"),
+            (
+                Some(Battery { percent: 40, charging: false, plugged_in: false, minutes_left: Some(45) }),
+                "40% · about 45 min left",
+            ),
+            (Some(Battery { percent: 55, charging: false, plugged_in: false, minutes_left: None }), "55%"),
             (None, "No battery"),
         ];
         for (battery, want) in cases {

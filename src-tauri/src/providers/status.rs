@@ -133,7 +133,7 @@ mod tests {
     struct Src;
     impl StatusSource for Src {
         fn battery(&self) -> Option<Battery> {
-            Some(Battery { percent: 82, charging: false, minutes_left: None })
+            Some(Battery { percent: 82, charging: false, plugged_in: false, minutes_left: None })
         }
         fn memory(&self) -> Memory {
             Memory { used: 1 << 30, total: 2 << 30 }
