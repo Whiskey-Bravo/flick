@@ -457,7 +457,11 @@ impl Engine {
     /// Runs a row's menu action. Nothing is ranked or recorded: an action is
     /// not a launch.
     pub fn act(&self, provider: &str, id: &str, action: Action) -> Result<Outcome, String> {
-        let outcome = self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action)?;
+        let outcome = match self.provider(provider).ok_or_else(|| format!("unknown provider: {provider}"))?.act(id, action) {
+            // No to Windows' "delete for good?": the item and its row stay, with no error.
+            Err(e) if action == Action::Delete && e == crate::file_ops::DELETE_DECLINED => return Ok(Outcome::Keep),
+            other => other?,
+        };
         // Gone for good (to the Recycle Bin): what Flick knows about it goes too.
         if action == Action::Delete {
             self.pins.forget(id);
@@ -1830,6 +1834,18 @@ mod tests {
         assert_eq!(d.e.act("files", &b, Action::Delete), Err("in use".to_string()));
         assert_eq!(d.remembered(&b), (true, 15, true));
         assert_eq!(d.found("b.txt"), [b]);
+    }
+
+    #[test]
+    fn delete_declined_in_windows_prompt_keeps_the_row_with_no_error() {
+        let d = disk();
+        let a = d.id("a.txt");
+        d.remember(&a);
+        d.ops.fail("recycle", crate::file_ops::DELETE_DECLINED);
+        assert_eq!(d.e.act("files", &a, Action::Delete), Ok(Outcome::Keep));
+        assert_eq!(d.ops.calls(), [format!("recycle {a}")]);
+        assert_eq!(d.remembered(&a), (true, 15, true), "nothing forgotten");
+        assert_eq!(d.found("a.txt"), [a]);
     }
 
     #[test]

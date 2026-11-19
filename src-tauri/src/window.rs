@@ -1,6 +1,6 @@
 //! The `bar` window: created once by Tauri at startup, then only shown and hidden.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -450,6 +450,9 @@ pub fn hide(app: &AppHandle) {
 /// is never destroyed.
 pub fn install_handlers(app: &AppHandle) {
     let Some(w) = bar(app) else { return };
+    if let Ok(h) = w.hwnd() {
+        BAR_HWND.store(h.0 as isize, Ordering::SeqCst);
+    }
     let handle = app.clone();
     w.on_window_event(move |event| match event {
         WindowEvent::Focused(false) if hides_on_blur(held_open(), within_blur_grace()) => hide(&handle),
@@ -459,6 +462,18 @@ pub fn install_handlers(app: &AppHandle) {
         }
         _ => {}
     });
+}
+
+/// The bar window's handle once its handlers are installed (0 before).
+static BAR_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// The bar window's handle, for a Windows prompt that the bar should own
+/// (so it opens in front of it, not behind other windows).
+pub fn bar_hwnd() -> Option<HWND> {
+    match BAR_HWND.load(Ordering::SeqCst) {
+        0 => None,
+        h => Some(HWND(h as _)),
+    }
 }
 
 /// How many holds are on: while any is, a focus loss does not hide the bar

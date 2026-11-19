@@ -16,7 +16,7 @@ use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::UI::Shell::{
     FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, SHObjectProperties, SHOpenWithDialog, DROPFILES,
-    FILEOPERATION_FLAGS, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+    FILEOPERATION_FLAGS, FOFX_RECYCLEONDELETE, FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
     OAIF_EXEC, OPENASINFO, SHOP_FILEPATH,
 };
 
@@ -150,15 +150,51 @@ pub(crate) fn zip_entry_name(base: &Path, item: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Writes `zip` holding `item` (a file, or a folder with everything in it)
-/// under its own name, relative to `parent`. Symlinks and junctions are left
-/// out, never followed. Names are stored as UTF-8, contents deflated.
-fn write_zip(parent: &Path, item: &Path, zip: &Path) -> Result<(), String> {
+/// 100 ns ticks from 1601-01-01 (a FILETIME) to 1970-01-01.
+const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+
+/// A zip entry's date and time from a local time given as a FILETIME (100 ns
+/// ticks since 1601-01-01): `None` outside what a zip can hold (1980-2107).
+pub(crate) fn zip_time(local_ticks: u64) -> Option<zip::DateTime> {
+    let secs = local_ticks.checked_sub(FILETIME_UNIX_EPOCH)? / 10_000_000;
+    let (days, rest) = ((secs / 86_400) as i64, secs % 86_400);
+    // Days since 1970-01-01 to a civil date (H. Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u8;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u8;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let (hour, minute, second) = ((rest / 3_600) as u8, (rest / 60 % 60) as u8, (rest % 60) as u8);
+    zip::DateTime::from_date_and_time(u16::try_from(year).ok()?, month, day, hour, minute, second).ok()
+}
+
+/// A file's modification time as a zip entry's (local time, as Explorer's
+/// zips have it); `None` when it can't be had or held.
+fn zip_time_of(meta: &std::fs::Metadata) -> Option<zip::DateTime> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::Storage::FileSystem::FileTimeToLocalFileTime;
+    let since = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    let ticks = FILETIME_UNIX_EPOCH + since.as_secs() * 10_000_000 + u64::from(since.subsec_nanos()) / 100;
+    let utc = FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+    let mut local = FILETIME::default();
+    // SAFETY: both point at live FILETIMEs for the call.
+    unsafe { FileTimeToLocalFileTime(&utc, &mut local) }.ok()?;
+    zip_time((u64::from(local.dwHighDateTime) << 32) | u64::from(local.dwLowDateTime))
+}
+
+/// Writes `file` (the new zip) holding `item` (a file, or a folder with
+/// everything in it) under its own name, relative to `parent`. Symlinks and
+/// junctions are left out, never followed. Names are stored as UTF-8,
+/// contents deflated, each entry with its file's modification time; an entry
+/// of 4 GiB or more is written as ZIP64.
+fn write_zip(parent: &Path, item: &Path, file: std::fs::File) -> Result<(), String> {
     use std::io::Write;
     use zip::write::SimpleFileOptions;
-    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    // `create_new`: never replaces a zip that appeared since the name was picked.
-    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(zip).map_err(|e| short(&e))?;
+    let base = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     let mut writer = zip::ZipWriter::new(file);
     let mut stack = vec![item.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -170,12 +206,17 @@ fn write_zip(parent: &Path, item: &Path, zip: &Path) -> Result<(), String> {
             }
             continue;
         }
+        let options = match zip_time_of(&meta) {
+            Some(time) => base.last_modified_time(time),
+            None => base,
+        };
         if meta.is_dir() {
             writer.add_directory(format!("{name}/"), options).map_err(|e| e.to_string())?;
             for child in std::fs::read_dir(&current).map_err(|e| short(&e))? {
                 stack.push(child.map_err(|e| short(&e))?.path());
             }
         } else {
+            let options = options.large_file(meta.len() >= u64::from(u32::MAX));
             writer.start_file(name, options).map_err(|e| e.to_string())?;
             let mut source = std::fs::File::open(&current).map_err(|e| short(&e))?;
             std::io::copy(&mut source, &mut writer).map_err(|e| short(&e))?;
@@ -184,12 +225,61 @@ fn write_zip(parent: &Path, item: &Path, zip: &Path) -> Result<(), String> {
     writer.finish().map_err(|e| e.to_string())?.flush().map_err(|e| short(&e))
 }
 
-/// The program and arguments for a terminal in the current directory:
-/// Windows Terminal when `wt` is there, else a console window of cmd.exe.
-pub(crate) fn terminal_command(wt: Option<&Path>) -> (PathBuf, Vec<OsString>) {
+/// How many names a compress tries when the ones it picked keep appearing
+/// before it can create them.
+const ZIP_NAME_TRIES: usize = 20;
+
+/// Zips `path` next to itself, as `<name>.zip` or the next free `<name> (N).zip`;
+/// the zip's path. `taken` says which names look used. The zip is created
+/// new, so nothing already there is ever replaced: a name that turns out to
+/// be taken anyway is skipped for the next one. A failed zip is removed only
+/// when this call created it.
+fn compress_to(path: &Path, taken: &dyn Fn(&Path) -> bool) -> Result<PathBuf, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (Some(parent), false) = (path.parent(), name.is_empty()) else { return Err("can't compress this".into()) };
+    let failed = || format!("Couldn't compress {name}");
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    let mut tried: Vec<PathBuf> = Vec::new();
+    for _ in 0..ZIP_NAME_TRIES {
+        let zip = zip_target(path, is_dir, &|p| taken(p) || tried.iter().any(|t| t == p));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&zip) {
+            Ok(file) => {
+                return match write_zip(parent, path, file) {
+                    Ok(()) => Ok(zip),
+                    Err(_) => {
+                        // Ours: created by the open above.
+                        let _ = std::fs::remove_file(&zip);
+                        Err(failed())
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => tried.push(zip),
+            Err(_) => return Err(failed()),
+        }
+    }
+    Err(failed())
+}
+
+/// The error for a terminal in a network folder when only cmd.exe is there.
+pub(crate) const NO_NETWORK_TERMINAL: &str = "Can't open a terminal in a network folder without Windows Terminal";
+
+/// Whether `path` is on a network share (`\\server\share\…`, also in its
+/// `\\?\UNC\…` form).
+fn is_unc(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let upper = text.to_ascii_uppercase();
+    upper.starts_with(r"\\?\UNC\") || (text.starts_with(r"\\") && !text.starts_with(r"\\?\") && !text.starts_with(r"\\.\"))
+}
+
+/// The program and arguments for a terminal in `folder` (passed as the
+/// working directory): Windows Terminal when `wt` is there, else a console
+/// window of cmd.exe, which can't start in a network folder (it would open in
+/// the Windows folder instead), so that is refused.
+pub(crate) fn terminal_command(wt: Option<&Path>, folder: &Path) -> Result<(PathBuf, Vec<OsString>), String> {
     match wt {
-        Some(wt) => (wt.to_path_buf(), vec!["-d".into(), ".".into()]),
-        None => (PathBuf::from(crate::quote::system32("cmd.exe")), Vec::new()),
+        Some(wt) => Ok((wt.to_path_buf(), vec!["-d".into(), ".".into()])),
+        None if is_unc(folder) => Err(NO_NETWORK_TERMINAL.into()),
+        None => Ok((PathBuf::from(crate::quote::system32("cmd.exe")), Vec::new())),
     }
 }
 
@@ -265,25 +355,53 @@ fn file_name_of(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// The error `recycle` gives when the user answered No to Windows' prompt
+/// (delete for good an item the bin can't take): the item stays, and the
+/// engine treats the delete as not done, with no error to show.
+pub(crate) const DELETE_DECLINED: &str = "delete declined";
+
+/// How a shell file operation did not finish.
+#[derive(Debug, PartialEq)]
+enum ShellError {
+    /// The user said No (or cancelled) in a prompt Windows showed.
+    Declined,
+    Failed,
+}
+
+/// Whether an operation's error code means the user said No or cancelled.
+fn declined(code: windows::core::HRESULT) -> bool {
+    use windows::Win32::Foundation::{ERROR_CANCELLED, E_ABORT};
+    use windows::Win32::UI::Shell::COPYENGINE_E_USER_CANCELLED;
+    code == COPYENGINE_E_USER_CANCELLED || code == ERROR_CANCELLED.to_hresult() || code == E_ABORT
+}
+
 /// One shell file operation on `path`, with `flags`, run to the end on this
-/// thread (COM is set up for the call). `queue` adds the work to the operation.
+/// thread (COM is set up for the call). `queue` adds the work to the
+/// operation. Any prompt Windows shows is owned by the bar's window.
 fn shell_operation(
     path: &Path,
     flags: FILEOPERATION_FLAGS,
     queue: impl FnOnce(&IFileOperation, &IShellItem) -> windows::core::Result<()>,
-) -> Result<(), String> {
+) -> Result<(), ShellError> {
     let name = wide(path);
+    let failed = |_| ShellError::Failed;
     crate::launch::with_com(|| {
         // SAFETY: `name` is NUL-terminated and outlives the calls; the interfaces
         // are used on this thread only and released when they go out of scope.
         unsafe {
-            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(|e| e.to_string())?;
-            op.SetOperationFlags(flags).map_err(|e| e.to_string())?;
-            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None).map_err(|e| e.to_string())?;
-            queue(&op, &item).map_err(|e| e.to_string())?;
-            op.PerformOperations().map_err(|e| e.to_string())?;
-            if op.GetAnyOperationsAborted().map_err(|e| e.to_string())?.as_bool() {
-                return Err("aborted".to_string());
+            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL).map_err(failed)?;
+            op.SetOperationFlags(flags).map_err(failed)?;
+            if let Some(owner) = crate::window::bar_hwnd() {
+                // Without an owner the prompt can open behind other windows.
+                let _ = op.SetOwnerWindow(owner);
+            }
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(name.as_ptr()), None).map_err(failed)?;
+            queue(&op, &item).map_err(failed)?;
+            if let Err(e) = op.PerformOperations() {
+                return Err(if declined(e.code()) { ShellError::Declined } else { ShellError::Failed });
+            }
+            if op.GetAnyOperationsAborted().map_err(failed)?.as_bool() {
+                return Err(ShellError::Declined);
             }
             Ok(())
         }
@@ -295,7 +413,7 @@ pub struct SystemFileOps;
 
 impl FileOps for SystemFileOps {
     fn open_terminal(&self, folder: &Path) -> Result<(), String> {
-        let (program, args) = terminal_command(windows_terminal().as_deref());
+        let (program, args) = terminal_command(windows_terminal().as_deref(), folder)?;
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         crate::launch::start_in(&program.to_string_lossy(), &args, &folder.to_string_lossy())
     }
@@ -381,15 +499,8 @@ impl FileOps for SystemFileOps {
     }
 
     fn compress(&self, path: &Path) -> Result<PathBuf, String> {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let (Some(parent), false) = (path.parent(), name.is_empty()) else { return Err("can't compress this".into()) };
-        let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
-        let zip = zip_target(path, is_dir, &|p| p.exists());
-        write_zip(parent, path, &zip).map_err(|_| {
-            let _ = std::fs::remove_file(&zip);
-            format!("Couldn't compress {name}")
-        })?;
-        Ok(zip)
+        // A link counts as taken even when what it points at is gone.
+        compress_to(path, &|p| std::fs::symlink_metadata(p).is_ok())
     }
 
     fn set_cloud_pin(&self, path: &Path, keep: bool) -> Result<(), String> {
@@ -399,14 +510,19 @@ impl FileOps for SystemFileOps {
         }
     }
 
-    /// Asks for a confirmation only when the item is too big for the bin
-    /// (it would be deleted for good): never silently.
+    /// Asks for a confirmation only when the item can't go to the bin (too
+    /// big, a network share): Windows' own prompt, owned by the bar, which
+    /// is held open meanwhile. A No there is [`DELETE_DECLINED`].
     fn recycle(&self, path: &Path) -> Result<(), String> {
         let flags = FOFX_RECYCLEONDELETE | FOF_ALLOWUNDO | FOF_WANTNUKEWARNING | FOF_NOERRORUI | FOF_SILENT;
-        shell_operation(path, flags, |op, item| unsafe { op.DeleteItem(item, None) })
-            .map_err(|_| format!("Couldn't delete {}", file_name_of(path)))
+        crate::window::holding_open(|| shell_operation(path, flags, |op, item| unsafe { op.DeleteItem(item, None) })).map_err(|e| match e {
+            ShellError::Declined => DELETE_DECLINED.to_string(),
+            ShellError::Failed => format!("Couldn't delete {}", file_name_of(path)),
+        })
     }
 
+    /// No FOF_NOCONFIRMATION: should the name be taken after all (it was
+    /// free a moment ago), Windows asks instead of replacing the file.
     fn rename(&self, path: &Path, new_name: &str) -> Result<PathBuf, String> {
         valid_new_name(new_name)?;
         let target = path.with_file_name(new_name);
@@ -415,9 +531,9 @@ impl FileOps for SystemFileOps {
         if !same_name && std::fs::symlink_metadata(&target).is_ok() {
             return Err("A file with that name already exists".into());
         }
-        let flags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+        let flags = FOF_NOERRORUI | FOF_SILENT;
         let new = wide_str(new_name);
-        shell_operation(path, flags, |op, item| unsafe { op.RenameItem(item, PCWSTR(new.as_ptr()), None) })
+        crate::window::holding_open(|| shell_operation(path, flags, |op, item| unsafe { op.RenameItem(item, PCWSTR(new.as_ptr()), None) }))
             .map_err(|_| format!("Couldn't rename {}", file_name_of(path)))?;
         Ok(target)
     }
@@ -587,11 +703,84 @@ mod tests {
     #[test]
     fn terminal_prefers_windows_terminal() {
         let wt = PathBuf::from(r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\wt.exe");
-        let (program, args) = terminal_command(Some(&wt));
+        let local = Path::new(r"C:\Work");
+        let (program, args) = terminal_command(Some(&wt), local).unwrap();
         assert_eq!((program, strings(&args)), (wt, vec!["-d".to_string(), ".".to_string()]));
-        let (program, args) = terminal_command(None);
+        let (program, args) = terminal_command(None, local).unwrap();
         assert!(program.to_string_lossy().to_lowercase().ends_with(r"system32\cmd.exe"), "{program:?}");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn a_network_folder_needs_windows_terminal() {
+        let wt = PathBuf::from(r"C:\wt.exe");
+        for share in [r"\\server\share", r"\\server\share\x y", r"\\?\UNC\server\share\x"] {
+            assert_eq!(terminal_command(None, Path::new(share)), Err(NO_NETWORK_TERMINAL.to_string()), "{share}");
+            assert!(terminal_command(Some(&wt), Path::new(share)).is_ok(), "{share}");
+        }
+        assert!(terminal_command(None, Path::new(r"\\?\C:\Work")).is_ok(), "a local long path");
+        assert!(terminal_command(None, Path::new(r"D:\")).is_ok());
+    }
+
+    #[test]
+    fn the_fake_refuses_a_network_terminal_like_the_real_one_without_wt() {
+        // The fake records the call; the rule itself is `terminal_command`'s,
+        // which the real `open_terminal` asks before starting anything.
+        let ops = FakeFileOps::default();
+        ops.fail("open_terminal", NO_NETWORK_TERMINAL);
+        assert_eq!(ops.open_terminal(Path::new(r"\\server\share")), Err(NO_NETWORK_TERMINAL.to_string()));
+    }
+
+    #[test]
+    fn zip_times_are_the_files_own() {
+        let ticks = |unix: u64| FILETIME_UNIX_EPOCH + unix * 10_000_000;
+        // 2024-02-29 13:45:30 and 1999-12-31 23:59:58.
+        assert_eq!(zip_time(ticks(1_709_214_330)), Some(zip::DateTime::from_date_and_time(2024, 2, 29, 13, 45, 30).unwrap()));
+        assert_eq!(zip_time(ticks(946_684_798)), Some(zip::DateTime::from_date_and_time(1999, 12, 31, 23, 59, 58).unwrap()));
+        assert_eq!(zip_time(ticks(0)), None, "1970: before what a zip holds");
+        assert_eq!(zip_time(0), None);
+    }
+
+    #[test]
+    fn compress_never_touches_a_zip_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let existing = dir.path().join("a.zip");
+        std::fs::write(&existing, b"not mine").unwrap();
+        // The name looked free when picked (another compress raced it in).
+        let zip = compress_to(&file, &|_| false).unwrap();
+        assert_eq!(zip, dir.path().join("a (2).zip"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"not mine");
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip).unwrap()).unwrap();
+        let entry = archive.by_index(0).unwrap();
+        assert_eq!(entry.name().unwrap(), "a.txt");
+        let mtime = std::fs::metadata(&file).unwrap();
+        assert_eq!(entry.last_modified(), zip_time_of(&mtime), "the file's own time");
+        assert_ne!(entry.last_modified().map(|t| t.year()), Some(1980));
+    }
+
+    #[test]
+    fn a_failed_compress_removes_only_its_own_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("gone.zip");
+        std::fs::write(&existing, b"not mine").unwrap();
+        // The item is missing, so writing fails after the zip was created.
+        let gone = dir.path().join("gone.txt");
+        assert_eq!(compress_to(&gone, &|_| false), Err("Couldn't compress gone.txt".to_string()));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"not mine");
+        let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["gone.zip"], "its own half-written zip is gone, the other one stays");
+    }
+
+    #[test]
+    fn a_no_in_windows_prompt_is_a_decline() {
+        use windows::Win32::Foundation::{ERROR_CANCELLED, E_ABORT, E_FAIL};
+        use windows::Win32::UI::Shell::COPYENGINE_E_USER_CANCELLED;
+        assert!(declined(COPYENGINE_E_USER_CANCELLED));
+        assert!(declined(ERROR_CANCELLED.to_hresult()));
+        assert!(declined(E_ABORT));
+        assert!(!declined(E_FAIL));
     }
 
     #[test]

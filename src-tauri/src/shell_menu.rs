@@ -1,6 +1,7 @@
 //! Windows' own classic context menu for a file or folder (More options…):
 //! entries from shell extensions (cloud apps, PowerToys, Send to, Share)
-//! appear as in Explorer, and the one picked runs. Not unit-tested: it shows a
+//! appear as in Explorer, and the one picked runs; Windows' own Rename and
+//! Delete are left out (Flick's are in its menu). Not unit-tested: it shows a
 //! real menu. `Engine::more_options` checks the row before this is reached.
 
 use std::cell::RefCell;
@@ -8,17 +9,18 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows::core::{w, Interface, PCSTR, PCWSTR};
+use windows::core::{w, Interface, PCSTR, PCWSTR, PSTR};
 use windows::Win32::Foundation::{ERROR_CANCELLED, E_ABORT, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, IBindCtx, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, SHBindToParent, SHParseDisplayName, CMF_EXTENDEDVERBS,
-    CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, SEE_MASK_NOASYNC,
+    CMF_NORMAL, GCS_VERBW, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, SEE_MASK_NOASYNC,
     SEE_MASK_UNICODE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, PostMessageW, RegisterClassW,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyMenu, DestroyWindow, GetMenuItemCount, GetMenuItemID,
+    PostMessageW, RegisterClassW, MF_BYCOMMAND,
     SetForegroundWindow, TrackPopupMenuEx, HMENU, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
@@ -95,6 +97,7 @@ fn on_own_thread(path: &Path, x: i32, y: i32) -> Result<bool, String> {
     if added.is_err() {
         return Err(NO_MENU.into());
     }
+    drop_own_entries(&menu, &popup);
     let picked = {
         let _handler = Handling::set(&menu);
         // SAFETY: the owner window and the menu belong to this thread and
@@ -112,6 +115,35 @@ fn on_own_thread(path: &Path, x: i32, y: i32) -> Result<bool, String> {
         return Ok(false);
     };
     invoke(&menu, owner.0, offset, x, y)
+}
+
+/// Whether an entry with this verb is left out of Windows' menu: Rename and
+/// Delete are Flick's own entries (Delete with its second Enter), and keep
+/// Flick's pins, ranking and history in step; Windows' would bypass both.
+fn dropped_verb(verb: &str) -> bool {
+    verb.eq_ignore_ascii_case("rename") || verb.eq_ignore_ascii_case("delete")
+}
+
+/// Removes the entries [`dropped_verb`] names from the menu's top level (where
+/// Explorer puts them); every other entry stays. An entry whose verb can't be
+/// read stays too.
+fn drop_own_entries(menu: &IContextMenu, popup: &Popup) {
+    // SAFETY: `popup.0` is a live menu of this thread; the verb buffer
+    // outlives each call, which writes at most `buf.len()` UTF-16 units.
+    unsafe {
+        for pos in (0..GetMenuItemCount(Some(popup.0))).rev() {
+            let Some(offset) = command_offset(GetMenuItemID(popup.0, pos) as i32) else { continue };
+            let mut buf = [0u16; 64];
+            // GCS_VERBW writes UTF-16 through the PSTR.
+            if menu.GetCommandString(offset as usize, GCS_VERBW, None, PSTR(buf.as_mut_ptr().cast()), buf.len() as u32).is_err() {
+                continue;
+            }
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            if dropped_verb(&String::from_utf16_lossy(&buf[..end])) {
+                let _ = DeleteMenu(popup.0, offset + FIRST_ID, MF_BYCOMMAND);
+            }
+        }
+    }
 }
 
 /// The command offset `InvokeCommand` takes for the id the menu returned;
@@ -306,6 +338,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_own_rename_and_delete_are_left_out() {
+        for verb in ["rename", "Delete", "DELETE"] {
+            assert!(dropped_verb(verb), "{verb}");
+        }
+        for verb in ["open", "properties", "copy", "cut", "link", "runas", "", "delete2"] {
+            assert!(!dropped_verb(verb), "{verb}");
+        }
+    }
 
     #[test]
     fn only_the_menus_own_ids_are_run() {
