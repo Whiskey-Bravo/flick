@@ -22,7 +22,8 @@ pub enum RegisterError {
 }
 
 /// Where combos are registered. `keys` is always the normalized combo
-/// (`normalize_combo`). Never call on the main thread.
+/// (`normalize_combo`). Never call on the main thread, except once during
+/// setup, before the config watcher, the tray and Settings exist.
 pub trait KeyRegistry: Send + Sync {
     /// Registers `keys`; a combo held by anyone (another program, or the bar
     /// hotkey) is `Taken` and is left alone.
@@ -105,7 +106,9 @@ impl DirectKeys {
     /// shortcut actually registered (after any fallback), not just the one asked
     /// for. While paused it only remembers `bar` and `defs` for the resume and
     /// shows them in the status without registering (`item_for` stays None).
-    /// Never on the main thread.
+    /// Never on the main thread, except once during setup, before the config
+    /// watcher, the tray and Settings exist: the plugin then runs inline there
+    /// and no other thread can hold `work`.
     pub fn apply(&self, bar: &str, defs: &[DirectHotkeyDef]) {
         let mut work = self.work.lock().unwrap_or_else(|e| e.into_inner());
         if work.paused {
@@ -233,7 +236,8 @@ fn shortcut(keys: &str) -> Result<Shortcut, RegisterError> {
     Shortcut::from_str(&normalize_combo(keys)).map_err(|_| RegisterError::Invalid)
 }
 
-/// The real registry: the global-shortcut plugin. Never called on the main thread.
+/// The real registry: the global-shortcut plugin. Never called on the main
+/// thread, except during setup (see `DirectKeys::apply`).
 pub struct PluginKeys {
     app: AppHandle,
     on_press: fn(&AppHandle, &str),
