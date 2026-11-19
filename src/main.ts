@@ -98,6 +98,17 @@ const svgUrl = (name: string): string => {
   return url;
 };
 
+// Opt-in timing (the back end's FLICK_TIMING): asked once; off means no calls at all.
+let timingOn = false;
+invoke<boolean>("timing_enabled").then((on) => (timingOn = on), () => {});
+/// Reports `name` with the time since `since` (a `performance.now()` value) once the next frame comes.
+const reportAtFrame = (name: "page.shown_to_paint" | "page.query_to_paint" | "page.tick", since: number) => {
+  if (!timingOn) return;
+  requestAnimationFrame(() => {
+    invoke("timing_mark", { name, micros: Math.round((performance.now() - since) * 1000) }).catch(() => {});
+  });
+};
+
 let state: State = initial;
 let querySeq = 0;
 /// Bumped on every `bar:shown`: an activation answered after the bar was
@@ -350,7 +361,9 @@ function scheduleTick() {
   if (tickTimer !== null) return;
   tickTimer = window.setTimeout(() => {
     tickTimer = null;
+    const started = performance.now();
     dispatch({ type: "answersReady" });
+    reportAtFrame("page.tick", started);
   }, 1000 - (Date.now() % 1000) + 5);
 }
 
@@ -411,9 +424,12 @@ function run(effect: Effect) {
   switch (effect.type) {
     case "query": {
       const seq = ++querySeq;
+      const sent = performance.now();
       invoke<Item[]>("query", { text: effect.text, scope: effect.scope })
         .then((items) => {
-          if (seq === querySeq) dispatch({ type: "results", items });
+          if (seq !== querySeq) return;
+          dispatch({ type: "results", items });
+          reportAtFrame("page.query_to_paint", sent);
         })
         .catch((err) => {
           if (seq === querySeq) dispatch({ type: "queryFailed", message: String(err) });
@@ -566,10 +582,12 @@ document.addEventListener("mousedown", (e) => {
 const listenFailed = (err: unknown) => dispatch({ type: "failed", message: `Event listener failed: ${err}` });
 
 const afterShow = (event: Event) => {
+  const handled = performance.now();
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
   jumpNext = true; // nothing glides in from where it was when the bar closed
   dispatch(event);
+  reportAtFrame("page.shown_to_paint", handled);
   input.focus();
   // The opening animation of the medium and high levels, played from its
   // start on every show (a no-op under Minimal).

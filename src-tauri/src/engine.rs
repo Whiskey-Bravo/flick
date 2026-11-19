@@ -263,7 +263,11 @@ impl Engine {
         let mut ranked: Vec<(u32, usize, ResultItem)> = providers
             .flat_map(|p| {
                 let share = p.plain_share();
-                p.query(q).into_iter().map(move |item| {
+                let found = {
+                    let _files = if crate::timing::enabled() && p.name() == "files" { crate::timing::span("query.files") } else { crate::timing::span_off() };
+                    p.query(q)
+                };
+                found.into_iter().map(move |item| {
                     let boost = p.rank_key(&item.id).map_or(0, |key| self.ranking.boost(p.name(), &key));
                     (item.score.saturating_add(boost), share, item)
                 })

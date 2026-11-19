@@ -39,6 +39,7 @@ mod status;
 mod updates;
 mod taskbar;
 mod theme;
+mod timing;
 mod tray;
 mod uninstall;
 mod window;
@@ -1011,6 +1012,7 @@ pub fn run_helper_if_asked() -> bool {
 }
 
 pub fn run() {
+    timing::init();
     // Everything Flick starts inherits this directory unless told otherwise:
     // the user profile, not wherever Flick happened to be started from (and
     // Flick then holds no handle on that folder).
@@ -1031,6 +1033,8 @@ pub fn run() {
             commands::hide,
             commands::toggle_pin,
             commands::past_searches,
+            timing::timing_enabled,
+            timing::timing_mark,
             commands::act,
             settings::settings_state,
             settings::settings_set,

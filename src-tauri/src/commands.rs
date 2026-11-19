@@ -12,7 +12,10 @@ use crate::AppState;
 /// In-memory only. `async` runs it on the async runtime instead of the main thread.
 #[tauri::command(async)]
 pub fn query(text: String, scope: Option<String>, state: State<AppState>) -> Vec<ResultItem> {
-    state.engine.query(&text, scope.as_deref())
+    let timer = crate::timing::query_timer();
+    let rows = state.engine.query(&text, scope.as_deref());
+    timer.finish(text.chars().count(), rows.len());
+    rows
 }
 
 /// Runs a follow-up once the bar has hidden (paste, clipboard history, snip,
