@@ -731,7 +731,10 @@ document.addEventListener("click", (e) => {
 });
 
 document.addEventListener("mousedown", (e) => {
-  e.preventDefault(); // keep focus in the input
+  // Keep focus in the input. A press in the input itself keeps its default,
+  // so the mouse can place the caret and select text there.
+  if (e.target === input) return;
+  e.preventDefault();
   input.focus();
 });
 
