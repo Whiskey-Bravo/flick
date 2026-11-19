@@ -628,10 +628,16 @@ export function queryArgs(effect: { text: string; scope: string | null }, seq: n
   return { text: effect.text, scope: effect.scope, seq };
 }
 
+/** The arguments of the one retry: no number (sequence 0), which the back end
+ *  never cancels, so the retry cannot be answered with null and cannot loop. */
+export function retryArgs(effect: { text: string; scope: string | null }) {
+  return queryArgs(effect, 0);
+}
+
 /** What to do with the answer to the CURRENT search. The back end answers null
  *  only for a search a higher number overtook, which cannot be the current one;
- *  should it happen anyway, ask again (the new number is the highest, so that
- *  answer completes) rather than leave `awaiting` set for ever. */
+ *  should it happen anyway, ask again once, unnumbered (see `retryArgs`), rather
+ *  than leave `awaiting` set for ever. */
 export function queryReply(items: Item[] | null): { type: "results"; items: Item[] } | "ask again" {
   return items ? { type: "results", items } : "ask again";
 }

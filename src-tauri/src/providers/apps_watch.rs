@@ -44,7 +44,9 @@ pub enum Signal {
     Ignore,
     /// Something changed.
     Change,
-    /// The watcher failed (or a watched folder went away): events may be missed.
+    /// The watcher reported a failure: events may be missed. On Windows the
+    /// backend does not report runtime failures (it can stop without telling);
+    /// the full refresh every `FULL_AFTER` when the bar opens bounds that.
     Lost,
 }
 
@@ -72,7 +74,8 @@ pub fn route(signal: Signal, on_lost: &dyn Fn()) -> bool {
 
 /// Watch the folders that exist now (recursively; one created later is not
 /// watched) and call `request` once per quiet burst of changes, on a thread
-/// of its own. A watcher error calls `on_lost` and also requests a refresh.
+/// of its own. A watcher error calls `on_lost` and also requests a refresh
+/// (but on Windows the watcher can stop without any error).
 /// `Err` when no folder can be watched; the caller then relies on refreshing
 /// when the bar opens. The thread ends when the returned watcher is dropped.
 pub fn watch(

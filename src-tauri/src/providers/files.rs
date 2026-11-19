@@ -45,6 +45,9 @@ const MAX_WAIT: Duration = Duration::from_secs(10);
 const MIN_RESCAN_GAP: Duration = Duration::from_secs(30);
 /// ...and at least this many times the duration of the last full scan.
 const RESCAN_GAP_FACTOR: u32 = 3;
+/// A clean, watched index is still rescanned by the periodic tick once the
+/// last completed full scan is this old (a watcher that died silently).
+const MAX_CLEAN_AGE: Duration = Duration::from_secs(2 * 60 * 60);
 const NOT_FOUND: &str = "file not found";
 
 /// One indexed file or folder in list form, for tests (the provider keeps the
@@ -202,9 +205,11 @@ fn change_is_relevant(paths: &[PathBuf], roots: &[PathBuf]) -> bool {
 /// Whether a watcher event can change the index. The index holds only names
 /// and folder-ness, so only creations, removals and renames count, plus
 /// `Other` and events whose backend lost track (`need_rescan`). Content
-/// writes (`Modify(Any)` on Windows), metadata and access are ignored: a file
-/// written continuously must not rescan the roots over and over. Hidden or
-/// system attribute changes are left to the periodic refresh.
+/// writes (`Modify(Any)` on Windows), metadata and access do not trigger a
+/// rescan: a file written continuously must not rescan the roots over and over.
+/// They still mark the index dirty (except plain content writes and reads, see
+/// [`ignored_event_may_matter`]), so hidden or system attribute changes are
+/// left to the periodic refresh.
 fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
     need_rescan
         || matches!(
@@ -214,10 +219,15 @@ fn event_triggers_rescan(kind: &EventKind, need_rescan: bool) -> bool {
 }
 
 /// Whether the periodic refresh must rescan: when changes are known to be
-/// unapplied (`dirty`), or when nothing watches the roots (then it is the only
-/// way changes are found).
-fn periodic_due(dirty: bool, watching: bool) -> bool {
-    dirty || !watching
+/// unapplied (`dirty`), when nothing watches the roots (then it is the only
+/// way changes are found), or when the last completed full scan is older than
+/// [`MAX_CLEAN_AGE`] (`age`; `None`: no scan yet). The age cap bounds the
+/// damage of a watcher that stopped without telling: on Windows the `notify`
+/// backend never reports a buffer overflow or a vanished root to its handler,
+/// it just stops watching. On a PC in use, ordinary file saves mark the index
+/// dirty, so the saving is mostly while the PC is idle.
+fn periodic_due(dirty: bool, watching: bool, age: Option<Duration>) -> bool {
+    dirty || !watching || age.is_some_and(|a| a >= MAX_CLEAN_AGE)
 }
 
 /// What the watcher knows about the index, shared with its callback.
@@ -247,15 +257,17 @@ impl WatchState {
     /// It stays unwatched until the next `watch` or `set_roots`, so every
     /// tick then scans (today's behaviour).
     fn check_roots(&self, exists: impl Fn(&Path) -> bool) {
-        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.iter().any(|(root, was)| exists(root) != *was) {
+        // The lock is not held while the disk is asked.
+        let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let changed = seen.iter().any(|(root, was)| exists(root) != *was);
+        if changed {
             self.dirty.store(true, Ordering::SeqCst);
             self.watching.store(false, Ordering::SeqCst);
         }
     }
 
-    fn periodic_due(&self) -> bool {
-        periodic_due(self.dirty.load(Ordering::SeqCst), self.watching.load(Ordering::SeqCst))
+    fn periodic_due(&self, age: Option<Duration>) -> bool {
+        periodic_due(self.dirty.load(Ordering::SeqCst), self.watching.load(Ordering::SeqCst), age)
     }
 }
 
@@ -319,7 +331,9 @@ fn on_watch_result(
     roots: &Mutex<Vec<PathBuf>>,
     res: notify::Result<notify::Event>,
 ) -> Option<Vec<PathBuf>> {
-    // An error means events were missed.
+    // An error means events were missed. On Windows the backend never reports
+    // runtime errors (a buffer overflow, a vanished root): the watcher can stop
+    // without telling, and the age cap of the periodic tick bounds the damage.
     let Ok(event) = res else {
         state.dirty.store(true, Ordering::SeqCst);
         return None;
@@ -536,18 +550,32 @@ impl FilesProvider {
     }
 
     /// The periodic refresh: a scan only when [`periodic_due`] says so (the
-    /// watcher lost track of something, or there is none).
+    /// watcher lost track of something, there is none, or the last scan is
+    /// older than [`MAX_CLEAN_AGE`]).
     pub fn refresh_if_due(&self) {
         let home = self.home.clone();
         self.refresh_if_due_using(
             |roots, hint| scan_index(roots, home.as_deref(), MAX_ENTRIES, MAX_DEPTH, MAX_PER_FOLDER, hint),
             path_exists,
+            Instant::now(),
         );
     }
 
-    fn refresh_if_due_using(&self, scan: impl FnMut(&[PathBuf], Sizes) -> Index, exists: impl Fn(&Path) -> bool) {
+    /// How long ago the last completed full scan finished, at `now` (`None`:
+    /// none has completed yet; a running one does not reset the age).
+    fn scan_age(&self, now: Instant) -> Option<Duration> {
+        let last = *self.last_scan.lock().unwrap_or_else(|e| e.into_inner());
+        last.and_then(|(start, took)| took.map(|t| now.saturating_duration_since(start + t)))
+    }
+
+    fn refresh_if_due_using(
+        &self,
+        scan: impl FnMut(&[PathBuf], Sizes) -> Index,
+        exists: impl Fn(&Path) -> bool,
+        now: Instant,
+    ) {
         self.watch_state.check_roots(exists);
-        if self.watch_state.periodic_due() {
+        if self.watch_state.periodic_due(self.scan_age(now)) {
             self.refresh_using(scan);
         }
     }
@@ -631,6 +659,11 @@ impl FilesProvider {
     /// first change of a burst). If the watcher cannot be created the error
     /// is returned and the periodic refresh rescans every time (see [`periodic_due`]).
     pub fn watch(self: &Arc<Self>) -> notify::Result<()> {
+        self.watch_using(os_drive_is_fixed)
+    }
+
+    /// `watch` with the drive-type lookup passed in (tests).
+    fn watch_using(self: &Arc<Self>, fixed: impl Fn(char) -> bool) -> notify::Result<()> {
         let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
         let shared_roots = self.roots.clone();
         let state = self.watch_state.clone();
@@ -657,7 +690,7 @@ impl FilesProvider {
                 }
             }
         }
-        self.watch_state.arm(&self.roots(), all, path_exists, os_drive_is_fixed);
+        self.watch_state.arm(&self.roots(), all, path_exists, fixed);
         let weak = Arc::downgrade(self);
         std::thread::spawn(move || {
             // Ends when the watcher (and with it `tx`) or the provider is dropped.
@@ -1648,10 +1681,52 @@ mod tests {
 
     #[test]
     fn the_periodic_refresh_scans_when_dirty_or_unwatched() {
-        assert!(!periodic_due(false, true));
-        assert!(periodic_due(true, true));
-        assert!(periodic_due(false, false));
-        assert!(periodic_due(true, false));
+        let young = Some(Duration::from_secs(60));
+        assert!(!periodic_due(false, true, young));
+        assert!(!periodic_due(false, true, None));
+        assert!(periodic_due(true, true, young));
+        assert!(periodic_due(false, false, young));
+        assert!(periodic_due(true, false, young));
+        // Age does not matter once it is due anyway.
+        let old = Some(MAX_CLEAN_AGE * 3);
+        assert!(periodic_due(true, false, old));
+    }
+
+    #[test]
+    fn a_clean_watched_index_is_rescanned_once_the_last_scan_is_two_hours_old() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        assert!(!periodic_due(false, true, Some(min(119))));
+        assert!(periodic_due(false, true, Some(min(120))));
+        assert!(periodic_due(false, true, Some(min(121))));
+
+        let p = watched_provider();
+        let mut scans = 0;
+        let t0 = Instant::now();
+        // A completed scan that finished at t0.
+        *p.last_scan.lock().unwrap() = Some((t0, Some(Duration::ZERO)));
+        tick_at(&p, &mut scans, t0 + min(119));
+        assert_eq!(scans, 0);
+        tick_at(&p, &mut scans, t0 + min(120));
+        assert_eq!(scans, 1, "too old: scanned although clean and watched");
+        // The scan reset the age: the next tick, 30 minutes later, has nothing to do.
+        let after = p.last_scan.lock().unwrap().unwrap().0;
+        tick_at(&p, &mut scans, after + min(30));
+        assert_eq!(scans, 1);
+        // A scan still running does not count as completed.
+        *p.last_scan.lock().unwrap() = Some((t0, None));
+        tick_at(&p, &mut scans, t0 + min(500));
+        assert_eq!(scans, 1);
+    }
+
+    fn tick_at(p: &FilesProvider, scans: &mut usize, now: Instant) {
+        p.refresh_if_due_using(
+            |_, _| {
+                *scans += 1;
+                Index::default()
+            },
+            path_exists,
+            now,
+        );
     }
 
     /// A provider whose watcher is alive and clean, and a scan that only counts.
@@ -1672,6 +1747,7 @@ mod tests {
                 Index::default()
             },
             exists,
+            Instant::now(),
         );
     }
 
@@ -1813,7 +1889,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (p, _) = provider(vec![]);
         p.set_roots(vec![dir.path().to_path_buf(), dir.path().join("missing")]);
-        p.watch().unwrap();
+        p.watch_using(|_| true).unwrap();
         // A missing root is not watched: the periodic refresh must keep scanning.
         assert!(!p.watch_state.watching.load(Ordering::SeqCst));
         let mut scans = 0;
@@ -1823,7 +1899,7 @@ mod tests {
         // All roots present: the watcher vouches again.
         let (p, _) = provider(vec![]);
         p.set_roots(vec![dir.path().to_path_buf()]);
-        p.watch().unwrap();
+        p.watch_using(|_| true).unwrap();
         assert!(p.watch_state.watching.load(Ordering::SeqCst));
     }
 
@@ -1906,7 +1982,7 @@ mod tests {
             tick_with(&p, &mut scans, |_| true);
         }
         assert_eq!(scans, 3, "due on every tick while such a root is configured");
-        assert!(periodic_due(false, p.watch_state.watching.load(Ordering::SeqCst)));
+        assert!(periodic_due(false, p.watch_state.watching.load(Ordering::SeqCst), None));
         // One untrusted root among local ones is enough.
         p.watch_state.arm(&[PathBuf::from(r"C:\Users\x"), unc], true, |_| true, fixed_c_only);
         assert!(!p.watch_state.watching.load(Ordering::SeqCst));

@@ -121,7 +121,7 @@ pub fn shown(app: &AppHandle) {
     let Some(state) = app.try_state::<State>() else { return };
     let change = state.lock().on_show();
     if change.is_some() {
-        apply(app, "webview.normal");
+        apply(app);
     }
 }
 
@@ -132,7 +132,7 @@ fn spawn_check(app: &AppHandle, generation: u64) {
         let Some(state) = app.try_state::<State>() else { return };
         let change = state.lock().on_timer(generation, Instant::now());
         if change.is_some() {
-            apply(&app, "webview.low");
+            apply(&app);
         }
     });
 }
@@ -141,7 +141,7 @@ fn spawn_check(app: &AppHandle, generation: u64) {
 /// on the main thread, under a short lock released before the call), so a
 /// late-running request can never undo a newer one. No lock is held across
 /// the WebView call, and nothing here waits for the main thread.
-fn apply(app: &AppHandle, mark: &'static str) {
+fn apply(app: &AppHandle) {
     let Some(w) = app.get_webview_window(crate::window::LABEL) else { return };
     let handle = app.clone();
     let _ = w.with_webview(move |webview| {
@@ -149,12 +149,15 @@ fn apply(app: &AppHandle, mark: &'static str) {
             Some(state) => state.lock().level(),
             None => return,
         };
-        set_level(&webview, level);
-        crate::timing::mark(mark, 0);
+        // Marked only when the call worked, under the level actually applied.
+        if set_level(&webview, level) {
+            crate::timing::mark(mark_name(level), 0);
+        }
     });
 }
 
-fn set_level(webview: &tauri::webview::PlatformWebview, level: Level) {
+/// True when the runtime accepted the level.
+fn set_level(webview: &tauri::webview::PlatformWebview, level: Level) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
     };
@@ -165,9 +168,18 @@ fn set_level(webview: &tauri::webview::PlatformWebview, level: Level) {
     // SAFETY: `memory_interface`'s conditions hold: this runs inside
     // `with_webview`, on the main thread, with the bar's own controller.
     unsafe {
-        if let Some(view) = memory_interface(webview) {
-            let _ = view.SetMemoryUsageTargetLevel(target);
+        match memory_interface(webview) {
+            Some(view) => view.SetMemoryUsageTargetLevel(target).is_ok(),
+            None => false,
         }
+    }
+}
+
+/// The timing mark for a level that was applied.
+fn mark_name(level: Level) -> &'static str {
+    match level {
+        Level::Low => "webview.low",
+        Level::Normal => "webview.normal",
     }
 }
 
@@ -183,10 +195,8 @@ unsafe fn memory_interface(
 ) -> Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_19> {
     use std::ffi::c_void;
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_19;
-    // IID of ICoreWebView2_19, 6921f954-79b0-437f-a997-c85811897c68, as a GUID in memory.
-    const IID: [u8; 16] = [
-        0x54, 0xf9, 0x21, 0x69, 0xb0, 0x79, 0x7f, 0x43, 0xa9, 0x97, 0xc8, 0x58, 0x11, 0x89, 0x7c, 0x68,
-    ];
+    // IID of ICoreWebView2_19.
+    let iid = windows::core::GUID::from_u128(0x6921f954_79b0_437f_a997_c85811897c68);
     let core = webview.controller().CoreWebView2().ok()?;
     // A COM interface is a pointer to a pointer to its vtable, which starts
     // with IUnknown's QueryInterface, AddRef, Release.
@@ -194,11 +204,11 @@ unsafe fn memory_interface(
     if raw.is_null() {
         return None;
     }
-    type QueryInterface = unsafe extern "system" fn(*mut c_void, *const [u8; 16], *mut *mut c_void) -> i32;
+    type QueryInterface = unsafe extern "system" fn(*mut c_void, *const windows::core::GUID, *mut *mut c_void) -> i32;
     let vtable = *(raw as *const *const QueryInterface);
     let query = *vtable;
     let mut found: *mut c_void = std::ptr::null_mut();
-    if query(raw, &IID, &mut found) < 0 || found.is_null() {
+    if query(raw, &iid, &mut found) < 0 || found.is_null() {
         return None;
     }
     // The call added a reference; the wrapper's drop releases it.
@@ -210,6 +220,25 @@ mod tests {
     use super::*;
 
     const S: Duration = Duration::from_secs(1);
+
+    #[test]
+    fn the_mark_is_named_after_the_level_applied() {
+        assert_eq!(mark_name(Level::Low), "webview.low");
+        assert_eq!(mark_name(Level::Normal), "webview.normal");
+    }
+
+    #[test]
+    fn a_reveal_while_hidden_counts_as_a_show() {
+        // `window::reveal` calls `shown`: the tracker must not think the visible
+        // bar is hidden, and the next hide must start a new check.
+        let t0 = Instant::now();
+        let mut t = Tracker::new(t0);
+        let first = t.generation();
+        assert_eq!(t.on_show(), None);
+        assert_eq!(t.on_timer(first, t0 + 60 * S), None, "the 20 s check is void");
+        let second = t.on_hide(t0 + 61 * S);
+        assert_ne!(first, second, "a later hide starts a new check");
+    }
 
     #[test]
     fn low_comes_after_twenty_seconds_hidden_and_only_once() {

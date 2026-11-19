@@ -316,6 +316,9 @@ fn show_as(app: &AppHandle, shown: Shown, mut steps: crate::timing::Steps) {
 pub fn reveal(app: &AppHandle) {
     set_weather_hidden(app, false);
     if let Some(w) = bar(app) {
+        // The bar comes back without `show_as`: the memory tracker must still
+        // learn that it is visible (and put the WebView back to normal).
+        crate::webview_memory::shown(app);
         reveal_window(&w, &mut crate::timing::Steps::off());
     }
 }

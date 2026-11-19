@@ -8,7 +8,7 @@ import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } f
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
   capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
-  panelItem, queryArgs, queryReply, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  panelItem, queryArgs, queryReply, retryArgs, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -448,17 +448,25 @@ function run(effect: Effect) {
     case "query": {
       const seq = ++querySeq;
       const sent = performance.now();
-      invoke<Item[] | null>("query", queryArgs(effect, seq))
-        .then((items) => {
-          if (seq !== querySeq) return;
-          const reply = queryReply(items);
-          if (reply === "ask again") return run(effect);
-          dispatch(reply);
-          reportAtFrame("page.query_to_paint", sent);
-        })
-        .catch((err) => {
-          if (seq === querySeq) dispatch({ type: "queryFailed", message: String(err) });
-        });
+      // `again`: an unnumbered retry is allowed (once; it is never cancelled).
+      const ask = (args: ReturnType<typeof queryArgs>, again: boolean): void => {
+        invoke<Item[] | null>("query", args)
+          .then((items) => {
+            if (seq !== querySeq) return;
+            const reply = queryReply(items);
+            if (reply === "ask again") {
+              if (again) ask(retryArgs(effect), false);
+              else dispatch({ type: "queryFailed", message: "no answer" });
+              return;
+            }
+            dispatch(reply);
+            reportAtFrame("page.query_to_paint", sent);
+          })
+          .catch((err) => {
+            if (seq === querySeq) dispatch({ type: "queryFailed", message: String(err) });
+          });
+      };
+      ask(queryArgs(effect, seq), true);
       break;
     }
     case "liveRow": {

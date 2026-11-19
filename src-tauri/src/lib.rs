@@ -530,7 +530,10 @@ pub(crate) struct AppState {
     /// the main thread (the global-shortcut plugin does its work there), so a
     /// main-thread lock would hang Flick for good. What the main thread needs
     /// of the config is read from `mirror`, which `store_config` keeps in step.
-    /// Nothing may hold this lock across a tray, menu or window call either.
+    /// `reload_with` and `change_bar_hotkey` hold it across the hotkey
+    /// registration (which waits for the main thread); that is safe only
+    /// because of the rule above. Nothing else may hold it across a call that
+    /// waits for the main thread (a tray, menu or window call).
     pub(crate) config: Mutex<Config>,
     /// The settings the main thread reads, copied in by `store_config`.
     pub(crate) mirror: mirror::ConfigMirror,

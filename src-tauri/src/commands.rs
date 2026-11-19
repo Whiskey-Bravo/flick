@@ -28,9 +28,18 @@ pub fn query(text: String, scope: Option<String>, seq: Option<u64>, state: State
 #[tauri::command(async)]
 pub fn live_row(provider: String, id: String, state: State<AppState>) -> Option<ResultItem> {
     let timer = crate::timing::tick_timer();
-    let item = state.engine.item(&provider, &id).filter(|i| i.live);
+    let item = live_item(&provider, &id, |p, i| state.engine.item(p, i));
     timer.finish();
     item
+}
+
+/// Only the `answers` provider has live rows: any other provider is not asked
+/// (`item` can reach providers that read devices or the disk).
+fn live_item(provider: &str, id: &str, ask: impl FnOnce(&str, &str) -> Option<ResultItem>) -> Option<ResultItem> {
+    if provider != "answers" {
+        return None;
+    }
+    ask(provider, id).filter(|i| i.live)
 }
 
 /// Runs a follow-up once the bar has hidden (paste, clipboard history, snip,
@@ -166,6 +175,22 @@ pub fn hide(app: AppHandle) {
 mod tests {
     use super::*;
     use crate::launch;
+
+    #[test]
+    fn live_rows_come_only_from_the_answers_provider() {
+        let live = || Some(ResultItem { live: true, ..Default::default() });
+        // Another provider is not asked at all.
+        let mut asked = false;
+        let out = live_item("devices", "connect:headset", |_, _| {
+            asked = true;
+            live()
+        });
+        assert!(out.is_none());
+        assert!(!asked, "the engine must not be called for another provider");
+        // `answers` is asked, and only a live row comes back.
+        assert!(live_item("answers", "clock", |_, _| live()).is_some());
+        assert!(live_item("answers", "clock", |_, _| Some(ResultItem::default())).is_none());
+    }
 
     #[test]
     fn cancelled_elevation_hides_silently() {

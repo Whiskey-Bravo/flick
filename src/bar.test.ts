@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, rowsFromWheel, visibleItems, wantsTick, type Effect, type Event, type Item, type State } from "./bar";
+import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, visibleItems, wantsTick, type Effect, type Event, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -1321,6 +1321,9 @@ describe("mouse and menu", () => {
 describe("query numbering", () => {
   it("sends_the_page_sequence_with_the_query", () => {
     expect(queryArgs({ text: "fi", scope: null }, 42)).toEqual({ text: "fi", scope: null, seq: 42 });
+  });
+  it("the_retry_carries_sequence_zero_which_is_never_cancelled", () => {
+    expect(retryArgs({ text: "fi", scope: "shortcut:x" })).toEqual({ text: "fi", scope: "shortcut:x", seq: 0 });
   });
   it("a_null_answer_for_the_current_search_asks_again_instead_of_waiting_for_ever", () => {
     expect(queryReply(null)).toBe("ask again");

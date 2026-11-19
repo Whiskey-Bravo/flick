@@ -57,6 +57,9 @@ pub const ALIAS_PENALTY: u32 = 200;
 
 /// The bar opening re-reads what may have changed when the last read is older than this.
 pub const SHOW_REFRESH_AGE: Duration = Duration::from_secs(60);
+/// With the Start-menu folders watched, a full refresh still runs when the bar
+/// opens and the last one is older than this.
+pub const FULL_AFTER: Duration = Duration::from_secs(30 * 60);
 
 /// `scan_store_apps` gives up (and kills PowerShell) after this long.
 pub const STORE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -412,6 +415,8 @@ pub struct AppsProvider {
     queued: AtomicBool,
     /// The Start-menu folders are watched, so shortcuts need no polling.
     watching: AtomicBool,
+    /// When the last full refresh (shortcuts and Store) started (`None`: never).
+    last_full_at: Mutex<Option<Instant>>,
     /// Shortcuts and targets of the last refresh, reused by a Store-only refresh.
     last_start: Mutex<Vec<AppEntry>>,
     last_targets: Mutex<Targets>,
@@ -481,30 +486,30 @@ impl AppsProvider {
     /// older than `SHOW_REFRESH_AGE`. With the folders watched that is the
     /// Store list (Store installs leave no file behind); without a watcher,
     /// everything. Never blocks.
+    /// Even with the folders watched, a full refresh runs when the last one is
+    /// older than `FULL_AFTER`: on Windows the watcher can stop without
+    /// telling, and this bounds how stale the shortcuts can get.
     pub fn refresh_on_show(self: &Arc<Self>) {
-        if self.watching.load(Ordering::SeqCst) {
-            self.refresh_store_if_older(SHOW_REFRESH_AGE);
-        } else {
-            self.refresh_if_older(SHOW_REFRESH_AGE);
-        }
-    }
-
-    /// Re-read the Store apps unless that was done within `max_age`, on a
-    /// thread of its own. Requests that overlap collapse into one run.
-    pub fn refresh_store_if_older(self: &Arc<Self>, max_age: Duration) {
-        if let Some(job) = self.due_job(max_age, false) {
+        if let Some((_, job)) = self.show_job() {
             std::thread::spawn(job);
         }
     }
 
-    /// As `refresh_store_if_older`, for a full refresh (no watcher).
-    pub fn refresh_if_older(self: &Arc<Self>, max_age: Duration) {
-        if let Some(job) = self.due_job(max_age, true) {
-            std::thread::spawn(job);
+    /// What `refresh_on_show` runs, and whether it is a full refresh.
+    fn show_job(self: &Arc<Self>) -> Option<(bool, Box<dyn FnOnce() + Send>)> {
+        if !self.watching.load(Ordering::SeqCst) {
+            return self.due_job(SHOW_REFRESH_AGE, true).map(|j| (true, j));
         }
+        let now = (self.now)();
+        let last_full = *self.last_full_at.lock().unwrap_or_else(|e| e.into_inner());
+        // No full refresh yet: the first one is still on its way.
+        if last_full.is_some_and(|t| now.saturating_duration_since(t) >= FULL_AFTER) {
+            return self.due_job(Duration::ZERO, true).map(|j| (true, j));
+        }
+        self.due_job(SHOW_REFRESH_AGE, false).map(|j| (false, j))
     }
 
-    /// The job behind `refresh_store_if_older` (or the full one), or `None`
+    /// The Store-only job (or the full one), or `None`
     /// when the last Store listing is younger than `max_age` or a job is queued.
     fn due_job(self: &Arc<Self>, max_age: Duration, full: bool) -> Option<Box<dyn FnOnce() + Send>> {
         let now = (self.now)();
@@ -652,6 +657,7 @@ impl AppsProvider {
             last_store_at: Mutex::new(None),
             queued: AtomicBool::new(false),
             watching: AtomicBool::new(false),
+            last_full_at: Mutex::new(None),
             last_start: Mutex::new(Vec::new()),
             last_targets: Mutex::new(Targets::default()),
         })
@@ -724,7 +730,9 @@ impl AppsProvider {
         self.publish(&start, &last_store);
         *self.last_start.lock().unwrap_or_else(|e| e.into_inner()) = start.clone();
         *self.last_targets.lock().unwrap_or_else(|e| e.into_inner()) = targets.clone();
-        *self.last_store_at.lock().unwrap_or_else(|e| e.into_inner()) = Some((self.now)());
+        let now = (self.now)();
+        *self.last_store_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        *self.last_full_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
         if let Some(fresh) = scan_store() {
             self.set_plans(&start, &fresh, &targets, &programs);
             self.publish(&start, &fresh);
@@ -1413,6 +1421,41 @@ mod tests {
         assert_eq!(source.calls(), 1);
         clock.advance(Duration::from_secs(61));
         assert!(p.due_job(Duration::from_secs(60), false).is_some());
+    }
+
+    #[test]
+    fn a_watched_start_menu_still_gets_a_full_refresh_every_30_minutes() {
+        let clock = Clock::new();
+        let source = Counting::new(Some(vec![calc_store()]));
+        let p = AppsProvider::with_store_source(source.clone(), clock.as_fn(), vec![]);
+        p.set_watching(true);
+        p.refresh_from(vec![shortcut("Blender", r"C:\b.lnk")], || None);
+        // 29 minutes on, the Store list is over 60 s old: Store only.
+        clock.advance(Duration::from_secs(29 * 60));
+        let (full, job) = p.show_job().expect("Store list is old");
+        assert!(!full);
+        job();
+        assert_eq!(source.calls(), 1);
+        // 30 minutes after the last full refresh: a full one, and only one.
+        clock.advance(Duration::from_secs(61));
+        let (full, job) = p.show_job().expect("30 min since the full refresh");
+        assert!(full);
+        assert!(p.show_job().is_none(), "overlapping requests collapse into it");
+        drop(job); // not run (it would read the real Start menu): free the queue slot by hand
+        p.queued.store(false, Ordering::SeqCst);
+        // A full refresh resets the age (it is run here through its stages).
+        p.refresh_from(vec![shortcut("Blender", r"C:\b.lnk")], || None);
+        clock.advance(Duration::from_secs(61));
+        let (full, _) = p.show_job().expect("Store list is old");
+        assert!(!full);
+    }
+
+    #[test]
+    fn an_unwatched_start_menu_is_refreshed_in_full_on_show() {
+        let clock = Clock::new();
+        let p = AppsProvider::with_store_source(Counting::new(None), clock.as_fn(), vec![]);
+        let (full, _) = p.show_job().expect("never read: due");
+        assert!(full);
     }
 
     #[test]
