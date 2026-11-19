@@ -5,9 +5,17 @@
   WriteRegStr HKCU "Software\Classes\AppUserModelId\${BUNDLEID}" "DisplayName" "${PRODUCTNAME}"
 !macroend
 
-; Remove "start at login" and the app id when Flick is uninstalled.
-; tauri-plugin-autostart writes a value named after the product ("Flick")
-; under HKCU ...\Run. Skipped on an update, which must keep both (same guard as
+; Remove Flick's sign-in task before its files go: flick.exe deletes the task
+; and the old Run value. Skipped on an update, which keeps Start at login.
+!macro NSIS_HOOK_PREUNINSTALL
+  ${If} $UpdateMode <> 1
+    ExecWait '"$INSTDIR\flick.exe" --remove-login-task'
+  ${EndIf}
+!macroend
+
+; Remove the old "start at login" and the app id when Flick is uninstalled.
+; The old way (a plugin) wrote a value named after the product ("Flick")
+; under HKCU ...\Run. Skipped on an update, which must keep it (same guard as
 ; Tauri's own).
 !macro NSIS_HOOK_POSTUNINSTALL
   ${If} $UpdateMode <> 1

@@ -6,7 +6,6 @@ use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 
 use crate::{launch, settings_window, window};
 
@@ -35,13 +34,14 @@ pub fn build(
     error: Option<&str>,
     on_reload: impl Fn(&AppHandle) + Send + Sync + 'static,
 ) -> tauri::Result<()> {
-    let start_at_login = app.autolaunch().is_enabled().unwrap_or(false);
     let open = MenuItem::with_id(app, "open", "Open", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let edit = MenuItem::with_id(app, "edit_config", "Edit config", true, None::<&str>)?;
     let reload = MenuItem::with_id(app, "reload", "Reload", true, None::<&str>)?;
+    // Task Scheduler and the registry block, so the real state is read in the
+    // background after the tray exists (`lib.rs`), which then ticks the item.
     let login =
-        CheckMenuItem::with_id(app, "start_at_login", "Start at login", true, start_at_login, None::<&str>)?;
+        CheckMenuItem::with_id(app, "start_at_login", "Start at login", true, false, None::<&str>)?;
     // Kept so the Settings window can move the check mark.
     app.manage(LoginItem(login.clone()));
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -95,24 +95,33 @@ pub fn build(
     Ok(())
 }
 
-/// The menu toggles the check mark on click; make autostart follow it, and put
-/// the mark back to the real state if that fails.
+/// The menu toggles the check mark on click (main thread); make Start at login
+/// follow it, off the main thread (Task Scheduler blocks), and put the mark
+/// back to the real state afterwards.
 fn set_start_at_login(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
-    let manager = app.autolaunch();
     let wanted = item.is_checked().unwrap_or(false);
-    let _ = if wanted { manager.enable() } else { manager.disable() };
-    let actual = manager.is_enabled().unwrap_or(false);
-    if actual != wanted {
-        let _ = item.set_checked(actual);
-    }
-    let _ = app.emit_to(crate::settings::WINDOW, "settings:changed", ());
+    let app = app.clone();
+    std::thread::spawn(move || {
+        // Debug builds only read: they would register the debug exe.
+        let actual = match std::env::current_exe() {
+            Ok(exe) if !cfg!(debug_assertions) => crate::login_task::set(&crate::login_task::WindowsLoginStart, wanted, &exe),
+            Ok(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
+            Err(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
+        };
+        set_login_checked(&app, actual);
+        let _ = app.emit_to(crate::settings::WINDOW, "settings:changed", ());
+    });
 }
 
-/// Puts the tray's "Start at login" check mark on `on`. No-op until the tray exists.
+/// Puts the tray's "Start at login" check mark on `on`, on the main thread.
+/// No-op until the tray exists.
 pub fn set_login_checked(app: &AppHandle, on: bool) {
-    if let Some(item) = app.try_state::<LoginItem>() {
-        let _ = item.0.set_checked(on);
-    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(item) = handle.try_state::<LoginItem>() {
+            let _ = item.0.set_checked(on);
+        }
+    });
 }
 
 /// Windows shows at most this many UTF-16 units of a tray tooltip.

@@ -21,6 +21,7 @@ mod hotkey_notice;
 mod icon;
 mod item_search;
 mod launch;
+mod login_task;
 mod mirror;
 mod net;
 mod notifications;
@@ -57,7 +58,6 @@ use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 
 use answers::number::{Formats, WindowsFormats};
 use bookmarks::{BookmarkSource, Firefox};
@@ -1021,9 +1021,15 @@ fn reminders_path() -> PathBuf {
 }
 
 /// Runs the Win-key helper when this process was started as one (see
-/// winkey_helper.rs) and returns true; false for a normal start.
+/// winkey_helper.rs) and returns true; false for a normal start. Also handles
+/// `--remove-login-task` (the uninstaller's: removes the sign-in task and the
+/// Run value, then exits without a window).
 pub fn run_helper_if_asked() -> bool {
     let args: Vec<String> = std::env::args().collect();
+    if login_task::wants_remove_login_task(&args) {
+        login_task::remove_all(&login_task::WindowsLoginStart);
+        return true;
+    }
     match winkey_helper::helper_parent(&args) {
         Some(parent) => {
             winkey_helper::helper_main(parent);
@@ -1046,7 +1052,6 @@ pub fn run() {
         // Must be first: a second launch shows the running instance and exits.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| window::show(app)))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_autostart::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
@@ -1256,11 +1261,6 @@ fn setup(app: &AppHandle) {
         window::show(app);
     }
 
-    // Before the tray, so its check mark reads the new state. Debug builds would
-    // register the debug exe for start-at-login, so they skip this.
-    if first_run && !cfg!(debug_assertions) {
-        let _ = app.autolaunch().enable();
-    }
     let _ = tray::build(app, hotkey_error.as_deref(), |app| {
         let app = app.clone();
         // Off the main thread: all of these can block. Config first, so a
@@ -1280,12 +1280,30 @@ fn setup(app: &AppHandle) {
         });
     });
 
+    start_login(app, first_run);
+
     let watch_handle = app.clone();
     if let Ok(w) = config::watch(path, move || reload_config(&watch_handle)) {
         *app.state::<AppState>().watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
     }
 
     emit_config_error(app, join_errors(loaded.error, hotkey_error));
+}
+
+/// Start at login, in the background (Task Scheduler and the registry block):
+/// the first run turns it on, any other start moves an old install (Run value,
+/// or a task for another exe) over, then the tray's check mark follows the real
+/// state. Debug builds only read: they would register the debug exe.
+fn start_login(app: &AppHandle, first_run: bool) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let s = &login_task::WindowsLoginStart;
+        let on = match std::env::current_exe() {
+            Ok(exe) if !cfg!(debug_assertions) => login_task::at_start(s, first_run, &exe),
+            _ => login_task::is_enabled(s),
+        };
+        tray::set_login_checked(&app, on);
+    });
 }
 
 /// The threads that build and refresh the indexes, each doing its disk work
