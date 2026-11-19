@@ -129,10 +129,11 @@ pub fn migrate(s: &dyn LoginStart, exe: &Path) {
     }
 }
 
-/// What a start does: the first run turns Start at login on, any other start
-/// moves an old install over (`migrate`). Returns whether it is on afterwards.
-pub fn at_start(s: &dyn LoginStart, first_run: bool, exe: &Path) -> bool {
-    if first_run {
+/// What a start does: the first run (or a restore after a manual upgrade,
+/// see `restore_marker`) turns Start at login on, any other start moves an
+/// old install over (`migrate`). Returns whether it is on afterwards.
+pub fn at_start(s: &dyn LoginStart, turn_on: bool, exe: &Path) -> bool {
+    if turn_on {
         return set(s, true, exe);
     }
     migrate(s, exe);
@@ -155,6 +156,23 @@ fn startup_approved_enabled(bytes: Option<&[u8]>) -> bool {
 /// Windows paths compare without regard to case.
 fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+}
+
+/// The uninstaller's removal: like `remove_all`, and says whether Start at
+/// login was on, so the caller can leave `restore_marker`.
+pub fn remove_for_uninstall(s: &dyn LoginStart) -> bool {
+    let was_on = is_enabled(s);
+    remove_all(s);
+    was_on
+}
+
+/// A file next to the config left by the uninstaller when Start at login was
+/// on. A manual upgrade runs the old version's uninstaller first (the
+/// installer's default "Uninstall before installing"), which removes Start at
+/// login; the new version's next start finds this file, turns it back on and
+/// deletes the file. In-app updates skip the uninstall hook and need none.
+pub fn restore_marker(config: &Path) -> PathBuf {
+    config.with_file_name("start-at-login.restore")
 }
 
 /// Removes the task and the Run value; absent ones are fine.
@@ -516,6 +534,35 @@ mod tests {
         assert!(at_start(&old, false, exe));
         assert_eq!(old.task(), Some(exe.to_path_buf()));
         assert!(!old.run());
+    }
+
+    #[test]
+    fn remove_for_uninstall_says_whether_it_was_on() {
+        let task = FakeLoginStart::with(Some(EXE), false);
+        assert!(remove_for_uninstall(&task));
+        assert_eq!(task.task(), None);
+        let run = FakeLoginStart::with(None, true);
+        assert!(remove_for_uninstall(&run));
+        assert!(!run.run());
+        let off = FakeLoginStart::default();
+        assert!(!remove_for_uninstall(&off));
+    }
+
+    #[test]
+    fn restore_marker_is_next_to_the_config() {
+        let config = Path::new(r"C:\Users\u\AppData\Roaming\Flick\config.toml");
+        assert_eq!(
+            restore_marker(config),
+            PathBuf::from(r"C:\Users\u\AppData\Roaming\Flick\start-at-login.restore")
+        );
+    }
+
+    #[test]
+    fn a_restore_after_a_manual_upgrade_turns_it_back_on() {
+        // The old version's uninstaller removed the task and left the marker.
+        let after_upgrade = FakeLoginStart::default();
+        assert!(at_start(&after_upgrade, true, Path::new(EXE)));
+        assert_eq!(after_upgrade.task(), Some(PathBuf::from(EXE)));
     }
 
     impl LoginStart for FakeLoginStart {
