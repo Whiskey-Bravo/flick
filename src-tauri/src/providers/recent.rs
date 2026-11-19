@@ -212,7 +212,9 @@ impl Provider for RecentProvider {
     fn query(&self, q: &Query) -> Vec<ResultItem> {
         let Some(folder) = &self.folder else { return no_folder(self.name()) };
         let (fs, links, dir) = (Arc::clone(&self.fs), Arc::clone(&self.links), folder.clone());
-        let load = self.store.get(&folder_key(folder), move || read_recent(&*fs, &*links, &dir));
+        // COM is held for the whole read: each link's target then costs a
+        // reference count, not a COM load and unload.
+        let load = self.store.get(&folder_key(folder), move || crate::launch::with_com(|| read_recent(&*fs, &*links, &dir)));
         let entries = match loaded(self.name(), load, &folder.to_string_lossy()) {
             Ok(entries) => entries,
             Err(rows) => return rows,
