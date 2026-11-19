@@ -1908,6 +1908,21 @@ mod tests {
     }
 
     #[test]
+    fn rename_declined_in_windows_prompt_moves_nothing() {
+        let d = disk();
+        let a = d.id("a.txt");
+        d.remember(&a);
+        d.pins.toggle("path", &a);
+        d.ops.fail("rename", crate::file_ops::RENAME_DECLINED);
+        assert_eq!(d.e.rename("files", &a, "c.txt"), Err(crate::file_ops::RENAME_DECLINED.to_string()));
+        assert_eq!(d.ops.calls(), [format!("rename {a} c.txt")]);
+        assert_eq!(d.remembered(&a), (true, 15, true), "nothing forgotten");
+        assert_eq!(d.remembered(&d.id("c.txt")), (false, 0, false));
+        assert_eq!(d.pins.list(), [("files".to_string(), a.clone()), ("path".to_string(), a.clone())]);
+        assert_eq!(d.found("a.txt"), [a]);
+    }
+
+    #[test]
     fn rename_refuses_an_existing_name() {
         let d = disk();
         let (a, b) = (d.id("a.txt"), d.id("b.txt"));

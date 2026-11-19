@@ -360,6 +360,10 @@ fn file_name_of(path: &Path) -> String {
 /// engine treats the delete as not done, with no error to show.
 pub(crate) const DELETE_DECLINED: &str = "delete declined";
 
+/// The error `rename` gives when the user answered No to Windows' prompt: the
+/// item keeps its name; the command answers with no new id and no error.
+pub(crate) const RENAME_DECLINED: &str = "rename declined";
+
 /// How a shell file operation did not finish.
 #[derive(Debug, PartialEq)]
 enum ShellError {
@@ -534,7 +538,10 @@ impl FileOps for SystemFileOps {
         let flags = FOF_NOERRORUI | FOF_SILENT;
         let new = wide_str(new_name);
         crate::window::holding_open(|| shell_operation(path, flags, |op, item| unsafe { op.RenameItem(item, PCWSTR(new.as_ptr()), None) }))
-            .map_err(|_| format!("Couldn't rename {}", file_name_of(path)))?;
+            .map_err(|e| match e {
+                ShellError::Declined => RENAME_DECLINED.to_string(),
+                ShellError::Failed => format!("Couldn't rename {}", file_name_of(path)),
+            })?;
         Ok(target)
     }
 }

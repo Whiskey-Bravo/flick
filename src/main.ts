@@ -580,9 +580,10 @@ function run(effect: Effect) {
     }
     case "rename": {
       const at = shows;
-      invoke<string>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
+      invoke<string | null>("rename", { provider: effect.item.provider, id: effect.item.id, newName: effect.name })
         .then((id) => {
-          if (at === shows) dispatch({ type: "renamed", id });
+          // null: the user said No to a prompt of Windows' own.
+          if (at === shows) dispatch(id === null ? { type: "renameDeclined" } : { type: "renamed", id });
         })
         .catch((err) => {
           if (at === shows) dispatch({ type: "failed", message: actionFailureText(effect.item, "rename", err) });
