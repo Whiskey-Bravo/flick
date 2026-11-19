@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::answers::weather;
@@ -226,7 +225,7 @@ pub fn settings_state(app: AppHandle, state: State<AppState>) -> SettingsState {
         config,
         file_error: read_config(&config::config_path()).err(),
         distros,
-        start_at_login: app.autolaunch().is_enabled().unwrap_or(false),
+        start_at_login: crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
         version: app.package_info().version.to_string(),
     }
 }
@@ -357,9 +356,10 @@ pub fn settings_delete_hotkey(keys: String, app: AppHandle) -> Result<(), String
 /// Returns the state Windows ended up with, and moves the tray's check mark to it.
 #[tauri::command(async)]
 pub fn settings_set_start_at_login(on: bool, app: AppHandle) -> bool {
-    let manager = app.autolaunch();
-    let _ = if on { manager.enable() } else { manager.disable() };
-    let actual = manager.is_enabled().unwrap_or(false);
+    let actual = match std::env::current_exe() {
+        Ok(exe) => crate::login_task::set(&crate::login_task::WindowsLoginStart, on, &exe),
+        Err(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
+    };
     crate::tray::set_login_checked(&app, actual);
     actual
 }

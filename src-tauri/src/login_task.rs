@@ -102,6 +102,16 @@ pub fn migrate(s: &dyn LoginStart, exe: &Path) {
     }
 }
 
+/// What a start does: the first run turns Start at login on, any other start
+/// moves an old install over (`migrate`). Returns whether it is on afterwards.
+pub fn at_start(s: &dyn LoginStart, first_run: bool, exe: &Path) -> bool {
+    if first_run {
+        return set(s, true, exe);
+    }
+    migrate(s, exe);
+    is_enabled(s)
+}
+
 /// Windows paths compare without regard to case.
 fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
@@ -401,6 +411,26 @@ mod tests {
         fn log(&self) -> Vec<String> {
             self.0.lock().unwrap().log.clone()
         }
+    }
+
+    #[test]
+    fn at_start_first_run_turns_it_on() {
+        let fake = FakeLoginStart::default();
+        assert!(at_start(&fake, true, Path::new(r"C:\Flick\flick.exe")));
+        assert_eq!(fake.task(), Some(PathBuf::from(r"C:\Flick\flick.exe")));
+    }
+
+    #[test]
+    fn at_start_later_keeps_off_off_and_moves_old_installs() {
+        let exe = Path::new(r"C:\Flick\flick.exe");
+        let off = FakeLoginStart::default();
+        assert!(!at_start(&off, false, exe));
+        assert_eq!(off.task(), None);
+        assert!(!off.run());
+        let old = FakeLoginStart::with(None, true);
+        assert!(at_start(&old, false, exe));
+        assert_eq!(old.task(), Some(exe.to_path_buf()));
+        assert!(!old.run());
     }
 
     impl LoginStart for FakeLoginStart {

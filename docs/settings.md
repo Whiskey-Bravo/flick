@@ -8,7 +8,7 @@ The Settings window, themes and animations, updates, and the config file.
 
 Open the Settings window from the tray menu (Settings), by typing `settings` in the bar, or with the Open Settings row on the first-run welcome. Every setting is there, so you never have to open the config file. Changes in General, Search, Quick answers and Updates apply at once; a shortcut, workspace or hotkey is saved when you press Save.
 
-- **General**: the hotkey (click the box and press the keys), Win key opens Flick (see [Win key](windows.md#win-key)), Start at login, remembering past searches and launches (with a Clear history button), and the WSL distro.
+- **General**: the hotkey (click the box and press the keys), Win key opens Flick (see [Win key](windows.md#win-key)), Start at login (a task in Task Scheduler starts Flick within seconds of signing in; it is not listed in Task Manager's Startup apps, so switch it here or in the tray menu), remembering past searches and launches (with a Clear history button), and the WSL distro.
 - **Search**: the folders to search (add or remove them) and your pins, which you can reorder or unpin.
 - **Quick answers**: going online, your home city, currency and temperature unit, and the search engine.
 - **Shortcuts**: your list of shortcuts, with an editor that checks each one as you type.
