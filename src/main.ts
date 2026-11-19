@@ -462,7 +462,7 @@ function run(effect: Effect) {
       break;
     }
     case "liveRow": {
-      const key = `${effect.provider} ${effect.id}`;
+      const key = `${effect.provider}\u0000${effect.id}`;
       if (liveInFlight.has(key)) break;
       liveInFlight.add(key);
       const at = shows;
