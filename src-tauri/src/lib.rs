@@ -21,6 +21,7 @@ mod hotkey_notice;
 mod icon;
 mod item_search;
 mod launch;
+mod mirror;
 mod net;
 mod notifications;
 mod paste;
@@ -521,7 +522,15 @@ pub(crate) struct AppState {
     pub(crate) updates: Arc<Updates>,
     /// Last good config. Held for the whole of a reload, which serialises
     /// reloads and every push of config into the providers.
+    ///
+    /// THE MAIN THREAD NEVER LOCKS THIS. A reload holds it while it waits for
+    /// the main thread (the global-shortcut plugin does its work there), so a
+    /// main-thread lock would hang Flick for good. What the main thread needs
+    /// of the config is read from `mirror`, which `store_config` keeps in step.
+    /// Nothing may hold this lock across a tray, menu or window call either.
     pub(crate) config: Mutex<Config>,
+    /// The settings the main thread reads, copied in by `store_config`.
+    pub(crate) mirror: mirror::ConfigMirror,
     /// Result of the last successful WSL detection; `Unknown` until one
     /// succeeds. Lock order: `config`, then this.
     pub(crate) detected: Mutex<WslState>,
@@ -542,6 +551,13 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
+    /// Stores `new` into `config` (`slot`, the locked guard's content) and
+    /// into the main thread's copy; the only place a config is stored after
+    /// start. Returns the config it replaced.
+    fn store_config(&self, slot: &mut Config, new: Config) -> Config {
+        self.mirror.store(slot, new)
+    }
+
     pub(crate) fn config_error(&self) -> Option<String> {
         self.config_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -1182,6 +1198,7 @@ fn setup(app: &AppHandle) {
         providers: providers.clone(),
         updates,
         config: Mutex::new(loaded.config.clone()),
+        mirror: mirror::ConfigMirror::new(&loaded.config),
         detected: Mutex::new(WslState::Unknown),
         hotkey: Mutex::new(None),
         bar_hotkey: Mutex::new(None),
@@ -1519,7 +1536,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     if loaded.config.weather_city.trim() != config.weather_city.trim() {
         p.weather.set_home(loaded.config.weather_city.trim());
     }
-    let old = std::mem::replace(&mut *config, loaded.config);
+    let old = state.store_config(&mut config, loaded.config);
     if loaded.error.is_none() {
         state.updates.set_enabled(config.check_updates);
     }
@@ -1556,12 +1573,10 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
 }
 
 /// The theme and animation level of the config in force.
+/// Read from the main thread's copy: the `appearance` command and the setup
+/// run on the main thread, which never locks the config.
 fn current_appearance(state: &AppState) -> theme::Appearance {
-    let config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-    theme::Appearance {
-        tab_completion: config.tab_completion,
-        ..theme::resolve(&config.theme, &config.custom_theme, &config.animations)
-    }
+    state.mirror.appearance()
 }
 
 /// What a page applies when it loads: the theme's colours and the animation

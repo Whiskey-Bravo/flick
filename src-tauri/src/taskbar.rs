@@ -103,9 +103,9 @@ thread_local! {
 /// The bar was shown: bring the taskbar up if the setting is on and the
 /// taskbar hides by itself. Safe to call when it is already up.
 pub fn raise(app: &AppHandle) {
-    let on = app
-        .try_state::<crate::AppState>()
-        .is_some_and(|s| s.config.lock().unwrap_or_else(|e| e.into_inner()).show_taskbar);
+    // The main thread's copy: the config's own lock may be held by a reload
+    // that is waiting for this very thread.
+    let on = app.try_state::<crate::AppState>().is_some_and(|s| s.mirror.show_taskbar());
     if !on {
         return;
     }
