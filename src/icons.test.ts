@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { builtinName, fallbackName, serverUrl, pickIconSrc } from "./icons";
+import { builtinName, fallbackName, serverUrl, pickIconSrc, forgetFailedIcons } from "./icons";
 
 describe("icons", () => {
   it("builds the server url from the encoded key and scaled size", () => {
@@ -25,5 +25,13 @@ describe("icons", () => {
     expect(pickIconSrc("a", loaded, failed, "fb")).toEqual({ src: "a", visible: true });
     expect(pickIconSrc("b", loaded, failed, "fb")).toEqual({ src: "fb", visible: true });
     expect(pickIconSrc("c", loaded, failed, "fb")).toEqual({ src: "c", visible: false });
+  });
+  it("forgets failures when the bar is shown, keeping loaded icons", () => {
+    const loaded = new Set(["a"]);
+    const failed = new Set(["b"]);
+    forgetFailedIcons(failed);
+    expect(failed.size).toBe(0);
+    expect(pickIconSrc("b", loaded, failed, "fb")).toEqual({ src: "b", visible: false });
+    expect(pickIconSrc("a", loaded, failed, "fb")).toEqual({ src: "a", visible: true });
   });
 });

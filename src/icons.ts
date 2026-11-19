@@ -32,3 +32,9 @@ export function pickIconSrc(
   if (failed.has(url)) return { src: fallback, visible: true };
   return { src: url, visible: loaded.has(url) };
 }
+
+// A failed icon is asked for again the next time the bar is shown (not on
+// every render while it is shown); loaded icons stay cached.
+export function forgetFailedIcons(failed: Set<string>): void {
+  failed.clear();
+}
