@@ -560,9 +560,9 @@ function run(effect: Effect) {
   }
 }
 
+// Text typed through an IME or a dead key is ordinary search text: rewriting
+// the field mid-composition would garble it, so it never switches to a path.
 input.addEventListener("input", (e) => dispatch({ type: "input", text: input.value, composing: (e as InputEvent).isComposing }));
-// The composed text is final now: let the reducer treat it as ordinary typing.
-input.addEventListener("compositionend", () => dispatch({ type: "input", text: input.value, composing: false }));
 
 const KEYS = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape", "F1", "p", "Tab"] as const;
 // Browser defaults that make no sense in a launcher: focus change, help, reload, print, find.
