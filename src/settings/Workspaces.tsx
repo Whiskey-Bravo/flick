@@ -8,6 +8,7 @@ import {
   type WorkspaceDef,
 } from "./api";
 import { ItemPicker } from "./ItemPicker";
+import { oneAtATime } from "./oneAtATime";
 import type { LeaveGuard } from "./Shortcuts";
 import {
   addItem,
@@ -101,7 +102,15 @@ export function Workspaces({ state, guard }: { state: SettingsState; guard: Leav
     }
   }, [state]);
 
-  const doSave = async (): Promise<boolean> => {
+  // The editor as it is now: the leave question's Save (made by an older
+  // render) sends what the editor shows when it is clicked.
+  const now = useRef({ form, original });
+  now.current = { form, original };
+  const [saving, setSaving] = useState(false);
+  const [once] = useState(() => oneAtATime(setSaving));
+
+  const doSave = (): Promise<boolean> => once(async () => {
+    const { form, original } = now.current;
     setSaveError(null);
     try {
       await settingsSaveWorkspace(original, toWsDef(form));
@@ -115,7 +124,7 @@ export function Workspaces({ state, guard }: { state: SettingsState; guard: Leav
       setSaveError(message(e));
       return false;
     }
-  };
+  });
 
   const valid = check?.key === key && check.error === null && form.name.trim() !== "";
 
@@ -202,8 +211,8 @@ export function Workspaces({ state, guard }: { state: SettingsState; guard: Leav
         <div class="sc-editor">
           {asking && (
             <div class="sc-ask" role="alertdialog" ref={askRef}>
-              <span>This shortcut has unsaved changes.</span>
-              <button disabled={!valid} onClick={() => asking("save")}>
+              <span>This workspace has unsaved changes.</span>
+              <button disabled={!valid || saving} onClick={() => asking("save")}>
                 Save
               </button>
               <button onClick={() => asking("discard")}>Discard</button>
@@ -259,7 +268,7 @@ export function Workspaces({ state, guard }: { state: SettingsState; guard: Leav
           )}
 
           <div class="sc-actions">
-            <button class="primary" disabled={!valid || !dirty} onClick={() => void doSave()}>
+            <button class="primary" disabled={!valid || !dirty || saving} onClick={() => void doSave()}>
               Save
             </button>
             {original !== null &&
