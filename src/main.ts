@@ -7,8 +7,8 @@ import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, pickIconSrc, serverUrl } from "./icons";
 import {
-  capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
-  panelItem, queryArgs, queryReply, retryArgs, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type State,
+  arrowActsOnList, capOf, failureText, initial, movedEnough, reduce, rowsFromWheel, completion, highlighted, visibleItems,
+  panelItem, queryArgs, queryReply, retryArgs, shownRows as allRows, wantsTick, type Effect, type Event, type Item, type MenuAction, type Point, type Row, type State,
 } from "./bar";
 
 type Event_ = MouseEvent;
@@ -238,14 +238,18 @@ function moveTo(y: number, rows: number) {
 }
 
 // Rows on screen at the last render, so only rows that are new fade in.
-let shownRows = new Set<string>();
-const rowKey = (item: Item): string => `${item.provider}\u0000${item.id}`;
+let paintedKeys = new Set<string>();
 
-function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
+// A small chevron, drawn like the other inline icons: pointing right, turned down when open.
+const CHEVRON = '<svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5 10.5 8 6 12.5"/></svg>';
+
+function renderItem(item: Row, index: number, fresh: boolean): HTMLLIElement {
   const li = document.createElement("li");
   li.className = "result";
   li.dataset.index = String(index);
-  li.dataset.key = rowKey(item);
+  li.dataset.key = item.key;
+  if (item.depth > 0) li.style.setProperty("--depth", String(Math.min(item.depth, 5)));
+  if (item.provider === "fold") li.classList.add("made");
   if (fresh) {
     li.classList.add("fresh");
     li.style.setProperty("--at", String(index - state.top));
@@ -270,6 +274,12 @@ function renderItem(item: Item, index: number, fresh: boolean): HTMLLIElement {
     star.alt = "Pinned";
     star.src = svgUrl("star");
     li.append(star);
+  }
+  if (item.fold !== "none") {
+    const chevron = document.createElement("span");
+    chevron.className = item.fold === "unfolded" ? "chevron open" : "chevron";
+    chevron.innerHTML = CHEVRON;
+    li.append(chevron);
   }
   return li;
 }
@@ -383,8 +393,8 @@ function render() {
   qrPanel.hidden = !qr;
   if (qr) renderQr(qr);
   listWrap.hidden = rows.length === 0 || !!qr;
-  list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i, !shownRows.has(rowKey(item)))));
-  shownRows = new Set(rows.map(rowKey));
+  list.replaceChildren(...rows.map((item, i) => renderItem(item, state.top + i, !paintedKeys.has(item.key))));
+  paintedKeys = new Set(rows.map((r) => r.key));
   list.style.setProperty("--rows", String(rows.length));
   // 5px: the list's top border and padding. Out of view: parked on the nearest edge.
   const at = Math.max(0, Math.min(state.selected - state.top, Math.max(0, rows.length - 1)));
@@ -401,7 +411,7 @@ function render() {
   ghostTyped.textContent = whole === null ? "" : state.text;
   ghostRest.textContent = whole === null ? "" : whole.slice(state.text.length);
   const cap = capOf(state);
-  const len = state.items.length;
+  const len = allRows(state).length;
   track.hidden = len <= cap;
   if (len > cap) {
     thumb.style.height = `${(cap / len) * 100}%`;
@@ -418,9 +428,10 @@ function render() {
 /// icons and the animations stay as they are. False when the row's element is
 /// not on screen (the caller then renders normally).
 function patchLiveRow(item: Item): boolean {
-  const key = rowKey(item);
+  // Live rows are search results (depth 0).
+  const shown = state.items.find((i) => i.provider === item.provider && i.id === item.id);
+  const key = allRows(state).find((r) => r.depth === 0 && r.provider === item.provider && r.id === item.id)?.key;
   const li = Array.from(list.children).find((c): c is HTMLElement => c instanceof HTMLElement && c.dataset.key === key);
-  const shown = state.items.find((i) => rowKey(i) === key);
   const title = li?.querySelector(".title");
   const sub = li?.querySelector(".subtitle");
   if (!shown || !title || !sub) return false;
@@ -502,6 +513,20 @@ function run(effect: Effect) {
         });
       break;
     }
+    case "unfold": {
+      const at = shows;
+      const { key, path } = effect;
+      type Reply = Extract<Event, { type: "unfolded" }>["reply"];
+      const denied: Reply = { state: "denied", rows: [], more: 0, typed: "" };
+      invoke<Reply>("unfold", { path })
+        .then((reply) => {
+          if (at === shows) dispatch({ type: "unfolded", key, path, reply });
+        })
+        .catch(() => {
+          if (at === shows) dispatch({ type: "unfolded", key, path, reply: denied });
+        });
+      break;
+    }
     case "loadPast":
       invoke<string[]>("past_searches")
         .then((items) => dispatch({ type: "past", items }))
@@ -526,12 +551,16 @@ function run(effect: Effect) {
     case "hide":
       invoke("hide").catch(() => {});
       break;
+    default: {
+      const unhandled: never = effect;
+      void unhandled;
+    }
   }
 }
 
 input.addEventListener("input", () => dispatch({ type: "input", text: input.value }));
 
-const KEYS = ["ArrowUp", "ArrowDown", "Enter", "Escape", "F1", "p", "Tab"] as const;
+const KEYS = ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Enter", "Escape", "F1", "p", "Tab"] as const;
 // Browser defaults that make no sense in a launcher: focus change, help, reload, print, find.
 const SWALLOWED = ["Tab", "F1", "F5"];
 const SWALLOWED_CTRL = ["p", "f", "r"];
@@ -569,6 +598,12 @@ input.addEventListener("keydown", (e) => {
   const key = KEYS.find((k) => k === (e.key.length === 1 ? e.key.toLowerCase() : e.key));
   if (!key || e.isComposing) return;
   if (key === "p" && !e.ctrlKey) return; // plain p is text
+  // Left and Right move the caret unless it sits at the end of the text.
+  if (
+    (key === "ArrowLeft" || key === "ArrowRight") &&
+    !arrowActsOnList(key, input.selectionStart, input.selectionEnd, input.value.length, e.ctrlKey || e.shiftKey || e.altKey || e.metaKey)
+  )
+    return;
   e.preventDefault();
   // Held Enter/Escape must not repeat: it would skip the two-step confirm.
   if (e.repeat && (key === "Enter" || key === "Escape" || key === "F1" || key === "p" || key === "Tab")) return;
@@ -619,6 +654,10 @@ document.addEventListener("click", (e) => {
     return;
   }
   const index = rowIndex(e);
+  if (index !== null && target.closest(".chevron")) {
+    dispatch({ type: "fold", index });
+    return;
+  }
   if (index !== null) dispatch({ type: "click", index, ctrl: e.ctrlKey, shift: e.shiftKey });
   else if (state.menu) dispatch({ type: "menuClose" });
 });

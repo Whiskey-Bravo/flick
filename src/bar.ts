@@ -104,6 +104,12 @@ function foldsShown(items: Item[], unfolded: Record<string, Fold>): Record<strin
 // or its full path before the back end said.
 const typedOf = (f: Fold): string => f.typed || f.path;
 
+/** Left and Right act on the list only with the caret at the end of the text,
+ *  nothing selected and no modifier held; otherwise they move the caret. */
+export function arrowActsOnList(_key: string, selStart: number | null, selEnd: number | null, length: number, mods: boolean): boolean {
+  return !mods && selStart === length && selEnd === length;
+}
+
 // The mouse wheel scrolls the list by whole rows: the remainder carries over.
 export const WHEEL_PX_PER_ROW = 40;
 export function rowsFromWheel(acc: number, deltaY: number): { rows: number; acc: number } {
@@ -477,7 +483,7 @@ function step(s: State, e: Event): Result {
       // Text added at the end while the selection is inside an unfolded folder:
       // the bar switches to that folder's path, followed by what was added.
       const row = shownRows(s)[s.selected];
-      const f = row && row.parent !== null ? s.unfolded[row.parent] : undefined;
+      const f = row && row.parent !== null && s.scope === null ? s.unfolded[row.parent] : undefined;
       const text = f && e.text.length > s.text.length && e.text.startsWith(s.text) ? typedOf(f) + e.text.slice(s.text.length) : e.text;
       return done(
         fit({

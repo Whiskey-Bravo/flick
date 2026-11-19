@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
+import { arrowActsOnList, completion, failureText, highlighted, initial, menuActions, movedEnough, panelItem, queryArgs, queryReply, reduce, retryArgs, rowsFromWheel, shownRows, visibleItems, wantsTick, type Effect, type Event, type Fold, type Item, type State } from "./bar";
 
 const item = (id: string, confirm = false): Item => ({
   id, provider: "apps", title: id, subtitle: "", confirm,
@@ -1677,6 +1677,13 @@ describe("folder unfolding", () => {
       // On the unfolded folder itself (depth 0): ordinary.
       expect(run(at(tree(), 0), { type: "input", text: "projf" }).state.text).toBe("projf");
     });
+
+    it("inside_a_pick_list_typing_is_ordinary", () => {
+      const s = { ...at(tree(), 2), scope: { name: "web", prompt: "Search" } };
+      const r = run(s, { type: "input", text: "projf" });
+      expect(r.state.text).toBe("projf");
+      expect(r.effects).toEqual([{ type: "query", text: "projf", scope: "web" }]);
+    });
   });
 
   describe("what folds", () => {
@@ -1782,5 +1789,16 @@ describe("folder unfolding", () => {
       unchanged({ ...s, awaiting: true }, { type: "fold", index: 1 });
       unchanged({ ...s, pending: true }, { type: "fold", index: 1 });
     });
+  });
+});
+
+describe("arrowActsOnList", () => {
+  it("acts_only_with_the_caret_at_the_end_and_no_selection_or_modifier", () => {
+    expect(arrowActsOnList("ArrowRight", 5, 5, 5, false)).toBe(true);
+    expect(arrowActsOnList("ArrowLeft", 0, 0, 0, false)).toBe(true);
+    expect(arrowActsOnList("ArrowRight", 2, 2, 5, false)).toBe(false);
+    expect(arrowActsOnList("ArrowLeft", 0, 5, 5, false)).toBe(false);
+    expect(arrowActsOnList("ArrowRight", 5, 5, 5, true)).toBe(false);
+    expect(arrowActsOnList("ArrowRight", null, null, 5, false)).toBe(false);
   });
 });

@@ -365,6 +365,45 @@ input {
   color: var(--warning);
 }
 
+/* Rows inside an unfolded folder: content indented 20px per level (the
+   highlight and the row background stay full width). */
+.result {
+  padding-left: calc(14px + var(--depth, 0) * 20px);
+}
+
+/* Rows the page makes inside a folder (Reading..., Empty folder, N more...). */
+.result.made .title,
+.result.made .subtitle {
+  color: var(--dim);
+}
+
+/* The fold control at a folder row's right end: right when folded, down when open. */
+.chevron {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin-right: -6px;
+  border-radius: 6px;
+  color: var(--dim);
+}
+
+.chevron svg {
+  display: block;
+  transition: transform 120ms;
+}
+
+.chevron.open svg {
+  transform: rotate(90deg);
+}
+
+.chevron:hover {
+  color: var(--text, currentColor);
+  background: var(--row);
+}
+
 input::placeholder {
   color: var(--faint);
   opacity: 1;

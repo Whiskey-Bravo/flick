@@ -2346,6 +2346,7 @@ mod tests {
                 "close chrome / quit all",
                 "report.pdf",
                 r"C:\ / ~\Documents\",
+                "Right / Left",
                 "dl",
                 "recent",
                 "v / v invoice",
@@ -2383,7 +2384,7 @@ mod tests {
                 "Tab",
             ]
         );
-        let flick = &help[37];
+        let flick = &help[38];
         assert_eq!(flick.subtitle, "open the config file to change the hotkey, file folders and shortcuts");
         assert_eq!(flick.id, "flick config");
     }
@@ -2391,7 +2392,7 @@ mod tests {
     #[test]
     fn help_word_ignores_case() {
         let r = rig(vec![], vec![]);
-        assert_eq!(r.engine.query("Help", None).len(), 45);
+        assert_eq!(r.engine.query("Help", None).len(), 46);
         let filtered = r.engine.query("HELP fi", None);
         assert!(!filtered.is_empty());
         assert!(filtered.iter().all(|i| i.provider == engine::HELP));
