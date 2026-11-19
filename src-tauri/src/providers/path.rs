@@ -623,8 +623,8 @@ mod tests {
         roots.set(vec![PathBuf::from(r"C:\Cloud")]);
         let row = |p: &str, dir| entry_row_in(&roots, "path", Path::new(p), dir, String::new(), 0, String::new()).actions;
         assert_eq!(row(r"C:\Cloud\a.txt", false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
-        assert_eq!(row(r"C:\Cloud\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
-        assert_eq!(row(r"C:\CloudBackup\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
+        assert_eq!(row(r"C:\Cloud\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(row(r"C:\CloudBackup\d", true), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, MoreOptions]);
         assert_eq!(row(r"C:\", true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
         // Rename is the rename command and More options is not handled yet; a drive root cannot be deleted.
         let r = rig();

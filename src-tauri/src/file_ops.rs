@@ -48,7 +48,7 @@ pub trait FileOps: Send + Sync {
 /// `\\server\share\`, which cannot be compressed, renamed, deleted or kept offline.
 pub(crate) fn menu(is_dir: bool, cloud: bool, drive_root: bool) -> Vec<Action> {
     let mut actions = if is_dir {
-        vec![Action::OpenFolder, Action::OpenTerminal, Action::CopyPath, Action::Compress, Action::Properties]
+        vec![Action::OpenFolder, Action::OpenTerminal, Action::CopyPath, Action::Compress, Action::Rename, Action::Delete, Action::Properties]
     } else {
         vec![Action::Reveal, Action::OpenWith, Action::CopyFile, Action::CopyPath, Action::Rename, Action::Delete]
     };
@@ -640,13 +640,13 @@ mod tests {
 
     #[test]
     fn menu_orders_for_file_and_folder() {
-        assert_eq!(menu(true, true, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(menu(true, true, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
         assert_eq!(menu(false, true, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
     }
 
     #[test]
     fn menu_without_cloud_drops_the_pair() {
-        assert_eq!(menu(true, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, MoreOptions]);
+        assert_eq!(menu(true, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, MoreOptions]);
         assert_eq!(menu(false, false, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
     }
 

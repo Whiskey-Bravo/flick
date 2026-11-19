@@ -1537,7 +1537,7 @@ mod tests {
         );
         assert_eq!(
             p.item(r"C:\Cloud\dir").unwrap().actions,
-            [OpenFolder, OpenTerminal, CopyPath, Compress, Properties, KeepOffline, FreeUpSpace, MoreOptions]
+            [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, KeepOffline, FreeUpSpace, MoreOptions]
         );
         assert_eq!(p.item(r"C:\x\b.txt").unwrap().actions, [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
         assert_eq!(p.act(r"C:\x\b.txt", Rename), Err("can't do that here".to_string()));
