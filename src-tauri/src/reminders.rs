@@ -110,7 +110,11 @@ pub struct Reminders {
     now: Clock,
     fire: Fire,
     max_sleep: Duration,
+    /// Held across the file's reads and writes.
     state: Mutex<State>,
+    /// A copy of `State::items`, for [`Reminders::pending`]: the query path
+    /// never waits on `state` while a slow disk reads or writes the file.
+    shown: Mutex<Vec<Reminder>>,
     /// Woken by `add` and `cancel`.
     wake: Condvar,
     started: AtomicBool,
@@ -134,6 +138,7 @@ impl Reminders {
             fire,
             max_sleep,
             state: Mutex::new(State { items: vec![], next_id: 1, loaded: false, dirty: false, overdue: vec![] }),
+            shown: Mutex::new(vec![]),
             wake: Condvar::new(),
             started: AtomicBool::new(false),
         })
@@ -169,6 +174,7 @@ impl Reminders {
         }
         st.dirty = false;
         st.next_id = st.next_id.saturating_add(1);
+        self.publish(&st);
         self.wake.notify_all();
         Ok(r)
     }
@@ -183,14 +189,20 @@ impl Reminders {
             return false;
         };
         st.items.remove(at);
+        self.publish(&st);
         self.persist(&mut st);
         self.wake.notify_all();
         true
     }
 
-    /// Pending items by due. Memory only.
+    /// Pending items by due. Memory only, and never waits on a file read or write.
     pub fn pending(&self) -> Vec<Reminder> {
-        self.lock().items.clone()
+        self.shown.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// Copies the items for [`Reminders::pending`]; called after each change.
+    fn publish(&self, st: &State) {
+        *self.shown.lock().unwrap_or_else(PoisonError::into_inner) = st.items.clone();
     }
 
     /// True once the file has been read.
@@ -246,6 +258,7 @@ impl Reminders {
         st.items = items;
         st.loaded = true;
         st.dirty = changed;
+        self.publish(st);
     }
 
     /// Saves `items` and records whether the file now matches them.
@@ -275,6 +288,7 @@ impl Reminders {
             return vec![];
         }
         let due: Vec<Reminder> = st.items.drain(..n).collect();
+        self.publish(st);
         self.persist(st);
         due
     }
@@ -291,6 +305,7 @@ impl Reminders {
         let (missed, rest): (Vec<Reminder>, Vec<Reminder>) =
             std::mem::take(&mut st.items).into_iter().partition(|r| overdue.contains(&r.id));
         st.items = rest;
+        self.publish(st);
         if !missed.is_empty() {
             self.persist(st);
         }
@@ -692,6 +707,20 @@ mod tests {
         assert_eq!(g.r.pending(), vec![r]);
         let aside = g.dir.path().join("reminders.json.corrupt");
         assert_eq!(std::fs::read_to_string(aside).unwrap(), "not json {", "kept for the user");
+    }
+
+    #[test]
+    fn pending_never_waits_while_the_file_is_read_or_written() {
+        let g = rig(None);
+        let r = g.r.add(g.now() + Duration::from_secs(60), "pizza", false).unwrap();
+        // The state lock is held, as during a slow save.
+        let _busy = g.r.lock();
+        let (tx, rx) = channel();
+        let reminders = Arc::clone(&g.r);
+        std::thread::spawn(move || {
+            let _ = tx.send(reminders.pending());
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_secs(1)), Ok(vec![r]));
     }
 
     #[test]
