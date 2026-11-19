@@ -12,6 +12,7 @@ import {
 import { DIRECT_HINT, WEAK_COMBO, directComboOk, hotkeyFromEvent, hotkeyKeys } from "./hotkey";
 import { emptyHkForm as empty, hkSync, isHkDirty, keepRemoveError, type HkForm, type RemoveError } from "./hotkeyForm";
 import { ItemPicker } from "./ItemPicker";
+import { oneAtATime } from "./oneAtATime";
 import type { LeaveGuard } from "./Shortcuts";
 import "./shortcuts.css";
 import "./workspaces.css";
@@ -133,7 +134,15 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
     }
   }, [state]);
 
-  const doSave = async (): Promise<boolean> => {
+  // The editor as it is now: the leave question's Save (made by an older
+  // render) sends what the editor shows when it is clicked.
+  const now = useRef({ form, original });
+  now.current = { form, original };
+  const [saving, setSaving] = useState(false);
+  const [once] = useState(() => oneAtATime(setSaving));
+
+  const doSave = (): Promise<boolean> => once(async () => {
+    const { form, original } = now.current;
     if (!form.item) return false;
     setSaveError(null);
     try {
@@ -147,7 +156,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
       setSaveError(message(e));
       return false;
     }
-  };
+  });
 
   const pending = useRef<Promise<boolean> | null>(null);
   const mayLeave = (): Promise<boolean> => {
@@ -241,8 +250,8 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
         <div class="sc-editor">
           {asking && (
             <div class="sc-ask" role="alertdialog" ref={askRef}>
-              <span>This shortcut has unsaved changes.</span>
-              <button disabled={!valid} onClick={() => asking("save")}>
+              <span>This hotkey has unsaved changes.</span>
+              <button disabled={!valid || saving} onClick={() => asking("save")}>
                 Save
               </button>
               <button onClick={() => asking("discard")}>Discard</button>
@@ -283,7 +292,7 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
           )}
 
           <div class="sc-actions">
-            <button class="primary" disabled={!valid || !dirty} onClick={() => void doSave()}>
+            <button class="primary" disabled={!valid || !dirty || saving} onClick={() => void doSave()}>
               Save
             </button>
           </div>

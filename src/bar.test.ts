@@ -414,10 +414,13 @@ describe("bar", () => {
     ]);
   });
 
-  it("enter after an empty fill is queued, not run on old items", () => {
+  it("enter after an empty fill is not run on old items, nor on rows not seen yet", () => {
     const s = run(withItems(item("old")), { type: "outcome", outcome: { kind: "fill", text: "" } }, key("Enter"));
     expect(s.effects).toEqual([]);
-    expect(s.state.queued).toBe("none");
+    expect(s.state.queued).toBeNull();
+    // Text filled in: the Enter waits for its rows.
+    const t = run(withItems(item("old")), { type: "outcome", outcome: { kind: "fill", text: "a" } }, key("Enter"));
+    expect(t.state.queued).toBe("none");
   });
 
   it("F1 during a pending activation keeps Enter blocked", () => {
@@ -455,6 +458,15 @@ describe("bar", () => {
     const r = run(early.state, { type: "results", items: [item("Alpha"), item("beta")] });
     expect(r.effects).toEqual([]);
     expect(r.state.items).toHaveLength(2);
+  });
+
+  it("enter right after Esc out of a pick list is not queued", () => {
+    const scoped = run(initial, { type: "outcome", outcome: { kind: "step", prompt: "proj", scope: "shortcut:proj" } }, { type: "results", items: [item("Alpha")] }).state;
+    const left = run(scoped, key("Escape"), key("Enter"));
+    expect(left.state.queued).toBeNull();
+    // The empty bar's rows arrive: none of them is opened unseen.
+    const r = run(left.state, { type: "results", items: [{ ...item("p"), origin: "pin" }] });
+    expect(r.effects).toEqual([]);
   });
 
   it("enter after typing inside a pick list is still queued", () => {
@@ -1232,6 +1244,21 @@ describe("mouse and menu", () => {
           expect([s.rename, s.text]).toEqual([null, "x"]);
         }
       });
+
+      it("a blur while the rename is on its way keeps rename mode and the typed name", () => {
+        // Windows' own prompt (overwrite, change the extension) takes the focus.
+        const sent = run(start().state, { type: "input", text: "new.docx" }, key("Enter")).state;
+        const blurred = run(sent, { type: "blurred" }).state;
+        expect([blurred.rename !== null, blurred.text, blurred.pending]).toEqual([true, "new.docx", true]);
+        // No in the prompt: the typed name is still there to send again.
+        const declined = run(blurred, { type: "renameDeclined" }).state;
+        expect([declined.rename !== null, declined.text]).toEqual([true, "new.docx"]);
+        expect(kind(run(declined, key("Enter")))).toEqual(["rename"]);
+        // Yes: the rename ends as usual, back on the text from before.
+        const ok = run(blurred, { type: "renamed", id: "C:/x/new.docx" });
+        expect([ok.state.rename, ok.state.text]).toEqual([null, "x"]);
+        expect(ok.effects).toEqual([{ type: "query", text: "x", scope: null, keepSelection: true }]);
+      });
     });
   });
 
@@ -1246,6 +1273,13 @@ describe("mouse and menu", () => {
       expect(run(a, { type: "wheel", rows: -100 }).state.top).toBe(0);
       const b = run(s, { type: "wheel", rows: 5 }, key("ArrowDown")).state;
       expect([b.selected, b.top]).toEqual([1, 1]);
+    });
+
+    it("tab_on_a_row_scrolled_out_of_view_brings_it_back_before_the_menu_opens", () => {
+      const s = withItems(rich("r0", { actions: ["copy_path"] }), ...Array.from({ length: 19 }, (_, i) => item(`r${i + 1}`)));
+      const r = run(s, { type: "wheel", rows: 5 }, key("Tab")).state;
+      expect(r.menu?.index).toBe(0);
+      expect(r.top).toBe(0);
     });
 
     it("wheel_closes_an_open_menu", () => {
@@ -1282,6 +1316,17 @@ describe("mouse and menu", () => {
       const typed = run(initial, { type: "shown" }, { type: "input", text: "a" }, { type: "results", items: [item("a")] });
       expect(run(typed.state, { type: "updateChanged" }).effects).toEqual([]);
       expect(run(empty.state, { type: "hidden" }, { type: "updateChanged" }).effects).toEqual([]);
+    });
+
+    it("rows still shown for older text are not kept: the empty bar opens on the first pin", () => {
+      // "fi" typed and deleted: the "fi" rows show until the empty bar's answer comes.
+      const s = run(initial, { type: "shown" }, { type: "input", text: "fi" }, { type: "results", items: [item("Firefox")] }, { type: "input", text: "" }).state;
+      const r = run(s, { type: "updateChanged" });
+      expect(r.state.keep).toBeNull();
+      const update = rich("update", { provider: "update" });
+      const pin = rich("p", { origin: "pin" });
+      const after = run(r.state, { type: "results", items: [update, pin] }).state;
+      expect(after.selected).toBe(1);
     });
   });
 

@@ -48,11 +48,15 @@ export function General({ state }: { state: SettingsState }) {
     // One chain, so a quick pause then resume reach Rust in that order.
     calls = calls.then(() => settingsPauseHotkey(on)).catch(() => {});
   };
+  // Capturing as it is now, for a save that ends after a new capture started.
+  const capturingNow = useRef(false);
   const startCapture = () => {
     pause(true);
+    capturingNow.current = true;
     setCapturing(true);
   };
   const stopCapture = () => {
+    capturingNow.current = false;
     setCapturing(false);
     pause(false);
   };
@@ -79,9 +83,13 @@ export function General({ state }: { state: SettingsState }) {
     }
     const combo = hotkeyFromEvent(e);
     if (combo === null) return;
+    capturingNow.current = false;
     setCapturing(false);
     const done = combo !== config.hotkey ? save("hotkey", { key: "hotkey", value: combo }) : Promise.resolve();
-    void done.then(() => pause(false));
+    // The hotkey stays released when the button was clicked again meanwhile.
+    void done.then(() => {
+      if (!capturingNow.current) pause(false);
+    });
   };
 
   const setStartAtLogin = async (on: boolean) => {

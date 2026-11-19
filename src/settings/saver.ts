@@ -14,12 +14,15 @@ export function useSaver(state: SettingsState) {
     if (!sameConfig(last.current, state.config)) setErrors({});
     last.current = state.config;
   }, [state]);
-  const save = async (field: string, setting: Setting) => {
+  /** Saves one setting; resolves true when it was saved. */
+  const save = async (field: string, setting: Setting): Promise<boolean> => {
     try {
       await settingsSet(setting);
       setErrors((e) => (e[field] ? { ...e, [field]: "" } : e));
+      return true;
     } catch (err) {
       setErrors((e) => ({ ...e, [field]: String(err) }));
+      return false;
     }
   };
   return { errors, save };

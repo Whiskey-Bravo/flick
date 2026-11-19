@@ -1,4 +1,4 @@
-import { useEffect, useState } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import { settingsCheckCity, settingsCurrencies, type SettingsState } from "./api";
 import { SEARCH_ENGINES, TEMPERATURE, engineChoice, engineError } from "./choices";
 import { useSaver } from "./saver";
@@ -22,15 +22,22 @@ export function Answers({ state }: { state: SettingsState }) {
   useEffect(() => {
     settingsCurrencies().then(setCurrencies, () => {});
   }, []);
-  // The file is the truth: follow it after every reload.
+  // The city lookups asked, and whether the latest is still on its way. Only
+  // the latest one's answer counts, so a slow older lookup can't save its city.
+  const lookup = useRef({ n: 0, running: false });
+  // The file is the truth: follow it after every reload. Not the city while
+  // a lookup runs: a miss keeps the typed text.
   useEffect(() => {
-    setCity(config.weather_city);
+    if (!lookup.current.running) setCity(config.weather_city);
     setEngine(config.search_engine);
     setCustom((c) => c || engineChoice(config.search_engine) === "Custom");
   }, [state]);
 
   const checkCity = async () => {
     const wanted = city.trim();
+    // Whatever happens now, an older lookup's answer no longer counts.
+    const n = ++lookup.current.n;
+    lookup.current.running = false;
     if (wanted === config.weather_city) return;
     if (wanted === "") {
       setCityNote(null);
@@ -44,13 +51,17 @@ export function Answers({ state }: { state: SettingsState }) {
       void save("weather_city", { key: "weather_city", value: wanted });
       return;
     }
+    lookup.current.running = true;
+    let found: { ok: boolean; text: string };
     try {
-      const label = await settingsCheckCity(wanted);
-      setCityNote({ ok: true, text: label });
-      void save("weather_city", { key: "weather_city", value: wanted });
+      found = { ok: true, text: await settingsCheckCity(wanted) };
     } catch (e) {
-      setCityNote({ ok: false, text: String(e) });
+      found = { ok: false, text: String(e) };
     }
+    if (n !== lookup.current.n) return;
+    lookup.current.running = false;
+    setCityNote(found);
+    if (found.ok) void save("weather_city", { key: "weather_city", value: wanted });
   };
 
   const choice = custom ? "Custom" : engineChoice(config.search_engine);

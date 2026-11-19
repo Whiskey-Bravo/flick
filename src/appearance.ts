@@ -155,3 +155,26 @@ export function normalizeColor(color: string): string | null {
   const c = channels(color);
   return c ? `#${c.map((v) => v.toString(16).padStart(2, "0")).join("")}` : null;
 }
+
+/** The custom colours to save from the edited ones: each that is a colour,
+ *  normalized; one still being typed keeps its saved value. Null when such a
+ *  one has no saved value to fall back on. */
+export function colorsToSave(draft: Colors, saved: Colors | undefined): Colors | null {
+  const out = { ...draft };
+  for (const name of COLOR_NAMES) {
+    const c = normalizeColor(draft[name]) ?? (saved ? normalizeColor(saved[name]) : null);
+    if (c === null) return null;
+    out[name] = c;
+  }
+  return out;
+}
+
+/** The edited custom colours after the file reloads: the file's, except a
+ *  value still being typed (not a colour yet), which stays. */
+export function draftAfterReload(saved: Colors | undefined, draft: Colors | null): Colors | null {
+  if (!saved) return null;
+  if (!draft) return saved;
+  const out = { ...saved };
+  for (const name of COLOR_NAMES) if (normalizeColor(draft[name]) === null) out[name] = draft[name];
+  return out;
+}
