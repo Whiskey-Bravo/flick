@@ -2248,7 +2248,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         fs::create_dir_all(&root).unwrap();
-        p.watch_state.arm(&[root.clone()], true, path_exists, |_| true);
+        p.watch_state.arm(std::slice::from_ref(&root), true, path_exists, |_| true);
         assert!(p.watch_state.watching.load(Ordering::SeqCst));
         let mut scans = 0;
         // Unchanged root: no scan.
@@ -2269,7 +2269,7 @@ mod tests {
     fn a_root_that_comes_back_is_noticed_too() {
         let (p, _) = provider(vec![]);
         let root = PathBuf::from(r"E:\usb\docs");
-        p.watch_state.arm(&[root.clone()], false, |_| false, |_| true);
+        p.watch_state.arm(std::slice::from_ref(&root), false, |_| false, |_| true);
         // It was missing when the watch was set up (so not watched) ...
         assert!(!p.watch_state.watching.load(Ordering::SeqCst));
         p.watch_state.watching.store(true, Ordering::SeqCst);
@@ -2284,7 +2284,7 @@ mod tests {
     fn a_network_root_is_never_vouched_for() {
         let (p, _) = provider(vec![]);
         let unc = PathBuf::from(r"\\server\share\docs");
-        p.watch_state.arm(&[unc.clone()], true, |_| true, fixed_c_only);
+        p.watch_state.arm(std::slice::from_ref(&unc), true, |_| true, fixed_c_only);
         assert!(!p.watch_state.watching.load(Ordering::SeqCst));
         let mut scans = 0;
         for _ in 0..3 {

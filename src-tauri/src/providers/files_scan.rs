@@ -246,7 +246,7 @@ impl Index {
             .unzip();
         let old_name = old.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
         let is_old = |s: &Slot| beside[s.parent as usize] && self.name(s).to_lowercase() == old_name;
-        if !below.contains(&true) && !self.slots.iter().any(|s| is_old(s)) {
+        if !below.contains(&true) && !self.slots.iter().any(&is_old) {
             return None;
         }
         let mut out = Index::with_capacity(self.sizes());

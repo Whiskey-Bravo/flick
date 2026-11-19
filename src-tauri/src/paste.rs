@@ -69,7 +69,8 @@ pub fn clipboard_sequence() -> u32 {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pasted {
-    Pasted,
+    /// The keys went to the window in front.
+    Done,
     NoTarget,
     Gone,
     Blocked,
@@ -151,7 +152,7 @@ pub fn paste_into(
         return Pasted::ClipboardChanged;
     }
     match d.send_ctrl_v() {
-        Ok(()) => Pasted::Pasted,
+        Ok(()) => Pasted::Done,
         Err(_) => Pasted::KeysFailed,
     }
 }
@@ -406,7 +407,7 @@ mod tests {
         assert!(d.calls().iter().all(|c| c != "ctrl_v"));
 
         let d = FakeDesktop::new(vec![Some(2), Some(2), Some(1)]);
-        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Pasted);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Done);
         let calls = d.calls();
         assert_eq!(calls.iter().filter(|c| *c == "ctrl_v").count(), 1);
         assert_eq!(calls.iter().filter(|c| *c == "foreground").count(), 3);
@@ -433,7 +434,7 @@ mod tests {
 
         // It moves on late, settles, then the paste goes ahead.
         let d = FakeDesktop::new(vec![Some(1)]).sequence(vec![0, 0, 5, 6, 6]);
-        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Pasted);
+        assert_eq!(paste_into(Some(1), &d, 0, &current, WAIT, TICK), Pasted::Done);
         let calls = d.calls();
         let front = calls.iter().position(|c| c.starts_with("bring_to_front")).unwrap();
         let settled = calls.iter().rposition(|c| c == "sequence").unwrap();

@@ -1246,6 +1246,7 @@ mod tests {
     const DEF_GIFT_UPPER: &str = "https://en.wiktionary.org/api/rest_v1/page/definition/Gift";
 
     #[test]
+    #[allow(clippy::type_complexity)]
     fn no_second_def_request_once_the_text_moved_on() {
         // The first request is in flight (100 ms to 400 ms) when something else happens at 200 ms.
         let moves: [(&str, fn(&WordsProvider)); 4] = [

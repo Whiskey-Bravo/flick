@@ -590,7 +590,7 @@ const WIN_KEY_RETRY: Duration = Duration::from_secs(10);
 /// Whether the worker starts the helper now, without being asked: the
 /// setting is on, no helper runs, and the last start is long enough ago.
 fn win_key_start_due(on: bool, running: bool, since_last_start: Option<Duration>) -> bool {
-    on && !running && since_last_start.map_or(true, |d| d >= WIN_KEY_RETRY)
+    on && !running && since_last_start.is_none_or(|d| d >= WIN_KEY_RETRY)
 }
 
 /// What decides whether a lone Win press opens Flick. Each is set elsewhere;

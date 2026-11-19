@@ -31,7 +31,7 @@ pub struct Found {
 /// when the header is in a non-Latin script.
 fn decode(raw: &[u8]) -> String {
     let raw = raw.strip_prefix(&[0xFF, 0xFE]).unwrap_or(raw);
-    let utf16 = raw.len() % 2 == 0 && raw.iter().skip(1).step_by(2).any(|&b| b == 0);
+    let utf16 = raw.len().is_multiple_of(2) && raw.iter().skip(1).step_by(2).any(|&b| b == 0);
     if utf16 {
         let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&units)

@@ -102,7 +102,7 @@ impl WinKeyHook {
             .name("flick-winkey-lone".into())
             .spawn(move || {
                 for () in lone_rx {
-                    let _ = catch_unwind(AssertUnwindSafe(|| on_lone()));
+                    let _ = catch_unwind(AssertUnwindSafe(&on_lone));
                 }
             })
             .map_err(|_| UNAVAILABLE.to_string())?;
@@ -612,7 +612,7 @@ fn holding(now: u64) -> bool {
 }
 
 fn may_take() -> bool {
-    MAY_TAKE.with(|c| c.get().is_some_and(|f| catch_unwind(AssertUnwindSafe(|| f())).unwrap_or(false)))
+    MAY_TAKE.with(|c| c.get().is_some_and(|f| catch_unwind(AssertUnwindSafe(f)).unwrap_or(false)))
 }
 
 /// Posts a message to this (the hook) thread's own loop.

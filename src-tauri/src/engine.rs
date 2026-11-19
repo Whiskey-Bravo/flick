@@ -1863,7 +1863,7 @@ mod tests {
         assert_eq!(d.e.act("files", &a, Action::Delete), Err("file not found".to_string()));
         assert!(d.ops.calls().is_empty());
         assert_eq!(d.remembered(&a), (true, 15, true));
-        assert_eq!(d.found("a.txt"), [a.clone()], "the index is untouched too");
+        assert_eq!(d.found("a.txt"), std::slice::from_ref(&a), "the index is untouched too");
         // A failing recycle keeps them as well.
         let b = d.id("b.txt");
         d.remember(&b);
@@ -1985,7 +1985,7 @@ mod tests {
     fn rename_patches_the_files_index() {
         let d = disk();
         let a = d.id("a.txt");
-        assert_eq!(d.found("a.txt"), [a.clone()]);
+        assert_eq!(d.found("a.txt"), std::slice::from_ref(&a));
         let new = d.e.rename("files", &a, "Ä b.txt").unwrap();
         assert_eq!(d.found("Ä b"), [new]);
         assert!(d.found("a.txt").is_empty(), "{:?}", d.found("a.txt"));
@@ -2029,7 +2029,7 @@ mod tests {
         }
         assert!(d.ops.calls().is_empty());
         assert_eq!(d.remembered(&a), (true, 15, true));
-        assert_eq!(d.found("a.txt"), [a.clone()]);
+        assert_eq!(d.found("a.txt"), std::slice::from_ref(&a));
         // Nothing indexed under that id, or no such provider: a short error, and no call either.
         assert_eq!(d.e.rename("files", &d.id("zzz.txt"), "ok.txt"), Err("file not found".to_string()));
         assert_eq!(d.e.rename("nowhere", &a, "ok.txt"), Err("unknown provider: nowhere".to_string()));

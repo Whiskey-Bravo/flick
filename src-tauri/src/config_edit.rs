@@ -394,12 +394,15 @@ fn edit_table(table: &mut Table, wanted: &Table, keys: &[&str]) -> Option<String
     (!leftover.is_empty()).then_some(leftover)
 }
 
+/// The table to edit: what finds it, and the error when none matches.
+type At<'a> = (&'a dyn Fn(&Table) -> bool, String);
+
 /// Adds `wanted` as a new `[[kind]]` table after every other table (`at` is `None`), or
 /// edits the first `[[kind]]` table `at` matches where it stands, keeping the comments above it.
 fn upsert_table(
     text: &str,
     kind: &str,
-    at: Option<(&dyn Fn(&Table) -> bool, String)>,
+    at: Option<At<'_>>,
     wanted: Table,
     keys: &[&str],
 ) -> Result<String, String> {

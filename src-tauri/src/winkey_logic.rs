@@ -185,7 +185,7 @@ pub fn hold_is_stale(now_ms: u64, last_ms: u64) -> bool {
 /// [`HOLD_STALE_MS`] (`last_same_ms`), so without one the "down" is left over
 /// from a press whose up went where the hook can't see.
 pub fn fresh_press(now_ms: u64, last_same_ms: Option<u64>) -> bool {
-    last_same_ms.map_or(true, |last| hold_is_stale(now_ms, last))
+    last_same_ms.is_none_or(|last| hold_is_stale(now_ms, last))
 }
 
 /// Decides the [`Step`] for `ev`, after [`Press::on`] gave `verdict`. `take`

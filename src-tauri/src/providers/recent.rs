@@ -189,6 +189,8 @@ pub struct RecentProvider {
 }
 
 impl RecentProvider {
+    /// One argument per seam, so tests can hand in fakes.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Loader<Vec<RecentEntry>>>,
         fs: Arc<dyn FileSystem>,
@@ -536,7 +538,7 @@ mod tests {
         assert_eq!(rows[0].provider, "downloads");
         assert_eq!(d.p.item(&id).unwrap().title, "a.zip");
         assert_eq!(d.p.act(&id, Action::CopyPath), Ok(Outcome::Hide));
-        assert_eq!(*d.clip.0.lock().unwrap(), [id.clone()]);
+        assert_eq!(*d.clip.0.lock().unwrap(), std::slice::from_ref(&id));
         assert_eq!(d.p.activate(&id, Modifier::None), Ok(Outcome::Hide));
         assert_eq!(d.p.activate(&id, Modifier::Ctrl), Ok(Outcome::Hide));
         assert_eq!(d.launcher.calls(), [format!("open {id}"), format!("reveal {id}")]);

@@ -115,6 +115,7 @@ pub fn broad_roots() -> Vec<PathBuf> {
 /// anything else opens Installed apps, as does a shortcut that passes
 /// arguments or whose exe is a `_proxy` launcher (the program is then a host,
 /// not the app).
+#[allow(clippy::too_many_arguments)]
 pub fn plan(
     name: &str,
     has_args: bool,
@@ -344,8 +345,8 @@ mod tests {
     #[test]
     fn direct_only_when_the_exe_is_inside_an_install_location() {
         let foo = program("Foo", Some(r"C:\Program Files\Foo"), Some(r"C:\Program Files\Foo\unins000.exe"), false);
-        assert_eq!(plan_for(r"C:\Program Files\Foo\foo.exe", &[foo.clone()]), direct(r"C:\Program Files\Foo\unins000.exe"));
-        assert_eq!(plan_for(r"c:\program files\foo\bin\foo.exe", &[foo.clone()]), direct(r"C:\Program Files\Foo\unins000.exe"));
+        assert_eq!(plan_for(r"C:\Program Files\Foo\foo.exe", std::slice::from_ref(&foo)), direct(r"C:\Program Files\Foo\unins000.exe"));
+        assert_eq!(plan_for(r"c:\program files\foo\bin\foo.exe", std::slice::from_ref(&foo)), direct(r"C:\Program Files\Foo\unins000.exe"));
         // A sibling that merely shares a name prefix is not inside.
         assert_eq!(plan_for(r"C:\Program Files\Foobar\foobar.exe", &[foo]), Some(Uninstall::Settings));
     }
@@ -353,7 +354,7 @@ mod tests {
     #[test]
     fn the_program_name_must_share_a_word_with_the_app() {
         let foo = program("Foo 2.1", Some(r"C:\Program Files\Foo"), Some("foo-uninstall"), false);
-        assert_eq!(plan_named("Foo", r"C:\Program Files\Foo\foo.exe", &[foo.clone()]), direct("foo-uninstall"));
+        assert_eq!(plan_named("Foo", r"C:\Program Files\Foo\foo.exe", std::slice::from_ref(&foo)), direct("foo-uninstall"));
         assert_eq!(plan_named("Bar", r"C:\Program Files\Foo\bar.exe", &[foo]), Some(Uninstall::Settings));
         // A web-app shortcut hosted by the browser must not uninstall the browser.
         let chrome = program(
@@ -363,7 +364,7 @@ mod tests {
             false,
         );
         let proxy = r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe";
-        assert_eq!(plan_named("YouTube", proxy, &[chrome.clone()]), Some(Uninstall::Settings));
+        assert_eq!(plan_named("YouTube", proxy, std::slice::from_ref(&chrome)), Some(Uninstall::Settings));
         // Even under its own name: the exe is a launcher for web apps.
         assert_eq!(plan_named("Google Chrome", proxy, &[chrome]), Some(Uninstall::Settings));
     }
@@ -378,7 +379,7 @@ mod tests {
         );
         let proxy = Path::new(r"C:\Program Files\Google\Chrome\Application\chrome_proxy.exe");
         let args = |name, has_args, exe| {
-            plan(name, has_args, Some(exe), None, &[chrome.clone()], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
+            plan(name, has_args, Some(exe), None, std::slice::from_ref(&chrome), Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
         };
         for has_args in [false, true] {
             assert_eq!(args("Google Docs", has_args, proxy), Some(Uninstall::Settings));
@@ -386,7 +387,7 @@ mod tests {
         let foo = program("Foo", Some(r"C:\Program Files\Foo"), Some("foo-uninstall"), false);
         let foo_exe = Path::new(r"C:\Program Files\Foo\foo.exe");
         let foo_plan = |has_args| {
-            plan("Foo", has_args, Some(foo_exe), None, &[foo.clone()], Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
+            plan("Foo", has_args, Some(foo_exe), None, std::slice::from_ref(&foo), Path::new(r"C:\Windows"), Path::new(r"C:\Apps\Flick"), &broad())
         };
         assert_eq!(foo_plan(false), direct("foo-uninstall"));
         assert_eq!(foo_plan(true), Some(Uninstall::Settings));

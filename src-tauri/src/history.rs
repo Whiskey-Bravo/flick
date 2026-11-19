@@ -247,7 +247,7 @@ mod tests {
         h.forget_launches(&[pair("apps", "a"), pair("nowhere", "z")]);
         assert_eq!(recent_ids(&h), vec!["b"]);
         let path = dir.path().join("history.json");
-        let saved = |p: &std::path::Path| std::fs::read_to_string(p).map_or(false, |t| !t.contains("\"a\""));
+        let saved = |p: &std::path::Path| std::fs::read_to_string(p).is_ok_and(|t| !t.contains("\"a\""));
         for _ in 0..200 {
             if saved(&path) {
                 break;
