@@ -1265,7 +1265,7 @@ fn setup(app: &AppHandle) {
             reload_config_after_detection(&app, detection);
             let state = app.state::<AppState>();
             let p = &state.providers;
-            p.apps.refresh();
+            p.apps.refresh_now();
             p.games.refresh();
             p.bookmarks.refresh_now();
             p.files.refresh();
@@ -1298,13 +1298,19 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
         // The thread keeps it alive. Without one, the apps are refreshed
         // when the bar opens (`refresh_on_show`).
         let on_change = apps.clone();
+        let on_lost = apps.clone();
+        // Set before the watcher exists, so an early error is not overwritten.
+        apps.set_watching(true);
         let _watcher = providers::apps_watch::watch(
             &providers::apps::start_menu_roots(),
             providers::apps_watch::QUIET,
             move || on_change.refresh(),
+            move || on_lost.set_watching(false),
         )
         .ok();
-        apps.set_watching(_watcher.is_some());
+        if _watcher.is_none() {
+            apps.set_watching(false);
+        }
         apps.refresh();
         loop {
             games.refresh();

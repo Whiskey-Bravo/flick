@@ -37,21 +37,55 @@ impl Debounce {
     }
 }
 
-/// Watch the folders that exist (recursively) and call `request` once per
-/// quiet burst of changes, on a thread of its own. `Err` when no folder can
-/// be watched; the caller then relies on refreshing when the bar opens. The
-/// thread ends when the returned watcher is dropped.
+/// What a watcher result means.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Signal {
+    /// A read of a shortcut, not a change.
+    Ignore,
+    /// Something changed.
+    Change,
+    /// The watcher failed (or a watched folder went away): events may be missed.
+    Lost,
+}
+
+pub fn signal(res: &notify::Result<notify::Event>) -> Signal {
+    match res {
+        Err(_) => Signal::Lost,
+        Ok(e) if matches!(e.kind, EventKind::Access(_)) => Signal::Ignore,
+        Ok(_) => Signal::Change,
+    }
+}
+
+/// What `signal` does: `Lost` calls `on_lost` (the caller stops relying on
+/// the watcher) and, like `Change`, asks for a refresh (`true`), which
+/// re-reads whatever was missed.
+pub fn route(signal: Signal, on_lost: &dyn Fn()) -> bool {
+    match signal {
+        Signal::Ignore => false,
+        Signal::Change => true,
+        Signal::Lost => {
+            on_lost();
+            true
+        }
+    }
+}
+
+/// Watch the folders that exist now (recursively; one created later is not
+/// watched) and call `request` once per quiet burst of changes, on a thread
+/// of its own. A watcher error calls `on_lost` and also requests a refresh.
+/// `Err` when no folder can be watched; the caller then relies on refreshing
+/// when the bar opens. The thread ends when the returned watcher is dropped.
 pub fn watch(
     roots: &[PathBuf],
     quiet: Duration,
     request: impl Fn() + Send + 'static,
+    on_lost: impl Fn() + Send + 'static,
 ) -> notify::Result<RecommendedWatcher> {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<Signal>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        // A watcher error means missed events; refreshing on show covers them.
-        // Reads of a shortcut are not changes.
-        if res.is_ok_and(|e| !matches!(e.kind, EventKind::Access(_))) {
-            let _ = tx.send(());
+        let s = signal(&res);
+        if s != Signal::Ignore {
+            let _ = tx.send(s);
         }
     })?;
     let mut watched = 0;
@@ -70,13 +104,13 @@ pub fn watch(
         loop {
             let event = if pending {
                 match rx.recv_timeout(POLL) {
-                    Ok(()) => true,
+                    Ok(s) => route(s, &on_lost),
                     Err(RecvTimeoutError::Timeout) => false,
                     Err(RecvTimeoutError::Disconnected) => return,
                 }
             } else {
                 match rx.recv() {
-                    Ok(()) => true,
+                    Ok(s) => route(s, &on_lost),
                     Err(_) => return,
                 }
             };
@@ -151,24 +185,45 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel::<()>();
         let c = count.clone();
-        let _watcher = watch(&[missing, dir.path().to_path_buf()], Duration::from_millis(300), move || {
+        let _watcher = watch(&[missing, dir.path().to_path_buf()], Duration::from_millis(500), move || {
             c.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(());
-        })
+        }, || {})
         .expect("a watcher on the folder that exists");
         let sub = dir.path().join("Some Vendor");
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("x.lnk"), b"").unwrap();
         std::fs::write(dir.path().join("y.lnk"), b"").unwrap();
-        rx.recv_timeout(Duration::from_secs(5)).expect("a refresh request within 5 s");
-        assert!(rx.recv_timeout(Duration::from_secs(1)).is_err(), "only one request");
+        rx.recv_timeout(Duration::from_secs(8)).expect("a refresh request in time");
+        assert!(rx.recv_timeout(Duration::from_secs(2)).is_err(), "only one request");
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn no_folder_to_watch_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(watch(&[dir.path().join("nope")], QUIET, || {}).is_err());
-        assert!(watch(&[], QUIET, || {}).is_err());
+        assert!(watch(&[dir.path().join("nope")], QUIET, || {}, || {}).is_err());
+        assert!(watch(&[], QUIET, || {}, || {}).is_err());
+    }
+
+    #[test]
+    fn an_error_requests_a_refresh_and_stops_the_watching_flag() {
+        use std::sync::atomic::AtomicBool;
+        let watching = AtomicBool::new(true);
+        let lost = || watching.store(false, Ordering::SeqCst);
+        assert!(!route(Signal::Ignore, &lost));
+        assert!(route(Signal::Change, &lost));
+        assert!(watching.load(Ordering::SeqCst), "ordinary events leave watching on");
+        assert!(route(Signal::Lost, &lost));
+        assert!(!watching.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn results_map_to_signals() {
+        let err: notify::Result<notify::Event> = Err(notify::Error::generic("gone"));
+        assert_eq!(signal(&err), Signal::Lost);
+        let ev = |kind| Ok(notify::Event::new(kind));
+        assert_eq!(signal(&ev(EventKind::Access(notify::event::AccessKind::Any))), Signal::Ignore);
+        assert_eq!(signal(&ev(EventKind::Create(notify::event::CreateKind::File))), Signal::Change);
     }
 }

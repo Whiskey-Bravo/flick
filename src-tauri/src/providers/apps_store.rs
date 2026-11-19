@@ -10,6 +10,12 @@ use super::apps::AppEntry;
 /// so the caller keeps its last good list.
 pub trait StoreSource: Send + Sync {
     fn list(&self) -> Option<Vec<AppEntry>>;
+
+    /// As `list`, for a user's explicit Reload: every source is tried, no
+    /// rate limit applies.
+    fn list_forced(&self) -> Option<Vec<AppEntry>> {
+        self.list()
+    }
 }
 
 /// The apps folder read in process: no process start.
@@ -54,21 +60,31 @@ impl Chain {
     }
 }
 
-impl StoreSource for Chain {
-    fn list(&self) -> Option<Vec<AppEntry>> {
+impl Chain {
+    fn ask(&self, forced: bool) -> Option<Vec<AppEntry>> {
         if let Some(apps) = self.primary.list() {
             return Some(apps);
         }
         let now = (self.now)();
         {
             let mut last = self.last_fallback.lock().unwrap_or_else(|e| e.into_inner());
-            if last.is_some_and(|t| now.saturating_duration_since(t) < FALLBACK_GAP) {
+            if !forced && last.is_some_and(|t| now.saturating_duration_since(t) < FALLBACK_GAP) {
                 return None;
             }
             *last = Some(now);
         }
         // No lock held while PowerShell runs.
         self.fallback.list()
+    }
+}
+
+impl StoreSource for Chain {
+    fn list(&self) -> Option<Vec<AppEntry>> {
+        self.ask(false)
+    }
+
+    fn list_forced(&self) -> Option<Vec<AppEntry>> {
+        self.ask(true)
     }
 }
 
@@ -220,6 +236,22 @@ mod tests {
         assert_eq!(ps.calls(), 1);
         clock.advance(Duration::from_secs(61));
         assert!(chain.list().is_some());
+        assert_eq!(ps.calls(), 2);
+    }
+
+    #[test]
+    fn a_forced_listing_always_tries_powershell() {
+        let clock = Clock::new();
+        let ps = Counting::new(Some(vec![calc()]));
+        let chain = Chain::new(Arc::new(Fixed(None)), ps.clone(), clock.as_fn());
+        assert!(chain.list().is_some());
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(chain.list(), None);
+        assert_eq!(ps.calls(), 1);
+        assert_eq!(chain.list_forced(), Some(vec![calc()]));
+        assert_eq!(ps.calls(), 2);
+        // The forced run counts as the last one: a normal one right after waits.
+        assert_eq!(chain.list(), None);
         assert_eq!(ps.calls(), 2);
     }
 

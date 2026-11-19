@@ -341,11 +341,17 @@ pub fn shortcut_details(lnk: &str) -> Option<(String, bool)> {
 pub fn with_com<R>(f: impl FnOnce() -> R) -> R {
     // SAFETY: plain COM init/uninit pair on the current thread.
     let com = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
-    let out = f();
-    if com.is_ok() {
-        unsafe { CoUninitialize() };
+    // Balanced on unwind too: a panic in `f` must not leak the init count.
+    struct Uninit(bool);
+    impl Drop for Uninit {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
     }
-    out
+    let _uninit = Uninit(com.is_ok());
+    f()
 }
 
 /// # Safety

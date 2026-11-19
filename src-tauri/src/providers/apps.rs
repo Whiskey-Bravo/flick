@@ -666,6 +666,14 @@ impl AppsProvider {
         self.refresh_locked(start, add_shortcut_aliases, || self.source.list());
     }
 
+    /// `refresh` for an explicit Reload: the Store list is asked of every
+    /// source, whatever the rate limit on the fallback.
+    pub fn refresh_now(&self) {
+        let _queue = self.refreshing.lock().unwrap_or_else(|e| e.into_inner());
+        let start = scan_start_menu(&start_menu_roots());
+        self.refresh_locked(start, add_shortcut_aliases, || self.source.list_forced());
+    }
+
     /// `refresh` with every stage passed in (tests).
     #[cfg(test)]
     fn refresh_from_stages(
