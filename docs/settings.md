@@ -77,6 +77,6 @@ open = "https://docs.rs"
 <details>
 <summary>When changes take effect, and errors</summary>
 
-Changes are picked up as soon as you save the file; changed `file_roots` are searched again in the background. If the file has an error, Flick keeps the last good settings and shows the error in the bar. If the hotkey is not a valid shortcut or is in use by another program, the bar and the tray tooltip say so. Without WSL, `>` commands are not offered, whatever `wsl_distro` says.
+Changes are picked up as soon as you save the file; changed `file_roots` are searched again in the background. If the file has an error, Flick keeps the last good settings and shows the error in the bar. If the hotkey is not a valid shortcut or is in use by another program, a Windows notification says so once, and the bar and the tray tooltip keep saying it; the tray icon carries an amber dot until the hotkey works again. Without WSL, `>` commands are not offered, whatever `wsl_distro` says.
 
 </details>

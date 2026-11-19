@@ -68,7 +68,7 @@ If you press Enter while results for what you just typed are still on their way,
 
 On an empty bar, Enter opens the most recent launch again.
 
-The hotkey does nothing while an exclusive full-screen app (such as a game) is in front. A game that is minimised or behind another window doesn't block it.
+The hotkey does nothing while an exclusive full-screen app (such as a game) is in front. Nothing pops up over the game; afterwards the tray icon's tooltip and the first line of its menu say that the last press was ignored, until the bar next opens. A game that is minimised or behind another window doesn't block it.
 
 Ctrl+Shift+Enter works for apps only, both Start-menu shortcuts and Store apps. Your own shortcuts with `admin = true` always run as administrator. A Store app that cannot be elevated says "this app cannot be run as administrator" instead of opening normally. Cancelling the UAC prompt just closes the bar.
 

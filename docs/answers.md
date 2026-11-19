@@ -14,8 +14,8 @@ Type a question and the answer appears as the first row, above apps. Enter copie
 | `5.5 km in m`, `70 f in c`, `3 cups in ml` | The conversion |
 | `20 usd in eur`, `$20 in gbp` | The conversion at the European Central Bank's latest rates |
 | `20 usd` | The same, into your home currency |
-| `time` | The time and weekday here, with today's date |
-| `time tokyo` | The time and weekday there, and how far ahead or behind you it is |
+| `time` | The time with seconds and the weekday here, with today's date. It counts up while the bar is open; Enter copies the time of that moment |
+| `time tokyo` | The same for there, and how far ahead or behind you it is |
 | `in 45 days`, `3 weeks ago`, `days until 24 dec` | The date, or the number of days |
 | `weather london` | The weather there now; Enter opens a web search for it |
 | `weather` | The weather in your `weather_city` |

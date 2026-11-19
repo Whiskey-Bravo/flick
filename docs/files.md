@@ -30,7 +30,7 @@ The list shows up to 50 results and scrolls. Files take at most five of every ei
 
 `v` lists the text items of Windows' clipboard history (the one Win+V shows), newest first, up to 50. Type after it to filter (`v invoice`). Enter pastes the item into the window you were in before the bar opened. When it can't be sure the paste lands right, it only copies: when that window is gone, runs as administrator or does not come to the front, when the clipboard did not take the item, or when you open the bar again in the meantime. Ctrl+Enter, Ctrl+Shift+Enter, or Copy in the row's menu, only copy. This needs Windows' Clipboard history setting; when it is off the row says `Clipboard history is off`, `Turn it on in Settings`, and Enter opens that setting.
 
-`qr` draws the clipboard text as a QR code in the bar; `qr some text` draws the typed text instead. Enter copies the text.
+`qr` draws the clipboard text as a QR code in the bar; `qr some text` draws the typed text instead. Enter copies the text. Save as picture in the code's menu (Tab or right-click), or Ctrl+S, opens the Windows Save window and writes the code as a PNG picture, large enough to print.
 
 `snip` (also `screenshot`) opens Windows' snip tool; the snip lands on the clipboard.
 
