@@ -89,6 +89,41 @@ fn roots_for_profile(profile: Option<&OsStr>) -> Vec<PathBuf> {
     profile.map(|p| vec![PathBuf::from(p)]).unwrap_or_default()
 }
 
+/// The roots as the index uses them: `/` written as `\`, no trailing
+/// separator (a drive root keeps its `\`), and without any root that repeats
+/// an earlier one or lies inside another (compared without case). Every row
+/// id is built from a root, so ids then have one form, and no entry is
+/// indexed twice.
+fn normalize_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let tidy: Vec<String> = roots
+        .into_iter()
+        .map(|r| {
+            let text = r.to_string_lossy().replace('/', r"\");
+            let bare = text.trim_end_matches('\\');
+            if bare.ends_with(':') || (bare.is_empty() && !text.is_empty()) {
+                format!(r"{bare}\")
+            } else {
+                bare.to_string()
+            }
+        })
+        .collect();
+    let key = |r: &str| r.trim_end_matches('\\').to_lowercase();
+    // Whether `inner` is `outer` or lies inside it.
+    let covers = |outer: &str, inner: &str| {
+        let (outer, inner) = (key(outer), key(inner));
+        inner == outer || inner.strip_prefix(&outer).is_some_and(|rest| rest.starts_with('\\'))
+    };
+    let mut out: Vec<String> = Vec::new();
+    for r in tidy {
+        if out.iter().any(|o| covers(o, &r)) {
+            continue;
+        }
+        out.retain(|o| !covers(&r, o));
+        out.push(r);
+    }
+    out.into_iter().map(PathBuf::from).collect()
+}
+
 /// Every file and folder under `roots`, breadth-first: skips hidden and
 /// system entries, dot-names and build/tool folders, does not follow links,
 /// stops at `MAX_DEPTH` levels, at an equal share of `MAX_ENTRIES` per root
@@ -460,6 +495,9 @@ pub struct FilesProvider {
     scanned: AtomicBool,
     /// Bumped by every swap of `index`: a patch built from an older one is not swapped in.
     epoch: AtomicU64,
+    /// Renames and deletes patched in (`moved`) since the running scan began:
+    /// replayed onto its result, which may have listed a folder before the change.
+    moves: Mutex<Vec<(PathBuf, Option<PathBuf>)>>,
     /// What the watcher vouches for; decides whether the periodic refresh scans.
     watch_state: Arc<WatchState>,
 }
@@ -524,7 +562,8 @@ impl FilesProvider {
             ops,
             index: RwLock::new(index),
             cloud: Arc::clone(cloud_roots::shared()),
-            roots: Arc::new(Mutex::new(default_roots())),
+            roots: Arc::new(Mutex::new(normalize_roots(default_roots()))),
+            moves: Mutex::new(Vec::new()),
             generation: AtomicU64::new(0),
             refresh_state: Mutex::new(RefreshState::default()),
             last_scan: Mutex::new(None),
@@ -539,9 +578,10 @@ impl FilesProvider {
 
     /// Empty = [`default_roots`]. The current index keeps answering until the
     /// next `refresh`; a scan already running for the old roots is discarded.
-    /// A running watcher moves to the new roots.
+    /// A running watcher moves to the new roots. The roots are tidied first
+    /// (see [`normalize_roots`]).
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
-        let roots = if roots.is_empty() { default_roots() } else { roots };
+        let roots = normalize_roots(if roots.is_empty() { default_roots() } else { roots });
         let old = std::mem::replace(&mut *self.roots.lock().unwrap_or_else(|e| e.into_inner()), roots.clone());
         // The index is stale until the next scan, which clears this when it starts.
         self.watch_state.dirty.store(true, Ordering::SeqCst);
@@ -652,20 +692,41 @@ impl FilesProvider {
     }
 
     /// Scans until a scan finishes with the roots it started with, and swaps
-    /// that one in: a stale result never replaces a newer one.
+    /// that one in: a stale result never replaces a newer one. Renames and
+    /// deletes patched in while it ran are applied to it first, so it does
+    /// not bring back what they changed.
     fn scan_and_swap(&self, scan: &mut impl FnMut(&[PathBuf], Sizes) -> Index) {
         loop {
             let generation = self.generation.load(Ordering::SeqCst);
+            // This scan covers every refresh asked for before it starts (a
+            // root change that made the last attempt start over, too).
+            self.refresh_state.lock().unwrap_or_else(|e| e.into_inner()).again = false;
             // Cleared before the walk, so a change during it marks the index dirty again.
             self.watch_state.dirty.store(false, Ordering::SeqCst);
+            self.moves.lock().unwrap_or_else(|e| e.into_inner()).clear();
             let started = Instant::now();
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, None));
             let hint = self.index.read().unwrap_or_else(|e| e.into_inner()).sizes();
-            let fresh = scan(&self.roots(), hint);
+            let mut fresh = scan(&self.roots(), hint);
             *self.last_scan.lock().unwrap_or_else(|e| e.into_inner()) = Some((started, Some(started.elapsed())));
-            // Measured before the write lock is taken (it walks every folder).
+            // Patches are replayed outside the write lock; one that comes in
+            // meanwhile is replayed on the next pass.
+            let mut replayed = 0;
+            let mut index = loop {
+                let pending = self.moves.lock().unwrap_or_else(|e| e.into_inner())[replayed..].to_vec();
+                for (old, new) in &pending {
+                    if let Some(patched) = fresh.patched(old, new.as_deref()) {
+                        fresh = patched;
+                    }
+                }
+                replayed += pending.len();
+                let index = self.index.write().unwrap_or_else(|e| e.into_inner());
+                if self.moves.lock().unwrap_or_else(|e| e.into_inner()).len() == replayed {
+                    break index;
+                }
+            };
+            // Measured under the write lock only when timing is on (it walks every folder).
             let measured = timing::enabled().then(|| (fresh.len(), fresh.memory()));
-            let mut index = self.index.write().unwrap_or_else(|e| e.into_inner());
             if self.generation.load(Ordering::SeqCst) == generation {
                 let old = std::mem::replace(&mut *index, fresh);
                 self.epoch.fetch_add(1, Ordering::SeqCst);
@@ -872,7 +933,7 @@ impl FilesProvider {
             actions: {
                 let full = index.path(s);
                 let path = full.to_string_lossy();
-                file_ops::menu(s.is_dir, self.cloud.contains(&path), file_ops::is_drive_root(&path))
+                file_ops::menu(s.is_dir, self.cloud.contains(&path), file_ops::is_volume_root(&path))
             },
             ..Default::default()
         }
@@ -927,7 +988,6 @@ impl Provider for FilesProvider {
 
     /// Only for indexed paths. The disk is asked here, never on the query path.
     fn rename(&self, id: &str, new_name: &str) -> Result<String, String> {
-        file_ops::valid_new_name(new_name)?;
         let known = self.index.read().unwrap_or_else(|e| e.into_inner()).find(Path::new(super::path::split_id(id).0)).is_some();
         if !known {
             return Err(NOT_FOUND.into());
@@ -936,8 +996,16 @@ impl Provider for FilesProvider {
         super::path::rename_entry(&kind, &*self.ops, id, new_name)
     }
 
-    /// Nothing to do when `old` is not in the index.
+    /// Nothing to do when `old` is not in the index. Noted for a scan that
+    /// runs meanwhile, which applies it to its own result before swapping in.
     fn moved(&self, old: &Path, new: Option<&Path>) {
+        // Noted before the patch: a scan that swaps in first replays it, and
+        // this loop then finds `old` gone from the swapped-in index. With no
+        // scan running there is nothing to note: the disk already changed, so
+        // the next scan lists it as it is now.
+        if self.refresh_state.lock().unwrap_or_else(|e| e.into_inner()).running {
+            self.moves.lock().unwrap_or_else(|e| e.into_inner()).push((old.to_path_buf(), new.map(Path::to_path_buf)));
+        }
         loop {
             let epoch = self.epoch.load(Ordering::SeqCst);
             // Built beside the live index, which keeps answering meanwhile.
@@ -1665,6 +1733,70 @@ mod tests {
     }
 
     #[test]
+    fn root_change_during_a_scan_rescans_once() {
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![PathBuf::from(r"C:\old")]);
+        let p2 = p.clone();
+        let mut scans = 0;
+        p.refresh_with(|roots| {
+            scans += 1;
+            if scans == 1 {
+                // A config reload: new roots, then a refresh request.
+                p2.set_roots(vec![PathBuf::from(r"C:\new")]);
+                p2.refresh();
+            }
+            vec![FileEntry::new(roots[0].join("hit.txt"), false)]
+        });
+        assert_eq!(scans, 2);
+    }
+
+    #[test]
+    fn a_rename_during_a_scan_survives_the_swap() {
+        let a = PathBuf::from(r"C:\d\a.txt");
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\gone.txt", false)]);
+        let p2 = p.clone();
+        p.refresh_with(|_| {
+            // The scan listed the folder before the rename and the delete.
+            p2.moved(&a, Some(Path::new(r"C:\d\b.txt")));
+            p2.moved(Path::new(r"C:\d\gone.txt"), None);
+            vec![entry(r"C:\d\a.txt", false), entry(r"C:\d\gone.txt", false)]
+        });
+        assert!(p.item(r"C:\d\b.txt").is_some());
+        assert!(p.item(r"C:\d\a.txt").is_none());
+        assert!(p.item(r"C:\d\gone.txt").is_none());
+    }
+
+    #[test]
+    fn a_rename_without_a_scan_is_not_kept() {
+        let (p, _) = provider(vec![entry(r"C:\d\a.txt", false)]);
+        p.moved(Path::new(r"C:\d\a.txt"), Some(Path::new(r"C:\d\b.txt")));
+        assert!(p.moves.lock().unwrap().is_empty());
+        assert!(p.item(r"C:\d\b.txt").is_some());
+    }
+
+    #[test]
+    fn roots_are_tidied() {
+        let roots = |list: &[&str]| normalize_roots(list.iter().map(PathBuf::from).collect());
+        let want = |list: &[&str]| list.iter().map(PathBuf::from).collect::<Vec<_>>();
+        assert_eq!(roots(&["C:/Users/u/Desktop/"]), want(&[r"C:\Users\u\Desktop"]));
+        assert_eq!(roots(&["D:/", "E:"]), want(&[r"D:\", r"E:\"]));
+        assert_eq!(roots(&[r"\\nas\share\"]), want(&[r"\\nas\share"]));
+        // Repeats and roots inside another root go, in either order.
+        assert_eq!(roots(&[r"C:\Users\u", "c:/users/U/", r"C:\Users\u\Documents"]), want(&[r"C:\Users\u"]));
+        assert_eq!(roots(&[r"C:\Users\u\Documents", r"C:\Users\u"]), want(&[r"C:\Users\u"]));
+        assert_eq!(roots(&[r"C:\", r"C:\Users"]), want(&[r"C:\"]));
+        // A name that only starts the same is another folder.
+        assert_eq!(roots(&[r"C:\Users\u", r"C:\Users\u2"]), want(&[r"C:\Users\u", r"C:\Users\u2"]));
+    }
+
+    #[test]
+    fn set_roots_tidies_them() {
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![PathBuf::from("C:/x/"), PathBuf::from(r"C:\x\y")]);
+        assert_eq!(p.roots(), [PathBuf::from(r"C:\x")]);
+    }
+
+    #[test]
     fn each_root_gets_an_equal_share() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("big"), dir.path().join("small"));
@@ -2061,7 +2193,10 @@ mod tests {
     fn a_watcher_that_cannot_start_leaves_the_periodic_refresh_on() {
         let dir = tempfile::tempdir().unwrap();
         let (p, _) = provider(vec![]);
-        p.set_roots(vec![dir.path().to_path_buf(), dir.path().join("missing")]);
+        // Side by side: a root inside another would be dropped.
+        let present = dir.path().join("present");
+        fs::create_dir(&present).unwrap();
+        p.set_roots(vec![present, dir.path().join("missing")]);
         p.watch_using(|_| true).unwrap();
         // A missing root is not watched: the periodic refresh must keep scanning.
         assert!(!p.watch_state.watching.load(Ordering::SeqCst));
