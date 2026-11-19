@@ -114,7 +114,7 @@ pub(crate) fn entry_row_in(
         subtitle,
         score,
         pinnable: true,
-        actions: file_ops::menu(is_dir, roots.contains(&text_for_menu), file_ops::is_drive_root(&text_for_menu)),
+        actions: file_ops::menu(is_dir, roots.contains(&text_for_menu), file_ops::is_volume_root(&text_for_menu)),
         complete,
         ..Default::default()
     }
@@ -199,7 +199,7 @@ pub(crate) fn handled(id: &str, action: Action) -> bool {
         | Action::Properties
         | Action::OpenWith
         | Action::CopyFile => true,
-        Action::Compress | Action::KeepOffline | Action::FreeUpSpace | Action::Delete => !file_ops::is_drive_root(id),
+        Action::Compress | Action::KeepOffline | Action::FreeUpSpace | Action::Delete => !file_ops::is_volume_root(id),
         _ => false,
     }
 }
@@ -227,9 +227,6 @@ pub(crate) fn run_entry_action(ops: &dyn FileOps, path: &str, action: Action) ->
     Ok(Outcome::Hide)
 }
 
-/// The text of the refusal to rename onto a name that is taken.
-const NAME_TAKEN: &str = "A file with that name already exists";
-
 /// Renames the file or folder row `id` to `new_name` in its folder; the new
 /// row id (a folder's ends with `\`). `kind` says what is at a path now
 /// (`Some(true)` folder, `Some(false)` file, `None` nothing). The name is
@@ -244,7 +241,7 @@ pub(crate) fn rename_entry(
 ) -> Result<String, String> {
     file_ops::valid_new_name(new_name)?;
     let (path, is_dir) = split_id(id);
-    if id.starts_with(INERT) || file_ops::is_drive_root(path) || kind(Path::new(path)) != Some(is_dir) {
+    if id.starts_with(INERT) || file_ops::is_volume_root(path) || kind(Path::new(path)) != Some(is_dir) {
         return Err(NOT_FOUND.into());
     }
     let old = Path::new(path);
@@ -254,7 +251,7 @@ pub(crate) fn rename_entry(
     }
     let target = old.with_file_name(new_name);
     if name.to_lowercase() != new_name.to_lowercase() && kind(&target).is_some() {
-        return Err(NAME_TAKEN.into());
+        return Err(file_ops::NAME_TAKEN.into());
     }
     let renamed = ops.rename(old, new_name)?;
     let renamed = renamed.to_string_lossy();
@@ -676,10 +673,21 @@ mod tests {
         assert_eq!(then(KeepOffline, r"C:\a.txt"), Then::CloudPin { path: r"C:\a.txt".into(), keep: true });
         assert_eq!(then(FreeUpSpace, r"C:\a.txt"), Then::CloudPin { path: r"C:\a.txt".into(), keep: false });
         assert!(r.ops.calls().is_empty(), "the work waits for the bar to hide");
-        // A drive root cannot be compressed or kept offline.
+        // A drive or share root cannot be compressed or kept offline.
         for action in [Compress, KeepOffline, FreeUpSpace] {
             assert_eq!(r.p.act(r"C:\", action), Err("can't do that here".to_string()));
+            assert!(!handled(r"\\nas\share\", action), "{action:?}");
         }
+        assert!(handled(r"\\nas\share\x\", Compress));
+    }
+
+    #[test]
+    fn a_share_root_row_offers_no_changes() {
+        use Action::*;
+        let roots = CloudRoots::default();
+        roots.set(vec![PathBuf::from(r"\\nas\share")]);
+        let row = entry_row_in(&roots, "path", Path::new(r"\\nas\share\"), true, String::new(), 0, String::new());
+        assert_eq!(row.actions, [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
     }
 
     #[test]
