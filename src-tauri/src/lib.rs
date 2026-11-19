@@ -2144,6 +2144,9 @@ mod tests {
         fn number(&self, x: f64) -> String {
             x.to_string()
         }
+        fn group(&self) -> char {
+            ','
+        }
         fn date(&self, d: jiff::civil::Date, _long: bool) -> String {
             d.to_string()
         }

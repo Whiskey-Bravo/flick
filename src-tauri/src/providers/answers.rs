@@ -265,7 +265,7 @@ impl AnswersProvider {
     }
 
     fn calc_row(&self, text: &str) -> Option<ResultItem> {
-        let c = calc::evaluate_with(text, &|n| self.formats.number(n))?;
+        let c = calc::evaluate_with(text, self.formats.group(), &|n| self.formats.number(n))?;
         let shown = self.number(c.value)?;
         Some(copy_row(&shown, format!("= {shown}"), c.shown, Icon::Calc, true))
     }
@@ -400,7 +400,7 @@ impl Provider for AnswersProvider {
         let today = now.to_zoned(self.local.clone()).date();
         let answer = if let Some(ask) = clock::parse_clock(text, today) {
             self.clock_row(ask, now, today)
-        } else if let Some(ask) = units::parse_conversion(text) {
+        } else if let Some(ask) = units::parse_conversion(text, self.formats.group()) {
             self.conversion_row(ask, text, now, &cfg)
         } else {
             self.calc_row(text)
@@ -634,6 +634,9 @@ mod tests {
         assert_eq!(titled(&r, "5 miles in km"), ("8,05 km".into(), "5 miles → km".into()));
         assert_eq!(titled(&r, "1234,5*1"), ("= 1.234,5".into(), "1.234,5 * 1".into()));
         assert_eq!(titled(&r, "0,1+0,2"), ("= 0,3".into(), "0,1 + 0,2".into()));
+        // `.` is the German group: before three digits it groups.
+        assert_eq!(titled(&r, "1.000 + 1"), ("= 1.001".into(), "1.000 + 1".into()));
+        assert_eq!(titled(&r, "1.000 km in m"), ("1.000.000 m".into(), "1.000 kilometers → m".into()));
         assert_eq!(one(&r, "in 1500 days").subtitle, "in 1.500 days");
         assert_eq!(one(&r, "1500 days ago").subtitle, "1.500 days ago");
         assert_eq!(one(&r, "1 mile in km").subtitle, "1 mile → km");
