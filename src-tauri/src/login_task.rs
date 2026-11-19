@@ -7,12 +7,12 @@
 //! can't be registered. Never both at once.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use windows::Win32::System::TaskScheduler::{
     TASK_CREATE_OR_UPDATE, TASK_INSTANCES_IGNORE_NEW, TASK_INSTANCES_POLICY, TASK_LOGON_INTERACTIVE_TOKEN,
     TASK_LOGON_TYPE, TASK_RUNLEVEL_LUA, TASK_RUNLEVEL_TYPE,
 };
-
 
 // The task definition (see the design): normal priority (the task default 7
 // is below normal), no time limit, runs on battery, a second start is
@@ -31,6 +31,17 @@ const CREATION_FLAGS: i32 = TASK_CREATE_OR_UPDATE.0;
 /// The old Run value tauri-plugin-autostart wrote.
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE_NAME: &str = "Flick";
+/// Where Windows records "disabled in Task Manager's Startup apps" for the
+/// Run list (REG_BINARY, same value name; the Run value itself stays).
+const STARTUP_APPROVED_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+
+/// Serialises the changes (`set`, `migrate`): the start-up thread, the
+/// Settings command and the tray toggle each run on their own background
+/// thread, and two interleaved register/delete sequences could leave both
+/// the task and the Run value. Safe because it is only ever taken on
+/// background threads (never the main thread), no other lock is held when
+/// it is taken, and nothing done while holding it waits on another thread.
+static CHANGE: Mutex<()> = Mutex::new(());
 
 /// The task's name in the root folder: one per user of the PC.
 fn task_name(sid: &str) -> String {
@@ -56,15 +67,20 @@ pub trait LoginStart: Send + Sync {
     fn register_task(&self, exe: &Path) -> Result<(), String>;
     /// Removes the task; Ok when there is none.
     fn delete_task(&self) -> Result<(), String>;
-    /// Whether the old Run value is present.
+    /// Whether the old Run value is present and not switched off in Task
+    /// Manager's Startup apps.
     fn run_value(&self) -> bool;
+    /// Whether a file exists at `p`.
+    fn exe_exists(&self, p: &Path) -> bool;
     /// Writes the Run value pointing at `exe` (quoted).
     fn set_run_value(&self, exe: &Path) -> Result<(), String>;
     /// Removes the Run value; Ok when there is none.
     fn delete_run_value(&self) -> Result<(), String>;
 }
 
-/// Start at login is on: the task or the old Run value is present.
+/// Start at login is on: the task or the old Run value is present. A
+/// scheduler error reads as off: Settings then offers to switch it on, which
+/// registers the task again.
 pub fn is_enabled(s: &dyn LoginStart) -> bool {
     matches!(s.task_path(), Ok(Some(_))) || s.run_value()
 }
@@ -73,6 +89,12 @@ pub fn is_enabled(s: &dyn LoginStart) -> bool {
 /// the task can't be registered) or off (both removed). Returns whether it
 /// is on afterwards.
 pub fn set(s: &dyn LoginStart, on: bool, exe: &Path) -> bool {
+    let _change = CHANGE.lock().unwrap_or_else(|e| e.into_inner());
+    set_locked(s, on, exe)
+}
+
+/// `set` with `CHANGE` already held.
+fn set_locked(s: &dyn LoginStart, on: bool, exe: &Path) -> bool {
     if !on {
         remove_all(s);
     } else if s.register_task(exe).is_ok() {
@@ -89,16 +111,21 @@ pub fn set(s: &dyn LoginStart, on: bool, exe: &Path) -> bool {
     is_enabled(s)
 }
 
-/// Moves an existing install over: a Run value, or a task for another exe,
+/// Moves an existing install over: a Run value, or a task whose exe is gone,
 /// becomes a task for `exe`. With neither present nothing happens, so a user
-/// who had Start at login off keeps it off.
+/// who had Start at login off keeps it off; a Run value switched off in Task
+/// Manager doesn't count as present (and is left alone: removing it would
+/// make the entry vanish from Task Manager's list). A task for another exe
+/// that still exists is left alone: another copy of Flick doesn't take it
+/// over, only Settings or the tray do.
 pub fn migrate(s: &dyn LoginStart, exe: &Path) {
+    let _change = CHANGE.lock().unwrap_or_else(|e| e.into_inner());
     let stale_task = match s.task_path() {
-        Ok(Some(path)) => !same_path(&path, exe),
+        Ok(Some(path)) => !same_path(&path, exe) && (path.as_os_str().is_empty() || !s.exe_exists(&path)),
         _ => false,
     };
     if stale_task || s.run_value() {
-        set(s, true, exe);
+        set_locked(s, true, exe);
     }
 }
 
@@ -110,6 +137,19 @@ pub fn at_start(s: &dyn LoginStart, first_run: bool, exe: &Path) -> bool {
     }
     migrate(s, exe);
     is_enabled(s)
+}
+
+/// Whether the StartupApproved value (None: there is none) leaves the entry
+/// on. Windows writes 02 00 00 00 plus eight zero bytes for enabled, and 03
+/// plus a non-zero timestamp when it was disabled in Task Manager. Same rule
+/// as auto-launch 0.6.0 (`src/windows.rs`, `last_eight_bytes_all_zeros`, used
+/// by `is_task_manager_enabled`): on when the last 8 bytes are all zero; a
+/// value shorter than 8 bytes counts as on there too.
+fn startup_approved_enabled(bytes: Option<&[u8]>) -> bool {
+    match bytes {
+        Some(b) if b.len() >= 8 => b.iter().rev().take(8).all(|v| *v == 0),
+        _ => true,
+    }
 }
 
 /// Windows paths compare without regard to case.
@@ -140,6 +180,9 @@ impl LoginStart for WindowsLoginStart {
     fn run_value(&self) -> bool {
         real::run_value()
     }
+    fn exe_exists(&self, p: &Path) -> bool {
+        p.exists()
+    }
     fn set_run_value(&self, exe: &Path) -> Result<(), String> {
         real::set_run_value(exe)
     }
@@ -168,7 +211,7 @@ mod real {
         COINIT_DISABLE_OLE1DDE,
     };
     use windows::Win32::System::Registry::{
-        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_ANY,
+        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ, RRF_RT_ANY, RRF_RT_REG_BINARY,
     };
     use windows::Win32::System::TaskScheduler::{
         IExecAction, ILogonTrigger, ITaskFolder, ITaskService, TaskScheduler, TASK_ACTION_EXEC, TASK_TRIGGER_LOGON,
@@ -338,12 +381,37 @@ mod real {
         }
     }
 
+    /// The Run value is present and not switched off in Task Manager.
     pub fn run_value() -> bool {
         // SAFETY: a presence check: no buffers passed.
-        unsafe {
+        let present = unsafe {
             RegGetValueW(HKEY_CURRENT_USER, &HSTRING::from(RUN_KEY), &HSTRING::from(RUN_VALUE_NAME), RRF_RT_ANY, None, None, None)
         }
-        .is_ok()
+        .is_ok();
+        present && startup_approved_enabled(startup_approved().as_deref())
+    }
+
+    /// The StartupApproved binary for the Run value; None when missing or
+    /// unreadable (then the entry counts as on, like the old plugin).
+    fn startup_approved() -> Option<Vec<u8>> {
+        let key = HSTRING::from(STARTUP_APPROVED_KEY);
+        let value = HSTRING::from(RUN_VALUE_NAME);
+        let mut size = 0u32;
+        // SAFETY: asks only for the size; no data buffer passed.
+        let r = unsafe { RegGetValueW(HKEY_CURRENT_USER, &key, &value, RRF_RT_REG_BINARY, None, None, Some(&mut size)) };
+        if r.is_err() {
+            return None;
+        }
+        let mut buf = vec![0u8; size as usize];
+        // SAFETY: `buf` has `size` bytes and the size pointer says so.
+        let r = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, &key, &value, RRF_RT_REG_BINARY, None, Some(buf.as_mut_ptr().cast()), Some(&mut size))
+        };
+        if r.is_err() {
+            return None;
+        }
+        buf.truncate(size as usize);
+        Some(buf)
     }
 
     pub fn set_run_value(exe: &Path) -> Result<(), String> {
@@ -363,13 +431,20 @@ mod real {
         .map_err(|e| err("couldn't write the Run value", e))
     }
 
+    /// Removes the Run value and Task Manager's on/off record for it (a
+    /// leftover record would otherwise decide for a Run value written later).
     pub fn delete_run_value() -> Result<(), String> {
-        // SAFETY: plain registry call with NUL-terminated strings.
-        let r = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, &HSTRING::from(RUN_KEY), &HSTRING::from(RUN_VALUE_NAME)) };
-        if r == ERROR_FILE_NOT_FOUND || r == ERROR_PATH_NOT_FOUND {
-            return Ok(());
-        }
-        r.ok().map_err(|e| err("couldn't remove the Run value", e))
+        let delete = |key: &str| {
+            // SAFETY: plain registry call with NUL-terminated strings.
+            let r = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, &HSTRING::from(key), &HSTRING::from(RUN_VALUE_NAME)) };
+            if r == ERROR_FILE_NOT_FOUND || r == ERROR_PATH_NOT_FOUND {
+                return Ok(());
+            }
+            r.ok()
+        };
+        let run = delete(RUN_KEY).map_err(|e| err("couldn't remove the Run value", e));
+        let approved = delete(STARTUP_APPROVED_KEY).map_err(|e| err("couldn't remove the Startup apps record", e));
+        run.and(approved)
     }
 }
 
@@ -382,6 +457,8 @@ mod tests {
     struct State {
         task: Option<PathBuf>,
         run: bool,
+        run_disabled: bool,
+        existing: Vec<PathBuf>,
         fail_register: bool,
         fail_delete_run: bool,
         log: Vec<String>,
@@ -393,6 +470,14 @@ mod tests {
     impl FakeLoginStart {
         fn with(task: Option<&str>, run: bool) -> Self {
             FakeLoginStart(Mutex::new(State { task: task.map(PathBuf::from), run, ..State::default() }))
+        }
+        fn disabled_in_task_manager(self) -> Self {
+            self.0.lock().unwrap().run_disabled = true;
+            self
+        }
+        fn existing(self, p: &str) -> Self {
+            self.0.lock().unwrap().existing.push(PathBuf::from(p));
+            self
         }
         fn failing_register(self) -> Self {
             self.0.lock().unwrap().fail_register = true;
@@ -457,7 +542,10 @@ mod tests {
         fn run_value(&self) -> bool {
             let mut st = self.0.lock().unwrap();
             st.log.push("run_value".into());
-            st.run
+            st.run && !st.run_disabled
+        }
+        fn exe_exists(&self, p: &Path) -> bool {
+            self.0.lock().unwrap().existing.iter().any(|e| same_path(e, p))
         }
         fn set_run_value(&self, exe: &Path) -> Result<(), String> {
             let mut st = self.0.lock().unwrap();
@@ -558,6 +646,55 @@ mod tests {
         migrate(&f, Path::new(EXE));
         assert_eq!(f.task(), Some(PathBuf::from(EXE)));
         assert!(!f.run());
+    }
+
+    #[test]
+    fn migrate_leaves_a_task_for_another_exe_that_still_exists() {
+        // A second install (or a portable copy) must not steal the task.
+        let f = FakeLoginStart::with(Some(r"C:\Old\flick.exe"), false).existing(r"C:\Old\flick.exe");
+        migrate(&f, Path::new(EXE));
+        assert_eq!(f.task(), Some(PathBuf::from(r"C:\Old\flick.exe")));
+        assert!(!f.log().iter().any(|c| c.starts_with("register_task")));
+    }
+
+    #[test]
+    fn migrate_re_points_a_task_whose_exe_is_gone() {
+        let f = FakeLoginStart::with(Some(r"C:\Old\flick.exe"), false);
+        migrate(&f, Path::new(EXE));
+        assert_eq!(f.task(), Some(PathBuf::from(EXE)));
+    }
+
+    #[test]
+    fn migrate_re_points_a_task_with_an_empty_path() {
+        let f = FakeLoginStart::with(Some(""), false);
+        migrate(&f, Path::new(EXE));
+        assert_eq!(f.task(), Some(PathBuf::from(EXE)));
+    }
+
+    #[test]
+    fn migrate_leaves_a_run_value_disabled_in_task_manager_alone() {
+        let f = FakeLoginStart::with(None, true).disabled_in_task_manager();
+        migrate(&f, Path::new(EXE));
+        assert_eq!(f.task(), None);
+        assert!(f.run(), "the user's Task Manager entry stays as it was");
+        assert!(!is_enabled(&f));
+        assert!(!at_start(&f, false, Path::new(EXE)));
+    }
+
+    #[test]
+    fn startup_approved_rule_matches_the_old_plugin() {
+        // No value: enabled.
+        assert!(startup_approved_enabled(None));
+        // Enabled as Windows writes it: 02 00 00 00 + 8 zero bytes.
+        assert!(startup_approved_enabled(Some(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])));
+        // Disabled: 03 00 00 00 + a non-zero FILETIME.
+        assert!(!startup_approved_enabled(Some(&[3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8])));
+        // Only the last 8 bytes count.
+        assert!(startup_approved_enabled(Some(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])));
+        assert!(!startup_approved_enabled(Some(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9])));
+        // Shorter than 8 bytes: the plugin treats it as enabled.
+        assert!(startup_approved_enabled(Some(&[3, 0, 0])));
+        assert!(startup_approved_enabled(Some(&[])));
     }
 
     #[test]

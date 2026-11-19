@@ -102,8 +102,10 @@ fn set_start_at_login(app: &AppHandle, item: &CheckMenuItem<tauri::Wry>) {
     let wanted = item.is_checked().unwrap_or(false);
     let app = app.clone();
     std::thread::spawn(move || {
+        // Debug builds only read: they would register the debug exe.
         let actual = match std::env::current_exe() {
-            Ok(exe) => crate::login_task::set(&crate::login_task::WindowsLoginStart, wanted, &exe),
+            Ok(exe) if !cfg!(debug_assertions) => crate::login_task::set(&crate::login_task::WindowsLoginStart, wanted, &exe),
+            Ok(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
             Err(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
         };
         set_login_checked(&app, actual);

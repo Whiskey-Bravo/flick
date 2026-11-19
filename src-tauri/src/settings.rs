@@ -356,8 +356,10 @@ pub fn settings_delete_hotkey(keys: String, app: AppHandle) -> Result<(), String
 /// Returns the state Windows ended up with, and moves the tray's check mark to it.
 #[tauri::command(async)]
 pub fn settings_set_start_at_login(on: bool, app: AppHandle) -> bool {
+    // Debug builds only read: they would register the debug exe.
     let actual = match std::env::current_exe() {
-        Ok(exe) => crate::login_task::set(&crate::login_task::WindowsLoginStart, on, &exe),
+        Ok(exe) if !cfg!(debug_assertions) => crate::login_task::set(&crate::login_task::WindowsLoginStart, on, &exe),
+        Ok(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
         Err(_) => crate::login_task::is_enabled(&crate::login_task::WindowsLoginStart),
     };
     crate::tray::set_login_checked(&app, actual);
