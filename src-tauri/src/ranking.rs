@@ -95,10 +95,23 @@ impl Ranking {
 }
 
 /// Serialise `value` and write it to a temp file next to `path`, then rename over it.
-/// The temp file is flushed to disk before the rename, so a power cut right after
-/// a save leaves the old file or the new one, never an empty one. Each write
-/// has its own temp name, so two saves of the same file at once cannot mix.
+/// Each write has its own temp name, so two saves of the same file at once
+/// cannot mix. Not flushed to disk: for files that are cheap to lose (picks,
+/// history, caches), as these saves run on every Enter. A power cut right after
+/// one can leave an empty file, which [`load_json`] moves aside.
 pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    write_json(path, value, false)
+}
+
+/// Like [`save_json`], but the temp file is flushed to disk before the rename,
+/// so a power cut right after a save leaves the old file or the new one, never
+/// an empty one. For what the user set by hand: reminders and pins.
+pub(crate) fn save_json_durable(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    write_json(path, value, true)
+}
+
+/// [`save_json`] and [`save_json_durable`]; `durable` flushes before the rename.
+fn write_json(path: &Path, value: &impl Serialize, durable: bool) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -107,7 +120,10 @@ pub(crate) fn save_json(path: &Path, value: &impl Serialize) -> std::io::Result<
     let tmp = temp_path(path);
     let written = std::fs::File::create(&tmp).and_then(|mut f| {
         f.write_all(json.as_bytes())?;
-        f.sync_all()
+        if durable {
+            f.sync_all()?;
+        }
+        Ok(())
     });
     written.and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);

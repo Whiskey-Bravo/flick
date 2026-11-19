@@ -5,7 +5,7 @@ use std::{path::PathBuf, sync::Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::file_ops::{moved_id, same_item};
-use crate::ranking::{load_json, save_json};
+use crate::ranking::{load_json, save_json_durable};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct Pin {
@@ -54,7 +54,7 @@ impl Pins {
             };
             (now_pinned, pins.clone())
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
         now_pinned
     }
 
@@ -72,7 +72,7 @@ impl Pins {
             pins.swap(i, j);
             pins.clone()
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
     }
 
     /// The item `old` (and anything below it, for a folder) is now at `new`:
@@ -101,7 +101,7 @@ impl Pins {
             *pins = seen;
             pins.clone()
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
     }
 
     /// Unpins the item `id`, of every provider. Saved like `toggle`.
@@ -116,7 +116,7 @@ impl Pins {
             }
             pins.clone()
         };
-        let _ = save_json(&self.path, &PinsFile { version: 1, pins: snapshot });
+        let _ = save_json_durable(&self.path, &PinsFile { version: 1, pins: snapshot });
     }
 
     pub fn is_pinned(&self, provider: &str, id: &str) -> bool {

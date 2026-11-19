@@ -8,7 +8,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::dirs::Clock;
-use crate::ranking::{load_json, save_json};
+use crate::ranking::{load_json, save_json_durable};
 
 /// Characters of reminder text kept.
 pub const MAX_TEXT: usize = 200;
@@ -206,7 +206,6 @@ impl Reminders {
             return false;
         };
         st.items.remove(at);
-        self.publish(&st);
         self.persist(&mut st);
         self.wake.notify_all();
         true
@@ -281,8 +280,10 @@ impl Reminders {
         self.publish(st);
     }
 
-    /// Saves the items and records whether the file now matches them.
+    /// Shows the items (see [`Reminders::publish`]), saves them and records
+    /// whether the file now matches them.
     fn persist(&self, st: &mut State) {
+        self.publish(st);
         st.dirty = self.save(st).is_err();
     }
 
@@ -295,7 +296,7 @@ impl Reminders {
             };
         }
         let items: Vec<Reminder> = st.items.iter().chain(&st.ahead).cloned().collect();
-        save_json(&self.path, &FileOut { version: VERSION, items: &items })
+        save_json_durable(&self.path, &FileOut { version: VERSION, items: &items })
     }
 
     /// Takes every item due by now out and saves the rest, before anything
@@ -322,7 +323,6 @@ impl Reminders {
             return vec![];
         }
         let due: Vec<Reminder> = st.items.drain(..n).collect();
-        self.publish(st);
         self.persist(st);
         due
     }
@@ -339,7 +339,6 @@ impl Reminders {
         let (missed, rest): (Vec<Reminder>, Vec<Reminder>) =
             std::mem::take(&mut st.items).into_iter().partition(|r| overdue.contains(&r.id));
         st.items = rest;
-        self.publish(st);
         if !missed.is_empty() {
             self.persist(st);
         }
