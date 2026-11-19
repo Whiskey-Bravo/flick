@@ -37,8 +37,7 @@ pub trait PowerRunner: Send + Sync {
 pub struct SystemPower;
 
 fn shutdown(args: &[&str]) -> Result<(), String> {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let exe = std::path::PathBuf::from(root).join(r"System32\shutdown.exe");
+    let exe = crate::quote::system32("shutdown.exe");
     let status = Command::new(exe)
         .args(args)
         .stdin(Stdio::null())

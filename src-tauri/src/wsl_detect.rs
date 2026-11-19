@@ -87,8 +87,7 @@ fn found(list: &[(String, bool)]) -> Option<Found> {
 
 /// Ask `wsl.exe` for its distros.
 pub fn detect() -> Detection {
-    let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-    let exe = PathBuf::from(root).join(r"System32\wsl.exe");
+    let exe = PathBuf::from(crate::quote::system32("wsl.exe"));
     from_run(run_hidden(&exe, &["-l", "-v"], LIST_TIMEOUT), exe.exists())
 }
 
