@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 /// The built-in themes, in the order Settings shows them. `custom` uses the
 /// config's `[custom_theme]`.
-pub const THEMES: [&str; 14] = [
+pub const THEMES: [&str; 15] = [
     "dark", "light", "midnight", "frost", "ember", "ocean", "forest", "grape", "rose", "sand", "mint", "sakura",
-    "glass", "custom",
+    "glass", "acrylic", "custom",
 ];
 /// The animation levels, calmest first. `wobble` moves things as weights on
 /// springs, with inertia.
@@ -86,6 +86,9 @@ pub struct Appearance {
     pub colors: Colors,
     /// The bar is see-through glass; `colors` then tint it.
     pub glass: bool,
+    /// The bar shows Windows' live blur of what is behind it; `colors` tint
+    /// it. Off when Windows cannot show it (see [`with_acrylic`]).
+    pub acrylic: bool,
     /// One of [`ANIMATIONS`].
     pub animations: String,
     /// The bar's `tab_completion` setting; it travels with the look so the
@@ -114,7 +117,7 @@ pub fn builtin(name: &str) -> Option<Colors> {
         "sand" => ["#f5efe4", "#e8dfd0", "#d9cdb9", "#2b241b", "#6a5e4e", "#b3541e", "#b3261e", "#7a5200"],
         "mint" => ["#eef7f1", "#dcebe1", "#c8ddd0", "#18261d", "#516457", "#1f8a4c", "#b3261e", "#775400"],
         "sakura" => ["#fbf0f3", "#f1dde4", "#e6cad3", "#2a1a20", "#735560", "#c2255c", "#b3261e", "#7a5200"],
-        "glass" => ["#14161c", "#ffffff", "#ffffff", "#ffffff", "#d0d3dc", "#9db4ff", "#ff9aa2", "#ffd479"],
+        "glass" | "acrylic" => ["#14161c", "#ffffff", "#ffffff", "#ffffff", "#d0d3dc", "#9db4ff", "#ff9aa2", "#ffd479"],
         _ => return None,
     }))
 }
@@ -205,10 +208,21 @@ pub fn resolve(theme: &str, custom: &CustomTheme, animations: &str) -> Appearanc
     Appearance {
         theme: name.to_string(),
         glass: name == "glass",
+        acrylic: name == "acrylic",
         colors,
         animations: animations.to_string(),
         tab_completion: false,
     }
+}
+
+/// Acrylic where Windows cannot show the live blur (`live` false: an older
+/// Windows, or Transparency effects off) becomes the dark look, so its text
+/// stays readable; the theme's name stays, so Settings still shows it chosen.
+pub fn with_acrylic(a: Appearance, live: bool) -> Appearance {
+    if !a.acrylic || live {
+        return a;
+    }
+    Appearance { colors: builtin("dark").expect("dark is built in"), acrylic: false, ..a }
 }
 
 /// The channels of a `#rrggbb` colour, 0 to 255.
@@ -263,12 +277,33 @@ mod tests {
             let a = resolve(name, &CustomTheme::default(), "high");
             assert_eq!(a.theme, name);
             assert_eq!(a.glass, name == "glass");
+            assert_eq!(a.acrylic, name == "acrylic");
             assert_eq!(a.animations, "high");
             for c in [&a.colors.background, &a.colors.surface, &a.colors.border, &a.colors.text, &a.colors.muted, &a.colors.accent, &a.colors.error, &a.colors.warning] {
                 assert!(valid_color(c) && c.len() == 7, "{name}: {c}");
             }
         }
         assert!(builtin("custom").is_none() && builtin("nope").is_none());
+    }
+
+    #[test]
+    fn acrylic_has_the_glass_colours_and_its_own_flag() {
+        let a = resolve("acrylic", &CustomTheme::default(), "");
+        assert_eq!((a.theme.as_str(), a.acrylic, a.glass), ("acrylic", true, false));
+        assert_eq!(a.colors, builtin("glass").unwrap());
+    }
+
+    #[test]
+    fn acrylic_falls_back_to_dark_where_windows_cannot_show_it() {
+        let a = resolve("acrylic", &CustomTheme::default(), "high");
+        let off = with_acrylic(a.clone(), false);
+        assert_eq!((off.theme.as_str(), off.acrylic, off.animations.as_str()), ("acrylic", false, "high"));
+        assert_eq!(off.colors, builtin("dark").unwrap());
+        assert_eq!(with_acrylic(a.clone(), true), a);
+        for other in ["glass", "dark"] {
+            let o = resolve(other, &CustomTheme::default(), "");
+            assert_eq!(with_acrylic(o.clone(), false), o);
+        }
     }
 
     #[test]
@@ -329,7 +364,7 @@ mod tests {
 
     #[test]
     fn every_solid_theme_is_readable() {
-        let solid: Vec<&str> = THEMES.iter().copied().filter(|n| !matches!(*n, "glass" | "custom")).collect();
+        let solid: Vec<&str> = THEMES.iter().copied().filter(|n| !matches!(*n, "glass" | "acrylic" | "custom")).collect();
         assert_eq!(solid.len(), 12);
         for name in solid {
             let c = builtin(name).unwrap();

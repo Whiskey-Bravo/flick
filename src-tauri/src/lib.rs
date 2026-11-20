@@ -1069,6 +1069,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::query,
+            commands::bar_shape,
             commands::live_row,
             commands::unfold,
             commands::activate,
@@ -1260,7 +1261,9 @@ fn setup(app: &AppHandle) {
     // The Win key: its worker starts the hook when the setting is on.
     {
         let state = app.state::<AppState>();
-        window::set_glass(app, current_appearance(&state).glass);
+        let look = current_appearance(&state);
+        window::set_glass(app, look.glass);
+        window::set_acrylic(app, look.acrylic);
         state.win_key.flags.set_bar_ready(app.get_webview_window(window::LABEL).is_some());
         let worker = app.clone();
         std::thread::Builder::new()
@@ -1667,6 +1670,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     // Both pages repaint with the theme and animation level now in force.
     let appearance = current_appearance(&state);
     window::set_glass(app, appearance.glass);
+    window::set_acrylic(app, appearance.acrylic);
     let _ = app.emit("appearance:changed", appearance);
 }
 
@@ -1674,7 +1678,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
 /// Read from the main thread's copy: the `appearance` command and the setup
 /// run on the main thread, which never locks the config.
 fn current_appearance(state: &AppState) -> theme::Appearance {
-    state.mirror.appearance()
+    theme::with_acrylic(state.mirror.appearance(), window::acrylic_live())
 }
 
 /// What a page applies when it loads: the theme's colours and the animation

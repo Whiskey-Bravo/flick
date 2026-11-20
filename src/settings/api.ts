@@ -21,7 +21,7 @@ export type ShortcutDef = {
 export type CustomTheme = Partial<Colors>;
 
 /** A theme as Settings shows it: `custom` carries the colours it has now. */
-export type ThemeInfo = { name: string; colors: Colors; glass: boolean };
+export type ThemeInfo = { name: string; colors: Colors; glass: boolean; acrylic: boolean };
 
 export type ItemRef = { provider: string; id: string; title: string };
 export type WorkspaceDef = { name: string; aliases: string[]; items: ItemRef[] };

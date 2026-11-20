@@ -283,6 +283,13 @@ fn show_as(app: &AppHandle, shown: Shown, mut steps: crate::timing::Steps) {
     // behind it. An already open bar keeps the picture it has.
     if hidden {
         take_backdrop(app, &w);
+        refresh_acrylic(app);
+        // Acrylic: the window kept the last list's height. Shrunk before it is
+        // on screen, so no tall blur shows below the fresh bar; the page tells
+        // the panel's height right after and the window grows to it.
+        if ACRYLIC.load(Ordering::SeqCst) {
+            let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, 1.0));
+        }
     }
     steps.step("backdrop");
     // Before the bar is on screen: its WebView is told to use normal memory
@@ -403,6 +410,135 @@ pub fn set_glass(app: &AppHandle, on: bool) {
             let height = if on { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
             let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
         }
+    }
+}
+
+/// Acrylic is on: Windows draws its live blur under the whole bar window, so
+/// the window is kept as tall as the panel (`apply_bar_shape`) and rounded
+/// by Windows. (A window region does not clip the blur: Windows ignores it.)
+static ACRYLIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switches the Acrylic theme's live blur and Windows' round corners on or
+/// off. Off also gives the window back its full height (Glass's, if Glass is
+/// what replaced it), so no other theme is left short or blurred.
+pub fn set_acrylic(app: &AppHandle, on: bool) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DEFAULT, DWMWCP_ROUND, DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
+    };
+    let was = ACRYLIC.swap(on, Ordering::SeqCst);
+    if on == was {
+        return;
+    }
+    let Some(w) = bar(app) else { return };
+    let Ok(h) = w.hwnd() else { return };
+    let hwnd = HWND(h.0 as _);
+    let backdrop: DWM_SYSTEMBACKDROP_TYPE = if on { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
+    let corners: DWM_WINDOW_CORNER_PREFERENCE = if on { DWMWCP_ROUND } else { DWMWCP_DEFAULT };
+    // SAFETY: `hwnd` is the bar's live window; each value is its attribute's
+    // documented type, passed with its size.
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&backdrop as *const DWM_SYSTEMBACKDROP_TYPE).cast(), 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(), 4);
+    }
+    if !on {
+        let height = if GLASS.load(Ordering::SeqCst) { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
+        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
+    }
+}
+
+/// Whether the Acrylic theme's live blur must be switched because Windows'
+/// Transparency setting changed since it was last applied (`on`).
+fn acrylic_changed(theme: &str, live: bool, on: bool) -> bool {
+    theme == "acrylic" && live != on
+}
+
+/// Before a show under the Acrylic theme: picks up a Transparency effects
+/// setting changed while Flick ran, so the bar never shows white text on the
+/// solid colour Windows puts in place of the blur. Other themes read nothing.
+fn refresh_acrylic(app: &AppHandle) {
+    let Some(state) = app.try_state::<crate::AppState>() else { return };
+    let look = state.mirror.appearance();
+    if look.theme != "acrylic" {
+        return;
+    }
+    let live = acrylic_live();
+    if !acrylic_changed(&look.theme, live, ACRYLIC.load(Ordering::SeqCst)) {
+        return;
+    }
+    let look = crate::theme::with_acrylic(look, live);
+    set_acrylic(app, look.acrylic);
+    let _ = app.emit("appearance:changed", look);
+}
+
+/// The bar window's height (CSS px) under Acrylic for a panel `panel_height`
+/// tall: whole pixels, at least 1, at most the plain window's height.
+fn acrylic_height(panel_height: f64) -> f64 {
+    panel_height.round().clamp(1.0, BAR_HEIGHT)
+}
+
+/// Acrylic only: makes the bar window as tall as its panel, `panel_height`
+/// CSS px (the page reports it whenever the panel changes size), so the blur
+/// shows only where the panel is.
+pub fn apply_bar_shape(app: &AppHandle, panel_height: f64) {
+    if !ACRYLIC.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(w) = bar(app) {
+        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, acrylic_height(panel_height)));
+    }
+}
+
+/// Whether Windows can show the Acrylic theme's live blur: Windows 11 22H2
+/// (build 22621) or later, with Transparency effects on. Read from the
+/// registry each time (cheap; the setting can change while Flick runs).
+pub fn acrylic_live() -> bool {
+    acrylic_possible(registry::build(), registry::transparency())
+}
+
+/// The rule behind [`acrylic_live`]: an unknown build counts as too old, an
+/// unknown Transparency setting as on (Windows' default).
+fn acrylic_possible(build: Option<u32>, transparency: Option<u32>) -> bool {
+    build.is_some_and(|b| b >= 22621) && transparency != Some(0)
+}
+
+mod registry {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+
+    /// Windows' build number, e.g. 26100.
+    pub fn build() -> Option<u32> {
+        let mut buf = [0u16; 32];
+        let mut bytes = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: `buf` is `bytes` long and outlives the call.
+        unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+                w!("CurrentBuildNumber"),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+            .ok()
+            .ok()?;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len]).trim().parse().ok()
+    }
+
+    /// Settings > Personalization > Colors > Transparency effects (0: off).
+    pub fn transparency() -> Option<u32> {
+        dword(HKEY_CURRENT_USER, w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"), w!("EnableTransparency"))
+    }
+
+    fn dword(root: HKEY, key: PCWSTR, name: PCWSTR) -> Option<u32> {
+        let mut value = 0u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        // SAFETY: `value` is a u32 and `bytes` its size.
+        unsafe { RegGetValueW(root, key, name, RRF_RT_REG_DWORD, None, Some((&mut value as *mut u32).cast()), Some(&mut bytes)).ok().ok()? };
+        Some(value)
     }
 }
 
@@ -578,6 +714,33 @@ fn bar_position(origin: (i32, i32), size: (u32, u32), width: u32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_acrylic_window_is_as_tall_as_its_panel() {
+        assert_eq!(acrylic_height(64.0), 64.0);
+        assert_eq!(acrylic_height(64.4), 64.0, "whole CSS px");
+        assert_eq!(acrylic_height(0.0), 1.0, "never empty");
+        assert_eq!(acrylic_height(500.0), BAR_HEIGHT, "never taller than the plain window");
+    }
+
+    #[test]
+    fn a_changed_transparency_setting_is_picked_up_at_the_next_show() {
+        assert!(acrylic_changed("acrylic", false, true), "Transparency effects turned off");
+        assert!(acrylic_changed("acrylic", true, false), "turned back on");
+        assert!(!acrylic_changed("acrylic", true, true));
+        assert!(!acrylic_changed("glass", false, false));
+        assert!(!acrylic_changed("dark", false, false));
+    }
+
+    #[test]
+    fn acrylic_needs_22h2_and_transparency_effects() {
+        assert!(acrylic_possible(Some(22621), Some(1)));
+        assert!(acrylic_possible(Some(26100), None), "an unset Transparency setting is Windows' default, on");
+        assert!(!acrylic_possible(Some(22000), Some(1)), "Windows 11 21H2");
+        assert!(!acrylic_possible(Some(19045), Some(1)), "Windows 10");
+        assert!(!acrylic_possible(Some(26100), Some(0)), "Transparency effects off");
+        assert!(!acrylic_possible(None, Some(1)), "an unknown build");
+    }
 
     #[test]
     fn hold_open_suppresses_blur_hide_and_is_released_on_error() {

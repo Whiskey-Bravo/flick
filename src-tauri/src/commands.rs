@@ -100,6 +100,13 @@ fn after_for(after: After, started: u64, now: u64) -> After {
 /// Activation can block for seconds (UAC prompt, broken shortcut), so it runs
 /// on a blocking-pool thread. See `settle` and `after_for` for what happens
 /// to the bar.
+/// The page's panel is `height` CSS px tall: under Acrylic the window is made
+/// as tall as it. Synchronous, so it runs on the main thread with the window.
+#[tauri::command]
+pub fn bar_shape(app: tauri::AppHandle, height: f64) {
+    crate::window::apply_bar_shape(&app, height);
+}
+
 #[tauri::command]
 pub async fn activate(
     provider: String,

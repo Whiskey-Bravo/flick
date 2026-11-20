@@ -199,6 +199,7 @@ pub struct ThemeInfo {
     name: &'static str,
     colors: crate::theme::Colors,
     glass: bool,
+    acrylic: bool,
 }
 
 /// The themes as Settings shows them.
@@ -207,7 +208,7 @@ fn theme_infos(custom: &crate::theme::CustomTheme) -> Vec<ThemeInfo> {
         .iter()
         .map(|&name| {
             let resolved = crate::theme::resolve(name, custom, "");
-            ThemeInfo { name, colors: resolved.colors, glass: resolved.glass }
+            ThemeInfo { name, colors: resolved.colors, glass: resolved.glass, acrylic: resolved.acrylic }
         })
         .collect()
 }
@@ -658,6 +659,7 @@ mod tests {
         let infos = theme_infos(&custom);
         assert_eq!(infos.iter().map(|t| t.name).collect::<Vec<_>>(), crate::theme::THEMES);
         assert_eq!(infos.iter().filter(|t| t.glass).map(|t| t.name).collect::<Vec<_>>(), ["glass"]);
+        assert_eq!(infos.iter().filter(|t| t.acrylic).map(|t| t.name).collect::<Vec<_>>(), ["acrylic"]);
         let own = infos.iter().find(|t| t.name == "custom").unwrap();
         assert_eq!((own.colors.background.as_str(), own.colors.text.as_str()), ("#101418", "#ececf1"));
     }

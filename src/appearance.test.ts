@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   DARK,
+  DEFAULT_APPEARANCE,
+  menuViewHeight,
+  applyAppearance,
   colorsToSave,
   contrast,
   contrastWarnings,
@@ -28,9 +31,24 @@ describe("appearance", () => {
 
   it("Settings uses the dark colours under Glass, the theme's otherwise", () => {
     const light = { ...DARK, background: "#f7f7f9", text: "#1c1d22" };
-    const solid: Appearance = { theme: "light", colors: light, glass: false, animations: "minimal", tab_completion: false };
+    const solid: Appearance = { theme: "light", colors: light, glass: false, acrylic: false, animations: "minimal", tab_completion: false };
     expect(settingsColors(solid)).toBe(light);
     expect(settingsColors({ ...solid, theme: "glass", glass: true })).toBe(DARK);
+    expect(settingsColors({ ...solid, theme: "acrylic", acrylic: true })).toBe(DARK);
+  });
+
+  it("under Acrylic a menu may use the full bar's height, as the window grows to fit it", () => {
+    expect(menuViewHeight(true, 110)).toBe(420);
+    expect(menuViewHeight(false, 110)).toBe(110);
+    expect(menuViewHeight(false, 460)).toBe(460);
+  });
+
+  it("marks the page when Acrylic's live blur is on", () => {
+    const root = { style: { setProperty: () => {}, colorScheme: "" }, dataset: {} } as unknown as HTMLElement;
+    applyAppearance({ ...DEFAULT_APPEARANCE, theme: "acrylic", acrylic: true }, DARK, root);
+    expect(root.dataset.acrylic).toBe("true");
+    applyAppearance(DEFAULT_APPEARANCE, DARK, root);
+    expect(root.dataset.acrylic).toBe("false");
   });
 
   it("bundled icons are repainted in the theme's text colour", () => {

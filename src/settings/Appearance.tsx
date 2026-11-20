@@ -26,6 +26,7 @@ const THEME_LABELS: Record<string, string> = {
   mint: "Mint",
   sakura: "Sakura",
   glass: "Glass",
+  acrylic: "Acrylic",
   custom: "Custom",
 };
 
@@ -130,12 +131,17 @@ export function Appearance({ state }: { state: SettingsState }) {
               class={t.name === theme ? "ap-theme active" : "ap-theme"}
               onClick={() => pickTheme(t.name)}
             >
-              <Swatch colors={t.colors} glass={t.glass} />
+              <Swatch colors={t.colors} glass={t.glass || t.acrylic} />
               <span class="ap-name">{THEME_LABELS[t.name] ?? t.name}</span>
             </button>
           ))}
         </div>
         {theme === "glass" && <p class="hint">Glass shows what is behind the bar. This window stays dark.</p>}
+        {theme === "acrylic" && (
+          <p class="hint">
+            Acrylic shows a live blur of what is behind the bar. It needs Windows 11 22H2 or later and Transparency effects on. This window stays dark.
+          </p>
+        )}
         {errors.theme && <p class="error">{errors.theme}</p>}
       </div>
 
@@ -147,7 +153,7 @@ export function Appearance({ state }: { state: SettingsState }) {
             <select value="" onChange={(e) => startFrom(e.currentTarget.value)}>
               <option value="">Choose a theme…</option>
               {themes
-                .filter((t) => t.name !== "custom" && !t.glass)
+                .filter((t) => t.name !== "custom" && !t.glass && !t.acrylic)
                 .map((t) => (
                   <option key={t.name} value={t.name}>
                     {THEME_LABELS[t.name] ?? t.name}

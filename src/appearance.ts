@@ -16,6 +16,8 @@ export type Appearance = {
   theme: string;
   colors: Colors;
   glass: boolean;
+  // Windows' live blur behind the bar (the Acrylic theme, where Windows can show it).
+  acrylic: boolean;
   animations: string;
   // The bar's "Tab completion" setting (it travels with the look).
   tab_completion: boolean;
@@ -53,6 +55,7 @@ export const DEFAULT_APPEARANCE: Appearance = {
   theme: "dark",
   colors: DARK,
   glass: false,
+  acrylic: false,
   animations: "minimal",
   tab_completion: false,
 };
@@ -73,15 +76,26 @@ export function cssVars(c: Colors): Record<string, string> {
   };
 }
 
-// The Settings window is never see-through: under Glass it uses the dark look.
+// The bar window's height under the plain themes (window.rs, BAR_HEIGHT).
+export const BAR_HEIGHT = 420;
+
+// How tall the room is that the actions menu may open into. Under Acrylic the
+// window is only as tall as the panel, but grows with it: the panel is
+// stretched to hold the menu, so the menu may use the plain window's height.
+export function menuViewHeight(acrylic: boolean, innerHeight: number): number {
+  return acrylic ? BAR_HEIGHT : innerHeight;
+}
+
+// The Settings window is never see-through: under Glass and Acrylic it uses the dark look.
 export function settingsColors(a: Appearance): Colors {
-  return a.glass ? DARK : a.colors;
+  return a.glass || a.acrylic ? DARK : a.colors;
 }
 
 export function applyAppearance(a: Appearance, colors: Colors, root: HTMLElement): void {
   for (const [name, value] of Object.entries(cssVars(colors))) root.style.setProperty(name, value);
   root.dataset.theme = a.theme;
   root.dataset.glass = String(a.glass);
+  root.dataset.acrylic = String(a.acrylic);
   root.dataset.motion = a.animations;
   // Text on an accent-coloured button: dark on a light accent, white otherwise.
   root.style.setProperty("--on-accent", onAccent(colors.accent));
