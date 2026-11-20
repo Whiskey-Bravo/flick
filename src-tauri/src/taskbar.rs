@@ -1,16 +1,19 @@
 //! Keeps an auto-hidden taskbar up while the bar is open (the `show_taskbar`
 //! setting).
 //!
-//! Windows shows a hidden taskbar only while it has the focus, the mouse is
-//! on it, or one of its buttons asks for attention. The first two would take
-//! the keyboard or the mouse from the bar, so this uses the third: an
-//! invisible window that never takes the focus gets a taskbar button, asks
-//! for attention until the taskbar is up, and then stops asking. The button
-//! turns into a plain one and the taskbar stays up for as long as the button
+//! First the taskbar on the bar's monitor is asked to show itself, with the
+//! message Explorer's own auto-hide code answers (`SHOW_AUTOHIDE`, not
+//! documented; other launchers use it too). Closing the bar asks it to hide
+//! again. If the taskbar is not up shortly after, a Windows update may have
+//! changed that, and the documented way takes over: Windows shows a hidden
+//! taskbar while one of its buttons asks for attention, so an invisible
+//! window that never takes the focus gets a taskbar button, asks for
+//! attention until the taskbar is up, and then stops asking. The button turns
+//! into a plain one and the taskbar stays up for as long as the button
 //! exists; closing the bar removes the window, and the taskbar hides again.
 //! No Windows setting is changed.
 //!
-//! Clicking the button gives that window the focus, the bar loses it and
+//! Clicking that button gives its window the focus, the bar loses it and
 //! hides as it does for any click elsewhere, and the window goes with it.
 //!
 //! Everything here runs on the main thread. Tests cover only the pure parts:
@@ -25,9 +28,10 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, REC
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETSTATE, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, FlashWindowEx, GetWindowRect, KillTimer,
-    RegisterClassW, SetLayeredWindowAttributes, SetTimer, ShowWindow, FLASHWINFO, FLASHW_STOP, FLASHW_TRAY, LWA_ALPHA,
-    SW_SHOWNOACTIVATE, WM_TIMER, WNDCLASSW, WS_EX_APPWINDOW, WS_EX_LAYERED, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW, FlashWindowEx, GetWindowRect, KillTimer,
+    PostMessageW, RegisterClassW, SendMessageW, SetLayeredWindowAttributes, SetTimer, ShowWindow, FLASHWINFO, FLASHW_STOP,
+    FLASHW_TRAY, ICON_BIG, ICON_SMALL, LWA_ALPHA, SW_SHOWNOACTIVATE, WM_GETICON, WM_SETICON, WM_TIMER, WNDCLASSW,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_POPUP, WS_SYSMENU,
 };
 
 /// `ABM_GETSTATE`'s auto-hide bit.
@@ -43,6 +47,12 @@ const GIVE_UP_MS: u64 = 3_000;
 /// How many times the taskbar is raised again if it hides while the bar is
 /// still open, so the button can never flash on and on.
 const MAX_RAISES: u32 = 3;
+/// Asks an auto-hidden taskbar to show itself (wParam 1) or hide again
+/// (wParam 0); lParam is the monitor. Not documented: Explorer's own message.
+const SHOW_AUTOHIDE: u32 = 0x05D1;
+/// How long the taskbar has to come up after the message before the button
+/// takes over.
+const MESSAGE_WAIT_MS: u64 = 400;
 
 /// What one timer tick does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +78,33 @@ fn tick(up_for_ms: Option<u64>, asking_for_ms: u64) -> Tick {
     }
 }
 
+/// What a tick does after the taskbar was asked to show itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Message {
+    /// The taskbar is up: hold.
+    Up,
+    /// Not yet: look again.
+    Wait,
+    /// It did not come: the button takes over.
+    Fallback,
+}
+
+fn after_message(up: bool, waited_ms: u64) -> Message {
+    if up {
+        Message::Up
+    } else if waited_ms >= MESSAGE_WAIT_MS {
+        Message::Fallback
+    } else {
+        Message::Wait
+    }
+}
+
+/// The taskbar on `monitor` among `taskbars` (taskbar, its monitor), the
+/// main one first; `None` when that monitor has none of its own.
+fn taskbar_for(monitor: isize, taskbars: &[(isize, isize)]) -> Option<isize> {
+    taskbars.iter().find(|(_, m)| *m == monitor).map(|(t, _)| *t)
+}
+
 /// Whether the taskbar counts as hidden: less than half of it is on its
 /// monitor. Rectangles are left, top, right, bottom.
 fn taskbar_hidden(taskbar: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) -> bool {
@@ -80,9 +117,11 @@ fn taskbar_hidden(taskbar: (i32, i32, i32, i32), monitor: (i32, i32, i32, i32)) 
 /// Where the helper window stands.
 #[derive(Clone, Copy)]
 enum Phase {
+    /// The taskbar was asked to show itself at `since`.
+    Messaged { since: Instant },
     /// Asking for attention since `since`; the taskbar came up at `up`.
     Asking { since: Instant, up: Option<Instant> },
-    /// The button is plain and the taskbar should be up.
+    /// The button is plain (or was never needed) and the taskbar should be up.
     Holding,
     /// Nothing more to do until the bar closes.
     Done,
@@ -93,6 +132,12 @@ struct Helper {
     hwnd: isize,
     phase: Phase,
     raises: u32,
+    /// The taskbar on the bar's monitor (0: none found) and that monitor.
+    taskbar: isize,
+    monitor: isize,
+    /// The taskbar was asked to show itself, so it is asked to hide when the
+    /// bar closes.
+    messaged: bool,
 }
 
 thread_local! {
@@ -109,23 +154,43 @@ pub fn raise(app: &AppHandle) {
     if !on {
         return;
     }
-    let _ = app.run_on_main_thread(|| {
+    let app = app.clone();
+    let _ = app.clone().run_on_main_thread(move || {
         if HELPER.with(|h| h.get()).is_some() || !auto_hides() {
             return;
         }
-        if let Some(hwnd) = create() {
-            let helper = Helper { hwnd: hwnd.0 as isize, phase: Phase::Asking { since: Instant::now(), up: None }, raises: 1 };
-            HELPER.with(|h| h.set(Some(helper)));
-            // SAFETY: a timer on the window this thread just made.
-            unsafe { SetTimer(Some(hwnd), TIMER, TICK_MS, None) };
+        let Some(bar) = bar_hwnd(&app) else { return };
+        // SAFETY: a lookup on the bar's live window.
+        let monitor = unsafe { MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+        let taskbar = taskbar_for(monitor, &taskbars()).unwrap_or(0);
+        let Some(hwnd) = create(bar) else { return };
+        let mut helper = Helper {
+            hwnd: hwnd.0 as isize,
+            phase: Phase::Messaged { since: Instant::now() },
+            raises: 1,
+            taskbar,
+            monitor,
+            messaged: false,
+        };
+        if taskbar != 0 && message(&helper, true) {
+            helper.messaged = true;
+        } else {
+            show_button(hwnd);
+            helper.phase = Phase::Asking { since: Instant::now(), up: None };
         }
+        HELPER.with(|h| h.set(Some(helper)));
+        // SAFETY: a timer on the window this thread just made.
+        unsafe { SetTimer(Some(hwnd), TIMER, TICK_MS, None) };
     });
 }
 
-/// The bar was hidden: remove the button, so the taskbar hides again.
+/// The bar was hidden: let the taskbar hide again and remove the button.
 pub fn lower(app: &AppHandle) {
     let _ = app.run_on_main_thread(|| {
         if let Some(helper) = HELPER.with(|h| h.take()) {
+            if helper.messaged {
+                message(&helper, false);
+            }
             let hwnd = HWND(helper.hwnd as _);
             // SAFETY: the window and timer this thread made.
             unsafe {
@@ -143,11 +208,47 @@ fn auto_hides() -> bool {
     unsafe { SHAppBarMessage(ABM_GETSTATE, &mut data) & AUTOHIDE != 0 }
 }
 
-/// Whether the taskbar is hidden right now; `None` when it can't be found.
-fn hidden_now() -> Option<bool> {
+/// The bar window's handle.
+fn bar_hwnd(app: &AppHandle) -> Option<HWND> {
+    let h = app.get_webview_window(crate::window::LABEL)?.hwnd().ok()?;
+    Some(HWND(h.0 as _))
+}
+
+/// Every taskbar with its monitor: the main one first, then one for each
+/// other monitor that shows its own (`Shell_SecondaryTrayWnd`).
+fn taskbars() -> Vec<(isize, isize)> {
+    // SAFETY: a lookup on a window just found.
+    let with_monitor = |t: HWND| (t.0 as isize, unsafe { MonitorFromWindow(t, MONITOR_DEFAULTTONEAREST) }.0 as isize);
+    let mut out = Vec::new();
+    // SAFETY: plain window lookups; each handle found is only measured.
+    unsafe {
+        if let Ok(main) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            out.push(with_monitor(main));
+        }
+        let mut after = None;
+        while let Ok(next) = FindWindowExW(None, after, w!("Shell_SecondaryTrayWnd"), None) {
+            out.push(with_monitor(next));
+            after = Some(next);
+        }
+    }
+    out
+}
+
+/// Asks the bar's taskbar to show itself (`show`) or hide again.
+fn message(helper: &Helper, show: bool) -> bool {
+    // SAFETY: a posted message to Explorer's taskbar window; nothing waits on it.
+    unsafe {
+        PostMessageW(Some(HWND(helper.taskbar as _)), SHOW_AUTOHIDE, WPARAM(usize::from(show)), LPARAM(helper.monitor))
+            .is_ok()
+    }
+}
+
+/// Whether the bar's taskbar is hidden right now (the main one when none was
+/// found for the bar's monitor); `None` when it can't be measured.
+fn hidden_now(taskbar: isize) -> Option<bool> {
     // SAFETY: plain reads on window and monitor handles; every result is checked.
     unsafe {
-        let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
+        let tray = if taskbar != 0 { HWND(taskbar as _) } else { FindWindowW(w!("Shell_TrayWnd"), None).ok()? };
         let mut rect = RECT::default();
         GetWindowRect(tray, &mut rect).ok()?;
         let mut monitor = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
@@ -168,22 +269,25 @@ fn instance() -> HINSTANCE {
     HINSTANCE(std::ptr::addr_of!(__ImageBase) as *mut std::ffi::c_void)
 }
 
-/// Makes the helper window: one transparent pixel far off screen, shown
-/// without taking the focus, with a taskbar button named Flick.
-fn create() -> Option<HWND> {
+/// Makes the helper window: one transparent pixel at the bar's corner, so a
+/// button for it lands on the bar's monitor, with Flick's icon. It stays
+/// hidden, without a button, until `show_button`; it also carries the timer.
+fn create(bar: HWND) -> Option<HWND> {
     let class = w!("FlickTaskbarButton");
     let wc = WNDCLASSW { lpfnWndProc: Some(proc), hInstance: instance(), lpszClassName: class, ..Default::default() };
-    // SAFETY: a valid class description (registering it again fails
-    // harmlessly); the window belongs to this thread.
+    let mut at = RECT::default();
+    // SAFETY: a read on the bar's live window; a valid class description
+    // (registering it again fails harmlessly); the window belongs to this thread.
     unsafe {
+        let _ = GetWindowRect(bar, &mut at);
         RegisterClassW(&wc);
         let hwnd = CreateWindowExW(
             WS_EX_APPWINDOW | WS_EX_LAYERED,
             class,
             w!("Flick"),
-            WS_POPUP,
-            -32000,
-            -32000,
+            WS_POPUP | WS_SYSMENU,
+            at.left,
+            at.top,
             1,
             1,
             None,
@@ -193,9 +297,22 @@ fn create() -> Option<HWND> {
         )
         .ok()?;
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // The bar's icons, so the button is not blank (a button shows its
+        // window's icon only when the window has a system menu).
+        for kind in [ICON_BIG, ICON_SMALL] {
+            let icon = SendMessageW(bar, WM_GETICON, Some(WPARAM(kind as usize)), None);
+            if icon.0 != 0 {
+                SendMessageW(hwnd, WM_SETICON, Some(WPARAM(kind as usize)), Some(LPARAM(icon.0)));
+            }
+        }
         Some(hwnd)
     }
+}
+
+/// Shows the helper window, which gives it its taskbar button.
+fn show_button(hwnd: HWND) {
+    // SAFETY: a window of this thread, shown without taking the focus.
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
 }
 
 /// Asks for attention (`true`) or stops asking.
@@ -216,12 +333,22 @@ fn on_timer(hwnd: HWND) {
     if helper.hwnd != hwnd.0 as isize {
         return;
     }
-    let hidden = hidden_now().unwrap_or(false);
+    let hidden = hidden_now(helper.taskbar).unwrap_or(false);
     let now = Instant::now();
+    let ms = |from: Instant| now.duration_since(from).as_millis() as u64;
     match helper.phase {
+        Phase::Messaged { since } => {
+            helper.phase = match after_message(!hidden, ms(since)) {
+                Message::Up => Phase::Holding,
+                Message::Wait => Phase::Messaged { since },
+                Message::Fallback => {
+                    show_button(hwnd);
+                    Phase::Asking { since: now, up: None }
+                }
+            };
+        }
         Phase::Asking { since, up } => {
             let up = if hidden { None } else { up.or(Some(now)) };
-            let ms = |from: Instant| now.duration_since(from).as_millis() as u64;
             helper.phase = match tick(up.map(ms), ms(since)) {
                 Tick::Ask => {
                     attention(hwnd, true);
@@ -242,7 +369,12 @@ fn on_timer(hwnd: HWND) {
         Phase::Holding if hidden => {
             helper.phase = if helper.raises < MAX_RAISES {
                 helper.raises += 1;
-                Phase::Asking { since: now, up: None }
+                if helper.messaged && message(&helper, true) {
+                    Phase::Messaged { since: now }
+                } else {
+                    show_button(hwnd);
+                    Phase::Asking { since: now, up: None }
+                }
             } else {
                 Phase::Done
             };
@@ -277,6 +409,26 @@ mod tests {
         assert_eq!(tick(Some(0), 400), Tick::Wait);
         assert_eq!(tick(Some(249), 400), Tick::Wait);
         assert_eq!(tick(Some(250), 400), Tick::Settle);
+    }
+
+    #[test]
+    fn after_the_message_the_taskbar_is_waited_for_then_the_button_takes_over() {
+        assert_eq!(after_message(true, 0), Message::Up);
+        assert_eq!(after_message(true, 390), Message::Up);
+        assert_eq!(after_message(false, 0), Message::Wait);
+        assert_eq!(after_message(false, MESSAGE_WAIT_MS - 1), Message::Wait);
+        assert_eq!(after_message(false, MESSAGE_WAIT_MS), Message::Fallback);
+    }
+
+    #[test]
+    fn the_taskbar_on_the_bars_monitor_is_the_one_used() {
+        // (taskbar, its monitor): the main one first, then the others.
+        let bars = [(10, 1), (20, 2), (30, 3)];
+        assert_eq!(taskbar_for(1, &bars), Some(10));
+        assert_eq!(taskbar_for(3, &bars), Some(30));
+        // A monitor without its own taskbar (only on the main one).
+        assert_eq!(taskbar_for(4, &bars), None);
+        assert_eq!(taskbar_for(1, &[]), None);
     }
 
     #[test]
