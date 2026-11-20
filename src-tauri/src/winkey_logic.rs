@@ -5,15 +5,16 @@
 //! so missed key-ups (Win+L, Ctrl+Alt+Del, elevated windows) can't wedge it;
 //! tracking only spans one press, from Win down to Win up.
 
-/// Keys and buttons already down when Win went down, read from Windows
-/// (`GetAsyncKeyState`) by the caller. `Default` is "nothing held".
+/// Keys already down when Win went down, read from Windows
+/// (`GetAsyncKeyState`) by the caller. `Default` is "nothing held". A mouse
+/// button held from before doesn't count: Win tapped mid-click or mid-drag
+/// still opens Flick; only a click during the press makes a combination.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
     pub other_win: bool,
-    pub mouse_button: bool,
     /// This same Win key was already down: the event is an auto-repeat (or the
     /// start of the press was missed). A low-level hook runs before Windows
     /// updates the key state, so a fresh press reads `false` here.
@@ -22,7 +23,7 @@ pub struct Held {
 
 impl Held {
     fn any_other(&self) -> bool {
-        self.ctrl || self.shift || self.alt || self.other_win || self.mouse_button
+        self.ctrl || self.shift || self.alt || self.other_win
     }
 }
 
@@ -79,14 +80,13 @@ impl Press {
         Press { state: State::Idle, mouse_hooked: false }
     }
 
-    /// Feed one event. `button_held_now` is the mouse button state read at
-    /// Win-up; it is ignored for other events.
-    pub fn on(&mut self, ev: Ev, button_held_now: bool) -> Verdict {
+    /// Feed one event.
+    pub fn on(&mut self, ev: Ev) -> Verdict {
         match ev {
             Ev::WinUp => {
                 let was = self.state;
                 self.state = State::Idle;
-                if was == State::Armed && !button_held_now {
+                if was == State::Armed {
                     self.mouse_hooked = false;
                     return Verdict::Lone;
                 }
@@ -289,155 +289,154 @@ mod tests {
 
     fn armed() -> Press {
         let mut p = Press::new();
-        assert_eq!(p.on(down(), false), Verdict::ArmMouse);
+        assert_eq!(p.on(down()), Verdict::ArmMouse);
         p
     }
 
     #[test]
     fn lone_left_or_right_win_is_lone() {
         let mut p = Press::new();
-        assert_eq!(p.on(down(), false), Verdict::ArmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(down()), Verdict::ArmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
     }
 
     #[test]
     fn win_combination_passes() {
         let mut p = armed();
-        assert_eq!(p.on(Ev::KeyDown { flick: false }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::KeyDown { flick: false }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::KeyDown { flick: false }), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::KeyDown { flick: false }), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
     fn ctrl_win_d_is_a_combination_from_the_start() {
         let mut p = Press::new();
         let held = Held { ctrl: true, ..none() };
-        assert_eq!(p.on(Ev::WinDown { physical: true, held }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::KeyDown { flick: false }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinDown { physical: true, held }), Verdict::Pass);
+        assert_eq!(p.on(Ev::KeyDown { flick: false }), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
         for held in [
             Held { shift: true, ..none() },
             Held { alt: true, ..none() },
             Held { other_win: true, ..none() },
-            Held { mouse_button: true, ..none() },
         ] {
             let mut p = Press::new();
-            assert_eq!(p.on(Ev::WinDown { physical: true, held }, false), Verdict::Pass);
-            assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+            assert_eq!(p.on(Ev::WinDown { physical: true, held }), Verdict::Pass);
+            assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
         }
     }
 
     #[test]
     fn click_or_wheel_spoils() {
         let mut p = armed();
-        assert_eq!(p.on(Ev::MouseDown { flick: false }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::MouseDown { flick: false }), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
 
         let mut p = armed();
-        assert_eq!(p.on(Ev::Wheel { flick: false }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::Wheel { flick: false }), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
     fn click_then_auto_repeat_stays_spoiled() {
         // Win keeps auto-repeating through a click; the repeats must not re-arm.
         let mut p = armed();
-        assert_eq!(p.on(Ev::MouseDown { flick: false }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(repeat(), false), Verdict::Pass);
-        assert_eq!(p.on(repeat(), false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::MouseDown { flick: false }), Verdict::DisarmMouse);
+        assert_eq!(p.on(repeat()), Verdict::Pass);
+        assert_eq!(p.on(repeat()), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
-    fn button_held_at_up_spoils() {
-        // Not a lone press; the mouse hook is still in, so it is removed.
-        let mut p = armed();
-        assert_eq!(p.on(Ev::WinUp, true), Verdict::DisarmMouse);
-        assert_eq!(p.on(down(), false), Verdict::ArmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+    fn a_button_held_from_before_does_not_count() {
+        // Win tapped while the left button is held (mid-click or mid-drag):
+        // still a lone press, so Flick opens and Start stays shut. Only a
+        // click during the press makes it a combination.
+        let mut p = Press::new();
+        assert_eq!(p.on(down()), Verdict::ArmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
     }
 
     #[test]
     fn flick_injections_are_ignored() {
         let mut p = armed();
-        assert_eq!(p.on(Ev::KeyDown { flick: true }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::MouseDown { flick: true }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::Wheel { flick: true }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(Ev::KeyDown { flick: true }), Verdict::Pass);
+        assert_eq!(p.on(Ev::MouseDown { flick: true }), Verdict::Pass);
+        assert_eq!(p.on(Ev::Wheel { flick: true }), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
     }
 
     #[test]
     fn other_programs_injections_spoil() {
         let mut p = armed();
-        assert_eq!(p.on(Ev::KeyDown { flick: false }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::KeyDown { flick: false }), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
     fn injected_win_never_arms() {
         let mut p = Press::new();
-        assert_eq!(p.on(Ev::WinDown { physical: false, held: none() }, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinDown { physical: false, held: none() }), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
 
         // An injected Win down during an armed press spoils it.
         let mut p = armed();
-        assert_eq!(p.on(Ev::WinDown { physical: false, held: none() }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinDown { physical: false, held: none() }), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
     fn auto_repeat_keeps_it_armed() {
         let mut p = armed();
-        assert_eq!(p.on(repeat(), false), Verdict::Pass);
-        assert_eq!(p.on(repeat(), false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(repeat()), Verdict::Pass);
+        assert_eq!(p.on(repeat()), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
     }
 
     #[test]
     fn both_win_keys_spoil() {
         let mut p = armed();
-        assert_eq!(p.on(Ev::OtherWinDown, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::OtherWinDown), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
     fn stale_modifiers_never_wedge() {
         // Win+L: the key-up of Win goes to the lock screen and is never seen.
         let mut p = armed();
-        assert_eq!(p.on(Ev::KeyDown { flick: false }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(down(), false), Verdict::ArmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(Ev::KeyDown { flick: false }), Verdict::DisarmMouse);
+        assert_eq!(p.on(down()), Verdict::ArmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
 
         // A missed Win-up of a press that was a combination from the start.
         let mut p = Press::new();
         let held = Held { ctrl: true, alt: true, ..none() };
-        assert_eq!(p.on(Ev::WinDown { physical: true, held }, false), Verdict::Pass);
-        assert_eq!(p.on(down(), false), Verdict::ArmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(Ev::WinDown { physical: true, held }), Verdict::Pass);
+        assert_eq!(p.on(down()), Verdict::ArmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
 
         // A missed Win-up of a clean press: the new press arms without a second install.
         let mut p = armed();
-        assert_eq!(p.on(down(), false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(down()), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
 
         // A missed Win-up of a clean press, then a combination: the hook comes out.
         let mut p = armed();
         let held = Held { shift: true, ..none() };
-        assert_eq!(p.on(Ev::WinDown { physical: true, held }, false), Verdict::DisarmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinDown { physical: true, held }), Verdict::DisarmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
 
         // Win-up with nothing armed.
         let mut p = Press::new();
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, true), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
     fn a_repeat_with_no_press_never_arms() {
         // Hook (re)installed while Win was already held: the start was missed.
         let mut p = Press::new();
-        assert_eq!(p.on(repeat(), false), Verdict::Pass);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Pass);
+        assert_eq!(p.on(repeat()), Verdict::Pass);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Pass);
     }
 
     #[test]
@@ -449,10 +448,10 @@ mod tests {
             Ev::Wheel { flick: false },
             Ev::OtherWinDown,
         ] {
-            assert_eq!(p.on(ev, false), Verdict::Pass);
+            assert_eq!(p.on(ev), Verdict::Pass);
         }
-        assert_eq!(p.on(down(), false), Verdict::ArmMouse);
-        assert_eq!(p.on(Ev::WinUp, false), Verdict::Lone);
+        assert_eq!(p.on(down()), Verdict::ArmMouse);
+        assert_eq!(p.on(Ev::WinUp), Verdict::Lone);
     }
 
     #[test]
@@ -485,9 +484,9 @@ mod tests {
     fn a_lone_tap_is_held_back_then_opens_flick() {
         let mut p = Press::new();
         let down = Ev::WinDown { physical: true, held: Held::default() };
-        let v = p.on(down, false);
+        let v = p.on(down);
         assert_eq!(step(false, down, v, true, false), Step::Hold);
-        let v = p.on(Ev::WinUp, false);
+        let v = p.on(Ev::WinUp);
         assert_eq!(step(true, Ev::WinUp, v, true, false), Step::Open);
     }
 

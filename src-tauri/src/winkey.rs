@@ -36,7 +36,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY,
-    VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_SHIFT, VK_XBUTTON1, VK_XBUTTON2,
+    VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -471,7 +471,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         let m = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
         if let Some(ev) = mouse_event(wparam.0 as u32, m.dwExtraInfo) {
             // Never swallowed: a mouse event at most replays the held Win first.
-            let _ = feed(ev, false, false, 0);
+            let _ = feed(ev, false, 0);
         }
     }
     // SAFETY: passing the event on unchanged.
@@ -505,23 +505,22 @@ fn on_key(k: &KBDLLHOOKSTRUCT) -> bool {
         }
     }
     let Some(ev) = key_event(vk, up, injected, k.dwExtraInfo, held) else { return false };
-    let button_held = ev == Ev::WinUp && any_button_down();
     // SAFETY: no arguments.
     let late = is_win(vk) && !up && is_late(unsafe { GetTickCount() }, k.time);
-    feed(ev, button_held, late, vk as u16)
+    feed(ev, late, vk as u16)
 }
 
 /// Feeds the state machine, acts on its verdict and on the [`Step`]; true
 /// swallows the event. `late`: the event reached the hook too late to hold
 /// back (Windows may already have timed the hook out and passed it). `vk` is
 /// the event's key (used only to remember which Win key is held).
-fn feed(ev: Ev, button_held: bool, late: bool, vk: u16) -> bool {
+fn feed(ev: Ev, late: bool, vk: u16) -> bool {
     // Busy only if a callback re-entered while the loop held it: let it pass.
     let now = now_ms();
     let Some((verdict, generation, step, replay)) = HOOKED.with(|h| {
         h.try_borrow_mut().ok().map(|mut h| {
             drop_stale(&mut h, now);
-            let verdict = h.press.on(ev, button_held);
+            let verdict = h.press.on(ev);
             let held = h.held.is_some();
             let take = match ev {
                 Ev::WinDown { .. } => verdict == Verdict::ArmMouse && may_take(),
@@ -688,13 +687,8 @@ fn held_now(vk: u32) -> Held {
         shift: key_down(VK_SHIFT.0),
         alt: key_down(VK_MENU.0),
         other_win: key_down(other as u16),
-        mouse_button: any_button_down(),
         win_already_down: key_down(vk as u16),
     }
-}
-
-fn any_button_down() -> bool {
-    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2].iter().any(|b| key_down(b.0))
 }
 
 fn win_held() -> bool {
