@@ -173,7 +173,7 @@ export function General({ state }: { state: SettingsState }) {
           />
           Show the taskbar while Flick is open
         </label>
-        <p class="hint">For a taskbar that hides by itself. A Flick button sits on it while the bar is open.</p>
+        <p class="hint">For a taskbar that hides by itself.</p>
         {errors.show_taskbar && <p class="error">{errors.show_taskbar}</p>}
       </div>
 

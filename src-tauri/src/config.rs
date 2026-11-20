@@ -47,7 +47,7 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## win_key: the Win key alone opens Flick instead of the Start menu; Win combinations keep working, Ctrl+Esc still opens Start (true: on).
 # win_key = false
 ##
-## show_taskbar: a taskbar that hides by itself comes up while Flick is open, with a Flick button on it (true: on).
+## show_taskbar: a taskbar that hides by itself comes up while Flick is open (true: on).
 # show_taskbar = false
 ##
 ## tab_completion: the rest of the top result's name shows in grey as you type and Tab takes it; no row is highlighted until you press Down (true: on).
