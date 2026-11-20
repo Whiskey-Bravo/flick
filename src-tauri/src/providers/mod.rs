@@ -6,6 +6,7 @@ pub mod apps_watch;
 pub mod bookmarks;
 pub mod clips;
 pub mod chores;
+pub mod claude;
 pub mod files;
 mod files_scan;
 pub mod flick;

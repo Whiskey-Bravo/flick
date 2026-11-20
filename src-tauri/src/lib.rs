@@ -155,6 +155,8 @@ struct Providers {
     /// Saved texts from the config, pasted by name.
     snippets: Arc<providers::snippets::SnippetsProvider>,
     shortcuts: Arc<ShortcutsProvider>,
+    /// "Open in Claude": the prompt step after the folder action.
+    claude: Arc<providers::claude::ClaudeProvider>,
     wsl: Arc<WslProvider>,
     welcome: Arc<WelcomeProvider>,
     update: Arc<UpdateProvider>,
@@ -213,6 +215,7 @@ impl Providers {
                 shortcuts.set_claude_app(launch::link_scheme_registered("claude"));
                 shortcuts
             },
+            claude: providers::claude::ClaudeProvider::new(launcher.clone()),
             wsl: WslProvider::new(launcher, distro),
             welcome: WelcomeProvider::new(Box::new(window::shows), open_settings),
             update: UpdateProvider::new(updates),
@@ -871,6 +874,7 @@ fn build_engine(
         Box::new(p.bookmarks.clone()),
         Box::new(p.workspaces.clone()),
         Box::new(p.shortcuts.clone()),
+        Box::new(p.claude.clone()),
         Box::new(p.snippets.clone()),
         Box::new(p.wsl.clone()),
         Box::new(SettingsProvider),
@@ -1154,6 +1158,8 @@ fn save_qr_window(app: AppHandle, notifier: Arc<dyn Notifier>) -> impl Fn(&str) 
 /// hotkey → tray → config watcher. Nothing here may stop startup, and nothing
 /// here scans the disk: every index is built on a background thread.
 fn setup(app: &AppHandle) {
+    // Whether folder rows offer "Open in Claude"; looked at again on reload.
+    launch::set_claude_app();
     let path = config::config_path();
     let first_run = !path.exists();
     cloud_roots::shared().refresh_if_due();
@@ -1613,7 +1619,8 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     let state = app.state::<AppState>();
     // Before the shortcuts are staged below: a Claude app installed (or
     // removed) since the last look changes what the built-in `claude` opens.
-    state.providers.shortcuts.set_claude_app(launch::link_scheme_registered("claude"));
+    // Also decides whether folder rows offer "Open in Claude".
+    state.providers.shortcuts.set_claude_app(launch::set_claude_app());
     let mut config = state.config.lock().unwrap_or_else(|e| e.into_inner());
     let redetected = detection.is_some();
     if let Some(detection) = detection {
@@ -2039,6 +2046,7 @@ mod tests {
             make: capture.make,
             snippets: capture.snippets,
             shortcuts: ShortcutsProvider::new(launcher.clone(), "Debian"),
+            claude: providers::claude::ClaudeProvider::new(launcher.clone()),
             wsl: WslProvider::new(launcher.clone(), "Debian"),
             welcome: WelcomeProvider::new(Box::new(|| 0), Box::new(|| Ok(()))),
             update: UpdateProvider::new(Arc::new(Updates::new(

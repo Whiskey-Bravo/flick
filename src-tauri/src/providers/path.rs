@@ -114,7 +114,7 @@ pub(crate) fn entry_row_in(
         subtitle,
         score,
         pinnable: true,
-        actions: file_ops::menu(is_dir, roots.contains(&text_for_menu), file_ops::is_volume_root(&text_for_menu)),
+        actions: file_ops::menu(is_dir, roots.contains(&text_for_menu), file_ops::is_volume_root(&text_for_menu), crate::launch::claude_app()),
         complete,
         ..Default::default()
     }
@@ -196,6 +196,7 @@ pub(crate) fn handled(id: &str, action: Action) -> bool {
         | Action::OpenFolder
         | Action::CopyPath
         | Action::OpenTerminal
+        | Action::OpenInClaude
         | Action::Properties
         | Action::OpenWith
         | Action::CopyFile => true,
@@ -211,6 +212,8 @@ pub(crate) fn run_entry_action(ops: &dyn FileOps, path: &str, action: Action) ->
     let later = |then| Ok(Outcome::HideThen { then });
     match action {
         Action::OpenTerminal => ops.open_terminal(p)?,
+        // The bar asks for a prompt; the claude provider opens the app.
+        Action::OpenInClaude => return Ok(super::claude::step(path)),
         Action::Properties => ops.properties(p)?,
         Action::OpenWith => ops.open_with(p)?,
         Action::CopyFile => ops.copy_file(p)?,
@@ -711,12 +714,12 @@ mod tests {
         assert_eq!(subs, ["This folder", "Folder", "Folder", "10 B", "2.0 KB"]);
         assert_eq!(rows[0].id, r"C:\");
         assert_eq!(rows[0].complete, "");
-        assert_eq!(rows[0].actions, file_ops::menu(true, false, true));
+        assert_eq!(rows[0].actions, file_ops::menu(true, false, true, false));
         assert_eq!(rows[1].id, r"C:\Games\");
         assert_eq!(rows[1].icon, "folder");
         assert_eq!(rows[3].id, r"C:\a.txt");
         assert_eq!(rows[3].icon, "ext:.txt");
-        assert_eq!(rows[3].actions, file_ops::menu(false, false, false));
+        assert_eq!(rows[3].actions, file_ops::menu(false, false, false, false));
         assert!(rows.iter().all(|r| r.provider == "path" && r.pinnable));
         assert_scores_fall(&rows);
     }
@@ -844,10 +847,10 @@ mod tests {
         let before = r.fs.reads();
         let row = r.p.item(r"C:\Games\").unwrap();
         assert_eq!((row.id.as_str(), row.title.as_str(), row.provider), (r"C:\Games\", "Games", "path"));
-        assert_eq!(row.actions, file_ops::menu(true, false, false));
+        assert_eq!(row.actions, file_ops::menu(true, false, false, false));
         assert!(row.pinnable);
         let row = r.p.item(r"C:\a.txt").unwrap();
-        assert_eq!(row.actions, file_ops::menu(false, false, false));
+        assert_eq!(row.actions, file_ops::menu(false, false, false, false));
         assert_eq!(r.p.item(r"C:\").unwrap().title, r"C:\");
         assert!(r.p.item("notes").is_none());
         assert_eq!(r.fs.reads(), before);

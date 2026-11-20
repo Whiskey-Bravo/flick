@@ -451,9 +451,9 @@ mod tests {
         let rows = ready(&r.p, &r.rx, "");
         assert_eq!(titles(&rows), ["a.txt", "Documents"]);
         assert_eq!(rows[0].id, format!(r"{DOCS}\a.txt"));
-        assert_eq!(rows[0].actions, crate::file_ops::menu(false, false, false));
+        assert_eq!(rows[0].actions, crate::file_ops::menu(false, false, false, false));
         assert_eq!(rows[1].id, format!(r"{DOCS}\"));
-        assert_eq!(rows[1].actions, crate::file_ops::menu(true, false, false));
+        assert_eq!(rows[1].actions, crate::file_ops::menu(true, false, false, false));
         assert_eq!((rows[0].folder.as_str(), rows[1].folder.as_str()), ("", format!(r"{DOCS}\").as_str()));
         assert_eq!(titles(&ready(&r.p, &r.rx, "doc")), ["Documents"]);
     }
@@ -533,7 +533,7 @@ mod tests {
         let rows = ready(&d.p, &d.rx, "");
         let id = rows[0].id.clone();
         assert_eq!(d.p.rank_key(&id), None);
-        assert_eq!(rows[0].actions, crate::file_ops::menu(false, false, false));
+        assert_eq!(rows[0].actions, crate::file_ops::menu(false, false, false, false));
         assert!(rows[0].pinnable);
         assert_eq!(rows[0].provider, "downloads");
         assert_eq!(d.p.item(&id).unwrap().title, "a.zip");
