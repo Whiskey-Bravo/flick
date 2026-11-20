@@ -16,8 +16,9 @@ pub const PROMPT: &str = "Prompt for Claude (optional)";
 const SCOPE: &str = "claude:";
 /// The Claude app's link for a new Code session.
 const NEW_SESSION: &str = "claude://code/new";
-/// The Claude app's icon (as the built-in `claude` shortcut shows it).
-pub const ICON: &str = r"shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude";
+/// The Claude app's icon, served by the icon server like the built-in
+/// `claude` shortcut's.
+const ICON: &str = r"file:shell:AppsFolder\Claude_pzs8sxrjxfjjc!Claude";
 
 /// The step that asks for the prompt for `folder`.
 pub fn step(folder: &str) -> Outcome {
@@ -128,6 +129,7 @@ mod tests {
         assert_eq!(p.activate(&typed[0].id, Modifier::None), Ok(Outcome::Hide));
         assert_eq!(launcher.calls(), ["open claude://code/new?folder=C%3A%5Cproj&q=add%20a%20readme"]);
         assert!(p.rank_key(&typed[0].id).is_none());
+        assert!(typed[0].icon.starts_with("file:shell:AppsFolder"), "served like the shortcut's");
     }
 
     #[test]
