@@ -406,6 +406,59 @@ pub fn set_glass(app: &AppHandle, on: bool) {
     }
 }
 
+/// Whether Windows can show the Acrylic theme's live blur: Windows 11 22H2
+/// (build 22621) or later, with Transparency effects on. Read from the
+/// registry each time (cheap; the setting can change while Flick runs).
+pub fn acrylic_live() -> bool {
+    acrylic_possible(registry::build(), registry::transparency())
+}
+
+/// The rule behind [`acrylic_live`]: an unknown build counts as too old, an
+/// unknown Transparency setting as on (Windows' default).
+fn acrylic_possible(build: Option<u32>, transparency: Option<u32>) -> bool {
+    build.is_some_and(|b| b >= 22621) && transparency != Some(0)
+}
+
+mod registry {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+
+    /// Windows' build number, e.g. 26100.
+    pub fn build() -> Option<u32> {
+        let mut buf = [0u16; 32];
+        let mut bytes = std::mem::size_of_val(&buf) as u32;
+        // SAFETY: `buf` is `bytes` long and outlives the call.
+        unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"),
+                w!("CurrentBuildNumber"),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buf.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+            .ok()
+            .ok()?;
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len]).trim().parse().ok()
+    }
+
+    /// Settings > Personalization > Colors > Transparency effects (0: off).
+    pub fn transparency() -> Option<u32> {
+        dword(HKEY_CURRENT_USER, w!(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"), w!("EnableTransparency"))
+    }
+
+    fn dword(root: HKEY, key: PCWSTR, name: PCWSTR) -> Option<u32> {
+        let mut value = 0u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        // SAFETY: `value` is a u32 and `bytes` its size.
+        unsafe { RegGetValueW(root, key, name, RRF_RT_REG_DWORD, None, Some((&mut value as *mut u32).cast()), Some(&mut bytes)).ok().ok()? };
+        Some(value)
+    }
+}
+
 /// Glass only, and only while the bar is still hidden: takes the picture of
 /// the screen where the bar window is about to appear and tells the page
 /// about it (id 0: none could be taken).
@@ -578,6 +631,16 @@ fn bar_position(origin: (i32, i32), size: (u32, u32), width: u32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acrylic_needs_22h2_and_transparency_effects() {
+        assert!(acrylic_possible(Some(22621), Some(1)));
+        assert!(acrylic_possible(Some(26100), None), "an unset Transparency setting is Windows' default, on");
+        assert!(!acrylic_possible(Some(22000), Some(1)), "Windows 11 21H2");
+        assert!(!acrylic_possible(Some(19045), Some(1)), "Windows 10");
+        assert!(!acrylic_possible(Some(26100), Some(0)), "Transparency effects off");
+        assert!(!acrylic_possible(None, Some(1)), "an unknown build");
+    }
 
     #[test]
     fn hold_open_suppresses_blur_hide_and_is_released_on_error() {

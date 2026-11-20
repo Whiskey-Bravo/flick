@@ -53,7 +53,7 @@ pub(crate) const DEFAULT_FILE: &str = "\
 ## tab_completion: the rest of the top result's name shows in grey as you type and Tab takes it; no row is highlighted until you press Down (true: on).
 # tab_completion = false
 ##
-## theme: dark, light, midnight, frost, ember, ocean, forest, grape, rose, sand, mint, sakura, glass or custom (your own colours, below).
+## theme: dark, light, midnight, frost, ember, ocean, forest, grape, rose, sand, mint, sakura, glass, acrylic (Windows' live blur; Windows 11 22H2 or later) or custom (your own colours, below).
 # theme = \"dark\"
 ## custom_theme: the colours of theme = \"custom\". Any you leave out are taken from dark.
 # custom_theme = { background = \"#101418\", surface = \"#1c232b\", border = \"#26303a\", text = \"#e8eef4\", muted = \"#9fb0c0\", accent = \"#4fd1c5\", error = \"#f0717a\", warning = \"#f2b441\" }

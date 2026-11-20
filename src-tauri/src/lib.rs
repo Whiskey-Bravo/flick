@@ -1674,7 +1674,7 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
 /// Read from the main thread's copy: the `appearance` command and the setup
 /// run on the main thread, which never locks the config.
 fn current_appearance(state: &AppState) -> theme::Appearance {
-    state.mirror.appearance()
+    theme::with_acrylic(state.mirror.appearance(), window::acrylic_live())
 }
 
 /// What a page applies when it loads: the theme's colours and the animation
