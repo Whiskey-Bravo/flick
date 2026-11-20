@@ -792,6 +792,20 @@ listen<string | null>("config:error", (e) => dispatch({ type: "configError", mes
 
 // The theme and animation level: asked once, then pushed on every change.
 let appearance: Appearance = DEFAULT_APPEARANCE;
+// Acrylic: the back end cuts the bar window to the panel, so Windows' blur
+// shows only behind it. Told the panel's height whenever it changes.
+let shapeSent = -1;
+const reportShape = () => {
+  if (!appearance.acrylic) {
+    shapeSent = -1;
+    return;
+  }
+  const height = panel.offsetHeight;
+  if (height === shapeSent) return;
+  shapeSent = height;
+  invoke("bar_shape", { height }).catch(() => {});
+};
+new ResizeObserver(reportShape).observe(panel);
 // Glass over a light picture writes in dark ink.
 let darkInk = false;
 const paint = () => {
@@ -804,6 +818,7 @@ const paint = () => {
   updateLens();
   updateRowLens();
   render();
+  reportShape();
 };
 const themed = (a: Appearance) => {
   appearance = a;

@@ -406,6 +406,67 @@ pub fn set_glass(app: &AppHandle, on: bool) {
     }
 }
 
+/// Acrylic is on: Windows draws its live blur under the bar window, which
+/// is cut to the panel's shape (`apply_bar_shape`).
+static ACRYLIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The panel's corner radius under Acrylic (CSS px, `--radius` in styles.css).
+const ACRYLIC_RADIUS: f64 = 22.0;
+
+/// Switches the Acrylic theme's live blur on or off. Off also takes back the
+/// window's cut, so no other theme is ever left clipped or blurred.
+pub fn set_acrylic(app: &AppHandle, on: bool) {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE};
+    use windows::Win32::Graphics::Gdi::SetWindowRgn;
+    let was = ACRYLIC.swap(on, Ordering::SeqCst);
+    if on == was {
+        return;
+    }
+    let Some(Ok(h)) = bar(app).map(|w| w.hwnd()) else { return };
+    let hwnd = HWND(h.0 as _);
+    let backdrop = if on { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
+    // SAFETY: `hwnd` is the bar's live window; the value is the attribute's
+    // documented type and size. A region of None removes the cut.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&backdrop as *const windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE).cast(),
+            std::mem::size_of_val(&backdrop) as u32,
+        );
+        if !on {
+            SetWindowRgn(hwnd, None, true);
+        }
+    }
+}
+
+/// The cut for a panel `panel_height` CSS px tall in a window `width_px` x
+/// `window_px` physical pixels at `scale`: (width, height, corner diameter)
+/// in physical pixels, at least 1 and at most the window tall.
+fn bar_shape_for(width_px: i32, panel_height: f64, scale: f64, radius: f64, window_px: i32) -> (i32, i32, i32) {
+    let height = ((panel_height * scale).round() as i32).clamp(1, window_px.max(1));
+    (width_px, height, (radius * 2.0 * scale).round() as i32)
+}
+
+/// Acrylic only: cuts the bar window to its panel, `panel_height` CSS px tall
+/// (the page reports it whenever the panel changes size), so the blur shows
+/// only where the panel is.
+pub fn apply_bar_shape(app: &AppHandle, panel_height: f64) {
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
+    if !ACRYLIC.load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(w) = bar(app) else { return };
+    let (Ok(h), Ok(size), Ok(scale)) = (w.hwnd(), w.outer_size(), w.scale_factor()) else { return };
+    let hwnd = HWND(h.0 as _);
+    let (width, height, corner) = bar_shape_for(size.width as i32, panel_height, scale, ACRYLIC_RADIUS, size.height as i32);
+    // SAFETY: a new region handed to the window; once set, Windows owns it.
+    unsafe {
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner);
+        SetWindowRgn(hwnd, Some(region), true);
+    }
+}
+
 /// Whether Windows can show the Acrylic theme's live blur: Windows 11 22H2
 /// (build 22621) or later, with Transparency effects on. Read from the
 /// registry each time (cheap; the setting can change while Flick runs).
@@ -631,6 +692,14 @@ fn bar_position(origin: (i32, i32), size: (u32, u32), width: u32) -> (i32, i32) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_acrylic_cut_follows_the_panel_in_physical_pixels() {
+        assert_eq!(bar_shape_for(680, 64.0, 1.0, 22.0, 420), (680, 64, 44));
+        assert_eq!(bar_shape_for(1020, 64.0, 1.5, 22.0, 630), (1020, 96, 66), "at 150% scaling");
+        assert_eq!(bar_shape_for(680, 0.0, 1.0, 22.0, 420), (680, 1, 44), "never empty");
+        assert_eq!(bar_shape_for(680, 500.0, 1.0, 22.0, 420), (680, 420, 44), "never taller than the window");
+    }
 
     #[test]
     fn acrylic_needs_22h2_and_transparency_effects() {
