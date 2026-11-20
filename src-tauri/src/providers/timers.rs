@@ -2,13 +2,13 @@
 //! list and cancel pending ones. Rows are never learned; the query reads only
 //! memory (the reminder thread reads the file).
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 
 use crate::dirs::Clock;
+use crate::zone::LocalZone;
 use crate::provider::{HelpLine, Modifier, Outcome, Provider, Query, ResultItem};
 use crate::providers::path::score_in_order;
 use crate::reminders::{
@@ -32,20 +32,14 @@ pub const WORDS: [&str; 4] = ["timer", "remind", "timers", "reminders"];
 pub struct TimersProvider {
     reminders: Arc<Reminders>,
     now: Clock,
-    /// The PC's zone: read at start, and again each time the bar is shown (`set_zone`).
-    tz: RwLock<TimeZone>,
+    /// The PC's zone, shared with the answers.
+    tz: Arc<LocalZone>,
     on_ready: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl TimersProvider {
-    pub fn new(reminders: Arc<Reminders>, now: Clock, tz: TimeZone, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
-        Self { reminders, now, tz: RwLock::new(tz), on_ready }
-    }
-
-    /// The PC's time zone changed (or may have): memory only. Reminders already
-    /// set keep their moment; new ones and the shown times use the new zone.
-    pub fn set_zone(&self, tz: TimeZone) {
-        *self.tz.write().unwrap_or_else(|e| e.into_inner()) = tz;
+    pub fn new(reminders: Arc<Reminders>, now: Clock, tz: Arc<LocalZone>, on_ready: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { reminders, now, tz, on_ready }
     }
 
     /// Now, in whole seconds rounded up (as dues are).
@@ -54,7 +48,7 @@ impl TimersProvider {
     }
 
     fn zoned(&self, secs: i64) -> Option<Zoned> {
-        let tz = self.tz.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let tz = self.tz.get();
         Some(Timestamp::from_second(secs).ok()?.to_zoned(tz))
     }
 
@@ -294,7 +288,7 @@ mod tests {
         let on_ready = Arc::new(move || {
             r.fetch_add(1, Ordering::SeqCst);
         });
-        let p = TimersProvider::new(Arc::clone(&reminders), now, jiff::tz::TimeZone::UTC, on_ready);
+        let p = TimersProvider::new(Arc::clone(&reminders), now, LocalZone::new(jiff::tz::TimeZone::UTC), on_ready);
         Rig { _dir: dir, reminders, p, ready, now: time }
     }
 
@@ -381,7 +375,7 @@ mod tests {
         let g = rig();
         let id = rows(&g.p, "timer 5m")[0].id.clone();
         g.p.activate(&id, Modifier::None).unwrap();
-        g.p.set_zone(jiff::tz::TimeZone::fixed(jiff::tz::offset(2)));
+        g.p.tz.set(jiff::tz::TimeZone::fixed(jiff::tz::offset(2)));
         assert_eq!(titles(&g.p, "timer 5m"), ["Timer 5 min \u{2014} rings at 16:32"]);
         assert_eq!(rows(&g.p, "timers")[0].subtitle, "rings at 16:32 \u{2014} 5 min left");
         assert_eq!(titles(&g.p, "remind 18:30 x"), ["Remind at 18:30 \u{2014} x"]);

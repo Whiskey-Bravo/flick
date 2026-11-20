@@ -55,6 +55,7 @@ mod winkey_logic;
 mod winkey_helper;
 mod winlist;
 mod wsl_detect;
+mod zone;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,9 +238,7 @@ impl Providers {
         // The time zone may have changed while Flick ran (travel, a manual
         // change). Read here, not on the query path: it is quick, as the zone
         // data is built into Flick.
-        let tz = jiff::tz::TimeZone::system();
-        self.answers.set_zone(tz.clone());
-        self.timers.set_zone(tz);
+        self.answers.zone().set(jiff::tz::TimeZone::system());
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
@@ -276,7 +275,8 @@ struct ExtraSources {
     /// `reminders.json`.
     reminders: PathBuf,
     now: dirs::Clock,
-    tz: jiff::tz::TimeZone,
+    /// Shared with the answers.
+    tz: Arc<zone::LocalZone>,
 }
 
 impl Extras {
@@ -289,6 +289,7 @@ impl Extras {
         open_settings: Opener,
         fire: Fire,
         report: Report,
+        tz: Arc<zone::LocalZone>,
     ) -> Self {
         let sources = ExtraSources {
             games: Arc::new(SystemGames),
@@ -300,7 +301,7 @@ impl Extras {
             chores: Arc::new(SystemChores),
             reminders: reminders_path(),
             now: Arc::new(std::time::SystemTime::now),
-            tz: jiff::tz::TimeZone::system(),
+            tz,
         };
         Self::over(launcher, on_ready, open_settings, fire, report, sources)
     }
@@ -1181,7 +1182,7 @@ fn setup(app: &AppHandle) {
     // A workspace whose items did not all open brings the bar back with its name and the count.
     let reopen = app.clone();
     let report: Report = Arc::new(move |name: &str, message: &str| window::reopen(&reopen, name, message));
-    let extras = Extras::new(launcher.clone(), on_ready.clone(), settings_opener(app), fire, report);
+    let extras = Extras::new(launcher.clone(), on_ready.clone(), settings_opener(app), fire, report, answers.provider.zone());
     let control = Control::new(launcher.clone(), on_ready);
     // Paste, Win+V, the snip and the colour picker, run once the bar has hidden.
     app.manage::<Arc<dyn AfterHide>>(Arc::new(FollowUps {
@@ -2013,7 +2014,7 @@ mod tests {
                 chores,
                 reminders: dir.path().join("reminders.json"),
                 now: Arc::new(|| std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap())),
-                tz: jiff::tz::TimeZone::UTC,
+                tz: zone::LocalZone::new(jiff::tz::TimeZone::UTC),
             },
         );
         // The fakes answer at once: read them here, as the background threads would.

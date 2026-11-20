@@ -10,6 +10,8 @@ use jiff::civil::Date;
 use jiff::tz::TimeZone;
 use jiff::Timestamp;
 
+use crate::zone::LocalZone;
+
 use crate::answers::calc;
 use crate::answers::clock::{self, ClockAsk, Place, Span};
 use crate::answers::number::Formats;
@@ -76,7 +78,7 @@ pub struct AnswersProvider {
     open_config: Opener,
     clock: Clock,
     /// The PC's zone: read at start, and again each time the bar is shown (`set_zone`).
-    local: RwLock<TimeZone>,
+    local: Arc<LocalZone>,
     config: RwLock<AnswersConfig>,
 }
 
@@ -222,7 +224,7 @@ impl AnswersProvider {
         open_config: Opener,
         clock: Clock,
     ) -> Arc<Self> {
-        Self::with_zone(formats, rates, weather, clipboard, launcher, open_config, clock, TimeZone::system())
+        Self::with_zone(formats, rates, weather, clipboard, launcher, open_config, clock, LocalZone::new(TimeZone::system()))
     }
 
     /// Like `new` with an explicit local zone, so tests do not depend on the PC.
@@ -235,7 +237,7 @@ impl AnswersProvider {
         launcher: Arc<dyn Launcher>,
         open_config: Opener,
         clock: Clock,
-        local: TimeZone,
+        local: Arc<LocalZone>,
     ) -> Arc<Self> {
         Arc::new(AnswersProvider {
             formats,
@@ -245,7 +247,7 @@ impl AnswersProvider {
             launcher,
             open_config,
             clock,
-            local: RwLock::new(local),
+            local,
             config: RwLock::new(AnswersConfig::default()),
         })
     }
@@ -259,14 +261,14 @@ impl AnswersProvider {
         self.config.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// The PC's time zone changed (or may have): memory only.
-    pub fn set_zone(&self, tz: TimeZone) {
-        *self.local.write().unwrap_or_else(|e| e.into_inner()) = tz;
+    /// The PC's time zone, shared with the timers.
+    pub fn zone(&self) -> Arc<LocalZone> {
+        self.local.clone()
     }
 
     /// The PC's time zone as last read.
     fn local(&self) -> TimeZone {
-        self.local.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.local.get()
     }
 
     /// Locale text of a finite number; None for NaN or infinity.
@@ -575,7 +577,7 @@ mod tests {
                 Ok(())
             }),
             Arc::new(move || *clock_source.lock().unwrap()),
-            jiff::tz::TimeZone::get("Europe/Berlin").unwrap(),
+            LocalZone::new(jiff::tz::TimeZone::get("Europe/Berlin").unwrap()),
         );
         answers.set_config(&config(online, city));
         Rig { answers, clipboard, launcher, opened, fetch, ready, now: clock, _dir: dir }
@@ -888,7 +890,7 @@ mod tests {
         *r.now.lock().unwrap() = "2026-07-01T12:00:07Z".parse().unwrap();
         assert_eq!(one(&r, "time").title, "14:00:07 Wed");
         // The user flew to Tokyo and Windows changed the zone.
-        r.answers.set_zone(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap());
+        r.answers.zone().set(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap());
         assert_eq!(one(&r, "time").title, "21:00:07 Wed");
         assert_eq!(one(&r, "time berlin").subtitle, "Berlin · 7 h behind");
     }
