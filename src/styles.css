@@ -623,7 +623,8 @@ input::placeholder {
 
 /* ---- Acrylic -------------------------------------------------------------
    Windows draws a live blur of what is behind the bar under the whole window
-   (window.rs), and the window is cut to the panel's shape. The panel only
+   (window.rs), and the window is kept as tall as the panel, with Windows'
+   own round corners (8px, so the panel's match). The panel only
    tints it and lights its rim; the rows are lighter washes over it. */
 :root[data-acrylic="true"] {
   --row: rgb(255 255 255 / 0.14);
@@ -633,8 +634,8 @@ input::placeholder {
   --menu: color-mix(in srgb, var(--bg) 88%, var(--text));
   --menu-border: color-mix(in srgb, var(--text) 24%, transparent);
   --menu-row: color-mix(in srgb, var(--text) 16%, transparent);
-  --radius: 22px;
-  --row-radius: 16px;
+  --radius: 8px;
+  --row-radius: 6px;
 }
 
 :root[data-acrylic="true"] .panel {

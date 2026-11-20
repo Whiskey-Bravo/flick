@@ -406,64 +406,55 @@ pub fn set_glass(app: &AppHandle, on: bool) {
     }
 }
 
-/// Acrylic is on: Windows draws its live blur under the bar window, which
-/// is cut to the panel's shape (`apply_bar_shape`).
+/// Acrylic is on: Windows draws its live blur under the whole bar window, so
+/// the window is kept as tall as the panel (`apply_bar_shape`) and rounded
+/// by Windows. (A window region does not clip the blur: Windows ignores it.)
 static ACRYLIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The panel's corner radius under Acrylic (CSS px, `--radius` in styles.css).
-const ACRYLIC_RADIUS: f64 = 22.0;
-
-/// Switches the Acrylic theme's live blur on or off. Off also takes back the
-/// window's cut, so no other theme is ever left clipped or blurred.
+/// Switches the Acrylic theme's live blur and Windows' round corners on or
+/// off. Off also gives the window back its full height (Glass's, if Glass is
+/// what replaced it), so no other theme is left short or blurred.
 pub fn set_acrylic(app: &AppHandle, on: bool) {
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE};
-    use windows::Win32::Graphics::Gdi::SetWindowRgn;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWMWCP_DEFAULT, DWMWCP_ROUND, DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
+    };
     let was = ACRYLIC.swap(on, Ordering::SeqCst);
     if on == was {
         return;
     }
-    let Some(Ok(h)) = bar(app).map(|w| w.hwnd()) else { return };
+    let Some(w) = bar(app) else { return };
+    let Ok(h) = w.hwnd() else { return };
     let hwnd = HWND(h.0 as _);
-    let backdrop = if on { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
-    // SAFETY: `hwnd` is the bar's live window; the value is the attribute's
-    // documented type and size. A region of None removes the cut.
+    let backdrop: DWM_SYSTEMBACKDROP_TYPE = if on { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
+    let corners: DWM_WINDOW_CORNER_PREFERENCE = if on { DWMWCP_ROUND } else { DWMWCP_DEFAULT };
+    // SAFETY: `hwnd` is the bar's live window; each value is its attribute's
+    // documented type, passed with its size.
     unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_SYSTEMBACKDROP_TYPE,
-            (&backdrop as *const windows::Win32::Graphics::Dwm::DWM_SYSTEMBACKDROP_TYPE).cast(),
-            std::mem::size_of_val(&backdrop) as u32,
-        );
-        if !on {
-            SetWindowRgn(hwnd, None, true);
-        }
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE, (&backdrop as *const DWM_SYSTEMBACKDROP_TYPE).cast(), 4);
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(), 4);
+    }
+    if !on {
+        let height = if GLASS.load(Ordering::SeqCst) { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
+        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
     }
 }
 
-/// The cut for a panel `panel_height` CSS px tall in a window `width_px` x
-/// `window_px` physical pixels at `scale`: (width, height, corner diameter)
-/// in physical pixels, at least 1 and at most the window tall.
-fn bar_shape_for(width_px: i32, panel_height: f64, scale: f64, radius: f64, window_px: i32) -> (i32, i32, i32) {
-    let height = ((panel_height * scale).round() as i32).clamp(1, window_px.max(1));
-    (width_px, height, (radius * 2.0 * scale).round() as i32)
+/// The bar window's height (CSS px) under Acrylic for a panel `panel_height`
+/// tall: whole pixels, at least 1, at most the plain window's height.
+fn acrylic_height(panel_height: f64) -> f64 {
+    panel_height.round().clamp(1.0, BAR_HEIGHT)
 }
 
-/// Acrylic only: cuts the bar window to its panel, `panel_height` CSS px tall
-/// (the page reports it whenever the panel changes size), so the blur shows
-/// only where the panel is.
+/// Acrylic only: makes the bar window as tall as its panel, `panel_height`
+/// CSS px (the page reports it whenever the panel changes size), so the blur
+/// shows only where the panel is.
 pub fn apply_bar_shape(app: &AppHandle, panel_height: f64) {
-    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
     if !ACRYLIC.load(Ordering::SeqCst) {
         return;
     }
-    let Some(w) = bar(app) else { return };
-    let (Ok(h), Ok(size), Ok(scale)) = (w.hwnd(), w.outer_size(), w.scale_factor()) else { return };
-    let hwnd = HWND(h.0 as _);
-    let (width, height, corner) = bar_shape_for(size.width as i32, panel_height, scale, ACRYLIC_RADIUS, size.height as i32);
-    // SAFETY: a new region handed to the window; once set, Windows owns it.
-    unsafe {
-        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, corner, corner);
-        SetWindowRgn(hwnd, Some(region), true);
+    if let Some(w) = bar(app) {
+        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, acrylic_height(panel_height)));
     }
 }
 
@@ -694,11 +685,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_acrylic_cut_follows_the_panel_in_physical_pixels() {
-        assert_eq!(bar_shape_for(680, 64.0, 1.0, 22.0, 420), (680, 64, 44));
-        assert_eq!(bar_shape_for(1020, 64.0, 1.5, 22.0, 630), (1020, 96, 66), "at 150% scaling");
-        assert_eq!(bar_shape_for(680, 0.0, 1.0, 22.0, 420), (680, 1, 44), "never empty");
-        assert_eq!(bar_shape_for(680, 500.0, 1.0, 22.0, 420), (680, 420, 44), "never taller than the window");
+    fn the_acrylic_window_is_as_tall_as_its_panel() {
+        assert_eq!(acrylic_height(64.0), 64.0);
+        assert_eq!(acrylic_height(64.4), 64.0, "whole CSS px");
+        assert_eq!(acrylic_height(0.0), 1.0, "never empty");
+        assert_eq!(acrylic_height(500.0), BAR_HEIGHT, "never taller than the plain window");
     }
 
     #[test]

@@ -792,7 +792,7 @@ listen<string | null>("config:error", (e) => dispatch({ type: "configError", mes
 
 // The theme and animation level: asked once, then pushed on every change.
 let appearance: Appearance = DEFAULT_APPEARANCE;
-// Acrylic: the back end cuts the bar window to the panel, so Windows' blur
+// Acrylic: the back end keeps the bar window as tall as the panel, so Windows' blur
 // shows only behind it. Told the panel's height whenever it changes.
 let shapeSent = -1;
 const reportShape = () => {
