@@ -381,11 +381,17 @@ fn parse_start_apps(json: &str) -> Vec<AppEntry> {
         .collect()
 }
 
-/// The Store entry for a listed app, or `None` for an empty name or an id
-/// without `!` (not a packaged app). Shared by every source of the list.
+/// The entry for an app Windows lists in its Start menu, opened through
+/// `shell:AppsFolder`. Kept: packaged apps (an id with `!`) and apps with a
+/// plain id of their own (`Docker.DockerForWindows.Settings`), which may have
+/// no shortcut file the Start-menu scan can find. `None` for an empty name,
+/// a name the scan skips too, and an id that is a path or a link (a shortcut
+/// the scan already has). Shared by every source of the list.
 pub(crate) fn store_entry(name: &str, app_id: &str) -> Option<AppEntry> {
     let name = name.trim();
-    (!name.is_empty() && app_id.contains('!')).then(|| AppEntry {
+    let packaged = app_id.contains('!');
+    let plain = !app_id.is_empty() && !app_id.contains(['\\', '/', ':']);
+    (!name.is_empty() && (packaged || plain) && !is_skipped(name)).then(|| AppEntry {
         name: name.to_string(),
         target: format!("{STORE_PREFIX}{app_id}"),
         kind: AppKind::Store,
@@ -1265,14 +1271,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_start_apps_array_keeps_only_packaged() {
+    fn parse_start_apps_array_keeps_apps_but_not_paths() {
         let json = r#"[
             {"Name": "1Password", "AppID": "DC5C6510.2032887045529_2v019pwa6amcg!Agilebits.OnePassword"},
-            {"Name": "Access", "AppID": "Microsoft.Office.MSACCESS.EXE.15"}
+            {"Name": "Access", "AppID": "Microsoft.Office.MSACCESS.EXE.15"},
+            {"Name": "Python", "AppID": "{6D809377-6AF0-444B-8957-A3773F02200E}\\Python\\python.exe"}
         ]"#;
         assert_eq!(
             parse_start_apps(json),
-            vec![store("1Password", "DC5C6510.2032887045529_2v019pwa6amcg!Agilebits.OnePassword")]
+            vec![
+                store("1Password", "DC5C6510.2032887045529_2v019pwa6amcg!Agilebits.OnePassword"),
+                store("Access", "Microsoft.Office.MSACCESS.EXE.15"),
+            ]
         );
     }
 
