@@ -3,6 +3,7 @@ mod answers;
 mod backdrop;
 mod bookmarks;
 mod clipboard;
+mod env_refresh;
 mod cliphistory;
 mod cloud_roots;
 mod chores;
@@ -1257,6 +1258,10 @@ fn setup(app: &AppHandle) {
     let hotkey_error = apply_hotkey(app, &loaded.config.hotkey, true);
     // After the bar hotkey, against the one that registered: it always wins.
     keys.apply(&registered_bar(app, &loaded.config.hotkey), &loaded.config.direct_hotkeys);
+
+    // Programs started from Flick see environment variables changed in
+    // Windows while it runs.
+    env_refresh::start();
 
     // The Win key: its worker starts the hook when the setting is on.
     {
