@@ -1,6 +1,6 @@
 [package]
 name = "flick"
-version = "0.16.0"
+version = "0.16.1"
 description = "Flick keyboard launcher"
 edition = "2021"
 
