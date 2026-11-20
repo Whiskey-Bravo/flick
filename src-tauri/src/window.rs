@@ -399,18 +399,41 @@ const BAR_HEIGHT: f64 = 420.0;
 const GLASS_BAR_HEIGHT: f64 = 460.0;
 
 /// Switches the Glass theme's backdrop on or off (see backdrop.rs) and gives
-/// the window the height that theme needs.
+/// the window the height that theme needs. Without a bar window nothing is
+/// recorded, so the next call (the next reload) does it.
 pub fn set_glass(app: &AppHandle, on: bool) {
-    let was = GLASS.swap(on, Ordering::SeqCst);
     if !on {
         crate::backdrop::clear();
     }
-    if on != was {
-        if let Some(w) = bar(app) {
-            let height = if on { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
+    if bar(app).is_none() {
+        return;
+    }
+    if on != GLASS.swap(on, Ordering::SeqCst) {
+        fit_window(app);
+    }
+}
+
+/// The bar window's height (CSS px) for the theme in force; `None` under
+/// Acrylic, where the page's panel decides (`apply_bar_shape`).
+fn window_height(acrylic: bool, glass: bool) -> Option<f64> {
+    match (acrylic, glass) {
+        (true, _) => None,
+        (false, true) => Some(GLASS_BAR_HEIGHT),
+        (false, false) => Some(BAR_HEIGHT),
+    }
+}
+
+/// Gives the bar window its theme's height. On the main thread, like
+/// `apply_bar_shape`, and reading the themes when it runs: a theme switch and
+/// a panel resize then never leave the window at the other one's height.
+fn fit_window(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(height) = window_height(ACRYLIC.load(Ordering::SeqCst), GLASS.load(Ordering::SeqCst)) else { return };
+        if let Some(w) = bar(&handle) {
             let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
         }
-    }
+    });
 }
 
 /// Acrylic is on: Windows draws its live blur under the whole bar window, so
@@ -420,18 +443,17 @@ static ACRYLIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// Switches the Acrylic theme's live blur and Windows' round corners on or
 /// off. Off also gives the window back its full height (Glass's, if Glass is
-/// what replaced it), so no other theme is left short or blurred.
+/// what replaced it), so no other theme is left short or blurred. Without a
+/// bar window nothing is recorded, so the next call does it.
 pub fn set_acrylic(app: &AppHandle, on: bool) {
     use windows::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_WINDOW_CORNER_PREFERENCE,
         DWMWCP_DEFAULT, DWMWCP_ROUND, DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
     };
-    let was = ACRYLIC.swap(on, Ordering::SeqCst);
-    if on == was {
+    let Some(Ok(h)) = bar(app).map(|w| w.hwnd()) else { return };
+    if on == ACRYLIC.swap(on, Ordering::SeqCst) {
         return;
     }
-    let Some(w) = bar(app) else { return };
-    let Ok(h) = w.hwnd() else { return };
     let hwnd = HWND(h.0 as _);
     let backdrop: DWM_SYSTEMBACKDROP_TYPE = if on { DWMSBT_TRANSIENTWINDOW } else { DWMSBT_NONE };
     let corners: DWM_WINDOW_CORNER_PREFERENCE = if on { DWMWCP_ROUND } else { DWMWCP_DEFAULT };
@@ -442,8 +464,7 @@ pub fn set_acrylic(app: &AppHandle, on: bool) {
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(), 4);
     }
     if !on {
-        let height = if GLASS.load(Ordering::SeqCst) { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
-        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
+        fit_window(app);
     }
 }
 
@@ -471,10 +492,11 @@ fn refresh_acrylic(app: &AppHandle) {
     let _ = app.emit("appearance:changed", look);
 }
 
-/// The bar window's height (CSS px) under Acrylic for a panel `panel_height`
-/// tall: whole pixels, at least 1, at most the plain window's height.
-fn acrylic_height(panel_height: f64) -> f64 {
-    panel_height.round().clamp(1.0, BAR_HEIGHT)
+/// The bar window's height in screen pixels under Acrylic for a panel
+/// `panel_height` CSS px tall at `scale` (1.25 at 125%): rounded up, so no
+/// pixel of the panel is cut off; at least 1, at most the plain window's height.
+fn acrylic_height(panel_height: f64, scale: f64) -> u32 {
+    (panel_height * scale).ceil().clamp(1.0, (BAR_HEIGHT * scale).round()) as u32
 }
 
 /// Acrylic only: makes the bar window as tall as its panel, `panel_height`
@@ -485,7 +507,9 @@ pub fn apply_bar_shape(app: &AppHandle, panel_height: f64) {
         return;
     }
     if let Some(w) = bar(app) {
-        let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, acrylic_height(panel_height)));
+        let Ok(scale) = w.scale_factor() else { return };
+        let Ok(size) = w.outer_size() else { return };
+        let _ = w.set_size(tauri::PhysicalSize::new(size.width, acrylic_height(panel_height, scale)));
     }
 }
 
@@ -717,10 +741,20 @@ mod tests {
 
     #[test]
     fn the_acrylic_window_is_as_tall_as_its_panel() {
-        assert_eq!(acrylic_height(64.0), 64.0);
-        assert_eq!(acrylic_height(64.4), 64.0, "whole CSS px");
-        assert_eq!(acrylic_height(0.0), 1.0, "never empty");
-        assert_eq!(acrylic_height(500.0), BAR_HEIGHT, "never taller than the plain window");
+        assert_eq!(acrylic_height(64.0, 1.0), 64);
+        // In screen pixels, rounded up: never a pixel of the panel cut off.
+        assert_eq!(acrylic_height(64.0, 1.25), 80);
+        assert_eq!(acrylic_height(64.4, 1.5), 97);
+        assert_eq!(acrylic_height(0.0, 1.25), 1, "never empty");
+        assert_eq!(acrylic_height(500.0, 1.5), 630, "never taller than the plain window");
+    }
+
+    #[test]
+    fn each_theme_gets_its_window_height() {
+        // Acrylic: the page's panel decides (`apply_bar_shape`).
+        assert_eq!(window_height(true, false), None);
+        assert_eq!(window_height(false, true), Some(GLASS_BAR_HEIGHT));
+        assert_eq!(window_height(false, false), Some(BAR_HEIGHT));
     }
 
     #[test]

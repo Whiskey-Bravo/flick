@@ -190,6 +190,8 @@ pub struct SettingsState {
     /// Every theme with its colours, in display order; `custom` carries the
     /// colours the config gives it now.
     themes: Vec<ThemeInfo>,
+    /// Whether Windows can show the Acrylic theme's live blur right now.
+    acrylic_live: bool,
     /// The languages `tr` knows, as (code, name), in the order shown.
     languages: Vec<(&'static str, &'static str)>,
 }
@@ -222,6 +224,7 @@ pub fn settings_state(app: AppHandle, state: State<AppState>) -> SettingsState {
     };
     SettingsState {
         themes: theme_infos(&config.custom_theme),
+        acrylic_live: crate::window::acrylic_live(),
         languages: crate::providers::words::LANGUAGES.to_vec(),
         config,
         file_error: read_config(&config::config_path()).err(),

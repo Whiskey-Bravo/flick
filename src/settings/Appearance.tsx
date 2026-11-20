@@ -142,6 +142,9 @@ export function Appearance({ state }: { state: SettingsState }) {
             Acrylic shows a live blur of what is behind the bar. It needs Windows 11 22H2 or later and Transparency effects on. This window stays dark.
           </p>
         )}
+        {theme === "acrylic" && !state.acrylic_live && (
+          <p class="error">Windows can't show the blur right now, so the bar uses the dark look.</p>
+        )}
         {errors.theme && <p class="error">{errors.theme}</p>}
       </div>
 

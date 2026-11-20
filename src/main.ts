@@ -775,6 +775,8 @@ const afterShow = (event: Event) => {
   jumpNext = true; // nothing glides in from where it was when the bar closed
   shapeSent = -1; // Acrylic: the back end shrank the window for the show
   dispatch(event);
+  // Acrylic: at once, not at the next frame: the window is 1 px tall until then.
+  sendShape();
   reportAtFrame("page.shown_to_paint", handled);
   input.focus();
   // The opening animation of the medium and high levels, played from its
@@ -802,16 +804,22 @@ listen<string | null>("config:error", (e) => dispatch({ type: "configError", mes
 let appearance: Appearance = DEFAULT_APPEARANCE;
 // Acrylic: the back end keeps the bar window as tall as the panel, so Windows' blur
 // shows only behind it. Told the panel's height whenever it changes.
+// At most once per frame: a list growing row by row resizes the window once.
 let shapeSent = -1;
-const reportShape = () => {
+let shapeFrame = 0;
+const sendShape = () => {
+  shapeFrame = 0;
   if (!appearance.acrylic) {
     shapeSent = -1;
     return;
   }
-  const height = panel.offsetHeight;
+  const height = panel.getBoundingClientRect().height;
   if (height === shapeSent) return;
   shapeSent = height;
   invoke("bar_shape", { height }).catch(() => {});
+};
+const reportShape = () => {
+  if (!shapeFrame) shapeFrame = requestAnimationFrame(sendShape);
 };
 new ResizeObserver(reportShape).observe(panel);
 // Glass over a light picture writes in dark ink.
