@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "flick"
-version = "0.15.5"
+version = "0.16.0"
 dependencies = [
  "getrandom 0.3.4",
  "jiff",
