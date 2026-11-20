@@ -167,6 +167,18 @@ function renderIcon(item: Item): HTMLSpanElement {
 const wobbling = (): boolean =>
   document.documentElement.dataset.motion === "wobble" && !matchMedia("(prefers-reduced-motion: reduce)").matches;
 const ROW = 44;
+// The selected row is a small piece of glass of its own over the panel's:
+// what lies behind it is bent at its rim and lit a little. Its size is read
+// from the list, as the moving highlight is hidden when animations are off.
+const updateRowLens = installLens(panel, glassLayers[0], "flick-row-lens", { edge: 14, shift: 11, spread: [1.25, 1, 0.8] }, {
+  size: () => {
+    const pad = getComputedStyle(list);
+    const width = list.clientWidth - parseFloat(pad.paddingLeft) - parseFloat(pad.paddingRight);
+    const radius = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--row-radius")) || 0;
+    return [width, ROW, radius];
+  },
+  extra: " brightness(1.12)",
+});
 // The list's border and padding around its rows.
 const LIST_EDGES = 9;
 let highlight: Spring = { x: 5, v: 0 };
@@ -790,6 +802,7 @@ const paint = () => {
     svgUrls.clear();
   }
   updateLens();
+  updateRowLens();
   render();
 };
 const themed = (a: Appearance) => {

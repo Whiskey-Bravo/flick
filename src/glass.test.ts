@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { LENS_EDGE, inkIsDark, lensMap } from "./glass";
+import { LENS_EDGE, inkIsDark, lensFit, lensMap, refraction } from "./glass";
 
 describe("glass", () => {
   const W = 200;
@@ -17,13 +17,13 @@ describe("glass", () => {
   it("pulls the rim's picture in from further inside", () => {
     // Left rim: shifted right (red above 128), no vertical shift.
     const left = at(0, 60);
-    expect(left[0]).toBeGreaterThan(240);
+    expect(left[0]).toBeGreaterThan(220);
     expect(left[1]).toBe(128);
     // Right rim: shifted left.
-    expect(at(W - 1, 60)[0]).toBeLessThan(16);
+    expect(at(W - 1, 60)[0]).toBeLessThan(36);
     // Top rim: shifted down; bottom rim: shifted up.
-    expect(at(100, 0)[1]).toBeGreaterThan(240);
-    expect(at(100, H - 1)[1]).toBeLessThan(16);
+    expect(at(100, 0)[1]).toBeGreaterThan(220);
+    expect(at(100, H - 1)[1]).toBeLessThan(36);
     expect(at(100, 0)[0]).toBe(128);
   });
 
@@ -45,6 +45,21 @@ describe("glass", () => {
     for (let i = 3; i < map.length; i += 4 * 97) expect(map[i]).toBe(255);
     // A size of nothing still gives one pixel, not an error.
     expect(lensMap(0, 0, 22).length).toBe(4);
+  });
+
+  it("bends like a rounded glass edge: nothing inside, steep at the rim", () => {
+    expect(refraction(0)).toBe(0);
+    expect(refraction(1)).toBe(1);
+    expect(refraction(0.5)).toBeLessThan(0.06);
+    expect(refraction(0.8)).toBeGreaterThan(0.15);
+    const ts = [0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1];
+    for (let i = 1; i < ts.length; i++) expect(refraction(ts[i])).toBeGreaterThan(refraction(ts[i - 1]));
+  });
+
+  it("gives a short panel a thinner, gentler edge", () => {
+    expect(lensFit(656, 430, LENS_EDGE)).toBe(1);
+    expect(lensFit(656, 64, LENS_EDGE)).toBeCloseTo((64 * 0.22) / LENS_EDGE, 5);
+    expect(lensFit(0, 0, LENS_EDGE)).toBe(0);
   });
 
   it("writes in dark ink only on a light picture", () => {
