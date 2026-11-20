@@ -15,7 +15,7 @@ export type Item = {
   live: boolean; // the row changes by itself: ask again every second while it shows
   folder: string; // absolute path ending in a backslash when the row is a folder that can unfold, "" = not
 };
-export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture" | "open_terminal" | "compress" | "properties" | "open_with" | "copy_file" | "rename" | "delete" | "keep_offline" | "free_up_space" | "more_options";
+export type Action = "reveal" | "open_folder" | "copy_path" | "admin" | "uninstall" | "close" | "close_window" | "copy" | "save_picture" | "open_terminal" | "open_in_claude" | "compress" | "properties" | "open_with" | "copy_file" | "rename" | "delete" | "keep_offline" | "free_up_space" | "more_options";
 export type Modifier = "none" | "ctrl" | "ctrl_shift";
 export type MenuAction = Action | "pin" | "unpin";
 export type Menu = { index: number; actions: MenuAction[]; selected: number; at: "pointer" | "row" };

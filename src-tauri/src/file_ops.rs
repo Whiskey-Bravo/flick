@@ -45,10 +45,15 @@ pub trait FileOps: Send + Sync {
 
 /// The actions menu of a file or folder row, in order. `cloud`: the item is
 /// under a cloud sync root (adds the keep/free pair); `drive_root`: `C:\` or
-/// `\\server\share\`, which cannot be compressed, renamed, deleted or kept offline.
-pub(crate) fn menu(is_dir: bool, cloud: bool, drive_root: bool) -> Vec<Action> {
+/// `\\server\share\`, which cannot be compressed, renamed, deleted or kept offline;
+/// `claude`: the Claude app is installed (folders get "Open in Claude").
+pub(crate) fn menu(is_dir: bool, cloud: bool, drive_root: bool, claude: bool) -> Vec<Action> {
     let mut actions = if is_dir {
-        vec![Action::OpenFolder, Action::OpenTerminal, Action::CopyPath, Action::Compress, Action::Rename, Action::Delete, Action::Properties]
+        let mut folder = vec![Action::OpenFolder, Action::OpenTerminal, Action::CopyPath, Action::Compress, Action::Rename, Action::Delete, Action::Properties];
+        if claude {
+            folder.insert(2, Action::OpenInClaude);
+        }
+        folder
     } else {
         vec![Action::Reveal, Action::OpenWith, Action::CopyFile, Action::CopyPath, Action::Rename, Action::Delete]
     };
@@ -640,20 +645,27 @@ mod tests {
 
     #[test]
     fn menu_orders_for_file_and_folder() {
-        assert_eq!(menu(true, true, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
-        assert_eq!(menu(false, true, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(menu(true, true, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, KeepOffline, FreeUpSpace, MoreOptions]);
+        assert_eq!(menu(false, true, false, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, KeepOffline, FreeUpSpace, MoreOptions]);
     }
 
     #[test]
     fn menu_without_cloud_drops_the_pair() {
-        assert_eq!(menu(true, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, MoreOptions]);
-        assert_eq!(menu(false, false, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
+        assert_eq!(menu(true, false, false, false), [OpenFolder, OpenTerminal, CopyPath, Compress, Rename, Delete, Properties, MoreOptions]);
+        assert_eq!(menu(false, false, false, false), [Reveal, OpenWith, CopyFile, CopyPath, Rename, Delete, MoreOptions]);
+    }
+
+    #[test]
+    fn folders_offer_claude_only_when_the_app_is_there() {
+        assert_eq!(menu(true, false, false, true), [OpenFolder, OpenTerminal, OpenInClaude, CopyPath, Compress, Rename, Delete, Properties, MoreOptions]);
+        assert_eq!(menu(true, false, true, true), [OpenFolder, OpenTerminal, OpenInClaude, CopyPath, Properties, MoreOptions]);
+        assert!(!menu(false, false, false, true).contains(&OpenInClaude));
     }
 
     #[test]
     fn menu_on_a_drive_root_drops_changes() {
-        assert_eq!(menu(true, false, true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
-        assert_eq!(menu(true, true, true), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
+        assert_eq!(menu(true, false, true, false), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
+        assert_eq!(menu(true, true, true, false), [OpenFolder, OpenTerminal, CopyPath, Properties, MoreOptions]);
     }
 
     #[test]

@@ -316,6 +316,7 @@ const MENU_LABELS: Record<MenuAction, string> = {
   copy: "Copy",
   save_picture: "Save as picture",
   open_terminal: "Open in Terminal",
+  open_in_claude: "Open in Claude",
   compress: "Compress to zip",
   properties: "Properties",
   open_with: "Open with…",

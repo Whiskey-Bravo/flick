@@ -957,7 +957,7 @@ impl FilesProvider {
             actions: {
                 let full = index.path(s);
                 let path = full.to_string_lossy();
-                file_ops::menu(s.is_dir, self.cloud.contains(&path), file_ops::is_volume_root(&path))
+                file_ops::menu(s.is_dir, self.cloud.contains(&path), file_ops::is_volume_root(&path), crate::launch::claude_app())
             },
             ..Default::default()
         }
@@ -1543,12 +1543,12 @@ mod tests {
     #[test]
     fn rows_offer_location_or_explorer_and_copy() {
         let (p, _) = provider(vec![entry(r"C:\x\notes.txt", false), entry(r"C:\x\notes", true)]);
-        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, file_ops::menu(false, false, false));
-        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, file_ops::menu(true, false, false));
+        assert_eq!(p.item(r"C:\x\notes.txt").unwrap().actions, file_ops::menu(false, false, false, false));
+        assert_eq!(p.item(r"C:\x\notes").unwrap().actions, file_ops::menu(true, false, false, false));
         let rows = p.query(&q("notes"));
         assert_eq!(rows.len(), 2);
         for r in rows {
-            assert_eq!(r.actions, file_ops::menu(r.icon == "folder", false, false), "{}", r.id);
+            assert_eq!(r.actions, file_ops::menu(r.icon == "folder", false, false, false), "{}", r.id);
             assert_eq!(r.complete, "");
         }
     }

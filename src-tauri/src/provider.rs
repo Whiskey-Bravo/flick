@@ -59,6 +59,8 @@ pub enum Action {
     SavePicture,
     /// Open a folder in Windows Terminal.
     OpenTerminal,
+    /// Open a folder in a new Claude Code session (the bar asks for a prompt first).
+    OpenInClaude,
     /// Compress a folder to a zip next to it.
     Compress,
     /// The item's Properties window.

@@ -480,6 +480,21 @@ pub mod testing {
 
 /// Whether Windows knows what opens `<scheme>:` links (an app registered
 /// the scheme). Reads the registry; never called by tests.
+/// Whether the Claude app is installed (its `claude://` link is registered),
+/// as last looked at by the running app (`set_claude_app`); false in tests.
+static CLAUDE_APP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn claude_app() -> bool {
+    CLAUDE_APP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Looks again whether the Claude app is installed; the result.
+pub fn set_claude_app() -> bool {
+    let installed = link_scheme_registered("claude");
+    CLAUDE_APP.store(installed, std::sync::atomic::Ordering::Relaxed);
+    installed
+}
+
 pub fn link_scheme_registered(scheme: &str) -> bool {
     use windows::core::{w, HSTRING};
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CLASSES_ROOT, RRF_RT_REG_SZ};
