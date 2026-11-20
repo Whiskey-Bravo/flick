@@ -283,6 +283,13 @@ fn show_as(app: &AppHandle, shown: Shown, mut steps: crate::timing::Steps) {
     // behind it. An already open bar keeps the picture it has.
     if hidden {
         take_backdrop(app, &w);
+        refresh_acrylic(app);
+        // Acrylic: the window kept the last list's height. Shrunk before it is
+        // on screen, so no tall blur shows below the fresh bar; the page tells
+        // the panel's height right after and the window grows to it.
+        if ACRYLIC.load(Ordering::SeqCst) {
+            let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, 1.0));
+        }
     }
     steps.step("backdrop");
     // Before the bar is on screen: its WebView is told to use normal memory
@@ -438,6 +445,30 @@ pub fn set_acrylic(app: &AppHandle, on: bool) {
         let height = if GLASS.load(Ordering::SeqCst) { GLASS_BAR_HEIGHT } else { BAR_HEIGHT };
         let _ = w.set_size(tauri::LogicalSize::new(BAR_WIDTH, height));
     }
+}
+
+/// Whether the Acrylic theme's live blur must be switched because Windows'
+/// Transparency setting changed since it was last applied (`on`).
+fn acrylic_changed(theme: &str, live: bool, on: bool) -> bool {
+    theme == "acrylic" && live != on
+}
+
+/// Before a show under the Acrylic theme: picks up a Transparency effects
+/// setting changed while Flick ran, so the bar never shows white text on the
+/// solid colour Windows puts in place of the blur. Other themes read nothing.
+fn refresh_acrylic(app: &AppHandle) {
+    let Some(state) = app.try_state::<crate::AppState>() else { return };
+    let look = state.mirror.appearance();
+    if look.theme != "acrylic" {
+        return;
+    }
+    let live = acrylic_live();
+    if !acrylic_changed(&look.theme, live, ACRYLIC.load(Ordering::SeqCst)) {
+        return;
+    }
+    let look = crate::theme::with_acrylic(look, live);
+    set_acrylic(app, look.acrylic);
+    let _ = app.emit("appearance:changed", look);
 }
 
 /// The bar window's height (CSS px) under Acrylic for a panel `panel_height`
@@ -690,6 +721,15 @@ mod tests {
         assert_eq!(acrylic_height(64.4), 64.0, "whole CSS px");
         assert_eq!(acrylic_height(0.0), 1.0, "never empty");
         assert_eq!(acrylic_height(500.0), BAR_HEIGHT, "never taller than the plain window");
+    }
+
+    #[test]
+    fn a_changed_transparency_setting_is_picked_up_at_the_next_show() {
+        assert!(acrylic_changed("acrylic", false, true), "Transparency effects turned off");
+        assert!(acrylic_changed("acrylic", true, false), "turned back on");
+        assert!(!acrylic_changed("acrylic", true, true));
+        assert!(!acrylic_changed("glass", false, false));
+        assert!(!acrylic_changed("dark", false, false));
     }
 
     #[test]

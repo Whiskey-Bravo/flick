@@ -76,6 +76,16 @@ export function cssVars(c: Colors): Record<string, string> {
   };
 }
 
+// The bar window's height under the plain themes (window.rs, BAR_HEIGHT).
+export const BAR_HEIGHT = 420;
+
+// How tall the room is that the actions menu may open into. Under Acrylic the
+// window is only as tall as the panel, but grows with it: the panel is
+// stretched to hold the menu, so the menu may use the plain window's height.
+export function menuViewHeight(acrylic: boolean, innerHeight: number): number {
+  return acrylic ? BAR_HEIGHT : innerHeight;
+}
+
 // The Settings window is never see-through: under Glass and Acrylic it uses the dark look.
 export function settingsColors(a: Appearance): Colors {
   return a.glass || a.acrylic ? DARK : a.colors;

@@ -2,7 +2,7 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, svgDataUrl, themedSvg, type Appearance } from "./appearance";
+import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, menuViewHeight, svgDataUrl, themedSvg, type Appearance } from "./appearance";
 import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, forgetFailedIcons, pickIconSrc, serverUrl } from "./icons";
@@ -334,6 +334,7 @@ function renderMenu() {
   menuEl.hidden = !m;
   if (!m) {
     menuEl.replaceChildren();
+    panel.style.minHeight = "";
     return;
   }
   menuEl.replaceChildren(
@@ -367,9 +368,12 @@ function renderMenu() {
   const w = menuEl.offsetWidth;
   const h = menuEl.offsetHeight;
   const left = at.x + w > window.innerWidth ? at.x - w : at.x;
-  const top = at.y + h > window.innerHeight ? at.y - h : at.y;
+  const room = menuViewHeight(appearance.acrylic, window.innerHeight);
+  const top = Math.max(0, at.y + h > room ? at.y - h : at.y);
   menuEl.style.left = `${Math.max(0, left)}px`;
-  menuEl.style.top = `${Math.max(0, top)}px`;
+  menuEl.style.top = `${top}px`;
+  // Acrylic: the panel stretches to hold the menu, and the window with it.
+  panel.style.minHeight = appearance.acrylic ? `${Math.min(room, top + h + 8)}px` : "";
 }
 
 // Only an <svg> built by Flick's backend is injected: anything else is dropped.
@@ -451,6 +455,9 @@ function render() {
   // Invisible while hidden (medium and high levels), so the next open starts
   // from nothing; anything that brings the bar back clears it.
   panel.classList.toggle("closed", state.hidden);
+  // Acrylic: the window follows the panel. Also from here, not only from the
+  // resize observer: after a show the height is told again even if unchanged.
+  reportShape();
 }
 
 /// A live row's new text, written into its element: the rows, the marker, the
@@ -766,6 +773,7 @@ const afterShow = (event: Event) => {
   shows++; // drop activation results from before this show
   querySeq++; // drop answers to queries from before this show
   jumpNext = true; // nothing glides in from where it was when the bar closed
+  shapeSent = -1; // Acrylic: the back end shrank the window for the show
   dispatch(event);
   reportAtFrame("page.shown_to_paint", handled);
   input.focus();
@@ -818,7 +826,6 @@ const paint = () => {
   updateLens();
   updateRowLens();
   render();
-  reportShape();
 };
 const themed = (a: Appearance) => {
   appearance = a;

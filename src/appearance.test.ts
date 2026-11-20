@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DARK,
   DEFAULT_APPEARANCE,
+  menuViewHeight,
   applyAppearance,
   colorsToSave,
   contrast,
@@ -34,6 +35,12 @@ describe("appearance", () => {
     expect(settingsColors(solid)).toBe(light);
     expect(settingsColors({ ...solid, theme: "glass", glass: true })).toBe(DARK);
     expect(settingsColors({ ...solid, theme: "acrylic", acrylic: true })).toBe(DARK);
+  });
+
+  it("under Acrylic a menu may use the full bar's height, as the window grows to fit it", () => {
+    expect(menuViewHeight(true, 110)).toBe(420);
+    expect(menuViewHeight(false, 110)).toBe(110);
+    expect(menuViewHeight(false, 460)).toBe(460);
   });
 
   it("marks the page when Acrylic's live blur is on", () => {
