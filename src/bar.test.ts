@@ -202,10 +202,10 @@ describe("bar", () => {
     expect(run(s, { type: "results", items: [] }).state.selected).toBe(0);
   });
 
-  it("arrows wrap", () => {
+  it("arrows stop at the ends", () => {
     const s = withItems(item("a"), item("b"), item("c"));
-    expect(run(s, key("ArrowUp")).state.selected).toBe(2);
-    expect(run(s, key("ArrowDown"), key("ArrowDown"), key("ArrowDown")).state.selected).toBe(0);
+    expect(run(s, key("ArrowUp")).state.selected).toBe(0);
+    expect(run(s, key("ArrowDown"), key("ArrowDown"), key("ArrowDown")).state.selected).toBe(2);
   });
 
   it("enter activates with modifier", () => {
@@ -347,7 +347,7 @@ describe("bar", () => {
 
   it("window follows selection upward", () => {
     const many = Array.from({ length: 12 }, (_, i) => item(String(i)));
-    let s = run(withItems(...many), key("ArrowUp")).state; // wraps to 11
+    let s = run(withItems(...many), ...Array(11).fill(key("ArrowDown"))).state;
     expect([s.selected, s.top]).toEqual([11, 4]);
     s = run(s, ...Array(7).fill(key("ArrowUp"))).state;
     expect([s.selected, s.top]).toEqual([4, 4]);
@@ -355,20 +355,20 @@ describe("bar", () => {
     expect([s.selected, s.top]).toEqual([3, 3]);
   });
 
-  it("arrows wrap across the full list and move the window", () => {
+  it("arrows stop at both ends of the full list", () => {
     const many = Array.from({ length: 12 }, (_, i) => item(String(i)));
     const s = withItems(...many);
     const up = run(s, key("ArrowUp")).state;
-    expect([up.selected, up.top]).toEqual([11, 4]);
-    const down = run(up, key("ArrowDown")).state;
-    expect([down.selected, down.top]).toEqual([0, 0]);
-    const short = withItems(item("a"), item("b"));
-    expect(run(short, key("ArrowUp")).state.top).toBe(0);
+    expect([up.selected, up.top]).toEqual([0, 0]);
+    const bottom = run(s, ...Array(11).fill(key("ArrowDown"))).state;
+    expect([bottom.selected, bottom.top]).toEqual([11, 4]);
+    const down = run(bottom, key("ArrowDown")).state;
+    expect([down.selected, down.top]).toEqual([11, 4]);
   });
 
   it("results reset the window", () => {
     const many = Array.from({ length: 12 }, (_, i) => item(String(i)));
-    const scrolled = run(withItems(...many), key("ArrowUp")).state;
+    const scrolled = run(withItems(...many), ...Array(11).fill(key("ArrowDown"))).state;
     expect(scrolled.top).toBe(4);
     const again = run(scrolled, { type: "results", items: many }).state;
     expect([again.selected, again.top]).toEqual([0, 0]);
@@ -380,11 +380,11 @@ describe("bar", () => {
     const many = Array.from({ length: 12 }, (_, i) => item(String(i)));
     let s = run(withItems(...many), { type: "configError", message: "cfg" }).state;
     expect(visibleItems(s)).toHaveLength(7);
-    s = run(s, key("ArrowUp")).state;
+    s = run(s, ...Array(11).fill(key("ArrowDown"))).state;
     expect([s.selected, s.top]).toEqual([11, 5]);
     expect(visibleItems(s)).toHaveLength(7);
     s = run(s, key("ArrowDown")).state;
-    expect([s.selected, s.top]).toEqual([0, 0]);
+    expect([s.selected, s.top]).toEqual([11, 5]);
   });
 
   it("fill outcome sets text and queries", () => {
@@ -619,7 +619,7 @@ describe("bar", () => {
       expect(s.selected).toBe(0);
     });
 
-    it("after moving down the empty bar's rows, Up moves back up and wraps, without recalling", () => {
+    it("after moving down the empty bar's rows, Up moves back up and stops at the top, without recalling", () => {
       const s = run(withPast("b"), { type: "results", items: [item("x"), item("y"), item("z")] }).state;
       const down2 = run(s, key("ArrowDown"), key("ArrowDown")).state;
       expect(down2.selected).toBe(2);
@@ -627,9 +627,9 @@ describe("bar", () => {
       expect([up1.selected, up1.text]).toEqual([1, ""]);
       const top = run(up1, key("ArrowUp")).state;
       expect([top.selected, top.text]).toEqual([0, ""]);
-      // On the top row, Up wraps to the last row: no old search appears.
-      const wrapped = run(top, key("ArrowUp")).state;
-      expect([wrapped.selected, wrapped.text]).toEqual([2, ""]);
+      // On the top row, Up stays there: no old search appears.
+      const stays = run(top, key("ArrowUp")).state;
+      expect([stays.selected, stays.text]).toEqual([0, ""]);
     });
 
     it("a row picked with the mouse also makes Up move up", () => {
@@ -664,13 +664,13 @@ describe("bar", () => {
       expect(down2.effects).toEqual([queryOf("")]);
     });
 
-    it("after moving through the rows, Up stays in them and wraps instead of recalling", () => {
+    it("after moving through the rows, Up stays in them instead of recalling", () => {
       const s = run(withPast("b"), { type: "results", items: [row("a"), row("c")] }, key("ArrowDown")).state;
       const up = run(s, key("ArrowUp")).state;
       expect([up.selected, up.text]).toEqual([0, ""]);
-      // On the top row Up wraps to the last row; no old search appears.
+      // On the top row Up stays there; no old search appears.
       const again = run(up, key("ArrowUp")).state;
-      expect([again.selected, again.text, again.recall]).toEqual([1, "", -1]);
+      expect([again.selected, again.text, again.recall]).toEqual([0, "", -1]);
     });
 
     it("going back up past a pin never drops into old searches", () => {
@@ -682,7 +682,7 @@ describe("bar", () => {
       const walked = run(open, key("ArrowDown"), key("ArrowDown"), key("ArrowUp"), key("ArrowUp")).state;
       expect([walked.selected, walked.text]).toEqual([0, ""]);
       const past = run(walked, key("ArrowUp")).state;
-      expect([past.selected, past.text]).toEqual([2, ""]);
+      expect([past.selected, past.text]).toEqual([0, ""]);
       // As the first move on a fresh bar, Up still recalls.
       expect(run(open, key("ArrowUp")).state.text).toBe("old");
       // And typing starts over: clearing the box gives recall back.
@@ -694,7 +694,7 @@ describe("bar", () => {
       const s = run(initial, { type: "results", items: [row("a"), row("b")] }).state;
       const r = run(s, key("ArrowUp"));
       expect(r.state.text).toBe("");
-      expect(r.state.selected).toBe(1);
+      expect(r.state.selected).toBe(0);
       expect(r.effects).toEqual([]);
     });
 
@@ -708,9 +708,9 @@ describe("bar", () => {
 
     it("Up with typed text moves the selection as before", () => {
       const s = run(withPast("b"), { type: "input", text: "x" }, { type: "results", items: [row("a"), row("c")] }).state;
-      const r = run(s, key("ArrowUp"));
+      const r = run(s, key("ArrowDown"), key("ArrowUp"));
       expect(r.state.text).toBe("x");
-      expect(r.state.selected).toBe(1);
+      expect(r.state.selected).toBe(0);
     });
 
     it("typing ends recall", () => {
@@ -718,7 +718,7 @@ describe("bar", () => {
       expect(recalled.recall).toBe(0);
       const typed = run(recalled, { type: "input", text: "bx" }, { type: "results", items: [row("a"), row("c")] }).state;
       expect(typed.recall).toBe(-1);
-      expect(run(typed, key("ArrowUp")).state.selected).toBe(1);
+      expect(run(typed, key("ArrowDown"), key("ArrowUp")).state.selected).toBe(0);
     });
 
     it("Ctrl+P pins only pinnable rows", () => {
@@ -831,7 +831,8 @@ describe("mouse and menu", () => {
     const s = withItems(rich("a", { pinnable: true, actions: ["reveal", "admin"] }));
     const open = run(s, { type: "menu", index: 0 }).state;
     expect(run(open, key("ArrowDown")).state.menu?.selected).toBe(1);
-    expect(run(open, key("ArrowUp")).state.menu?.selected).toBe(2);
+    expect(run(open, key("ArrowUp")).state.menu?.selected).toBe(0);
+    expect(run(open, key("ArrowDown"), key("ArrowDown"), key("ArrowDown")).state.menu?.selected).toBe(2);
     const esc = run(open, key("Escape"));
     expect(esc.state.menu).toBeNull();
     expect(esc.effects).toEqual([]);
@@ -1727,7 +1728,7 @@ describe("folder unfolding", () => {
       const down = run(s, key("ArrowDown"), key("ArrowDown")).state;
       expect(down.selected).toBe(2);
       expect(run(down, key("Enter")).effects).toEqual([{ type: "activate", item: entry("y"), modifier: "none", text: "", scope: null }]);
-      expect(run(s, key("ArrowUp")).state.selected).toBe(3);
+      expect(run(s, ...Array(5).fill(key("ArrowDown"))).state.selected).toBe(3);
       expect(visibleItems(s).map((r) => r.id)).toEqual(["D", "C:\\x\\x", "C:\\x\\y", "b"]);
       expect(run(s, { type: "hover", index: 3 }).state.selected).toBe(3);
       expect(run(s, { type: "click", index: 1, ctrl: true, shift: false }).effects).toEqual([
@@ -1740,7 +1741,7 @@ describe("folder unfolding", () => {
       // The window counts the shown rows.
       const many = { ...withItems(dir("D")), unfolded: { [k]: fold("C:\\D\\", ready(Array.from({ length: 15 }, (_, i) => entry(`f${i}`)))) } };
       expect(run(many, { type: "wheel", rows: 100 }).state.top).toBe(8);
-      const last = run(many, key("ArrowUp")).state;
+      const last = run(many, ...Array(16).fill(key("ArrowDown"))).state;
       expect([last.selected, last.top]).toEqual([15, 8]);
     });
   });

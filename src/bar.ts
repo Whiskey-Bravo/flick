@@ -725,14 +725,17 @@ function step(s: State, e: Event): Result {
   }
 }
 
+/** One row up (-1) or down (+1) from `at` among `n` rows, stopping at the first and last. */
+function stepWithin(at: number, step: number, n: number): number {
+  return Math.min(Math.max(at + step, 0), n - 1);
+}
+
 function onMenuKey(s: State, m: Menu, e: Extract<Event, { type: "key" }>): Result {
   const n = m.actions.length;
   switch (e.key) {
     case "ArrowUp":
-    case "ArrowDown": {
-      const step = e.key === "ArrowDown" ? 1 : n - 1;
-      return done({ ...s, menu: { ...m, selected: (m.selected + step) % n } });
-    }
+    case "ArrowDown":
+      return done({ ...s, menu: { ...m, selected: stepWithin(m.selected, e.key === "ArrowDown" ? 1 : -1, n) } });
     case "Enter":
       return reduce(s, { type: "menuPick", action: m.actions[m.selected] });
     case "Escape":
@@ -762,7 +765,7 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
     case "ArrowDown": {
       // Up on the empty bar recalls past searches, but only as the first move:
       // once the rows were moved through (arrows or mouse), the arrows stay in
-      // the rows and wrap at the ends, so going back up past a pin never
+      // the rows and stop at the ends, so going back up past a pin never
       // drops into old searches. Typing, or opening the bar again, starts over.
       const n = shownRows(s).length;
       const inRows = s.recall < 0 && s.browsed && n > 0;
@@ -775,8 +778,8 @@ function onKey(s: State, e: Extract<Event, { type: "key" }>): Result {
       if (!highlighted(s)) {
         return done(fit({ ...s, selected: e.key === "ArrowDown" ? s.selected : n - 1, browsed: true }));
       }
-      const step = e.key === "ArrowDown" ? 1 : n - 1;
-      return done(fit({ ...s, selected: (s.selected + step) % n, armed: null, browsed: true }));
+      const selected = stepWithin(s.selected, e.key === "ArrowDown" ? 1 : -1, n);
+      return done(fit({ ...s, selected, armed: null, browsed: true }));
     }
     case "ArrowLeft":
     case "ArrowRight":
