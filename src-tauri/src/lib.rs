@@ -55,6 +55,7 @@ mod winkey_logic;
 mod winkey_helper;
 mod winlist;
 mod wsl_detect;
+mod zone;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,9 +238,7 @@ impl Providers {
         // The time zone may have changed while Flick ran (travel, a manual
         // change). Read here, not on the query path: it is quick, as the zone
         // data is built into Flick.
-        let tz = jiff::tz::TimeZone::system();
-        self.answers.set_zone(tz.clone());
-        self.timers.set_zone(tz);
+        self.answers.zone().set(jiff::tz::TimeZone::system());
     }
 
     /// The bar hid: drop the clipboard history and clipboard text read for it,
@@ -276,7 +275,8 @@ struct ExtraSources {
     /// `reminders.json`.
     reminders: PathBuf,
     now: dirs::Clock,
-    tz: jiff::tz::TimeZone,
+    /// Shared with the answers.
+    tz: Arc<zone::LocalZone>,
 }
 
 impl Extras {
@@ -289,6 +289,7 @@ impl Extras {
         open_settings: Opener,
         fire: Fire,
         report: Report,
+        tz: Arc<zone::LocalZone>,
     ) -> Self {
         let sources = ExtraSources {
             games: Arc::new(SystemGames),
@@ -300,7 +301,7 @@ impl Extras {
             chores: Arc::new(SystemChores),
             reminders: reminders_path(),
             now: Arc::new(std::time::SystemTime::now),
-            tz: jiff::tz::TimeZone::system(),
+            tz,
         };
         Self::over(launcher, on_ready, open_settings, fire, report, sources)
     }
@@ -965,8 +966,8 @@ fn apply_detection(state: &AppState, detection: wsl_detect::Detection) {
 
 /// What [`push_config`] leaves to its caller.
 struct Pushed {
-    /// The file roots changed: the caller rescans the files in the background
-    /// (the watcher has already moved to the new roots).
+    /// The file roots changed: the caller moves the watcher and rescans the
+    /// files in the background, once the config lock is released.
     roots_changed: bool,
     /// The new shortcuts, to apply once the config lock is released.
     shortcuts: Staged,
@@ -984,7 +985,8 @@ fn push_config(p: &Providers, old: &Config, new: &Config, detected: &WslState) -
     p.workspaces.set(new.workspaces.clone());
     p.snippets.set(new.snippets.clone());
     // Unchanged roots are not re-set: that would restart a running scan and
-    // re-register the watcher for nothing.
+    // re-register the watcher for nothing. No disk access here (see
+    // `FilesProvider::rewatch`).
     let roots_changed = old.file_roots != new.file_roots;
     if roots_changed {
         p.files.set_roots(new.file_roots.clone());
@@ -1180,7 +1182,7 @@ fn setup(app: &AppHandle) {
     // A workspace whose items did not all open brings the bar back with its name and the count.
     let reopen = app.clone();
     let report: Report = Arc::new(move |name: &str, message: &str| window::reopen(&reopen, name, message));
-    let extras = Extras::new(launcher.clone(), on_ready.clone(), settings_opener(app), fire, report);
+    let extras = Extras::new(launcher.clone(), on_ready.clone(), settings_opener(app), fire, report, answers.provider.zone());
     let control = Control::new(launcher.clone(), on_ready);
     // Paste, Win+V, the snip and the colour picker, run once the bar has hidden.
     app.manage::<Arc<dyn AfterHide>>(Arc::new(FollowUps {
@@ -1415,18 +1417,13 @@ fn start_index_threads(app: &AppHandle, p: Providers) {
         }
     });
 
-    let handle = app.clone();
     let files = p.files;
     std::thread::spawn(move || {
-        {
-            // Under the config lock: a reload's `set_roots` then runs either
-            // before (and the watcher starts on its roots) or after (and
-            // moves the watcher).
-            let state = handle.state::<AppState>();
-            let _config = state.config.lock().unwrap_or_else(|e| e.into_inner());
-            // Without a watcher the periodic rescan (then always due) picks changes up.
-            let _ = files.watch();
-        }
+        // A reload's `set_roots` runs either before (and the watcher starts
+        // on its roots) or after (and its `rewatch` waits for the watcher,
+        // then moves it). Without a watcher the periodic rescan (then always
+        // due) picks changes up.
+        let _ = files.watch();
         // The first scan always runs. After it, the 30-minute tick scans
         // only when the watcher lost track of something or there is none.
         files.refresh();
@@ -1628,8 +1625,14 @@ fn reload_with(app: &AppHandle, detection: Option<wsl_detect::Detection>) {
     // its distro may be new).
     let (roots_changed, staged) = push_reload(&state.providers, &config, &loaded, &detected, redetected);
     if roots_changed {
+        // Off this thread and outside the lock: registering folders touches
+        // the disk. `rewatch` always ends on the latest roots, whatever order
+        // two reloads' threads run in.
         let files = state.providers.files.clone();
-        std::thread::spawn(move || files.refresh());
+        std::thread::spawn(move || {
+            files.rewatch();
+            files.refresh();
+        });
     }
     // Under the config lock, so concurrent reloads apply the switch in order.
     // At most one `remove_file`, and only when the switch changed.
@@ -2011,7 +2014,7 @@ mod tests {
                 chores,
                 reminders: dir.path().join("reminders.json"),
                 now: Arc::new(|| std::time::SystemTime::from("2026-11-17T14:27:00Z".parse::<jiff::Timestamp>().unwrap())),
-                tz: jiff::tz::TimeZone::UTC,
+                tz: zone::LocalZone::new(jiff::tz::TimeZone::UTC),
             },
         );
         // The fakes answer at once: read them here, as the background threads would.

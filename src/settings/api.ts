@@ -83,6 +83,8 @@ export type SettingsState = {
   version: string;
   /** Every theme with its colours, in display order. */
   themes: ThemeInfo[];
+  /** Whether Windows can show the Acrylic theme's live blur right now. */
+  acrylic_live: boolean;
   /** The languages `tr` knows, as [code, name]. */
   languages: [string, string][];
 };

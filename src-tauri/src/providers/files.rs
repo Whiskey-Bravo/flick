@@ -293,7 +293,7 @@ impl WatchState {
 
     /// A root that went away, or came back, without the watcher saying so
     /// (an ejected drive, a dropped share): stops vouching and marks dirty.
-    /// It stays unwatched until the next `watch` or `set_roots`, so every
+    /// It stays unwatched until the next `watch` or `rewatch`, so every
     /// tick then scans (today's behaviour).
     fn check_roots(&self, exists: impl Fn(&Path) -> bool) {
         // The lock is not held while the disk is asked.
@@ -387,7 +387,7 @@ fn on_watch_result(
     }
     let roots = roots.lock().unwrap_or_else(|e| e.into_inner());
     // A root that goes away is no longer watched, even if it comes back: it
-    // stays unwatched until the next `watch`/`set_roots`, so every tick scans
+    // stays unwatched until the next `watch`/`rewatch`, so every tick scans
     // (today's behaviour).
     if event_ends_a_root(&event.kind, &event.paths, &roots) {
         state.watching.store(false, Ordering::SeqCst);
@@ -490,8 +490,9 @@ pub struct FilesProvider {
     idle: Condvar,
     /// `%USERPROFILE%`, shown as `~` in subtitles.
     home: Option<PathBuf>,
-    /// Alive while watching; replaced by each `watch`.
-    watcher: Mutex<Option<RecommendedWatcher>>,
+    /// Alive while watching; replaced by each `watch`. Held while the
+    /// watcher is made or moved, so those never interleave.
+    watcher: Mutex<Option<Watching>>,
     /// Set once the first scan has been swapped in.
     scanned: AtomicBool,
     /// Bumped by every swap of `index`: a patch built from an older one is not swapped in.
@@ -579,26 +580,39 @@ impl FilesProvider {
 
     /// Empty = [`default_roots`]. The current index keeps answering until the
     /// next `refresh`; a scan already running for the old roots is discarded.
-    /// A running watcher moves to the new roots. The roots are tidied first
-    /// (see [`normalize_roots`]).
+    /// The roots are tidied first (see [`normalize_roots`]). No disk access,
+    /// so it may run under the config lock: a running watcher moves to the
+    /// new roots only at the next [`rewatch`](Self::rewatch).
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
         let roots = normalize_roots(if roots.is_empty() { default_roots() } else { roots });
-        let old = std::mem::replace(&mut *self.roots.lock().unwrap_or_else(|e| e.into_inner()), roots.clone());
-        // The index is stale until the next scan, which clears this when it starts.
+        *self.roots.lock().unwrap_or_else(|e| e.into_inner()) = roots;
+        // The index is stale until the next scan, which clears this when it
+        // starts; and the watcher does not vouch for the new roots yet.
         self.watch_state.dirty.store(true, Ordering::SeqCst);
+        self.watch_state.watching.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(w) = self.watcher.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            for r in &old {
-                let _ = w.unwatch(r);
-            }
-            // A root that cannot be watched (e.g. missing) misses events: the
-            // periodic refresh then rescans every time.
-            let mut all = true;
-            for r in &roots {
-                all &= w.watch(r, RecursiveMode::Recursive).is_ok();
-            }
-            self.watch_state.arm(&roots, all, path_exists, os_drive_is_fixed);
+    }
+
+    /// Moves a running watcher to the current roots (registering folders
+    /// touches the disk: call with no lock held). Calls in any order end with
+    /// the watcher on the latest roots; nothing to do without a watcher.
+    pub fn rewatch(&self) {
+        let mut guard = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = guard.as_mut() else { return };
+        // Registered afresh even when unchanged: a root that went away and
+        // came back needs a new registration.
+        let roots = self.roots();
+        for r in &w.roots {
+            let _ = w.watcher.unwatch(r);
         }
+        // A root that cannot be watched (e.g. missing) misses events: the
+        // periodic refresh then rescans every time.
+        let mut all = true;
+        for r in &roots {
+            all &= w.watcher.watch(r, RecursiveMode::Recursive).is_ok();
+        }
+        self.watch_state.arm(&roots, all, path_exists, os_drive_is_fixed);
+        w.roots = roots;
     }
 
     fn roots(&self) -> Vec<PathBuf> {
@@ -752,6 +766,9 @@ impl FilesProvider {
 
     /// `watch` with the drive-type lookup passed in (tests).
     fn watch_using(self: &Arc<Self>, fixed: impl Fn(char) -> bool) -> notify::Result<()> {
+        // Held to the end, so a `rewatch` waits and then finds this watcher.
+        let mut slot = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+        let roots = self.roots();
         let (tx, rx) = mpsc::channel::<Vec<PathBuf>>();
         let shared_roots = self.roots.clone();
         let state = self.watch_state.clone();
@@ -767,8 +784,8 @@ impl FilesProvider {
         })
         .inspect_err(|_| self.watch_state.dirty.store(true, Ordering::SeqCst))?;
         let mut all = true;
-        for root in self.roots() {
-            if let Err(e) = watcher.watch(&root, RecursiveMode::Recursive) {
+        for root in &roots {
+            if let Err(e) = watcher.watch(root, RecursiveMode::Recursive) {
                 // A missing root is skipped by the scan too, but is not watched:
                 // it appearing later would go unseen.
                 all = false;
@@ -778,7 +795,7 @@ impl FilesProvider {
                 }
             }
         }
-        self.watch_state.arm(&self.roots(), all, path_exists, fixed);
+        self.watch_state.arm(&roots, all, path_exists, fixed);
         let weak = Arc::downgrade(self);
         std::thread::spawn(move || {
             // Ends when the watcher (and with it `tx`) or the provider is dropped.
@@ -819,9 +836,15 @@ impl FilesProvider {
                 p.refresh();
             }
         });
-        *self.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(watcher);
+        *slot = Some(Watching { watcher, roots });
         Ok(())
     }
+}
+
+/// A live folder watcher and the roots it is registered on.
+struct Watching {
+    watcher: RecommendedWatcher,
+    roots: Vec<PathBuf>,
 }
 
 /// Records the size of a freshly built index (the caller checks that timing
@@ -2184,6 +2207,33 @@ mod tests {
         assert!(!p.watch_state.watching.load(Ordering::SeqCst));
         assert!(p.watch_state.dirty.load(Ordering::SeqCst));
         assert!(!event_ends_a_root(&EventKind::Create(notify::event::CreateKind::Any), &[PathBuf::from(r"C:\Users\x")], &[PathBuf::from(r"C:\Users\x")]));
+    }
+
+    #[test]
+    fn new_roots_move_the_watcher_only_when_asked() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (p, _) = provider(vec![]);
+        p.set_roots(vec![a.path().to_path_buf()]);
+        p.watch_using(|_| true).unwrap();
+        let watched = |p: &FilesProvider| p.watcher.lock().unwrap().as_ref().map(|w| w.roots.clone());
+        let a_roots = normalize_roots(vec![a.path().to_path_buf()]);
+        assert_eq!(watched(&p), Some(a_roots));
+        // Under the config lock: only the wish is stored, nothing is registered.
+        p.set_roots(vec![b.path().to_path_buf()]);
+        let b_roots = normalize_roots(vec![b.path().to_path_buf()]);
+        assert_ne!(watched(&p), Some(b_roots.clone()));
+        // After the lock: the watcher follows, and again stays on them.
+        p.rewatch();
+        assert_eq!(watched(&p), Some(b_roots.clone()));
+        assert!(p.watch_state.watching.load(Ordering::SeqCst));
+        p.rewatch();
+        assert_eq!(watched(&p), Some(b_roots));
+        // Without a watcher there is nothing to move.
+        let (q, _) = provider(vec![]);
+        q.set_roots(vec![a.path().to_path_buf()]);
+        q.rewatch();
+        assert!(q.watcher.lock().unwrap().is_none());
     }
 
     #[test]

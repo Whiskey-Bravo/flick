@@ -5,20 +5,26 @@ import {
   settingsHotkeyStatus,
   settingsPauseHotkey,
   settingsSaveHotkey,
+  type DirectHotkeyDef,
   type KeyStatusRow,
   type PickRow,
   type SettingsState,
 } from "./api";
 import { DIRECT_HINT, WEAK_COMBO, directComboOk, hotkeyFromEvent, hotkeyKeys } from "./hotkey";
-import { emptyHkForm as empty, hkSync, isHkDirty, keepRemoveError, type HkForm, type RemoveError } from "./hotkeyForm";
+import {
+  emptyHkForm as empty,
+  isHkDirty,
+  keepRemoveError,
+  toHkForm,
+  type HkForm,
+  type RemoveError,
+} from "./hotkeyForm";
 import { ItemPicker } from "./ItemPicker";
-import { oneAtATime } from "./oneAtATime";
-import type { LeaveGuard } from "./Shortcuts";
+import { EditorActions, EditorNotices, ErrorLine, ListLayout } from "./ListEditor";
+import { errorMessage, type LeaveGuard } from "./listEditorLogic";
+import { useListEditor } from "./useListEditor";
 import "./shortcuts.css";
 import "./workspaces.css";
-
-type Choice = "save" | "discard" | "stay";
-const message = (e: unknown) => (typeof e === "string" ? e : e instanceof Error ? e.message : "Could not save.");
 
 let calls: Promise<unknown> = Promise.resolve();
 
@@ -38,20 +44,27 @@ function Caps({ keys }: { keys: string }) {
 export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGuard }) {
   const defs = state.config.direct_hotkey;
   const [status, setStatus] = useState<KeyStatusRow[]>([]);
-  const [open, setOpen] = useState(false);
-  const [original, setOriginal] = useState<string | null>(null);
-  const [form, setForm] = useState<HkForm>(empty());
-  const [saved, setSaved] = useState<HkForm | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<RemoveError | null>(null);
-  const [changedNote, setChangedNote] = useState(false);
-  const [asking, setAsking] = useState<((c: Choice) => void) | null>(null);
   const [capturing, setCapturing] = useState(false);
   const paused = useRef(false);
-  const askRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (asking) askRef.current?.scrollIntoView({ block: "nearest" });
-  }, [asking !== null]);
+  const ed = useListEditor<HkForm, DirectHotkeyDef>({
+    state,
+    guard,
+    defs,
+    keyOf: (d) => d.keys,
+    formKey: (f) => f.keys,
+    empty,
+    toForm: toHkForm,
+    isDirty: isHkDirty,
+    // Saved as sent: the form is not replaced, and the Save button is off without an item.
+    canSave: (form) => form.item !== null,
+    write: (original, form) => settingsSaveHotkey(original, { keys: form.keys, item: form.item! }),
+    onSaved: () => setRemoveError(null),
+    onShow: () => setRemoveError(null),
+    // The Remove error stays only while its row is still in the file.
+    onFileChanged: () => setRemoveError((e) => keepRemoveError(e, defs)),
+  });
+  const { open, original, form } = ed;
 
   // The status line follows every reload.
   useEffect(() => {
@@ -105,199 +118,80 @@ export function Hotkeys({ state, guard }: { state: SettingsState; guard: LeaveGu
     }
     const combo = hotkeyFromEvent(e);
     if (combo === null) return;
-    setForm((f) => ({ ...f, keys: combo }));
-    setSaveError(null);
+    ed.patch({ keys: combo });
     stopCapture();
   };
 
-  const dirty = open && isHkDirty(saved, form);
   const weak = form.keys !== "" && !directComboOk(form.keys);
   const valid = form.keys !== "" && !weak && form.item !== null;
-
-  // The file changed: follow it unless there is an unsaved edit.
-  const latest = useRef({ open, dirty, saved, original });
-  latest.current = { open, dirty, saved, original };
-  useEffect(() => {
-    const { open, dirty, saved, original } = latest.current;
-    setRemoveError((e) => keepRemoveError(e, defs));
-    const act = hkSync(open, original, dirty, saved, defs);
-    if (act.kind === "note") {
-      setChangedNote(true);
-    } else if (act.kind === "reload") {
-      setSaved(act.form);
-      setForm(act.form);
-    } else if (act.kind === "close") {
-      setOpen(false);
-      setOriginal(null);
-      setSaved(null);
-      setForm(empty());
-    }
-  }, [state]);
-
-  // The editor as it is now: the leave question's Save (made by an older
-  // render) sends what the editor shows when it is clicked.
-  const now = useRef({ form, original });
-  now.current = { form, original };
-  const [saving, setSaving] = useState(false);
-  const [once] = useState(() => oneAtATime(setSaving));
-
-  const doSave = (): Promise<boolean> => once(async () => {
-    const { form, original } = now.current;
-    if (!form.item) return false;
-    setSaveError(null);
-    try {
-      await settingsSaveHotkey(original, { keys: form.keys, item: form.item });
-      setSaved(form);
-      setOriginal(form.keys);
-      setChangedNote(false);
-      setRemoveError(null);
-      return true;
-    } catch (e) {
-      setSaveError(message(e));
-      return false;
-    }
-  });
-
-  const pending = useRef<Promise<boolean> | null>(null);
-  const mayLeave = (): Promise<boolean> => {
-    if (!dirty) return Promise.resolve(true);
-    if (pending.current) return pending.current;
-    const p = (async () => {
-      const c = await new Promise<Choice>((resolve) => setAsking(() => resolve));
-      setAsking(null);
-      if (c === "stay") return false;
-      if (c === "save") return await doSave();
-      return true;
-    })();
-    pending.current = p;
-    void p.finally(() => (pending.current = null));
-    return p;
-  };
-  guard.current = mayLeave;
-  useEffect(() => () => void (guard.current = null), []);
-
-  const show = (def: { keys: string; item: HkForm["item"] } | null) => {
-    const f: HkForm = def ? { keys: def.keys, item: def.item } : empty();
-    setOpen(true);
-    setOriginal(def ? def.keys : null);
-    setSaved(def ? f : null);
-    setForm(f);
-    setSaveError(null);
-    setRemoveError(null);
-    setChangedNote(false);
-  };
-
-  const select = async (def: { keys: string; item: HkForm["item"] } | null) => {
-    if (def && open && original === def.keys) return;
-    if (await mayLeave()) show(def);
-  };
 
   const remove = async (keys: string) => {
     setRemoveError(null);
     try {
       await settingsDeleteHotkey(keys);
-      if (open && original === keys) {
-        setOpen(false);
-        setOriginal(null);
-        setSaved(null);
-        setForm(empty());
-      }
-      setSaveError(null);
+      if (open && original === keys) ed.close();
+      ed.setSaveError(null);
     } catch (e) {
-      setRemoveError({ keys, text: message(e) });
+      setRemoveError({ keys, text: errorMessage(e) });
     }
   };
 
-  const pickItem = (row: PickRow) => {
-    setForm((f) => ({ ...f, item: { provider: row.provider, id: row.id, title: row.title } }));
-    setSaveError(null);
-  };
+  const pickItem = (row: PickRow) => ed.patch({ item: { provider: row.provider, id: row.id, title: row.title } });
 
   return (
-    <div class="sc">
-      <div class="sc-list hk-list">
-        <button class="sc-add" onClick={() => select(null)}>
-          + Add hotkey
+    <ListLayout
+      listClass="hk-list"
+      addLabel="+ Add hotkey"
+      onAdd={() => ed.select(null)}
+      rows={defs.map((d) => {
+        const msg = status.find((s) => s.keys === d.keys);
+        return (
+          <div key={d.keys} class={ed.isOpen(d.keys) ? "sc-row hk-row active" : "sc-row hk-row"}>
+            <button class="hk-main" onClick={() => ed.select(d)}>
+              <span class="sc-name">
+                <Caps keys={d.keys} />
+              </span>
+              <span class="sc-about">{d.item.title}</span>
+              {msg && msg.state !== "ok" && <span class="hk-status">{msg.message}</span>}
+            </button>
+            {/* Removes at once, without the Delete confirm the other pages ask. */}
+            <button class="hk-remove" onClick={() => void remove(d.keys)}>
+              Remove
+            </button>
+          </div>
+        );
+      })}
+      count={defs.length}
+      emptyHint="No hotkeys yet."
+      listEnd={removeError !== null && <ErrorLine>{removeError.text}</ErrorLine>}
+      open={open}
+      idle="Pick a hotkey, or add a new one."
+    >
+      <EditorNotices ed={ed} noun="hotkey" valid={valid} />
+
+      <div class="sc-field">
+        <span>Keys</span>
+        <button
+          class={capturing ? "hotkey capturing hk-capture" : "hotkey hk-capture"}
+          onClick={startCapture}
+          onBlur={stopCapture}
+          onKeyDown={capturing ? onKey : undefined}
+        >
+          {capturing ? "Press the keys\u2026" : form.keys === "" ? "Click, then press the keys" : <Caps keys={form.keys} />}
         </button>
-        {defs.map((d) => {
-          const msg = status.find((s) => s.keys === d.keys);
-          return (
-            <div key={d.keys} class={open && original === d.keys ? "sc-row hk-row active" : "sc-row hk-row"}>
-              <button class="hk-main" onClick={() => select(d)}>
-                <span class="sc-name">
-                  <Caps keys={d.keys} />
-                </span>
-                <span class="sc-about">{d.item.title}</span>
-                {msg && msg.state !== "ok" && <span class="hk-status">{msg.message}</span>}
-              </button>
-              <button class="hk-remove" onClick={() => void remove(d.keys)}>
-                Remove
-              </button>
-            </div>
-          );
-        })}
-        {defs.length === 0 && <p class="sc-hint">No hotkeys yet.</p>}
-        {removeError !== null && (
-          <p class="sc-error" role="alert">
-            {removeError.text}
-          </p>
-        )}
+        {weak && <ErrorLine>{WEAK_COMBO}</ErrorLine>}
+        <small>{DIRECT_HINT}</small>
       </div>
 
-      {!open ? (
-        <div class="sc-editor sc-empty">Pick a hotkey, or add a new one.</div>
-      ) : (
-        <div class="sc-editor">
-          {asking && (
-            <div class="sc-ask" role="alertdialog" ref={askRef}>
-              <span>This hotkey has unsaved changes.</span>
-              <button disabled={!valid || saving} onClick={() => asking("save")}>
-                Save
-              </button>
-              <button onClick={() => asking("discard")}>Discard</button>
-              <button onClick={() => asking("stay")}>Stay</button>
-            </div>
-          )}
+      <div class="sc-field">
+        <span>Opens</span>
+        {form.item && <div class="hk-chosen">{form.item.title}</div>}
+        <ItemPicker forWorkspace={false} onPick={pickItem} />
+      </div>
 
-          {changedNote && <p class="sc-note">The config file changed. Your unsaved edit is kept.</p>}
+      {ed.saveError !== null && <ErrorLine>{ed.saveError}</ErrorLine>}
 
-          <div class="sc-field">
-            <span>Keys</span>
-            <button
-              class={capturing ? "hotkey capturing hk-capture" : "hotkey hk-capture"}
-              onClick={startCapture}
-              onBlur={stopCapture}
-              onKeyDown={capturing ? onKey : undefined}
-            >
-              {capturing ? "Press the keys\u2026" : form.keys === "" ? "Click, then press the keys" : <Caps keys={form.keys} />}
-            </button>
-            {weak && (
-              <p class="sc-error" role="alert">
-                {WEAK_COMBO}
-              </p>
-            )}
-            <small>{DIRECT_HINT}</small>
-          </div>
-
-          <div class="sc-field">
-            <span>Opens</span>
-            {form.item && <div class="hk-chosen">{form.item.title}</div>}
-            <ItemPicker forWorkspace={false} onPick={pickItem} />
-          </div>
-
-          {saveError !== null && (
-            <p class="sc-error" role="alert">
-              {saveError}
-            </p>
-          )}
-
-          <div class="sc-actions">
-            <button class="primary" disabled={!valid || !dirty || saving} onClick={() => void doSave()}>
-              Save
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+      <EditorActions ed={ed} valid={valid} />
+    </ListLayout>
   );
 }
