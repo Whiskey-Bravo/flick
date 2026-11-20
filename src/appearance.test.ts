@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   DARK,
   DEFAULT_APPEARANCE,
-  menuViewHeight,
+  layoutHeight, menuViewHeight,
   applyAppearance,
   colorsToSave,
   contrast,
@@ -113,5 +113,19 @@ describe("custom colours being edited", () => {
     expect(after).toEqual({ ...DARK, background: "#000000", text: "#12" });
     expect(draftAfterReload(undefined, draft)).toBeNull();
     expect(draftAfterReload(DARK, null)).toEqual(DARK);
+  });
+});
+
+describe("layoutHeight", () => {
+  const style = (o: Partial<Record<string, string>>) =>
+    ({ height: "64.4px", boxSizing: "border-box", paddingTop: "6px", paddingBottom: "6px", borderTopWidth: "1px", borderBottomWidth: "1px", ...o }) as unknown as CSSStyleDeclaration;
+  it("is the laid-out height, with fractions, whatever a transform does", () => {
+    expect(layoutHeight(style({}))).toBe(64.4);
+  });
+  it("adds padding and border when the height is the content's", () => {
+    expect(layoutHeight(style({ boxSizing: "content-box", height: "50px" }))).toBe(64);
+  });
+  it("is 0 for a height that is not a number", () => {
+    expect(layoutHeight(style({ height: "auto" }))).toBe(0);
   });
 });

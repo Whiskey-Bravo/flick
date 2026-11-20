@@ -2,7 +2,7 @@
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, menuViewHeight, svgDataUrl, themedSvg, type Appearance } from "./appearance";
+import { DARK, DEFAULT_APPEARANCE, GLASS_DARK_INK, applyAppearance, layoutHeight, menuViewHeight, svgDataUrl, themedSvg, type Appearance } from "./appearance";
 import { inkIsDark, installLens } from "./glass";
 import { HIGHLIGHT, LIST, pressed, settled, stepSpring, stretch, type Spring } from "./spring";
 import { builtinName, fallbackName, forgetFailedIcons, pickIconSrc, serverUrl } from "./icons";
@@ -813,7 +813,8 @@ const sendShape = () => {
     shapeSent = -1;
     return;
   }
-  const height = panel.getBoundingClientRect().height;
+  // The laid-out height: the opening animation's scaling would read short.
+  const height = layoutHeight(getComputedStyle(panel));
   if (height === shapeSent) return;
   shapeSent = height;
   invoke("bar_shape", { height }).catch(() => {});

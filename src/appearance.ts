@@ -79,6 +79,19 @@ export function cssVars(c: Colors): Record<string, string> {
 // The bar window's height under the plain themes (window.rs, BAR_HEIGHT).
 export const BAR_HEIGHT = 420;
 
+/**
+ * An element's laid-out border-box height from its computed style, in CSS px
+ * with fractions. Unlike a bounding box it ignores transforms, so the opening
+ * animation's scaling does not shrink it; 0 when the height is not a number.
+ */
+export function layoutHeight(cs: CSSStyleDeclaration): number {
+  const px = (v: string) => parseFloat(v) || 0;
+  const height = parseFloat(cs.height);
+  if (Number.isNaN(height)) return 0;
+  if (cs.boxSizing === "border-box") return height;
+  return height + px(cs.paddingTop) + px(cs.paddingBottom) + px(cs.borderTopWidth) + px(cs.borderBottomWidth);
+}
+
 // How tall the room is that the actions menu may open into. Under Acrylic the
 // window is only as tall as the panel, but grows with it: the panel is
 // stretched to hold the menu, so the menu may use the plain window's height.
